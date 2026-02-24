@@ -13820,6 +13820,164 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10K + SIGNALS_P10L + SIGNALS_P10M + SIGNALS_P10N + SIGNALS_P10O)
 
 
+# ── Phase 10P — S910 extensions + dual-channel AND + 50w channel (S911-S920) ──
+
+def sig_s911_s910_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S911: S910 (OR(20w/30w/40w)+compressed) + lag5pct.
+    Channel union + TSLA lagging SPY ≥5% over 20 days.
+    Hypothesis: 100% WR path — multi-scale structural + momentum lag."""
+    if sig_s910_milestone_channel_sweep(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s912_s910_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S912: S910 (OR(20w/30w/40w)+compressed) + VIX pct>70.
+    Elevated fear + multi-scale channel support + compression.
+    Hypothesis: WR > 94%, fear confirms oversold at structural support."""
+    if sig_s910_milestone_channel_sweep(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.70) else 0
+
+
+def sig_s913_dual_channel_and(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S913: Dual-channel AND — in lower 25% of BOTH 20w AND 30w channel.
+    Structural confluence: price satisfying two channel definitions simultaneously.
+    Hypothesis: tighter precision filter → WR > 94% vs either alone (WR=94%)."""
+    if tw is None or len(tw) < 30:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (18 <= vix_now <= 50):
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    if wk_idx < 30:
+        return 0
+    close_w = float(tw['close'].iloc[wk_idx])
+    # Both 20w AND 30w channel must see price in lower 25%
+    ch20 = _channel_at(tw.iloc[wk_idx - 20:wk_idx])
+    if ch20 is None or not _near_lower(close_w, ch20, 0.25):
+        return 0
+    ch30 = _channel_at(tw.iloc[wk_idx - 30:wk_idx])
+    if ch30 is None or not _near_lower(close_w, ch30, 0.25):
+        return 0
+    return 1
+
+
+def sig_s914_s913_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S914: Dual-channel AND + ATR compression.
+    Triple structural gate: 20w channel + 30w channel + squeeze.
+    Hypothesis: WR ≥ 95%, each gate independently valid."""
+    if sig_s913_dual_channel_and(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s915_s887_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S915: 30w channel + volume dry-up (<70% of 20d avg).
+    Volume dry-up at 30-week structural support — no panic selling, quiet accumulation.
+    Compare: S495 (20w+dryup) moderate, S495+compressed = 100% WR on 20w."""
+    if sig_s887_s215_30w_channel(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i, mult=0.70) else 0
+
+
+def sig_s916_s890_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S916: S890 (30w+compressed) + volume dry-up.
+    Triple gate: 30w structural support + ATR squeeze + quiet volume.
+    Hypothesis: 100% WR — the quietest compressed bounces at structural support always win."""
+    if sig_s890_milestone_s888_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i, mult=0.70) else 0
+
+
+def sig_s917_s215_50w_channel(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S917: 50-week channel lower 25% + VIX 18-50.
+    Longest structural channel tested — nearly 1 year of weekly data.
+    Hypothesis: very rare, near-perfect structural support, WR > 30w."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    if wk_idx < 50:
+        return 0
+    vix_now = float(vix['close'].iloc[i])
+    if not (18 <= vix_now <= 50):
+        return 0
+    ch = _channel_at(tw.iloc[wk_idx - 50:wk_idx])
+    if ch is None:
+        return 0
+    return 1 if _near_lower(float(tw['close'].iloc[wk_idx]), ch, 0.25) else 0
+
+
+def sig_s918_s917_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S918: 50-week channel + ATR compression.
+    Very long structural support + squeeze — rarest structural quality gate.
+    Hypothesis: WR ≥ 94%, fewer trades than 30w (n ≈ 10-14)."""
+    if sig_s917_s215_50w_channel(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s919_s910_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S919: S910 (channel union + compressed) + below 50MA.
+    Tests if below50MA is redundant on channel union (already redundant on 30w alone).
+    Hypothesis: S919 = S910 (all channel-union+compressed trades already below 50MA)."""
+    if sig_s910_milestone_channel_sweep(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 0 if _tsla_above_50ma(tsla, i) else 1
+
+
+def sig_s920_milestone_s914_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S920 MILESTONE: Dual-channel AND + compressed + lag5pct.
+    Ultimate precision signal: 20w+30w channel both active + squeeze + lag.
+    Hypothesis: 100% WR — hardest gate combination ever tested."""
+    if sig_s914_s913_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+SIGNALS_P10P: List[Tuple] = [
+    # Phase 10P — S910 extensions + dual-channel AND + 50w channel (S911-S920)
+    ('S911_s910_lag5pct',          sig_s911_s910_lag5pct,           10, 0.20, 50),
+    ('S912_s910_vix_pct70',        sig_s912_s910_vix_pct70,         10, 0.20, 50),
+    ('S913_dual_channel_and',      sig_s913_dual_channel_and,       10, 0.20, 50),
+    ('S914_s913_compressed',       sig_s914_s913_compressed,        10, 0.20, 50),
+    ('S915_s887_vol_dryup',        sig_s915_s887_vol_dryup,         10, 0.20, 50),
+    ('S916_s890_vol_dryup',        sig_s916_s890_vol_dryup,         10, 0.20, 50),
+    ('S917_s215_50w_channel',      sig_s917_s215_50w_channel,       10, 0.20, 50),
+    ('S918_s917_compressed',       sig_s918_s917_compressed,        10, 0.20, 50),
+    ('S919_s910_below50ma',        sig_s919_s910_below50ma,         10, 0.20, 50),
+    ('S920_milestone_dual_lag',    sig_s920_milestone_s914_lag5pct, 10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E
+           + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I + SIGNALS_P10J
+           + SIGNALS_P10K + SIGNALS_P10L + SIGNALS_P10M + SIGNALS_P10N + SIGNALS_P10O
+           + SIGNALS_P10P)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
