@@ -16464,6 +16464,205 @@ SIGNALS_P11C: List[Tuple] = [
     ('S1050_grand_vix15_champion',     sig_s1050_grand_vix15_champion,          10, 0.20, 50),
 ]
 
+
+# ── Phase 11D — Elevated VIX zone (20-50) + 5d-selloff + champion extensions (S1051-S1060) ──
+
+def sig_s1051_vix20_base(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1051: OR(20/30/40/50w) + compressed + VIX 20-50 (elevated VIX only).
+    Hypothesis: moderate-high fear regime = cleanest bounces → WR > S929's 95%?"""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (20 <= vix_now <= 50):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                return 1
+    return 0
+
+
+def sig_s1052_vix25_base(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1052: OR(20/30/40/50w) + compressed + VIX 25-50 (high VIX only).
+    Tests whether the highest fear regime (VIX 25+) gives the cleanest bounces."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (25 <= vix_now <= 50):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                return 1
+    return 0
+
+
+def sig_s1053_vix20_or_conditions(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1053: VIX 20-50 base + S993 OR-conditions (champion quality gate on elevated VIX).
+    Hypothesis: elevated VIX + quality gate = maximum quality bounces."""
+    if sig_s1051_vix20_base(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    if i >= 20:
+        spy_now = float(spy['close'].iloc[i])
+        spy_20d = float(spy['close'].iloc[i - 20])
+        if spy_20d > 0 and spy_now > spy_20d:
+            return 1
+    if i >= 5:
+        spy_now = float(spy['close'].iloc[i])
+        spy_5d = float(spy['close'].iloc[i - 5])
+        if spy_5d > 0 and spy_now > spy_5d:
+            return 1
+    return 0
+
+
+def sig_s1054_vix20_3way_precision(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1054: VIX 20-50 + (3d-selloff OR MACD<0 OR RSI<40) — S1034 conditions on elevated VIX.
+    Hypothesis: elevated VIX + 3-way precision = 100% WR, more trades than S1034."""
+    if sig_s1051_vix20_base(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist = _macd_histogram(tsla, i)
+    if hist is not None and hist < 0:
+        return 1
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and t_rsi < 40:
+        return 1
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    return 0
+
+
+def sig_s1055_vix20_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1055: VIX 20-50 base OR S1034 (VIX 15-50 precision) — alternative super-champion.
+    Tests whether VIX 20-50 base (unfiltered) union with S1034 gives 100% WR."""
+    if sig_s1051_vix20_base(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    return sig_s1034_vix15_3way_union(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s1056_s1041_or_5d_selloff(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1056: S1041 super-champion + 5d-selloff (TSLA 5d < -3%) as additional OR.
+    5d-selloff vs S1041: attempts to extend champion by catching medium-term selloffs."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if sig_s1014_s929_vix15_base(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 0
+    c_now = float(tsla['close'].iloc[i])
+    c_5d = float(tsla['close'].iloc[i - 5])
+    if c_5d <= 0:
+        return 0
+    return 1 if (c_now - c_5d) / c_5d < -0.03 else 0
+
+
+def sig_s1057_vix15_5d_selloff(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1057: VIX 15-50 base + TSLA 5-day return < -3% (5d-selloff condition).
+    Tests 5d window between 3d (S1025) and 10d (S1005). 3d=100% WR, 10d=92% WR."""
+    if sig_s1014_s929_vix15_base(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 0
+    c_now = float(tsla['close'].iloc[i])
+    c_5d = float(tsla['close'].iloc[i - 5])
+    if c_5d <= 0:
+        return 0
+    return 1 if (c_now - c_5d) / c_5d < -0.03 else 0
+
+
+def sig_s1058_vix15_3d_or_5d_selloff(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1058: VIX 15-50 + (3d-selloff OR 5d-selloff) — extended selloff window.
+    Union of 3d and 5d thresholds: catches more selling events."""
+    if sig_s1014_s929_vix15_base(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    if i >= 5:
+        c_now = float(tsla['close'].iloc[i])
+        c_5d = float(tsla['close'].iloc[i - 5])
+        if c_5d > 0 and (c_now - c_5d) / c_5d < -0.03:
+            return 1
+    return 0
+
+
+def sig_s1059_vix15_3d_5d_macd_rsi(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1059: VIX 15-50 + (3d-selloff OR 5d-selloff OR MACD<0 OR RSI<40) — 4-way with 5d.
+    Extends S1034 by adding 5d-selloff as 4th OR. Does it maintain 100% WR?"""
+    if sig_s1014_s929_vix15_base(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist = _macd_histogram(tsla, i)
+    if hist is not None and hist < 0:
+        return 1
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and t_rsi < 40:
+        return 1
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    if i >= 5:
+        c_now = float(tsla['close'].iloc[i])
+        c_5d = float(tsla['close'].iloc[i - 5])
+        if c_5d > 0 and (c_now - c_5d) / c_5d < -0.03:
+            return 1
+    return 0
+
+
+def sig_s1060_s1041_or_vix20_precision(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1060: S1041 OR VIX 20-50 precision (S1054) — super-champion with elevated VIX path.
+    Attempts to add elevated-VIX precise bounces to S1041's universe."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    return sig_s1054_vix20_3way_precision(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+SIGNALS_P11D: List[Tuple] = [
+    # Phase 11D — Elevated VIX zone (20-50) + 5d-selloff + champion extensions (S1051-S1060)
+    ('S1051_vix20_base',               sig_s1051_vix20_base,                    10, 0.20, 50),
+    ('S1052_vix25_base',               sig_s1052_vix25_base,                    10, 0.20, 50),
+    ('S1053_vix20_or_conditions',      sig_s1053_vix20_or_conditions,           10, 0.20, 50),
+    ('S1054_vix20_3way_precision',     sig_s1054_vix20_3way_precision,          10, 0.20, 50),
+    ('S1055_vix20_or_s1034',           sig_s1055_vix20_or_s1034,                10, 0.20, 50),
+    ('S1056_s1041_or_5d_selloff',      sig_s1056_s1041_or_5d_selloff,           10, 0.20, 50),
+    ('S1057_vix15_5d_selloff',         sig_s1057_vix15_5d_selloff,              10, 0.20, 50),
+    ('S1058_vix15_3d_or_5d_selloff',   sig_s1058_vix15_3d_or_5d_selloff,       10, 0.20, 50),
+    ('S1059_vix15_3d_5d_macd_rsi',     sig_s1059_vix15_3d_5d_macd_rsi,         10, 0.20, 50),
+    ('S1060_s1041_or_vix20_precision', sig_s1060_s1041_or_vix20_precision,      10, 0.20, 50),
+]
+
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
            + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
            + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
@@ -16482,7 +16681,7 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10K + SIGNALS_P10L + SIGNALS_P10M + SIGNALS_P10N + SIGNALS_P10O
            + SIGNALS_P10P + SIGNALS_P10Q + SIGNALS_P10R + SIGNALS_P10S + SIGNALS_P10T
            + SIGNALS_P10U + SIGNALS_P10V + SIGNALS_P10W + SIGNALS_P10X + SIGNALS_P10Y
-           + SIGNALS_P10Z + SIGNALS_P11A + SIGNALS_P11B + SIGNALS_P11C)
+           + SIGNALS_P10Z + SIGNALS_P11A + SIGNALS_P11B + SIGNALS_P11C + SIGNALS_P11D)
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
