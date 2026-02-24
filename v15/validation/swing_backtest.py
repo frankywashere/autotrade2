@@ -9644,6 +9644,119 @@ SIGNALS_P9K: List[Tuple] = [
     ('S610_s215_lag30d_5pct',   sig_s610_s215_lag30d_5pct,   10, 0.20, 50),
 ]
 
+# ── Phase 9L — Distance from 52-wk high, co-move (SPY also dropping), 3-way ──
+# Lessons from 9K: market co-move is REQUIRED for best bounces.
+# New dimensions: TSLA distance from 52-week high, SPY below 20MA explicitly.
+
+def _tsla_below_52wk_pct(tsla, i, pct: float = 0.20) -> bool:
+    """TSLA close is at least pct% below its 52-week (252d) high.
+    High discount from recent high = greater mean-reversion potential."""
+    lookback = min(252, i)
+    if lookback < 20:
+        return False
+    high_52wk = float(tsla['close'].iloc[i - lookback:i].max())
+    if high_52wk <= 0:
+        return False
+    discount = (high_52wk - float(tsla['close'].iloc[i])) / high_52wk
+    return discount >= pct
+
+
+def sig_s611_s597_spy_below20ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S611: S597 (8/8yr) + SPY below 20d MA (market also dropping).
+    Co-move setup: both TSLA and SPY are under pressure, TSLA just more so."""
+    if sig_s597_s215_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 0 if _spy_above_ma(spy, i, period=20) else 1
+
+
+def sig_s612_s541_spy_below20ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S612: S541 (below50MA + weekly support) + SPY below 20d MA (co-move).
+    Broad market weakness + TSLA at structural low = correlated bounce setup."""
+    if sig_s541_s215_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 0 if _spy_above_ma(spy, i, period=20) else 1
+
+
+def sig_s613_s215_52wk_discount20(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S613: S215 (weekly support) + TSLA 20%+ below 52-week high.
+    Structural low + significant discount from recent peak = strong mean-reversion."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_below_52wk_pct(tsla, i, pct=0.20) else 0
+
+
+def sig_s614_s541_52wk_discount20(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S614: S541 (below50MA + weekly support) + TSLA 20%+ below 52-week high.
+    Two-layer oversold: medium-term MA breakdown + large peak discount at support."""
+    if sig_s541_s215_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_below_52wk_pct(tsla, i, pct=0.20) else 0
+
+
+def sig_s615_s597_52wk_discount20(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S615: S597 (8/8yr) + TSLA 20%+ below 52-week high.
+    Broadest-coverage signal + substantial discount from peak = deep value setup."""
+    if sig_s597_s215_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_below_52wk_pct(tsla, i, pct=0.20) else 0
+
+
+def sig_s616_s215_bb_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S616: S215 (weekly support) + BB extreme + TSLA lag5pct (3-way).
+    All three independent oversold measures aligned: structural + BB + relative lag."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not _tsla_below_bb(tsla, i):
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s617_s526_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S617: S526 (MACD+VIX_cooldown, $1.08M, 92% WR) + TSLA lags SPY 5%+.
+    Fear receding + MACD turning + TSLA specific lag = timing + depth confirmation."""
+    if sig_s526_s333_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s618_s564_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S618: S564 (S215+TSLA_lag_SPY8%, $1.18M) + VIX cooldown.
+    Two independent high-alpha signals stacked: TSLA lag + VIX fear receding."""
+    if sig_s564_s215_tsla_lag_spy(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_was_elevated_now_cooling(vix, i) else 0
+
+
+def sig_s619_s541_lag10pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S619: S541 (below50MA + weekly support) + TSLA lags SPY 10%+ over 20d.
+    Between 8% and 12%: test optimal lag threshold for WR vs trade count."""
+    if sig_s541_s215_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.10) else 0
+
+
+def sig_s620_s597_below_bb(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S620: S597 (8/8yr) + below Bollinger Band.
+    8/8yr coverage base + BB extreme = statistical confirmation of depth."""
+    if sig_s597_s215_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_below_bb(tsla, i) else 0
+
+
+SIGNALS_P9L: List[Tuple] = [
+    # Phase 9L — 52-wk discount, co-move, 3-way combos (S611-S620)
+    ('S611_s597_spy_below20ma',    sig_s611_s597_spy_below20ma,    10, 0.20, 50),
+    ('S612_s541_spy_below20ma',    sig_s612_s541_spy_below20ma,    10, 0.20, 50),
+    ('S613_s215_52wk_disc20',      sig_s613_s215_52wk_discount20,  10, 0.20, 50),
+    ('S614_s541_52wk_disc20',      sig_s614_s541_52wk_discount20,  10, 0.20, 50),
+    ('S615_s597_52wk_disc20',      sig_s615_s597_52wk_discount20,  10, 0.20, 50),
+    ('S616_s215_bb_lag5pct',       sig_s616_s215_bb_lag5pct,       10, 0.20, 50),
+    ('S617_s526_lag5pct',          sig_s617_s526_lag5pct,          10, 0.20, 50),
+    ('S618_s564_vix_cooldown',     sig_s618_s564_vix_cooldown,     10, 0.20, 50),
+    ('S619_s541_lag10pct',         sig_s619_s541_lag10pct,         10, 0.20, 50),
+    ('S620_s597_below_bb',         sig_s620_s597_below_bb,         10, 0.20, 50),
+]
+
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
            + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
            + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
@@ -9654,7 +9767,7 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
            + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
            + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
-           + SIGNALS_P9J + SIGNALS_P9K)
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L)
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
