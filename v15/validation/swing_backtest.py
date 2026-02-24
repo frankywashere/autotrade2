@@ -935,6 +935,291 @@ def sig_s47_s32_spy_ma200_no_gap(i, tsla, spy, vix, tw, sw, rt, rs, w):
     return 1
 
 
+# ── Phase 6 (daily) — Proactive Break Prediction (S50+) ───────────────────────
+# These signals try to predict a channel BREAK *before* it happens, rather than
+# waiting for the bounce at the boundary. The goal: enter earlier, ride the
+# full breakout move.
+#
+# Key insight from c9 energy analysis:
+#   High energy at boundary → FAILED break → violent reversal (the bounce system trades this)
+#   Successful breaks tend to build slowly: compression, RSI divergence, SPY confirmation
+#
+# Signal structure: still LONG only. Predicts upside break of upper channel line.
+# Entry fires 1-5 bars BEFORE the price reaches the channel boundary.
+# Exit: same stop/timeout/signal logic as bounce signals.
+# Wider hold window (8-10d) to allow time for the break to develop.
+
+def _channel_width_ratio(tsla: pd.DataFrame, i: int, w: int, lookback: int = 10) -> float:
+    """Ratio of current channel width to channel width `lookback` bars ago.
+    < 1.0 = compression (narrowing), > 1.0 = expansion. Returns 1.0 on failure."""
+    ch_now  = _channel_at(tsla.iloc[max(0, i - w):i])
+    ch_past = _channel_at(tsla.iloc[max(0, i - w - lookback):i - lookback])
+    if ch_now is None or ch_past is None:
+        return 1.0
+    lo_now  = ch_now.lower_line[-1];  hi_now  = ch_now.upper_line[-1]
+    lo_past = ch_past.lower_line[-1]; hi_past = ch_past.upper_line[-1]
+    w_now  = hi_now  - lo_now
+    w_past = hi_past - lo_past
+    if w_past <= 0:
+        return 1.0
+    return w_now / w_past
+
+
+def _channel_pos(price: float, ch) -> float:
+    """Price position within channel: 0.0 = lower line, 1.0 = upper line."""
+    if ch is None:
+        return 0.5
+    lo = ch.lower_line[-1]; hi = ch.upper_line[-1]
+    w  = hi - lo
+    if w <= 0:
+        return 0.5
+    return (price - lo) / w
+
+
+def sig_s50_channel_compression_breakout(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S50: Channel width compressing + price upper half + SPY trending up.
+    Bets that compression (coiling) will resolve as upside break."""
+    if i < w + 15:
+        return 0
+    ch = _channel_at(tsla.iloc[i - w:i])
+    if ch is None:
+        return 0
+    price = tsla['close'].iloc[i]
+    pos   = _channel_pos(price, ch)
+    # Must be in upper half of channel (not already at boundary)
+    if pos < 0.45 or pos > 0.90:
+        return 0
+    # Channel must be compressing: current width < 85% of width 10 bars ago
+    compression = _channel_width_ratio(tsla, i, w, lookback=10)
+    if compression >= 0.88:
+        return 0
+    # SPY must be in uptrend (above 20d MA) — directional confirmation
+    spy_ma20 = spy['close'].iloc[i - 20:i].mean()
+    if spy['close'].iloc[i] < spy_ma20:
+        return 0
+    # TSLA RSI should show positive momentum
+    t_rsi = rt.iloc[i]
+    if pd.isna(t_rsi) or t_rsi < 48:
+        return 0
+    return 1
+
+
+def sig_s51_multi_touch_upper(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S51: TSLA has touched the upper 20% of channel 2+ times in last 8 bars
+    without breaking out → pressure accumulating, break imminent."""
+    if i < w + 10:
+        return 0
+    ch = _channel_at(tsla.iloc[i - w:i])
+    if ch is None:
+        return 0
+    price = tsla['close'].iloc[i]
+    pos   = _channel_pos(price, ch)
+    # Current price in upper 45% (approaching but not at boundary)
+    if pos < 0.40 or pos > 0.88:
+        return 0
+    # Count prior touches in last 8 bars (upper 20% of channel)
+    lo = ch.lower_line[-1]; hi = ch.upper_line[-1]; width = hi - lo
+    if width <= 0:
+        return 0
+    touches = 0
+    for j in range(i - 8, i):
+        if j < 0:
+            continue
+        p_j = tsla['close'].iloc[j]
+        if (p_j - lo) / width > 0.80:
+            touches += 1
+    if touches < 2:
+        return 0
+    # SPY not in downtrend
+    spy_ma20 = spy['close'].iloc[i - 20:i].mean()
+    if spy['close'].iloc[i] < spy_ma20 * 0.97:
+        return 0
+    return 1
+
+
+def sig_s52_rsi_divergence_breakout(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S52: TSLA RSI making new 10-bar high while price is mid-to-upper channel
+    (RSI divergence = hidden upside strength, break likely)."""
+    if i < w + 15:
+        return 0
+    ch = _channel_at(tsla.iloc[i - w:i])
+    if ch is None:
+        return 0
+    price = tsla['close'].iloc[i]
+    pos   = _channel_pos(price, ch)
+    # Mid-to-upper channel (0.40 - 0.85), not yet broken
+    if pos < 0.40 or pos > 0.88:
+        return 0
+    # RSI must be making a new 10-bar high (momentum accelerating)
+    t_rsi = rt.iloc[i]
+    if pd.isna(t_rsi):
+        return 0
+    rsi_window = rt.iloc[i - 10:i]
+    if t_rsi <= rsi_window.max():
+        return 0
+    # RSI > 55 (genuinely strong, not just bouncing from oversold)
+    if t_rsi < 55:
+        return 0
+    # SPY above 50d MA (bull regime context)
+    if i < 50:
+        return 0
+    spy_ma50 = spy['close'].iloc[i - 50:i].mean()
+    if spy['close'].iloc[i] < spy_ma50:
+        return 0
+    return 1
+
+
+def sig_s53_spy_accel_tsla_lag_break(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S53: Proactive SPY lag — SPY accelerating (3-day return > 1.5%) while
+    TSLA is lagging AND still mid-channel. Predicts TSLA breakout catch-up."""
+    if i < w + 5:
+        return 0
+    # SPY accelerating: 3-day return > 1.5%
+    spy_3d_ret = (spy['close'].iloc[i] / spy['close'].iloc[i - 3]) - 1.0
+    if spy_3d_ret < 0.015:
+        return 0
+    # TSLA lagging: TSLA 3-day return < SPY 3-day return
+    tsla_3d_ret = (tsla['close'].iloc[i] / tsla['close'].iloc[i - 3]) - 1.0
+    if tsla_3d_ret >= spy_3d_ret * 0.6:   # TSLA must be meaningfully behind
+        return 0
+    # TSLA not at channel top yet (still room to run)
+    ch = _channel_at(tsla.iloc[i - w:i])
+    if ch is not None:
+        pos = _channel_pos(tsla['close'].iloc[i], ch)
+        if pos > 0.85:  # already near top, break already happened
+            return 0
+    # VIX not panicking
+    if vix['close'].iloc[i] > 35:
+        return 0
+    return 1
+
+
+def sig_s54_compression_spy_lag(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S54: Combine S50 compression + S53 SPY acceleration — dual confirmation."""
+    if sig_s50_channel_compression_breakout(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    # SPY made new 10d high recently (within last 3 bars)
+    spy_10d_high = spy['close'].iloc[i - 10:i].max()
+    recent_spy_high = spy['close'].iloc[i - 3:i].max()
+    if recent_spy_high < spy_10d_high * 0.99:
+        return 0
+    # TSLA lagging SPY over 5 days
+    if i < 5:
+        return 0
+    spy_5d  = (spy['close'].iloc[i]  / spy['close'].iloc[i - 5])  - 1.0
+    tsla_5d = (tsla['close'].iloc[i] / tsla['close'].iloc[i - 5]) - 1.0
+    if tsla_5d >= spy_5d:
+        return 0
+    return 1
+
+
+def sig_s55_breakout_union(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S55: Union of S50 + S53 — either compression OR SPY acceleration qualifies."""
+    if sig_s50_channel_compression_breakout(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if sig_s53_spy_accel_tsla_lag_break(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    return 0
+
+
+def sig_s56_s51_ma200(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S56: S51 multi-touch + SPY above 200d MA — prevents buying distribution tops in bears."""
+    if i < 200:
+        return 0
+    spy_ma200 = spy['close'].iloc[i - 200:i].mean()
+    if spy['close'].iloc[i] < spy_ma200:
+        return 0
+    return sig_s51_multi_touch_upper(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s57_s51_intersect_s32(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S57: S51 AND S32 both agree — multi-touch breakout setup during proven lag regime."""
+    if sig_s51_multi_touch_upper(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if sig_s32_union_s29_s25(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1
+
+
+def sig_s58_s50_ma200(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S58: S50 compression + SPY above 200d MA — filters out bear compression traps."""
+    if i < 200:
+        return 0
+    spy_ma200 = spy['close'].iloc[i - 200:i].mean()
+    if spy['close'].iloc[i] < spy_ma200:
+        return 0
+    return sig_s50_channel_compression_breakout(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s59_breakout_or_bounce(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S59: Union of S32 (best bounce) + S56 (S51+MA200 break) — two complementary edges."""
+    if sig_s32_union_s29_s25(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if sig_s56_s51_ma200(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    return 0
+
+
+def sig_s60_s51_vix_regime(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S60: S51 multi-touch + VIX 15-35 (same regime filter as S32's core)."""
+    vix_now = vix['close'].iloc[i]
+    if not (15 <= vix_now <= 35):
+        return 0
+    return sig_s51_multi_touch_upper(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s61_s51_ma200_vix(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S61: S51 + SPY MA200 + VIX 15-35 — all three filters stacked."""
+    if i < 200:
+        return 0
+    spy_ma200 = spy['close'].iloc[i - 200:i].mean()
+    if spy['close'].iloc[i] < spy_ma200:
+        return 0
+    vix_now = vix['close'].iloc[i]
+    if not (15 <= vix_now <= 35):
+        return 0
+    return sig_s51_multi_touch_upper(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s63_s62_ma200(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S63: S62 (S32 + S51/VIX union) + SPY above 200d MA — cuts bear market noise."""
+    if i < 200:
+        return 0
+    spy_ma200 = spy['close'].iloc[i - 200:i].mean()
+    if spy['close'].iloc[i] < spy_ma200:
+        return 0
+    return sig_s62_s32_plus_s51_union(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s62_s32_plus_s51_union(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S62: S32 union S60 (S51+VIX15-35) — adds break-prediction signals only in good regime."""
+    if sig_s32_union_s29_s25(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if sig_s60_s51_vix_regime(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    return 0
+
+
+SIGNALS_P6D: List[Tuple] = [
+    # (name, fn, max_hold_days, stop_pct, channel_window)
+    # Wider hold (8-10d) to give breaks time to develop
+    ('S50_compression_breakout',     sig_s50_channel_compression_breakout, 10, 0.05, 50),
+    ('S51_multi_touch_upper',        sig_s51_multi_touch_upper,            10, 0.05, 50),
+    ('S52_rsi_divergence_break',     sig_s52_rsi_divergence_breakout,      10, 0.05, 50),
+    ('S53_spy_accel_tsla_lag',       sig_s53_spy_accel_tsla_lag_break,      7, 0.04, 50),
+    ('S54_compression_spy_lag',      sig_s54_compression_spy_lag,          10, 0.05, 50),
+    ('S55_breakout_union',           sig_s55_breakout_union,               10, 0.05, 50),
+    # Filtered variants
+    ('S56_s51_ma200',                sig_s56_s51_ma200,                    10, 0.05, 50),
+    ('S57_s51_intersect_s32',        sig_s57_s51_intersect_s32,             5, 0.04, 50),
+    ('S58_s50_ma200',                sig_s58_s50_ma200,                    10, 0.05, 50),
+    ('S59_bounce_or_break',          sig_s59_breakout_or_bounce,            7, 0.04, 50),
+    ('S60_s51_vix_regime',           sig_s60_s51_vix_regime,               10, 0.05, 50),
+    ('S61_s51_ma200_vix',            sig_s61_s51_ma200_vix,                10, 0.05, 50),
+    ('S62_s32_plus_s51_vix',         sig_s62_s32_plus_s51_union,            5, 0.04, 50),
+    ('S63_s62_ma200',                sig_s63_s62_ma200,                     5, 0.04, 50),
+]
+
 SIGNALS_P5D: List[Tuple] = [
     # (name, fn, max_hold_days, stop_pct, channel_window)
     ('S41_s32_spy_ma200',            sig_s41_s32_spy_ma200,            5, 0.04, 50),
@@ -946,7 +1231,7 @@ SIGNALS_P5D: List[Tuple] = [
     ('S47_s32_ma200_no_gap',         sig_s47_s32_spy_ma200_no_gap,     5, 0.04, 50),
 ]
 
-SIGNALS = SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D
+SIGNALS = SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
