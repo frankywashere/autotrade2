@@ -11843,6 +11843,128 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10A + SIGNALS_P10B)
 
 
+# ── Phase 10C — S777 extensions + BB recalibration + S631+below50MA (S781-S790) ──
+# S777 (below50MA + 20d discount, $1.85M+2025) is a new top signal.
+# Extend with precision filters. Recalibrate BB (try 15-20% width). Test S631+below50MA.
+
+def sig_s781_s777_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S781: S777 (S731+below50MA) + ATR compression.
+    Below 50MA at 20d discount + weekly support + volatility squeeze = high precision."""
+    if sig_s777_s731_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s782_s777_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S782: S777 (S731+below50MA) + volume dry-up.
+    Bear context + 20d discount + support + seller exhaustion = maximum setup."""
+    if sig_s777_s731_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i) else 0
+
+
+def sig_s783_s777_macd_up(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S783: S777 (S731+below50MA) + MACD turning up.
+    Below-50MA pullback to support where MACD just starting to reverse."""
+    if sig_s777_s731_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist_now  = _macd_histogram(tsla, i)
+    hist_prev = _macd_histogram(tsla, i - 1) if i > 0 else None
+    if hist_now is None or hist_prev is None:
+        return 1
+    return 1 if hist_now > hist_prev else 0
+
+
+def sig_s784_s777_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S784: S777 (S731+below50MA) + TSLA lags SPY 5%+.
+    Bear context + TSLA-specific underperformance: stock-specific bear at support."""
+    if sig_s777_s731_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s785_s777_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S785: S777 (S731+below50MA) + VIX pct>60.
+    Bear context + fear regime + 20d discount at weekly support."""
+    if sig_s777_s731_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s786_s631_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S786: S631 (10%disc + weekly) + below 50-day MA.
+    Apply below-50MA to our 52wk-discount anchor — complements S777."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 0 if _tsla_above_50ma(tsla, i) else 1
+
+
+def sig_s787_s215_bb_wide(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S787: Weekly channel support + BB width < 20% (recalibrated, wider threshold).
+    Previous BB threshold (8%) was too tight. Try 20% to find compressed-ish setups."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_bb_compressed(tsla, i, width_threshold=0.20) else 0
+
+
+def sig_s788_s631_bb_wide(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S788: S631 (10%disc + weekly) + BB width < 20%.
+    Recalibrated BB compression at peak discount level."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_bb_compressed(tsla, i, width_threshold=0.20) else 0
+
+
+def sig_s789_s731_bb_wide(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S789: S731 (weekly + 5% below 20d high) + BB width < 20%.
+    Recalibrated BB at 20d discount — compare to S741 (ATR compressed)."""
+    if sig_s731_s215_20d_disc5(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_bb_compressed(tsla, i, width_threshold=0.20) else 0
+
+
+def sig_s790_s777_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S790: S777 (S731+below50MA) + 52-week high discount 10%+.
+    Below 50MA + 20d disc + 52wk disc + weekly support = all discount anchors."""
+    if sig_s777_s731_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_below_52wk_pct(tsla, i, pct=0.10) else 0
+
+
+SIGNALS_P10C: List[Tuple] = [
+    # Phase 10C — S777 extensions + BB recalibration + S631+below50MA (S781-S790)
+    ('S781_s777_compressed',     sig_s781_s777_compressed,     10, 0.20, 50),
+    ('S782_s777_vol_dryup',      sig_s782_s777_vol_dryup,      10, 0.20, 50),
+    ('S783_s777_macd_up',        sig_s783_s777_macd_up,        10, 0.20, 50),
+    ('S784_s777_lag5pct',        sig_s784_s777_lag5pct,        10, 0.20, 50),
+    ('S785_s777_vix_pct60',      sig_s785_s777_vix_pct60,      10, 0.20, 50),
+    ('S786_s631_below50ma',      sig_s786_s631_below50ma,      10, 0.20, 50),
+    ('S787_s215_bb_wide',        sig_s787_s215_bb_wide,        10, 0.20, 50),
+    ('S788_s631_bb_wide',        sig_s788_s631_bb_wide,        10, 0.20, 50),
+    ('S789_s731_bb_wide',        sig_s789_s731_bb_wide,        10, 0.20, 50),
+    ('S790_s777_52wk_disc10',    sig_s790_s777_52wk_disc10,    10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
