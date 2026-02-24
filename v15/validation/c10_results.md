@@ -142,6 +142,84 @@ The nested CV gap (0.055) means Optuna overfit to 2015-2022 patterns.
 WINNER SO FAR: Arch2 (AUC=0.816, c9 tuned params, lag features).
 
 ================================================================================
+Arch4 — Loss Magnitude Weighting (sample_weight for large losers)
+================================================================================
+Hypothesis: Standard binary classification treats all losers equally. A -5% loss
+should matter more than a -0.2% loss. Weighting samples by loss magnitude forces
+the model to focus harder on correctly classifying the big losers.
+
+Formula: sample_weight[loser] = 1 + 500 * |pnl_pct|
+Example: -1% loss → weight=6, -5% loss → weight=26, winners → weight=1
+
+Changes from Arch2:
+  - SignalQualityModel.__init__: loss_weight_scale=500
+  - _compute_sample_weights(): weights based on pnl_pct magnitude for losers
+  - Applied to both win_model.fit() and pnl_model.fit() in all LOO folds
+  - CLI: --loss-weight 500 flag
+  - Model file: v15/validation/signal_quality_model_c10_arch4.pkl
+
+Status: COMPLETE — MARGINAL IMPROVEMENT
+
+Arch4 (tuned c9 params + loss_weight=500):
+  AUC: 0.818  Cal Brier: 0.050  (+0.002 vs Arch2's 0.816)
+  Model file: v15/validation/signal_quality_model_c10_arch4.pkl
+
+Top features remain similar, recent_avg_pnl_pct at rank 12 in win classifier.
+spy_vol_ratio_20 at rank 9 — confirms Arch1/2 feature importance stable.
+
+10-year backtest (2015-2024, bounce_cap=12x, max_trade_usd=$1M):
+  Baseline:       $14,985,439  (identical — baseline never uses ML)
+  Old-tiers:      $15,171,340  (+$185,901, +1.2%)
+  Upscale-only:   $15,597,717  (+$612,278, +4.1%)
+
+vs Arch2 upscale-only (2015-2024 only, excluding 2025):
+  Arch2: +$612,311  Arch4: +$612,278  → Difference: -$33 (essentially identical)
+
+Per-year upscale-only delta (Arch4):
+  2015: +$118   2016: +$357   2017: +$1    2018: +$4,839  2019: +$65
+  2020: +$228,992  2021: +$13,212  2022: +$6,822
+  2023: +$260,760  2024: +$97,111  (Total: +$612,278)
+
+CONCLUSION: Loss weighting gives +0.002 AUC improvement (0.816→0.818) but zero
+P&L impact. Arch4 vs Arch2 difference is -$33 = measurement noise. The hypothesis
+that better-calibrated loser detection would improve old-tiers is DISPROVEN.
+The fundamental bottleneck is the cap structure (12x bounce + $1M), not model
+calibration. Loss weighting is NEUTRAL — does not help old-tiers or upscale-only.
+
+================================================================================
+Exploration Item #4 — Break Energy Counter-Indicator
+================================================================================
+Hypothesis: High energy_score at channel boundary means a breakout is already
+"used up" → break signal should fail → skip high-energy break signals.
+(channel_surfer.py line 1011 already notes energy is anti-correlated with breaks)
+
+Analysis: c9_break_energy.py — 11yr + 2025 full dataset
+  Break trades: 7,765 (67% of all trades by count)
+  Break P&L share of total: 0.1% (essentially zero)
+  Break avg P&L: $1/trade
+
+Energy score distribution:
+  Q3 (0.5-0.75): 215 trades, WR=94.9%, avg=$1, 0.70x vs average
+  Q4 (>0.75):  7,550 trades, WR=93.4%, avg=$1, 1.01x vs average
+  Nearly all breaks have energy >0.5 — very little low-energy data
+
+Skip threshold analysis:
+  Skip >0.3 through >0.6: ALL 7765 trades skipped (all breaks have energy >0.3)
+  Skip >0.7: loses $10,746, saves 131 low-quality trades worth $155
+  Skip >0.8: loses $10,569, saves 313 trades worth $332
+  Skip >0.9: loses $10,368, saves 563 trades worth $533
+  → No threshold produces net gain
+
+Year-by-year break P&L: consistent $0.4-1.5K/year (all years)
+
+CONCLUSION: Break energy counter-indicator is NOT a useful rule. While high-energy
+breaks are slightly worse (0.70x in Q3 vs 1.01x in Q4), the absolute P&L values
+($1/trade either way) are too tiny to matter. Break trades are already so small/
+capped that no energy-based filter produces meaningful P&L improvement.
+BREAKS CONTRIBUTE 0.1% OF TOTAL P&L — not worth optimizing further.
+NEXT: Item #5 (swing/overnight variant) or #6 (SPY as separate instrument).
+
+================================================================================
 PHASE 2: Walk-Forward Note + Final Summary
 ================================================================================
 Walk-forward for ML model:
@@ -182,5 +260,59 @@ Key learnings:
      Adding more features yields diminishing returns.
 
 Next: 2025 true holdout test (when ready) or new branch (c11) for novel approaches.
+
+================================================================================
+Exploration Item #6 — SPY as Separate Instrument
+================================================================================
+Hypothesis: SPY also forms tradeable channels. Run channel surfer on SPY data
+(same physics, same arch rules), compare to TSLA.
+
+Method: validate_sizing --tsla data/SPYMin.txt --spy data/SPYMin.txt
+Using Arch2 model (TSLA-trained), 2015-2024 same capital $100K
+
+SPY Results (2015-2024, bounce_cap=12x, max_trade_usd=$1M):
+  Trades:    4,983  (vs TSLA: 10,604 — fewer trades per year)
+  Win Rate:  80.3%  (vs TSLA: 94.2% — dramatically lower)
+  PF:        16.88  (vs TSLA: 106.81 — much lower profit factor)
+  Sharpe:    0.92   (vs TSLA: 2.13 — dramatically worse risk-adjusted)
+  Max DD:    4.1%   (vs TSLA: 3.8% — slightly worse)
+  Baseline:  $2,168,416  (vs TSLA: $14,985,439 — SPY is 14.5% of TSLA)
+
+Per-year SPY baseline P&L:
+  2015: $112,404  2016: $105,636  2017: $12,013   2018: $205,400  2019: $118,060
+  2020: $851,057  2021: $141,960  2022: $428,483  2023: $95,813   2024: $97,589
+
+ML sizing on SPY (TSLA-trained model, out-of-distribution):
+  Old-tiers:    +$35,441 (+1.6%)  — all from 2020 only!
+  Upscale-only: +$44,557 (+2.1%)  — all from 2020 only!
+  9 of 10 years: ZERO ML lift (model doesn't recognize SPY features as high-quality)
+  2020 exception: COVID volatility matched TSLA model's high-quality training distribution
+
+CONCLUSION: SPY channels ARE real (positive every year), but:
+  1. SPY is 7x less profitable than TSLA on same capital ($2.2M vs $15.0M 10yr)
+  2. SPY WR=80% vs TSLA 94% — much noisier signals, worse R:R
+  3. TSLA ML model gives zero benefit on SPY (out-of-distribution)
+  4. For SPY ML benefit, need SPY-specific training (~10K SPY trades, ~2yr to collect)
+  5. SPY could add portfolio diversification but not worth as primary strategy
+  6. Avg P&L $435/trade (SPY) vs $1,413/trade (TSLA) — 3x per-trade difference
+
+================================================================================
+FINAL EXPLORATION SUMMARY — All Items Complete
+================================================================================
+Item  Result     Key Finding
+#1    ✓ Done     2025 holdout: +$9,983 (+0.6%) — model generalizes to unseen data
+#2    ✓ Skipped  Breaks=0.1% of P&L ($1/trade), bounce-only has fewer samples
+#3    ✓ Done     Arch4 (loss_weight=500): AUC=0.818, P&L=+$612K (identical to Arch2)
+#4    ✓ Done     Break energy: no counter-indicator rule helps (+$0 max benefit)
+#5    ○ Future   Swing/overnight variant: needs new architecture, deferred
+#6    ✓ Done     SPY channels: profitable but 7x less than TSLA, no ML benefit
+
+Winner: Arch2 (AUC=0.816) remains best. Arch4 adds 0.002 AUC at zero P&L cost but
+        since both give identical P&L, there's no reason to switch from Arch2.
+
+All exploration items (#1-4, #6) confirm the fundamental constraints:
+  - Model ceiling: AUC≈0.816-0.818 at 10K samples
+  - P&L ceiling: +3.8-4.1% lift due to cap structure (12x + $1M hard cap)
+  - The physics signal is the source of alpha; ML adds consistent but bounded lift
 
 ================================================================================

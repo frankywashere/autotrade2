@@ -282,7 +282,7 @@ class SignalQualityModel:
     Supports isotonic calibration and custom hyperparameters.
     """
 
-    def __init__(self, params: dict = None):
+    def __init__(self, params: dict = None, loss_weight_scale: float = 0.0):
         self.win_model = None
         self.pnl_model = None
         self.calibrator = None  # IsotonicRegression for calibrated win_prob
@@ -290,6 +290,7 @@ class SignalQualityModel:
         self.cv_metrics: Dict = {}
         self.feature_importance: Dict = {}
         self.params = params  # Custom LightGBM hyperparameters
+        self.loss_weight_scale = loss_weight_scale  # Weight losers by |pnl_pct| magnitude
 
     def train(self, snapshots: List[TradeSnapshot], verbose: bool = True):
         """Train with leave-one-year-out CV, then retrain on all data."""
@@ -351,7 +352,9 @@ class SignalQualityModel:
             X_cal = X_train[cal_mask_in_train]
             y_win_cal = y_win_train[cal_mask_in_train]
 
-            win_model, pnl_model = self._fit_models(X_model, y_win_model, y_pnl_model)
+            sw_model = self._compute_sample_weights(y_win_model, y_pnl_model)
+            win_model, pnl_model = self._fit_models(X_model, y_win_model, y_pnl_model,
+                                                     sample_weight=sw_model)
 
             # OOS predictions (wrap in DataFrame to match fit)
             X_test_df = self._make_df(X_test)
@@ -472,7 +475,9 @@ class SignalQualityModel:
         # --- Retrain on ALL data for production ---
         if verbose:
             print(f"\n  Retraining on all {len(snapshots)} samples for production model...")
-        self.win_model, self.pnl_model = self._fit_models(X, y_win, y_pnl)
+        sw_all = self._compute_sample_weights(y_win, y_pnl)
+        self.win_model, self.pnl_model = self._fit_models(X, y_win, y_pnl,
+                                                           sample_weight=sw_all)
 
         # Feature importance
         self._compute_feature_importance()
@@ -488,7 +493,20 @@ class SignalQualityModel:
             return pd.DataFrame([X], columns=names)
         return pd.DataFrame(X, columns=names)
 
-    def _fit_models(self, X, y_win, y_pnl):
+    def _compute_sample_weights(self, y_win, y_pnl):
+        """Compute sample weights for loss-magnitude weighting.
+
+        Winners get weight=1.0. Losers get weight = 1 + scale * |pnl_pct|.
+        If loss_weight_scale=0 (default), returns None (uniform weights).
+        """
+        if self.loss_weight_scale <= 0:
+            return None
+        weights = np.ones(len(y_win), dtype=np.float32)
+        loser_mask = y_win == 0
+        weights[loser_mask] = 1.0 + self.loss_weight_scale * np.abs(y_pnl[loser_mask])
+        return weights
+
+    def _fit_models(self, X, y_win, y_pnl, sample_weight=None):
         """Fit win classifier and pnl regressor."""
         X_df = self._make_df(X)
         try:
@@ -513,7 +531,7 @@ class SignalQualityModel:
                 n_jobs=-1,
                 **default_params,
             )
-            win_model.fit(X_df, y_win)
+            win_model.fit(X_df, y_win, sample_weight=sample_weight)
 
             pnl_model = lgb.LGBMRegressor(
                 objective='huber',
@@ -521,7 +539,7 @@ class SignalQualityModel:
                 n_jobs=-1,
                 **default_params,
             )
-            pnl_model.fit(X_df, y_pnl)
+            pnl_model.fit(X_df, y_pnl, sample_weight=sample_weight)
 
         except ImportError:
             print("  LightGBM not available, falling back to sklearn GBT")
@@ -685,6 +703,8 @@ def main():
                         help='Max exposure cap multiplier for bounce signals (default: 12.0, c9/Arch418)')
     parser.add_argument('--max-trade-usd', type=float, default=1_000_000.0,
                         help='Hard dollar cap per trade (default: 1000000, Arch418)')
+    parser.add_argument('--loss-weight', type=float, default=0.0,
+                        help='Scale factor for loss-magnitude sample weighting (0=off, try 200-500)')
     args = parser.parse_args()
 
     # Parse year range
@@ -728,7 +748,9 @@ def main():
         sys.exit(1)
 
     # Train model
-    model = SignalQualityModel(params=custom_params)
+    if args.loss_weight > 0:
+        print(f"  Loss-magnitude weighting: scale={args.loss_weight}")
+    model = SignalQualityModel(params=custom_params, loss_weight_scale=args.loss_weight)
     model.train(snapshots, verbose=True)
 
     # Save
