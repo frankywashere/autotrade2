@@ -7063,6 +7063,159 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q)
 
 
+# ── Phase 8R — VIX-pct aggressive extensions + cross with NR7/compressed/200MA ──
+# S407 ($1.45M, 7/7yr) and S408 (93% WR, 6/6yr) are the best signals ever found.
+# VIX percentile identifies sustained fear regimes — extend this dimension aggressively.
+# Cross with NR7, compressed, above200MA, SPY weak, VIX rec, monthly low, OPEX.
+
+def sig_s411_s408_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S411: S408 (MACD+VIX pct>70, 93% WR) + compressed ATR.
+    Best signal (S408) + structural compression filter.
+    Hypothesis: MACD turning + sustained fear + ATR compressed = maximum precision."""
+    if sig_s408_s333_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s412_s408_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S412: S408 (MACD+VIX pct>70) + above 200d MA.
+    Best signal in confirmed uptrend — bull regime + sustained fear = panic dip in bull market.
+    Hypothesis: sustained fear within an uptrend = aggressive buy-the-dip."""
+    if sig_s408_s333_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close > ma200 else 0
+
+
+def sig_s413_s408_spy_weak(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S413: S408 (MACD+VIX pct>70) + SPY below 50d SMA.
+    Best signal + broad market in downtrend.
+    Hypothesis: MACD turning + fear regime + bear trend = maximum excess discount."""
+    if sig_s408_s333_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 50:
+        return 1
+    spy_close = float(spy['close'].iloc[i])
+    spy_sma50 = float(spy['close'].iloc[i - 50:i].mean())
+    return 1 if spy_close < spy_sma50 else 0
+
+
+def sig_s414_s408_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S414: S408 (MACD+VIX pct>70) + NR7.
+    Best signal + NR7 tightest day filter.
+    Hypothesis: sustained fear + MACD turning on tightest day = maximum entry precision."""
+    if sig_s408_s333_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr7(tsla, i) else 0
+
+
+def sig_s415_s408_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S415: S408 (MACD+VIX pct>70) + VIX recovery (VIX also starting to cool).
+    VIX percentile AND VIX cooling simultaneously.
+    Hypothesis: fear regime + first signs of macro cooling = perfect asymmetric entry."""
+    if sig_s408_s333_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s416_s407_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S416: S407 (S215+VIX pct>70, $1.45M, 7/7yr) + compressed ATR.
+    Best high-volume signal + compression.
+    Hypothesis: sustained fear + weekly support + ATR compressed = coiled spring."""
+    if sig_s407_s215_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s417_s407_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S417: S407 (S215+VIX pct>70) + above 200d MA.
+    High-volume signal in uptrend.
+    Hypothesis: 25 trades at WR=80% split by trend — uptrend subset should be higher."""
+    if sig_s407_s215_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close > ma200 else 0
+
+
+def sig_s418_s407_spy_weak(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S418: S407 (S215+VIX pct>70) + SPY below 50d SMA.
+    High-volume signal + broad weakness context.
+    Hypothesis: sustained fear in bear trend = most discounted weekly support entries."""
+    if sig_s407_s215_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 50:
+        return 1
+    spy_close = float(spy['close'].iloc[i])
+    spy_sma50 = float(spy['close'].iloc[i - 50:i].mean())
+    return 1 if spy_close < spy_sma50 else 0
+
+
+def sig_s419_s407_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S419: S407 (S215+VIX pct>70) + NR7.
+    High-volume signal + NR7 tightest day.
+    Hypothesis: fear regime at weekly support on tightest day = best timing for S407."""
+    if sig_s407_s215_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr7(tsla, i) else 0
+
+
+def sig_s420_s407_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S420: S407 (S215+VIX pct>70) + VIX recovery.
+    VIX structurally elevated + VIX starting to cool = two VIX signals in sync.
+    Hypothesis: when structural fear AND immediate cooling coincide = ideal entry."""
+    if sig_s407_s215_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+SIGNALS_P8R: List[Tuple] = [
+    # Phase 8R — VIX percentile extensions (best indicator ever found)
+    ('S411_s408_compressed',    sig_s411_s408_compressed,    10, 0.20, 50),
+    ('S412_s408_above200ma',    sig_s412_s408_above200ma,    10, 0.20, 50),
+    ('S413_s408_spy_weak',      sig_s413_s408_spy_weak,      10, 0.20, 50),
+    ('S414_s408_nr7',           sig_s414_s408_nr7,           10, 0.20, 50),
+    ('S415_s408_vix_rec',       sig_s415_s408_vix_rec,       10, 0.20, 50),
+    ('S416_s407_compressed',    sig_s416_s407_compressed,    10, 0.20, 50),
+    ('S417_s407_above200ma',    sig_s417_s407_above200ma,    10, 0.20, 50),
+    ('S418_s407_spy_weak',      sig_s418_s407_spy_weak,      10, 0.20, 50),
+    ('S419_s407_nr7',           sig_s419_s407_nr7,           10, 0.20, 50),
+    ('S420_s407_vix_rec',       sig_s420_s407_vix_rec,       10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
