@@ -7983,6 +7983,404 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W)
 
 
+# ── Phase 8X — S464/S467 extensions + new: SPY momentum + stochastic ──────────
+# S464 ($1.04M, 83% WR, n=18) and S467 (100% WR, 4/4yr) → extend aggressively.
+# New: SPY made new 10d high today (SPY momentum), stochastic %K oversold.
+
+def _spy_new_nd_high(spy, i, n: int = 10) -> bool:
+    """SPY closed at/near new n-day high today — upside momentum."""
+    if i < n:
+        return False
+    spy_high = float(spy['high'].iloc[i - n:i].max())
+    spy_close = float(spy['close'].iloc[i])
+    return spy_close >= spy_high * 0.99   # within 1% of n-day high
+
+
+def sig_s471_s464_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S471: S464 (SPY>200MA+S215, $1.04M, n=18) + compressed ATR.
+    SPY bull uptrend + TSLA weekly support + ATR compression.
+    Hypothesis: S464 with n=18 trades → compression filter should raise WR significantly."""
+    if sig_s464_s215_spy_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s472_s464_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S472: S464 (SPY>200MA+S215, n=18) + NR7.
+    SPY bull uptrend + TSLA weekly support + tightest day.
+    Hypothesis: S464 filtered by NR7 = highest precision within the $1M signal."""
+    if sig_s464_s215_spy_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr7(tsla, i) else 0
+
+
+def sig_s473_s464_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S473: S464 (SPY>200MA+S215) + VIX recovery.
+    SPY bull uptrend + TSLA at weekly support + VIX starting to cool.
+    Hypothesis: bull market + VIX fear cooling = best timing in uptrend."""
+    if sig_s464_s215_spy_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s474_s464_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S474: S464 (SPY>200MA+S215) + TSLA above 200d MA.
+    Both SPY and TSLA in uptrend at TSLA weekly support.
+    Hypothesis: both stocks in bull regime + TSLA at support = cleanest bull dip."""
+    if sig_s464_s215_spy_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close > ma200 else 0
+
+
+def sig_s475_s467_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S475: S467 (MACD+VIX pct+SPY>200MA, 100% WR, 4/4yr) + compressed ATR.
+    4-way + compression → 5-layer signal.
+    Hypothesis: adding compression to 100% WR signal = tightest possible entry."""
+    if sig_s467_s408_spy_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s476_s464_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S476: S464 (SPY>200MA+S215, n=18) + VIX pct>70.
+    SPY bull uptrend + TSLA support + sustained fear = S466 (already done!).
+    This IS S466 — skip for dedup. Using for VIX pct60 instead."""
+    # S466 = S407 + SPY>200MA = S215 + VIX pct70 + SPY>200MA
+    # S464 + VIX pct70 = S215 + SPY>200MA + VIX pct70 = same signal
+    # Use VIX pct60 instead to test looser threshold with SPY uptrend
+    if sig_s464_s215_spy_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s477_s215_spy_momentum(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S477: S215 (weekly support) + SPY near 10d high (momentum confirmation).
+    NEW: SPY showing intraday/recent momentum while TSLA lags at weekly support.
+    Hypothesis: SPY at 10d high + TSLA at support = immediate lag catch signal."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _spy_new_nd_high(spy, i, n=10) else 0
+
+
+def sig_s478_s333_spy_momentum(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S478: S333 (MACD turning at weekly support) + SPY near 10d high.
+    MACD turning + SPY momentum = both indicators confirming separately.
+    Hypothesis: TSLA momentum reversing + SPY building = strongest simultaneous signal."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _spy_new_nd_high(spy, i, n=10) else 0
+
+
+def sig_s479_s407_spy_momentum(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S479: S407 (VIX pct70+S215, $1.45M) + SPY near 10d high.
+    Best signal + SPY momentum confirmation.
+    Hypothesis: sustained fear + SPY momentum = TSLA temporarily discounted."""
+    if sig_s407_s215_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _spy_new_nd_high(spy, i, n=10) else 0
+
+
+def sig_s480_s215_stoch_os(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S480: S215 (weekly support) + Stochastic %K < 20 (oversold).
+    NEW: Stochastic oversold at weekly support.
+    Hypothesis: weekly support + stochastic oversold = double technical bottom signal."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    stoch = _stoch_k(tsla, i, period=14)
+    if stoch is None:
+        return 1
+    return 1 if stoch < 20 else 0
+
+
+SIGNALS_P8X: List[Tuple] = [
+    # Phase 8X — S464/S467 extensions + SPY momentum + stochastic
+    ('S471_s464_compressed',     sig_s471_s464_compressed,     10, 0.20, 50),
+    ('S472_s464_nr7',            sig_s472_s464_nr7,            10, 0.20, 50),
+    ('S473_s464_vix_rec',        sig_s473_s464_vix_rec,        10, 0.20, 50),
+    ('S474_s464_above200ma',     sig_s474_s464_above200ma,     10, 0.20, 50),
+    ('S475_s467_compressed',     sig_s475_s467_compressed,     10, 0.20, 50),
+    ('S476_s464_vix_pct60',      sig_s476_s464_vix_pct70,      10, 0.20, 50),
+    ('S477_s215_spy_momentum',   sig_s477_s215_spy_momentum,   10, 0.20, 50),
+    ('S478_s333_spy_momentum',   sig_s478_s333_spy_momentum,   10, 0.20, 50),
+    ('S479_s407_spy_momentum',   sig_s479_s407_spy_momentum,   10, 0.20, 50),
+    ('S480_s215_stoch_os',       sig_s480_s215_stoch_os,       10, 0.20, 50),
+]
+
+# ── Phase 8Y — SPY momentum extensions + double-uptrend combos ────────────────
+# S477 (SPY new 10d high + S215) confirmed at 90% WR, 5/5yr.
+# Extend into: compressed, NR7, VIX pct, above200MA (3-way combos).
+# Also extend S474 (both SPY+TSLA>200MA) and best VIX pct signals with SPY momentum.
+
+def sig_s481_s477_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S481: S477 (SPY momentum + weekly support) + ATR compression.
+    Triple: SPY near 10d high + TSLA at weekly support + compressed volatility."""
+    if sig_s477_s215_spy_momentum(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s482_s477_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S482: S477 (SPY momentum + weekly support) + NR7 (narrowest range in 7d).
+    Triple: SPY at new high + TSLA pinching at weekly support."""
+    if sig_s477_s215_spy_momentum(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr7(tsla, i) else 0
+
+
+def sig_s483_s477_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S483: S477 (SPY momentum) + VIX > 60th pct of trailing 252d.
+    Triple: SPY momentum + weekly support + structurally elevated fear."""
+    if sig_s477_s215_spy_momentum(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s484_s477_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S484: S477 (SPY momentum) + TSLA above own 200d MA.
+    Triple: SPY at high + TSLA at weekly support + TSLA in bull uptrend."""
+    if sig_s477_s215_spy_momentum(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 0
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if float(tsla['close'].iloc[i]) > ma200 else 0
+
+
+def sig_s485_s474_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S485: S474 (SPY>200MA + TSLA>200MA + weekly support) + ATR compression.
+    Both in bull uptrend + volatility pinch = explosive spring-loaded setup."""
+    if sig_s474_s464_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s486_s474_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S486: S474 (double uptrend + weekly support) + NR7.
+    Both in bull trend + narrowest range = extreme compression before bounce."""
+    if sig_s474_s464_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr7(tsla, i) else 0
+
+
+def sig_s487_s474_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S487: S474 (double uptrend + weekly support) + VIX > 70th pct.
+    Triple: both in uptrend + weekly support + sustained fear."""
+    if sig_s474_s464_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.70) else 0
+
+
+def sig_s488_s440_spy_momentum(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S488: S440 (VIX pct60, $1.47M best signal) + SPY near 10d high.
+    Two completely independent confirmations: fear regime + SPY building momentum."""
+    if sig_s440_s215_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _spy_new_nd_high(spy, i, n=10) else 0
+
+
+def sig_s489_s408_spy_momentum(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S489: S408 (MACD+VIX pct70, WR=93%) + SPY near 10d high.
+    4-way: MACD turning + VIX fear regime + weekly support + SPY momentum."""
+    if sig_s408_s333_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _spy_new_nd_high(spy, i, n=10) else 0
+
+
+def sig_s490_s478_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S490: S478 (S333+SPY momentum, WR=86%) + ATR compression.
+    MACD turning + SPY momentum + volatility pinch = triple confirmation."""
+    if sig_s478_s333_spy_momentum(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+SIGNALS_P8Y: List[Tuple] = [
+    # Phase 8Y — SPY momentum extensions + double-uptrend combos (S481-S490)
+    ('S481_s477_compressed',     sig_s481_s477_compressed,     10, 0.20, 50),
+    ('S482_s477_nr7',            sig_s482_s477_nr7,            10, 0.20, 50),
+    ('S483_s477_vix_pct60',      sig_s483_s477_vix_pct60,      10, 0.20, 50),
+    ('S484_s477_above200ma',     sig_s484_s477_above200ma,     10, 0.20, 50),
+    ('S485_s474_compressed',     sig_s485_s474_compressed,     10, 0.20, 50),
+    ('S486_s474_nr7',            sig_s486_s474_nr7,            10, 0.20, 50),
+    ('S487_s474_vix_pct70',      sig_s487_s474_vix_pct70,      10, 0.20, 50),
+    ('S488_s440_spy_momentum',   sig_s488_s440_spy_momentum,   10, 0.20, 50),
+    ('S489_s408_spy_momentum',   sig_s489_s408_spy_momentum,   10, 0.20, 50),
+    ('S490_s478_compressed',     sig_s490_s478_compressed,     10, 0.20, 50),
+]
+
+# ── Phase 8Z — Capitulation signals + S500 milestone ─────────────────────────
+# New dimensions: consecutive TSLA down days (exhaustion), new n-day low (flush),
+# volume dry-up (quiet capitulation), and S500 milestone combining VIX pct + NR7 + weekly support.
+
+def _new_nd_low(tsla, i, n: int = 10) -> bool:
+    """Today's close is the lowest of the last n days — price flush."""
+    if i < n:
+        return False
+    today_close = float(tsla['close'].iloc[i])
+    hist_min = float(tsla['close'].iloc[i - n:i].min())
+    return today_close <= hist_min * 1.005  # within 0.5% of n-day low
+
+
+def _volume_below_avg(tsla, i, mult: float = 0.70, period: int = 20) -> bool:
+    """Today's volume < mult × 20d average (quiet day = no panic = capitulation drying up)."""
+    if i < period:
+        return True
+    if 'volume' not in tsla.columns:
+        return True
+    avg_vol = float(tsla['volume'].iloc[i - period:i].mean())
+    if avg_vol <= 0:
+        return True
+    return float(tsla['volume'].iloc[i]) < mult * avg_vol
+
+
+def sig_s491_s215_consec_down3(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S491: S215 (weekly support) + TSLA 3+ consecutive down closes.
+    NEW: Selling exhaustion after sequential multi-day decline at weekly support.
+    Hypothesis: capitulation into support = buyers stepping in en masse."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_consec_down(tsla, i, n=3) else 0
+
+
+def sig_s492_s333_consec_down3(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S492: S333 (MACD turning) + TSLA 3+ consecutive down closes.
+    MACD momentum inflection + sequential selling = reversal confirmation.
+    Hypothesis: MACD curvature shifts as sellers exhaust into weekly support."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_consec_down(tsla, i, n=3) else 0
+
+
+def sig_s493_s407_consec_down3(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S493: S407 (VIX pct>70 + weekly support, $1.45M) + TSLA 3 consec down.
+    Triple: sustained fear regime + weekly support + sequential selling exhaustion."""
+    if sig_s407_s215_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_consec_down(tsla, i, n=3) else 0
+
+
+def sig_s494_s215_new_10d_low(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S494: S215 (weekly support) + today is new 10-day closing low.
+    Price flush: TSLA hitting new short-term low at weekly support = capitulation."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _new_nd_low(tsla, i, n=10) else 0
+
+
+def sig_s495_s215_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S495: S215 (weekly support) + below-average volume (<70% of 20d avg).
+    Volume dry-up at support: no panic selling, institutional quietly accumulating."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i, mult=0.70) else 0
+
+
+def sig_s496_s494_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S496: S494 (new 10d low at weekly support) + ATR compression.
+    Price flush + volatility coiling = paradox spring (new low but very quiet)."""
+    if sig_s494_s215_new_10d_low(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s497_s481_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S497: S481 (SPY momentum + weekly support + compressed) + VIX pct>70.
+    4-way: SPY momentum + TSLA weekly support + ATR compressed + VIX fear.
+    Ultimate confluence: every dimension fired simultaneously."""
+    if sig_s481_s477_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.70) else 0
+
+
+def sig_s498_s464_consec_down3(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S498: S464 (SPY>200MA + weekly support, $1.04M) + TSLA 3 consec down.
+    Bull regime + weekly support + sequential capitulation = strongest setup in uptrend."""
+    if sig_s464_s215_spy_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_consec_down(tsla, i, n=3) else 0
+
+
+def sig_s499_s477_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S499: S477 (SPY momentum + weekly support) + VIX pct>60.
+    Triple: SPY at new high + TSLA at weekly support + VIX elevated.
+    Cross-dimension: market strength + individual weakness + macro fear."""
+    if sig_s477_s215_spy_momentum(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s500_milestone_vix_pct_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S500 MILESTONE: S215 (weekly support) + VIX pct>70 + NR7.
+    Three strongest discovered dimensions combined:
+    - Weekly support (multi-TF confluence, base of all best signals)
+    - VIX sustained fear percentile (highest P&L add-on found)
+    - NR7 narrowest range in 7 days (highest WR compression signal)
+    Hypothesis: VIX fear + price pinch at support = ultimate coiled spring."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not _vix_elevated_pct(vix, i, window=252, pct=0.70):
+        return 0
+    return 1 if _nr7(tsla, i) else 0
+
+
+SIGNALS_P8Z: List[Tuple] = [
+    # Phase 8Z — Capitulation signals + S500 milestone (S491-S500)
+    ('S491_s215_consec_down3',   sig_s491_s215_consec_down3,   10, 0.20, 50),
+    ('S492_s333_consec_down3',   sig_s492_s333_consec_down3,   10, 0.20, 50),
+    ('S493_s407_consec_down3',   sig_s493_s407_consec_down3,   10, 0.20, 50),
+    ('S494_s215_new_10d_low',    sig_s494_s215_new_10d_low,    10, 0.20, 50),
+    ('S495_s215_vol_dryup',      sig_s495_s215_vol_dryup,      10, 0.20, 50),
+    ('S496_s494_compressed',     sig_s496_s494_compressed,     10, 0.20, 50),
+    ('S497_s481_vix_pct70',      sig_s497_s481_vix_pct70,      10, 0.20, 50),
+    ('S498_s464_consec_down3',   sig_s498_s464_consec_down3,   10, 0.20, 50),
+    ('S499_s477_vix_pct60',      sig_s499_s477_vix_pct60,      10, 0.20, 50),
+    ('S500_milestone_vix_nr7',   sig_s500_milestone_vix_pct_nr7, 10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
