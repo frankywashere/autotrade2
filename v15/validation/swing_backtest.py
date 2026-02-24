@@ -14874,6 +14874,182 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10U)
 
 
+# ── Phase 10V — S963/S968 extensions + combined conditions + SPY window sweep (S971-S980) ──
+
+def sig_s971_s963_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S971: S963 (S929+3d-selloff3%) + lag5pct.
+    3-day acute selloff + 4-chan structural support + squeeze + TSLA lagging.
+    Hypothesis: 100% WR, fewer than S963 (n=11)."""
+    if sig_s963_s929_3d_selloff3pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s972_s968_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S972: S968 (S929+SPY_20d_up) + lag5pct.
+    Market recovering (SPY 20d up) + TSLA lagging SPY 5% over 20 days.
+    Hypothesis: 100% WR — SPY up + TSLA lagging = maximally strong catch-up setup."""
+    if sig_s968_s929_spy_20d_up(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s973_s929_selloff_and_spy_up(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S973: S929 + BOTH 3d selloff (-3%) AND SPY 20d up.
+    Dual condition: TSLA dropped sharply while market has been rising — extreme divergence.
+    Hypothesis: 100% WR, very few but highest individual quality."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    # 3-day TSLA selloff
+    if i < 3:
+        return 0
+    c_now = float(tsla['close'].iloc[i])
+    c_3d = float(tsla['close'].iloc[i - 3])
+    if c_3d <= 0 or (c_now - c_3d) / c_3d >= -0.03:
+        return 0
+    # SPY 20-day positive
+    if i < 20:
+        return 0
+    spy_now = float(spy['close'].iloc[i])
+    spy_20d = float(spy['close'].iloc[i - 20])
+    if spy_20d <= 0 or spy_now <= spy_20d:
+        return 0
+    return 1
+
+
+def sig_s974_s929_spy_10d_up(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S974: S929 + SPY 10-day return positive.
+    Shorter SPY recovery window (10d vs 20d in S968).
+    Hypothesis: slightly more trades than S968 (n=11), possibly lower WR."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 0
+    spy_now = float(spy['close'].iloc[i])
+    spy_10d = float(spy['close'].iloc[i - 10])
+    if spy_10d <= 0:
+        return 0
+    return 1 if spy_now > spy_10d else 0
+
+
+def sig_s975_s929_spy_30d_up(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S975: S929 + SPY 30-day return positive.
+    Longer SPY recovery (30d vs 20d in S968).
+    Hypothesis: similar to S968 or slightly fewer trades."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 30:
+        return 0
+    spy_now = float(spy['close'].iloc[i])
+    spy_30d = float(spy['close'].iloc[i - 30])
+    if spy_30d <= 0:
+        return 0
+    return 1 if spy_now > spy_30d else 0
+
+
+def sig_s976_s929_spy_20d_up3pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S976: S929 + SPY 20d return > +3% (more meaningful market recovery).
+    Compare to S968 (any positive 20d SPY): does requiring 3%+ matter?
+    Hypothesis: fewer trades but same 100% WR."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 20:
+        return 0
+    spy_now = float(spy['close'].iloc[i])
+    spy_20d = float(spy['close'].iloc[i - 20])
+    if spy_20d <= 0:
+        return 0
+    return 1 if (spy_now - spy_20d) / spy_20d > 0.03 else 0
+
+
+def sig_s977_s963_spy_20d_up(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S977: S963 (3d selloff 3%) + SPY 20d up.
+    Tests if S973 has different behavior vs S963+S968 separately.
+    Essentially same as S973 (3d selloff AND SPY 20d up)."""
+    return sig_s973_s929_selloff_and_spy_up(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s978_s968_3d_selloff(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S978: S968 (SPY 20d up) + 3d selloff 5%.
+    Same as S973 but with stricter 5% selloff threshold.
+    Tests: does the stricter selloff (5% vs 3%) reduce trades on S968?"""
+    if sig_s968_s929_spy_20d_up(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 3:
+        return 0
+    c_now = float(tsla['close'].iloc[i])
+    c_3d = float(tsla['close'].iloc[i - 3])
+    if c_3d <= 0:
+        return 0
+    return 1 if (c_now - c_3d) / c_3d < -0.05 else 0
+
+
+def sig_s979_s963_or_s968(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S979: S963 OR S968 — union of both 100% WR paths.
+    Maximizes coverage: fires on 3d selloff OR SPY 20d up (or both).
+    Hypothesis: n ≥ 11 (might overlap), WR should still be very high."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    # Condition 1: 3-day TSLA selloff ≥ 3%
+    has_selloff = False
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            has_selloff = True
+    # Condition 2: SPY 20d up
+    has_spy_up = False
+    if i >= 20:
+        spy_now = float(spy['close'].iloc[i])
+        spy_20d = float(spy['close'].iloc[i - 20])
+        if spy_20d > 0 and spy_now > spy_20d:
+            has_spy_up = True
+    return 1 if (has_selloff or has_spy_up) else 0
+
+
+def sig_s980_milestone_s973_lag(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S980 MILESTONE: S973 (3d selloff + SPY 20d up) + lag5pct.
+    Triple timing confluence: acute panic + market recovering + TSLA lagging.
+    Hypothesis: 100% WR, very few but highest conviction trades."""
+    if sig_s973_s929_selloff_and_spy_up(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+SIGNALS_P10V: List[Tuple] = [
+    # Phase 10V — S963/S968 extensions + combined + SPY window sweep (S971-S980)
+    ('S971_s963_lag5pct',          sig_s971_s963_lag5pct,           10, 0.20, 50),
+    ('S972_s968_lag5pct',          sig_s972_s968_lag5pct,           10, 0.20, 50),
+    ('S973_s929_selloff_spy_up',   sig_s973_s929_selloff_and_spy_up,10, 0.20, 50),
+    ('S974_s929_spy10d_up',        sig_s974_s929_spy_10d_up,        10, 0.20, 50),
+    ('S975_s929_spy30d_up',        sig_s975_s929_spy_30d_up,        10, 0.20, 50),
+    ('S976_s929_spy20d_up3pct',    sig_s976_s929_spy_20d_up3pct,    10, 0.20, 50),
+    ('S977_s963_spy20d',           sig_s977_s963_spy_20d_up,        10, 0.20, 50),
+    ('S978_s968_3d_selloff5pct',   sig_s978_s968_3d_selloff,        10, 0.20, 50),
+    ('S979_s963_or_s968',          sig_s979_s963_or_s968,           10, 0.20, 50),
+    ('S980_milestone_s973_lag',    sig_s980_milestone_s973_lag,     10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E
+           + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I + SIGNALS_P10J
+           + SIGNALS_P10K + SIGNALS_P10L + SIGNALS_P10M + SIGNALS_P10N + SIGNALS_P10O
+           + SIGNALS_P10P + SIGNALS_P10Q + SIGNALS_P10R + SIGNALS_P10S + SIGNALS_P10T
+           + SIGNALS_P10U + SIGNALS_P10V)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
