@@ -2230,12 +2230,14 @@ def _load_signal_quality_model():
     """Load the signal quality model into session state (once)."""
     if 'signal_quality_model' not in st.session_state:
         _load_log = []
-        # Prefer tuned model (Optuna + calibrated), fall back to base
+        # Prefer c10 arch2 model (177 features), then tuned (169 features), then base
         base_dir = Path(__file__).parent / 'validation'
-        model_path = base_dir / 'signal_quality_model_tuned.pkl'
+        model_path = base_dir / 'signal_quality_model_c10_arch2.pkl'
         if not model_path.exists():
-            model_path = base_dir / 'signal_quality_model.pkl'
-            _load_log.append(f"Tuned model not found, falling back to base: {model_path.name}")
+            model_path = base_dir / 'signal_quality_model_tuned.pkl'
+            if not model_path.exists():
+                model_path = base_dir / 'signal_quality_model.pkl'
+                _load_log.append(f"Tuned model not found, falling back to base: {model_path.name}")
         if model_path.exists():
             try:
                 from v15.validation.signal_quality_model import SignalQualityModel

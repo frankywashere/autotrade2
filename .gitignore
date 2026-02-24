@@ -11,6 +11,7 @@
 # Exception: signal quality models (small LightGBM, needed for Streamlit Cloud)
 !v15/validation/signal_quality_model_tuned.pkl
 !v15/validation/signal_quality_model.pkl
+!v15/validation/signal_quality_model_c10_arch2.pkl
 **/cache_*
 
 # Python
