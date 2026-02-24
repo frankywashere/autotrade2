@@ -18759,6 +18759,171 @@ SIGNALS_P11N: List[Tuple] = [
     ('S1170_s1041_large_gap_down',  sig_s1170_s1041_large_gap_down,  10, 0.20, 50),   # >1.5% gap-down
 ]
 
+# ── Phase 11O — Capstone: channel depth precision, exhaustion, trend context ──
+# S1171-S1180. Final frontier: ultra-channel-depth, consecutive-down-days exhaustion,
+# RSI crossover timing, SPY/TSLA trend context, moderate-gap sweet spot.
+
+def sig_s1171_s1041_chan10pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1171: S1041 with tighter channel filter — price in bottom 10% (vs 25%).
+    Tests if the deepest channel dips have better quality than standard 25%.
+    Uses same VIX+ATR+OR conditions as S1041 but checks channel pos < 10%."""
+    # Re-implement S1041 logic with 10% channel threshold instead of 25%
+    # S1041 = S993 OR S1034. Both use _near_lower with 0.25. Test 0.10.
+    if i < 50 or i < 20:
+        return 0
+    vix_now = float(vix['close'].iloc[i]) if i >= 0 else 20.0
+    if not (15.0 <= vix_now <= 50.0):
+        return 0
+    # ATR compression check (same as S1041 base)
+    atr_5 = float((tsla['high'].iloc[i-5:i] - tsla['low'].iloc[i-5:i]).mean())
+    atr_20 = float((tsla['high'].iloc[i-20:i] - tsla['low'].iloc[i-20:i]).mean())
+    if atr_20 <= 0 or atr_5 >= 0.75 * atr_20:
+        return 0
+    # Check any of the 4 channel windows at 10% depth
+    close_now = float(tsla['close'].iloc[i])
+    for win in (20, 30, 40, 50):
+        if i < win:
+            continue
+        ch = _channel_at(tsla.iloc[i - win:i])
+        if ch and _near_lower(close_now, ch, 0.10):
+            return 1
+    return 0
+
+
+def sig_s1172_s1041_moderate_gap(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1172: S1041 + moderate gap-down (0.3%-1.5%) — the 'sweet spot'.
+    Avoids tiny gaps (<0.3%) = flat open, and huge gaps (>1.5%) = panic which added losers.
+    Tests if the middle gap-down zone is the cleanest entry."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 1:
+        return 0
+    today_open = float(tsla['open'].iloc[i])
+    prev_close = float(tsla['close'].iloc[i - 1])
+    gap_pct = (today_open - prev_close) / prev_close
+    return 1 if (-0.015 <= gap_pct < -0.003) else 0
+
+
+def sig_s1173_s1041_tsla_below_50ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1173: S1041 + TSLA below 50d MA — medium-term downtrend context.
+    Channel bounce from below 50d MA = catching dip in weaker trend = higher urgency.
+    Hypothesis: below-50d entries resolve faster (more oversold)."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 50:
+        return 0
+    ma50 = float(tsla['close'].iloc[i - 50:i].mean())
+    return 1 if float(tsla['close'].iloc[i]) < ma50 else 0
+
+
+def sig_s1174_s1041_spy_above_50ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1174: S1041 + SPY above 50d MA — broad market uptrend (buy-the-dip context).
+    TSLA underperforms + market healthy = classic catch-up trade.
+    Hypothesis: SPY above 50d means dip is TSLA-specific, not systemic."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 50:
+        return 0
+    spy_ma50 = float(spy['close'].iloc[i - 50:i].mean())
+    return 1 if float(spy['close'].iloc[i]) >= spy_ma50 else 0
+
+
+def sig_s1175_s1041_rsi_crossup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1175: S1041 + RSI bullish crossover (yesterday RSI<40, today RSI>=40).
+    The exact moment RSI crosses back above 40 = oversold recovery signal.
+    More precise than RSI<40 (which catches entries already in oversold zone)."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 1:
+        return 0
+    rsi_today = rt.iloc[i]
+    rsi_prev  = rt.iloc[i - 1]
+    if pd.isna(rsi_today) or pd.isna(rsi_prev):
+        return 0
+    return 1 if (rsi_prev < 40.0 and rsi_today >= 40.0) else 0
+
+
+def sig_s1176_s1041_consec3_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1176: S1041 + 3 consecutive down closes before entry.
+    Exhaustion pattern: 3 red candles at channel support = max near-term selling.
+    Hypothesis: extended exhaustion accelerates the mean-reversion snap."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 3:
+        return 0
+    for j in range(1, 4):  # check last 3 bars all closed down
+        if float(tsla['close'].iloc[i - j]) >= float(tsla['open'].iloc[i - j]):
+            return 0
+    return 1
+
+
+def sig_s1177_s1041_consec3_up(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1177: S1041 + at least 1 green candle in prior 3 bars (opposite of S1176).
+    Control experiment: does having a prior green bar matter?
+    Tests if exhaustion requires all-red or mixed is fine."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 3:
+        return 0
+    for j in range(1, 4):
+        if float(tsla['close'].iloc[i - j]) >= float(tsla['open'].iloc[i - j]):
+            return 1  # found at least one green bar
+    return 0
+
+
+def sig_s1178_s1041_spy_below_50ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1178: S1041 + SPY below 50d MA — bear/correcting broad market.
+    Complement of S1174. Both TSLA and SPY weak = systemic sell-off bounce.
+    Tests if broad weakness leads to stronger or weaker S1041 bounces."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 50:
+        return 0
+    spy_ma50 = float(spy['close'].iloc[i - 50:i].mean())
+    return 1 if float(spy['close'].iloc[i]) < spy_ma50 else 0
+
+
+def sig_s1179_s1041_tsla_above_50ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1179: S1041 + TSLA above 50d MA — medium-term uptrend, dipping to channel.
+    Complement of S1173. TSLA in medium-term uptrend + short-term dip to channel.
+    Classic 'buy the dip in uptrend' setup."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 50:
+        return 0
+    ma50 = float(tsla['close'].iloc[i - 50:i].mean())
+    return 1 if float(tsla['close'].iloc[i]) >= ma50 else 0
+
+
+def sig_s1180_s1041_atr_extreme_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1180: S1041 with STRICTER ATR compression (atr_5 < 0.60 * atr_20 vs 0.75).
+    Tests if the deepest compression level (tighter than standard 0.75 threshold)
+    produces higher quality entries — 'more coiled spring' hypothesis."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 20:
+        return 0
+    atr_5  = float((tsla['high'].iloc[i-5:i] - tsla['low'].iloc[i-5:i]).mean())
+    atr_20 = float((tsla['high'].iloc[i-20:i] - tsla['low'].iloc[i-20:i]).mean())
+    if atr_20 <= 0:
+        return 0
+    # Stricter: require atr_5 < 60% of atr_20 (vs 75% in standard S1041)
+    return 1 if atr_5 < 0.60 * atr_20 else 0
+
+
+SIGNALS_P11O: List[Tuple] = [
+    ('S1171_s1041_chan10pct',        sig_s1171_s1041_chan10pct,        10, 0.20, 50),   # bottom 10% channel
+    ('S1172_s1041_moderate_gap',    sig_s1172_s1041_moderate_gap,    10, 0.20, 50),   # 0.3-1.5% gap-down
+    ('S1173_s1041_tsla_below50ma',  sig_s1173_s1041_tsla_below_50ma, 10, 0.20, 50),   # TSLA < 50d MA
+    ('S1174_s1041_spy_above50ma',   sig_s1174_s1041_spy_above_50ma,  10, 0.20, 50),   # SPY > 50d MA
+    ('S1175_s1041_rsi_crossup',     sig_s1175_s1041_rsi_crossup,     10, 0.20, 50),   # RSI cross above 40
+    ('S1176_s1041_consec3_down',    sig_s1176_s1041_consec3_down,    10, 0.20, 50),   # 3 red candles before
+    ('S1177_s1041_not_all_red',     sig_s1177_s1041_consec3_up,      10, 0.20, 50),   # has green bar prior 3d
+    ('S1178_s1041_spy_below50ma',   sig_s1178_s1041_spy_below_50ma,  10, 0.20, 50),   # SPY < 50d MA
+    ('S1179_s1041_tsla_above50ma',  sig_s1179_s1041_tsla_above_50ma, 10, 0.20, 50),   # TSLA > 50d MA
+    ('S1180_s1041_atr60pct',        sig_s1180_s1041_atr_extreme_compressed, 10, 0.20, 50),  # ATR < 60%
+]
+
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
            + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
            + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
@@ -18779,7 +18944,7 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10U + SIGNALS_P10V + SIGNALS_P10W + SIGNALS_P10X + SIGNALS_P10Y
            + SIGNALS_P10Z + SIGNALS_P11A + SIGNALS_P11B + SIGNALS_P11C + SIGNALS_P11D + SIGNALS_P11E
            + SIGNALS_P11F + SIGNALS_P11G + SIGNALS_P11H + SIGNALS_P11I + SIGNALS_P11J + SIGNALS_P11K
-           + SIGNALS_P11L + SIGNALS_P11M + SIGNALS_P11N)
+           + SIGNALS_P11L + SIGNALS_P11M + SIGNALS_P11N + SIGNALS_P11O)
 
 # ── sentinel — do not remove ──────────────────────────────────────────────────
 
