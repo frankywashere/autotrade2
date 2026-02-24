@@ -18550,6 +18550,215 @@ SIGNALS_P11L: List[Tuple] = [
     ('S1150_s1041_vix_rising',         sig_s1150_s1041_vix_rising,             10, 0.20, 50),
 ]
 
+# ── Phase 11M — Parameter sensitivity + seasonal + micro-structure on S1041 ───
+# Explore: hold period (7d/5d), stop loss (10%/15%/25%), Q4+Q1 seasonal,
+# NR7 (narrowest 7-bar range = maximum compression), gap-down entry.
+# S1151-S1160. Champion baseline: S1041 (n=23, 100% WR, $2,037K, hold=10, stop=20%).
+
+def sig_s1156_s1041_q4q1(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1156: S1041 + Q4/Q1 seasonal (Oct-Mar). TSLA fear months historically strongest.
+    Hypothesis: channel support bounces in Oct-Mar (year-end + new-year) have higher quality."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    month = tsla.index[i].month
+    return 1 if month in (10, 11, 12, 1, 2, 3) else 0
+
+
+def sig_s1157_s1041_q1(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1157: S1041 + Q1 only (Jan-Mar). Post-Jan-effect, tax-loss reversals.
+    Tests if early-year entries outperform."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    month = tsla.index[i].month
+    return 1 if month in (1, 2, 3) else 0
+
+
+def sig_s1158_s1041_q4(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1158: S1041 + Q4 only (Oct-Dec). Year-end window-dressing and rebalancing.
+    Tests if Oct-Dec has asymmetric bounce quality vs rest of year."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    month = tsla.index[i].month
+    return 1 if month in (10, 11, 12) else 0
+
+
+def sig_s1159_s1041_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1159: S1041 + NR7 (today's H-L range is smallest of last 7 bars).
+    NR7 = Toby Crabel pattern: maximum range contraction = spring fully coiled.
+    Combined with S1041's ATR_compressed → ultra-precision compression entry."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 7:
+        return 0
+    today_range = float(tsla['high'].iloc[i]) - float(tsla['low'].iloc[i])
+    past_ranges = [float(tsla['high'].iloc[i - j]) - float(tsla['low'].iloc[i - j])
+                   for j in range(1, 7)]
+    return 1 if today_range <= min(past_ranges) else 0
+
+
+def sig_s1160_s1041_gap_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1160: S1041 + gap-down entry (today open < yesterday close).
+    Entry on a gap-down bar = entering into weakness = higher urgency signal.
+    Hypothesis: gap-downs at channel support have faster mean-reversion."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 1:
+        return 0
+    today_open = float(tsla['open'].iloc[i])
+    prev_close = float(tsla['close'].iloc[i - 1])
+    return 1 if today_open < prev_close else 0
+
+
+SIGNALS_P11M: List[Tuple] = [
+    # -- Parameter variations (same signal function, different hold/stop in tuple) --
+    ('S1151_s1041_hold7',    sig_s1041_s993_or_s1034,   7, 0.20, 50),   # 7d hold
+    ('S1152_s1041_hold5',    sig_s1041_s993_or_s1034,   5, 0.20, 50),   # 5d hold
+    ('S1153_s1041_stop15',   sig_s1041_s993_or_s1034,  10, 0.15, 50),   # 15% stop
+    ('S1154_s1041_stop10',   sig_s1041_s993_or_s1034,  10, 0.10, 50),   # 10% stop
+    ('S1155_s1041_stop25',   sig_s1041_s993_or_s1034,  10, 0.25, 50),   # 25% stop
+    # -- Seasonal filters --
+    ('S1156_s1041_q4q1',     sig_s1156_s1041_q4q1,     10, 0.20, 50),   # Oct-Mar
+    ('S1157_s1041_q1',       sig_s1157_s1041_q1,       10, 0.20, 50),   # Jan-Mar
+    ('S1158_s1041_q4',       sig_s1158_s1041_q4,       10, 0.20, 50),   # Oct-Dec
+    # -- Micro-structure filters --
+    ('S1159_s1041_nr7',      sig_s1159_s1041_nr7,      10, 0.20, 50),   # NR7 compression
+    ('S1160_s1041_gap_down', sig_s1160_s1041_gap_down, 10, 0.20, 50),   # gap-down entry
+]
+
+# ── Phase 11N — Gap-up subset, Q2+Q3, NR7+gap combo, union with independent signals ──
+# S1161-S1170. Explores:
+#   - Gap-up subset (5 high-value non-gap-down trades)
+#   - Q2+Q3 complement (Apr-Sep trades)
+#   - Max-compression combo (NR7 + gap-down + S1041)
+#   - Can MACD crossup (S1123) or RSI<35 (S1088) add unique clean trades beyond S1041?
+#   - Large intraday gap (>2%) as independent panic entry
+#   - Week-of-month seasonal effects
+
+def sig_s1161_s1041_gap_up(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1161: S1041 + gap-UP or flat entry (open >= prev close = 5 non-gap-down trades).
+    These 5 trades are S1041's highest-value subset: avg ~$125K vs $78K for gap-downs.
+    Tests if entering on strength (no weakness gap) has different quality."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 1:
+        return 0
+    today_open = float(tsla['open'].iloc[i])
+    prev_close = float(tsla['close'].iloc[i - 1])
+    return 1 if today_open >= prev_close else 0
+
+
+def sig_s1162_s1041_q2q3(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1162: S1041 + Q2/Q3 (Apr-Sep) — complement of Q4+Q1.
+    The 11 warm-weather trades: earnings season + summer dips."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    month = tsla.index[i].month
+    return 1 if month in (4, 5, 6, 7, 8, 9) else 0
+
+
+def sig_s1163_s1041_gap_down_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1163: S1041 + gap-down + NR7 — triple compression: price contracted + gap lower.
+    Maximum setup quality: channel support + ATR compressed + NR7 + opening weakness."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 7:
+        return 0
+    today_open = float(tsla['open'].iloc[i])
+    prev_close = float(tsla['close'].iloc[i - 1])
+    if today_open >= prev_close:  # not a gap-down
+        return 0
+    today_range = float(tsla['high'].iloc[i]) - float(tsla['low'].iloc[i])
+    past_ranges = [float(tsla['high'].iloc[i - j]) - float(tsla['low'].iloc[i - j])
+                   for j in range(1, 7)]
+    return 1 if today_range <= min(past_ranges) else 0
+
+
+def sig_s1164_s1041_or_macd_crossup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1164: S1041 OR S1123 (MACD crossup at channel). Test: does MACD crossup add unique trades?
+    S1123 = S929 + MACD histogram crossed from negative to positive — 3 trades, avg=$155K.
+    If those 3 are NOT in S1041, this union > $2,037K."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    return sig_s1123_s929_macd_crossup(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s1165_s1041_or_rsi35(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1165: S1041 OR S1088 (RSI<35 at channel). Test: does RSI<35 add unique trades?
+    S1088 = OR(20/30/40/50w) + compressed + VIX 18-50 + RSI<35 — 3 trades, avg=$118K."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    return sig_s1088_s929_rsi35(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s1166_tsla_gap3pct_spy_flat(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1166: TSLA gap-down >3% + SPY flat (<1% gap) — TSLA-specific panic, market stable.
+    Fully independent of channel/ATR/VIX: pure gap-panic entry.
+    Tests if large TSLA-only gap-downs near weekly channels have edge."""
+    if i < 1:
+        return 0
+    tsla_open = float(tsla['open'].iloc[i])
+    tsla_prev  = float(tsla['close'].iloc[i - 1])
+    tsla_gap_pct = (tsla_open - tsla_prev) / tsla_prev
+    if tsla_gap_pct > -0.03:  # need >3% gap down
+        return 0
+    spy_open  = float(spy['open'].iloc[i])
+    spy_prev   = float(spy['close'].iloc[i - 1])
+    spy_gap_pct = abs((spy_open - spy_prev) / spy_prev)
+    if spy_gap_pct >= 0.01:  # SPY must be flat (<1% gap either way)
+        return 0
+    return 1
+
+
+def sig_s1167_s1041_or_tsla_gap3(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1167: S1041 OR (TSLA gap-down >3% + SPY flat). Tests if panic gaps add clean trades."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    return sig_s1166_tsla_gap3pct_spy_flat(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s1168_s1041_first_week(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1168: S1041 + first week of month (days 1-7). Month-open accumulation zone.
+    Tests if start-of-month entries have seasonal advantage."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if tsla.index[i].day <= 7 else 0
+
+
+def sig_s1169_s1041_nov_dec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1169: S1041 + November or December — year-end tax-loss + window-dressing.
+    Tests the 'Santa Claus' bounce hypothesis at channel support."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    month = tsla.index[i].month
+    return 1 if month in (11, 12) else 0
+
+
+def sig_s1170_s1041_large_gap_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1170: S1041 + large gap-down (>1.5%). Entering deeper into weakness.
+    Tests if larger opening gaps at channel support produce faster/larger reversals."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 1:
+        return 0
+    today_open = float(tsla['open'].iloc[i])
+    prev_close = float(tsla['close'].iloc[i - 1])
+    gap_pct = (today_open - prev_close) / prev_close
+    return 1 if gap_pct < -0.015 else 0
+
+
+SIGNALS_P11N: List[Tuple] = [
+    ('S1161_s1041_gap_up',          sig_s1161_s1041_gap_up,          10, 0.20, 50),   # 5 high-val gap-ups
+    ('S1162_s1041_q2q3',            sig_s1162_s1041_q2q3,            10, 0.20, 50),   # Apr-Sep complement
+    ('S1163_s1041_gap_down_nr7',    sig_s1163_s1041_gap_down_nr7,    10, 0.20, 50),   # max compression combo
+    ('S1164_s1041_or_macd_crossup', sig_s1164_s1041_or_macd_crossup, 10, 0.20, 50),   # S1041 + MACD crossup union
+    ('S1165_s1041_or_rsi35',        sig_s1165_s1041_or_rsi35,        10, 0.20, 50),   # S1041 + RSI<35 union
+    ('S1166_tsla_gap3_spy_flat',    sig_s1166_tsla_gap3pct_spy_flat, 10, 0.20, 50),   # independent panic gap
+    ('S1167_s1041_or_gap3',         sig_s1167_s1041_or_tsla_gap3,   10, 0.20, 50),   # S1041 + panic gap union
+    ('S1168_s1041_first_week',      sig_s1168_s1041_first_week,      10, 0.20, 50),   # first-week entries
+    ('S1169_s1041_nov_dec',         sig_s1169_s1041_nov_dec,         10, 0.20, 50),   # Nov-Dec entries
+    ('S1170_s1041_large_gap_down',  sig_s1170_s1041_large_gap_down,  10, 0.20, 50),   # >1.5% gap-down
+]
+
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
            + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
            + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
@@ -18570,7 +18779,7 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10U + SIGNALS_P10V + SIGNALS_P10W + SIGNALS_P10X + SIGNALS_P10Y
            + SIGNALS_P10Z + SIGNALS_P11A + SIGNALS_P11B + SIGNALS_P11C + SIGNALS_P11D + SIGNALS_P11E
            + SIGNALS_P11F + SIGNALS_P11G + SIGNALS_P11H + SIGNALS_P11I + SIGNALS_P11J + SIGNALS_P11K
-           + SIGNALS_P11L)
+           + SIGNALS_P11L + SIGNALS_P11M + SIGNALS_P11N)
 
 # ── sentinel — do not remove ──────────────────────────────────────────────────
 
