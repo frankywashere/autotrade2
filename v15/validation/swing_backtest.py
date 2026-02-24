@@ -36,6 +36,8 @@ from v15.data.native_tf import fetch_native_tf
 from v15.core.channel import detect_channel
 
 # ── Config ────────────────────────────────────────────────────────────────────
+# Overridable via --trade-usd CLI arg. Default $1M matches historical runs.
+# Use --trade-usd 10000 to match c10/c9 sizing ($10K/trade, $100K equity).
 MAX_TRADE_USD = 1_000_000
 SLIPPAGE_PCT  = 0.0005    # 0.05% per side
 COMM_PCT      = 0.0001    # 0.01% per side
@@ -209,11 +211,15 @@ def _resample_weekly(daily_df: pd.DataFrame) -> pd.DataFrame:
 def _record_trade(result: BacktestResult, signal: str, direction: int,
                   entry_date, entry_price: float,
                   exit_date, exit_price: float,
-                  reason: str, hold_days: int) -> None:
+                  reason: str, hold_days: int,
+                  trade_usd: float = None) -> float:
+    """Record a closed trade. Returns pnl_usd. trade_usd defaults to MAX_TRADE_USD."""
+    if trade_usd is None:
+        trade_usd = MAX_TRADE_USD
     eff_entry = entry_price * (1 + COST_PER_SIDE * direction)
     eff_exit  = exit_price  * (1 - COST_PER_SIDE * direction)
     pnl_pct   = direction * (eff_exit - eff_entry) / eff_entry
-    pnl_usd   = pnl_pct * MAX_TRADE_USD
+    pnl_usd   = pnl_pct * trade_usd
     result.trades.append(Trade(
         signal=signal, direction=direction,
         entry_date=entry_date, entry_price=entry_price,
@@ -221,6 +227,7 @@ def _record_trade(result: BacktestResult, signal: str, direction: int,
         exit_reason=reason, hold_days=hold_days,
         pnl_usd=pnl_usd, pnl_pct=pnl_pct,
     ))
+    return pnl_usd
 
 
 def run_swing_backtest(
@@ -237,8 +244,16 @@ def run_swing_backtest(
     warmup_bars:   int   = 70,
     start_year:    int   = 2015,
     end_year:      int   = 2024,
+    compound:      bool  = False,
 ) -> BacktestResult:
+    """Run swing backtest. If compound=True, position size scales with equity growth
+    (same model as c10/c9 surfer: equity_scale = equity / initial_equity).
+    Initial equity = MAX_TRADE_USD * 10 (e.g. $10K trade → $100K starting equity)."""
     result = BacktestResult(signal=signal_name)
+
+    # Compounding state
+    initial_equity = MAX_TRADE_USD * 10
+    equity         = initial_equity
 
     # Align to common daily dates
     common = tsla.index.intersection(spy.index).intersection(vix.index)
@@ -263,6 +278,7 @@ def run_swing_backtest(
     entry_bar   = 0
     entry_date  = None
     direction   = 0
+    open_trade_usd = MAX_TRADE_USD   # size locked in at entry
 
     for i in range(trade_start, n - 1):
         bar_year = tsla_full.index[i].year
@@ -277,20 +293,24 @@ def run_swing_backtest(
             # Stop loss (check vs close, exit at next open)
             if direction == 1 and price < entry_price * (1 - stop_pct):
                 exit_price = tsla_full['open'].iloc[i + 1]
-                _record_trade(result, signal_name, direction,
-                              entry_date, entry_price,
-                              tsla_full.index[i + 1], exit_price,
-                              'stop', hold_days)
+                pnl = _record_trade(result, signal_name, direction,
+                                    entry_date, entry_price,
+                                    tsla_full.index[i + 1], exit_price,
+                                    'stop', hold_days, open_trade_usd)
+                if compound:
+                    equity = max(equity + pnl, initial_equity * 0.10)
                 in_trade = False
                 continue
 
             # Timeout
             if hold_days >= max_hold_days:
                 exit_price = tsla_full['open'].iloc[i + 1]
-                _record_trade(result, signal_name, direction,
-                              entry_date, entry_price,
-                              tsla_full.index[i + 1], exit_price,
-                              'timeout', hold_days)
+                pnl = _record_trade(result, signal_name, direction,
+                                    entry_date, entry_price,
+                                    tsla_full.index[i + 1], exit_price,
+                                    'timeout', hold_days, open_trade_usd)
+                if compound:
+                    equity = max(equity + pnl, initial_equity * 0.10)
                 in_trade = False
                 continue
 
@@ -301,10 +321,12 @@ def run_swing_backtest(
                                 rsi_tsla, rsi_spy, channel_window)
                 if sig != direction:
                     exit_price = tsla_full['open'].iloc[i + 1]
-                    _record_trade(result, signal_name, direction,
-                                  entry_date, entry_price,
-                                  tsla_full.index[i + 1], exit_price,
-                                  'signal', hold_days)
+                    pnl = _record_trade(result, signal_name, direction,
+                                        entry_date, entry_price,
+                                        tsla_full.index[i + 1], exit_price,
+                                        'signal', hold_days, open_trade_usd)
+                    if compound:
+                        equity = max(equity + pnl, initial_equity * 0.10)
                     in_trade = False
                     continue
 
@@ -314,11 +336,14 @@ def run_swing_backtest(
                             tsla_weekly, spy_weekly,
                             rsi_tsla, rsi_spy, channel_window)
             if sig != 0:
-                entry_price = tsla_full['open'].iloc[i + 1]
-                entry_date  = tsla_full.index[i + 1]
-                entry_bar   = i + 1
-                direction   = sig
-                in_trade    = True
+                # Lock in position size at entry (compounding: scale with equity growth)
+                equity_scale   = (equity / initial_equity) if compound else 1.0
+                open_trade_usd = MAX_TRADE_USD * equity_scale
+                entry_price    = tsla_full['open'].iloc[i + 1]
+                entry_date     = tsla_full.index[i + 1]
+                entry_bar      = i + 1
+                direction      = sig
+                in_trade       = True
 
     # Close any still-open trade at end of data
     if in_trade:
@@ -326,7 +351,7 @@ def run_swing_backtest(
         _record_trade(result, signal_name, direction,
                       entry_date, entry_price,
                       tsla_full.index[-1], exit_price,
-                      'timeout', n - 1 - entry_bar)
+                      'timeout', n - 1 - entry_bar, open_trade_usd)
 
     return result
 
@@ -834,10 +859,97 @@ SIGNALS_P4: List[Tuple] = [
     ('S40_best_composite',           sig_s40_best_composite,            5, 0.04, 50),
 ]
 
-SIGNALS = SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4
+# ── Phase 5 (daily) — Bear market filter + refinements on S32 ─────────────────
+# Starting from S41. Goal: fix 2022 (-$306K) without hurting 9 profitable years.
+# Key idea: prolonged bears (2022) have SPY below 200d MA for months. VIX was
+# mostly 20-30 so the VIX cap alone didn't protect.
+
+def sig_s41_s32_spy_ma200(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S41: S32 + SPY above 200d MA — hard bear market filter."""
+    if i < 200:
+        return 0
+    spy_ma200 = spy['close'].iloc[i - 200:i].mean()
+    if spy['close'].iloc[i] < spy_ma200:
+        return 0
+    return sig_s32_union_s29_s25(i, tsla, spy, vix, tw, sw, rt, rs, w)
 
 
-# ── Phase 5 — Weekly bar signals ──────────────────────────────────────────────
+def sig_s42_s32_spy_ma100(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S42: S32 + SPY above 100d MA — medium-term trend filter (less restrictive)."""
+    if i < 100:
+        return 0
+    spy_ma100 = spy['close'].iloc[i - 100:i].mean()
+    if spy['close'].iloc[i] < spy_ma100:
+        return 0
+    return sig_s32_union_s29_s25(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s43_s32_no_gap_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S43: S32 + TSLA not gapping down >2% on entry day (avoid gap-down traps)."""
+    if sig_s32_union_s29_s25(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 1:
+        return 1
+    gap = (tsla['open'].iloc[i] / tsla['close'].iloc[i - 1]) - 1.0
+    if gap < -0.02:
+        return 0
+    return 1
+
+
+def sig_s44_s41_hold8(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S44: S41 (S32 + MA200) — same signal, tested with hold=8d in registry."""
+    return sig_s41_s32_spy_ma200(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s45_s32_tsla_above_50d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S45: S32 + TSLA itself above 50d MA (not in its own downtrend)."""
+    if i < 50:
+        return 0
+    tsla_ma50 = tsla['close'].iloc[i - 50:i].mean()
+    if tsla['close'].iloc[i] < tsla_ma50:
+        return 0
+    return sig_s32_union_s29_s25(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s46_s41_tsla_above_50d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S46: S41 (SPY MA200) + TSLA above 50d MA — dual trend filter."""
+    if sig_s41_s32_spy_ma200(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 50:
+        return 0
+    tsla_ma50 = tsla['close'].iloc[i - 50:i].mean()
+    if tsla['close'].iloc[i] < tsla_ma50:
+        return 0
+    return 1
+
+
+def sig_s47_s32_spy_ma200_no_gap(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S47: S41 + no gap-down filter — both bear + gap protection."""
+    if sig_s41_s32_spy_ma200(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 1:
+        return 1
+    gap = (tsla['open'].iloc[i] / tsla['close'].iloc[i - 1]) - 1.0
+    if gap < -0.02:
+        return 0
+    return 1
+
+
+SIGNALS_P5D: List[Tuple] = [
+    # (name, fn, max_hold_days, stop_pct, channel_window)
+    ('S41_s32_spy_ma200',            sig_s41_s32_spy_ma200,            5, 0.04, 50),
+    ('S42_s32_spy_ma100',            sig_s42_s32_spy_ma100,            5, 0.04, 50),
+    ('S43_s32_no_gap_down',          sig_s43_s32_no_gap_down,          5, 0.04, 50),
+    ('S44_s41_hold8d',               sig_s44_s41_hold8,                8, 0.04, 50),
+    ('S45_s32_tsla_above_50d',       sig_s45_s32_tsla_above_50d,       5, 0.04, 50),
+    ('S46_s41_tsla_above_50d',       sig_s46_s41_tsla_above_50d,       5, 0.04, 50),
+    ('S47_s32_ma200_no_gap',         sig_s47_s32_spy_ma200_no_gap,     5, 0.04, 50),
+]
+
+SIGNALS = SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D
+
+
+# ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
 # Wider stops (8-10%) appropriate for multi-week candles.
@@ -1209,7 +1321,21 @@ def main():
                         help='Bar frequency: daily (S01-S40, 10yr), '
                              'weekly (W01-W10, 10yr), hourly (H01-H10, ~2yr). '
                              'Default: daily')
+    parser.add_argument('--no-stop',    action='store_true',
+                        help='Disable stop losses (stop_pct=0.99) — test timeout-only exits')
+    parser.add_argument('--trade-usd',  type=int, default=None,
+                        help='Position size in USD (default: 1000000). '
+                             'Use 10000 to match c10/c9 sizing ($10K/trade, $100K equity).')
+    parser.add_argument('--compound',   action='store_true',
+                        help='Compound equity: position size scales with equity growth, '
+                             'same model as c10/c9 surfer. Pair with --trade-usd 10000.')
     args = parser.parse_args()
+
+    # Apply trade size override globally before any backtest runs
+    if args.trade_usd is not None:
+        import v15.validation.swing_backtest as _self
+        _self.MAX_TRADE_USD = args.trade_usd
+        globals()['MAX_TRADE_USD'] = args.trade_usd
 
     # Resolve default start year by mode
     if args.start_year is None:
@@ -1255,11 +1381,12 @@ def main():
                 tsla=tsla_h, spy=spy_h, vix=vix_h,
                 tsla_weekly=None, spy_weekly=None,
                 signal_fn=fn, signal_name=name,
-                max_hold_days=max_hold, stop_pct=stop,
+                max_hold_days=max_hold, stop_pct=0.99 if args.no_stop else stop,
                 channel_window=window,
                 warmup_bars=200,          # ~1 month of hourly bars
                 start_year=args.start_year,
                 end_year=args.end_year,
+                compound=args.compound,
             )
             elapsed = time.time() - t1
             results.append(r)
@@ -1290,11 +1417,12 @@ def main():
                 tsla=tsla_w, spy=spy_w, vix=vix_w,
                 tsla_weekly=None, spy_weekly=None,
                 signal_fn=fn, signal_name=name,
-                max_hold_days=max_hold, stop_pct=stop,
+                max_hold_days=max_hold, stop_pct=0.99 if args.no_stop else stop,
                 channel_window=window,
                 warmup_bars=60,           # ~1yr of weekly bars
                 start_year=args.start_year,
                 end_year=args.end_year,
+                compound=args.compound,
             )
             elapsed = time.time() - t1
             results.append(r)
@@ -1329,10 +1457,11 @@ def main():
                 tsla=tsla_d, spy=spy_d, vix=vix_d,
                 tsla_weekly=tsla_w, spy_weekly=spy_w,
                 signal_fn=fn, signal_name=name,
-                max_hold_days=max_hold, stop_pct=stop,
+                max_hold_days=max_hold, stop_pct=0.99 if args.no_stop else stop,
                 channel_window=window,
                 start_year=args.start_year,
                 end_year=args.end_year,
+                compound=args.compound,
             )
             elapsed = time.time() - t1
             results.append(r)
