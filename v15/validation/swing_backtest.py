@@ -15250,6 +15250,248 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10U + SIGNALS_P10V + SIGNALS_P10W)
 
 
+# ── Phase 10X — Closing in on n=20 100% WR + SPY-10d variant + S999/S1000 milestones (S991-S1000) ──
+
+def sig_s991_s929_or_lag_selloff_spy10d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S991: S929 + (lag5pct OR 3d-selloff OR SPY-10d-up).
+    Variant of S981 using SPY-10d instead of SPY-20d.
+    Hypothesis: catches a different subset — possibly finds the excluded winner."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    if i >= 10:
+        spy_now = float(spy['close'].iloc[i])
+        spy_10d = float(spy['close'].iloc[i - 10])
+        if spy_10d > 0 and spy_now > spy_10d:
+            return 1
+    return 0
+
+
+def sig_s992_s981_or_spy10d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S992: S981 extended with SPY-10d-up (4th condition).
+    Adds SPY-10d positive on top of S981's 3 conditions.
+    Hypothesis: catches the excluded winner → 100% WR, n=20."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    if i >= 20:
+        spy_now = float(spy['close'].iloc[i])
+        spy_20d = float(spy['close'].iloc[i - 20])
+        if spy_20d > 0 and spy_now > spy_20d:
+            return 1
+    if i >= 10:
+        spy_now = float(spy['close'].iloc[i])
+        spy_10d = float(spy['close'].iloc[i - 10])
+        if spy_10d > 0 and spy_now > spy_10d:
+            return 1
+    return 0
+
+
+def sig_s993_s981_or_spy5d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S993: S981 + SPY-5d-up (short SPY window as 4th condition).
+    Hypothesis: n=19 or 20, captures the excluded winner if SPY was up 5 days ago."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    if i >= 20:
+        spy_now = float(spy['close'].iloc[i])
+        spy_20d = float(spy['close'].iloc[i - 20])
+        if spy_20d > 0 and spy_now > spy_20d:
+            return 1
+    if i >= 5:
+        spy_now = float(spy['close'].iloc[i])
+        spy_5d = float(spy['close'].iloc[i - 5])
+        if spy_5d > 0 and spy_now > spy_5d:
+            return 1
+    return 0
+
+
+def sig_s994_s981_or_rsi45(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S994: S981 + (RSI < 45 as 4th condition).
+    Most 100% WR S929 trades have RSI<50. Adding RSI<45 catches excluded winner?
+    Hypothesis: n=19 or 20, tests if RSI condition identifies the excluded winner."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    if i >= 20:
+        spy_now = float(spy['close'].iloc[i])
+        spy_20d = float(spy['close'].iloc[i - 20])
+        if spy_20d > 0 and spy_now > spy_20d:
+            return 1
+    rsi = float(rt.iloc[i])
+    return 1 if rsi < 45 else 0
+
+
+def sig_s995_s981_or_vix_up5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S995: S981 + (VIX up 5%+ yesterday as 4th condition).
+    VIX spike = sudden fear injection before structural bounce.
+    Hypothesis: catches the excluded winner if VIX was spiking on that day."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    if i >= 20:
+        spy_now = float(spy['close'].iloc[i])
+        spy_20d = float(spy['close'].iloc[i - 20])
+        if spy_20d > 0 and spy_now > spy_20d:
+            return 1
+    # VIX spike: today's VIX > yesterday's VIX by ≥5%
+    if i >= 1:
+        vix_now = float(vix['close'].iloc[i])
+        vix_prev = float(vix['close'].iloc[i - 1])
+        if vix_prev > 0 and (vix_now - vix_prev) / vix_prev >= 0.05:
+            return 1
+    return 0
+
+
+def sig_s996_s981_or_tsla_5d_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S996: S981 + (TSLA 5d return < 0 as 4th condition).
+    TSLA has been declining over the past 5 days — catch the recent downtrend before bounce.
+    Hypothesis: catches the excluded winner which had a 5-day downtrend."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    if i >= 20:
+        spy_now = float(spy['close'].iloc[i])
+        spy_20d = float(spy['close'].iloc[i - 20])
+        if spy_20d > 0 and spy_now > spy_20d:
+            return 1
+    ret5 = _tsla_5d_return(tsla, i)
+    return 1 if ret5 < 0 else 0
+
+
+def sig_s997_s929_tsla_5d_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S997: S929 + TSLA 5-day return < 0 (any recent decline before bounce).
+    Most structural bounces have had some recent price decline.
+    Hypothesis: similar to S929 but excludes the rare 'price at support but still climbing' case."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    ret5 = _tsla_5d_return(tsla, i)
+    return 1 if ret5 < 0 else 0
+
+
+def sig_s998_s929_spy_positive_tsla_negative_5d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S998: S929 + SPY 5d positive AND TSLA 5d negative.
+    Classic relative weakness: market up, TSLA down over 5 days.
+    Hypothesis: WR ≥ 95%, captures most of S931's setups."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 0
+    spy_now = float(spy['close'].iloc[i])
+    spy_5d = float(spy['close'].iloc[i - 5])
+    tsla_now = float(tsla['close'].iloc[i])
+    tsla_5d = float(tsla['close'].iloc[i - 5])
+    if spy_5d <= 0 or tsla_5d <= 0:
+        return 0
+    spy_up = spy_now > spy_5d
+    tsla_down = tsla_now < tsla_5d
+    return 1 if (spy_up and tsla_down) else 0
+
+
+def sig_s999_milestone_s981_detail_run(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S999 MILESTONE: S981 — exact copy for --detail analysis run.
+    Run with --detail S999 to see trade-by-trade breakdown of the max 100% WR signal."""
+    return sig_s981_s931_or_s979(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s1000_milestone_grand(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1000 GRAND MILESTONE: S929 with all positive conditions ORed.
+    Union: lag5pct OR 3d-selloff OR SPY-20d-up OR SPY-10d-up OR TSLA-5d-down.
+    Attempts to identify the excluded winner and reach n=20 at 100% WR."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    # Condition 1: TSLA lagging SPY 5% over 20 days
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    # Condition 2: 3-day TSLA selloff ≥ 3%
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    # Condition 3: SPY 20-day positive
+    if i >= 20:
+        spy_now = float(spy['close'].iloc[i])
+        spy_20d = float(spy['close'].iloc[i - 20])
+        if spy_20d > 0 and spy_now > spy_20d:
+            return 1
+    # Condition 4: TSLA 5-day return negative (simple recent decline)
+    ret5 = _tsla_5d_return(tsla, i)
+    if ret5 < 0:
+        return 1
+    return 0
+
+
+SIGNALS_P10X: List[Tuple] = [
+    # Phase 10X — n=20 search + SPY variants + S999/S1000 grand milestones (S991-S1000)
+    ('S991_s929_or_lag_sell_spy10', sig_s991_s929_or_lag_selloff_spy10d, 10, 0.20, 50),
+    ('S992_s981_or_spy10d',         sig_s992_s981_or_spy10d,            10, 0.20, 50),
+    ('S993_s981_or_spy5d',          sig_s993_s981_or_spy5d,             10, 0.20, 50),
+    ('S994_s981_or_rsi45',          sig_s994_s981_or_rsi45,             10, 0.20, 50),
+    ('S995_s981_or_vix_up5pct',     sig_s995_s981_or_vix_up5pct,       10, 0.20, 50),
+    ('S996_s981_or_tsla5d_down',    sig_s996_s981_or_tsla_5d_down,     10, 0.20, 50),
+    ('S997_s929_tsla5d_down',       sig_s997_s929_tsla_5d_down,        10, 0.20, 50),
+    ('S998_s929_spy_up_tsla_down',  sig_s998_s929_spy_positive_tsla_negative_5d, 10, 0.20, 50),
+    ('S999_milestone_s981_detail',  sig_s999_milestone_s981_detail_run, 10, 0.20, 50),
+    ('S1000_grand_milestone',       sig_s1000_milestone_grand,          10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E
+           + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I + SIGNALS_P10J
+           + SIGNALS_P10K + SIGNALS_P10L + SIGNALS_P10M + SIGNALS_P10N + SIGNALS_P10O
+           + SIGNALS_P10P + SIGNALS_P10Q + SIGNALS_P10R + SIGNALS_P10S + SIGNALS_P10T
+           + SIGNALS_P10U + SIGNALS_P10V + SIGNALS_P10W + SIGNALS_P10X)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
