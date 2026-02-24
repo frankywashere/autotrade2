@@ -7667,6 +7667,157 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U)
 
 
+# ── Phase 8V — SPY-strength extensions + 4-way VIX pct combos + S500 prep ─────
+# S449 (SPY near 52wk high+S215, 86% WR, 5/5yr) is a major new pattern.
+# S441 (VIX pct60+MACD, 100% WR 6/6yr) and S442 (VIX pct60+compressed, PF=280).
+# Extend aggressively: add VIX pct to SPY strength, cross best signals together.
+
+def sig_s451_s449_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S451: S449 (SPY near 52wk high+S215, 5/5yr) + VIX pct>70.
+    3-way: SPY at annual strength + TSLA at weekly support + sustained fear.
+    Hypothesis: the fear/lag combo maximized — SPY strong but VIX elevated = TSLA panic."""
+    if sig_s449_s215_spy_at_52wk_high(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.70) else 0
+
+
+def sig_s452_s449_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S452: S449 (SPY near 52wk high+S215) + compressed ATR.
+    SPY strength + TSLA weekly support + ATR compression.
+    Hypothesis: SPY at highs + TSLA compressed at support = maximum reversion energy."""
+    if sig_s449_s215_spy_at_52wk_high(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s453_s449_macd(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S453: S449 (SPY near 52wk high+S215) + MACD turning.
+    SPY at highs + TSLA at weekly support + MACD momentum reversal.
+    Hypothesis: lag pattern + MACD confirms individual stock turning = strongest lag entry."""
+    if sig_s449_s215_spy_at_52wk_high(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist = _macd_histogram(tsla, i)
+    if hist is None:
+        return 1
+    hist_prev = _macd_histogram(tsla, i - 1)
+    if hist_prev is None:
+        return 1
+    return 1 if (hist > hist_prev and hist < 0) else 0
+
+
+def sig_s454_s449_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S454: S449 (SPY near 52wk high) + TSLA above 200d MA.
+    SPY at highs + TSLA in bull regime at weekly support.
+    Hypothesis: bull-trend pullback to support when SPY is ripping = snap-back."""
+    if sig_s449_s215_spy_at_52wk_high(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close > ma200 else 0
+
+
+def sig_s455_s441_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S455: S441 (VIX pct60+MACD, 100% WR 6/6yr) + compressed ATR.
+    4-way: VIX pct + weekly support + MACD + compressed.
+    Hypothesis: filtering the 100% WR signal with compression = ultra-precision."""
+    if sig_s441_s440_macd(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s456_s441_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S456: S441 (VIX pct60+MACD, 100% WR) + above 200d MA.
+    100% WR signal in confirmed uptrend.
+    Hypothesis: VIX fear + MACD momentum in bull trend = best combo."""
+    if sig_s441_s440_macd(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close > ma200 else 0
+
+
+def sig_s457_s442_macd(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S457: S442 (VIX pct60+compressed, PF=280, 7/7yr) + MACD turning.
+    4-way: VIX pct + weekly support + compressed + MACD momentum.
+    Hypothesis: adding MACD to PF=280 signal → 100% WR subset."""
+    if sig_s442_s440_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist = _macd_histogram(tsla, i)
+    if hist is None:
+        return 1
+    hist_prev = _macd_histogram(tsla, i - 1)
+    if hist_prev is None:
+        return 1
+    return 1 if (hist > hist_prev and hist < 0) else 0
+
+
+def sig_s458_s442_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S458: S442 (VIX pct60+compressed, PF=280) + above 200d MA.
+    Best PF signal filtered to uptrend.
+    Hypothesis: extreme PF signal in bull trend = most consistent entries."""
+    if sig_s442_s440_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close > ma200 else 0
+
+
+def sig_s459_s407_spy_high(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S459: S407 (VIX pct>70+S215, $1.45M, 7/7yr) + SPY near 52wk high.
+    PARADOX signal: sustained fear (VIX high) + SPY at annual strength simultaneously.
+    Hypothesis: when VIX is elevated but SPY is strong, TSLA is the panic selloff target."""
+    if sig_s407_s215_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _spy_near_52wk_high(spy, i, frac=0.05) else 0
+
+
+def sig_s460_s408_spy_high(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S460: S408 (MACD+VIX pct>70, 93% WR, 6/6yr) + SPY near 52wk high.
+    Best signal (S408) + SPY at strength.
+    Hypothesis: MACD turning + sustained fear + SPY ripping = TSLA snap-back."""
+    if sig_s408_s333_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _spy_near_52wk_high(spy, i, frac=0.05) else 0
+
+
+SIGNALS_P8V: List[Tuple] = [
+    # Phase 8V — SPY strength extensions + 4-way VIX pct combos
+    ('S451_s449_vix_pct70',     sig_s451_s449_vix_pct70,     10, 0.20, 50),
+    ('S452_s449_compressed',    sig_s452_s449_compressed,    10, 0.20, 50),
+    ('S453_s449_macd',          sig_s453_s449_macd,          10, 0.20, 50),
+    ('S454_s449_above200ma',    sig_s454_s449_above200ma,    10, 0.20, 50),
+    ('S455_s441_compressed',    sig_s455_s441_compressed,    10, 0.20, 50),
+    ('S456_s441_above200ma',    sig_s456_s441_above200ma,    10, 0.20, 50),
+    ('S457_s442_macd',          sig_s457_s442_macd,          10, 0.20, 50),
+    ('S458_s442_above200ma',    sig_s458_s442_above200ma,    10, 0.20, 50),
+    ('S459_s407_spy_high',      sig_s459_s407_spy_high,      10, 0.20, 50),
+    ('S460_s408_spy_high',      sig_s460_s408_spy_high,      10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
