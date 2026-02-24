@@ -133,11 +133,16 @@ TEMPORAL_FEATURES = [
 
 # SPY/VIX correlation features
 CORRELATION_FEATURES = [
-    'spy_return_5bar',        # SPY 5-bar return
-    'spy_return_20bar',       # SPY 20-bar return
-    'spy_tsla_corr_20',      # Rolling 20-bar correlation SPY vs TSLA
-    'vix_level',              # VIX level (from ^VIX daily)
-    'vix_change_5d',          # VIX 5-day change
+    'spy_return_5bar',           # SPY 5-bar return (25 min momentum)
+    'spy_return_20bar',          # SPY 20-bar return (100 min momentum)
+    'spy_tsla_corr_20',          # Rolling 20-bar correlation SPY vs TSLA
+    'vix_level',                 # VIX level (from ^VIX daily)
+    'vix_change_5d',             # VIX 5-day change
+    # c10: new SPY RSI features
+    'spy_rsi_14',                # SPY RSI(14) — market momentum at signal time
+    'spy_tsla_rsi_divergence',   # TSLA RSI(14) - SPY RSI(14): +ve = TSLA oversold vs market (best bounces)
+    'spy_intraday_return',       # SPY % return from today's open (green/red market day context)
+    'spy_vol_ratio_20',          # SPY volume / 20-bar avg (high = market-driven move)
 ]
 
 
@@ -487,6 +492,39 @@ def extract_correlation_features(
                 spy_recent = spy_closes[-20:]
                 if len(tsla_recent) == len(spy_recent) and np.std(tsla_recent) > 0 and np.std(spy_recent) > 0:
                     features[2] = np.corrcoef(tsla_recent, spy_recent)[0, 1]
+
+            # c10: SPY RSI(14)
+            if len(spy_closes) >= 15:
+                features[5] = compute_rsi(spy_closes, 14)
+
+            # c10: TSLA RSI - SPY RSI divergence (positive = TSLA oversold vs market)
+            if len(spy_closes) >= 15 and bar_idx >= 14:
+                tsla_rsi = compute_rsi(tsla_closes[:bar_idx + 1], 14)
+                features[6] = tsla_rsi - features[5]
+
+            # c10: SPY intraday return from today's open (green/red market day)
+            try:
+                ct = tsla_index[bar_idx]
+                import pandas as _pd
+                ct_naive = _pd.Timestamp(ct).tz_localize(None) if getattr(ct, 'tzinfo', None) else _pd.Timestamp(ct)
+                day_start = ct_naive.normalize()
+                spy_idx = spy_available.index
+                spy_idx_naive = spy_idx.tz_localize(None) if spy_idx.tz is not None else spy_idx
+                spy_today = spy_available[spy_idx_naive >= day_start]
+                if len(spy_today) >= 1:
+                    spy_open_today = float(spy_today['open'].iloc[0])
+                    if spy_open_today > 0:
+                        features[7] = (float(spy_closes[-1]) - spy_open_today) / spy_open_today
+            except Exception:
+                pass
+
+            # c10: SPY volume ratio vs 20-bar average
+            if 'volume' in spy_available.columns:
+                spy_vols = spy_available['volume'].values
+                if len(spy_vols) >= 20:
+                    avg_vol = np.mean(spy_vols[-20:])
+                    if avg_vol > 0:
+                        features[8] = float(spy_vols[-1]) / avg_vol
 
     if vix_df is not None and len(vix_df) > 0 and tsla_index is not None:
         current_time = tsla_index[bar_idx]

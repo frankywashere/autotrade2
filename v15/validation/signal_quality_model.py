@@ -120,10 +120,13 @@ def _append_signal_meta(
         confluence = sig_data.get('confluence_score', 0.0) if sig_data else 0.0
         energy = sig_data.get('energy_score', 0.0) if sig_data else 0.0
 
-        # VIX level from base features (index for vix_level in correlation features)
-        # vix_level is the 4th correlation feature (0-indexed: 3)
-        # Correlation features start at 115+18+14+12 = 159, so vix_level is at 162
-        vix_level = float(base_features[162]) if len(base_features) > 162 else 0.0
+        # VIX level from base features — look up dynamically to handle feature count changes
+        try:
+            from v15.core.surfer_ml import get_feature_names as _gfn
+            _vix_idx = _gfn().index('vix_level')
+        except (ValueError, ImportError):
+            _vix_idx = 167  # fallback: 120 per-TF + 18 cross + 14 ctx + 12 temporal + 3 corr
+        vix_level = float(base_features[_vix_idx]) if len(base_features) > _vix_idx else 0.0
         meta[17] = vix_level * pos_score  # sig_vix_x_position
 
         meta[18] = confluence * energy  # sig_confluence_x_energy
