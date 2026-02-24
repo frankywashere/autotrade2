@@ -5427,6 +5427,171 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8F + SIGNALS_P8G)
 
 
+# ── Phase 8H — below200MA signals (for bear-trend regimes like 2025) + S310 ───
+# 2025 OOS: TSLA was below 200d MA all year — the above200MA signals had 0 trades.
+# The below200MA signals (S291 family) are what fire in bear-trend regimes.
+# Also extend S310 (above200MA+below50MA) which bridges the two regimes.
+
+def sig_s311_s291_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S311: S291 (S215+below200MA, bear trend) + VIX recovery timing.
+    Bear-trend weekly support bounce + fear cooling = counter-trend with momentum.
+    Hypothesis: VIX recovery confirms the bounce attempt in a downtrend is real."""
+    if sig_s291_s215_below200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s312_s291_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S312: S291 (S215+below200MA) + compressed ATR only.
+    Bear-trend + weekly support + coiling compression.
+    Hypothesis: compression in a downtrend at support = sellers running out of fuel."""
+    if sig_s291_s215_below200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s313_s291_consec_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S313: S291 (S215+below200MA) + 3+ consecutive down closes.
+    Bear-trend capitulation: 3 down days into weekly support in a downtrend.
+    Hypothesis: acceleration of decline in downtrend to weekly support = peak exhaustion."""
+    if sig_s291_s215_below200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 3:
+        return 1
+    for j in range(3):
+        if float(tsla['close'].iloc[i - j]) >= float(tsla['close'].iloc[i - j - 1]):
+            return 0
+    return 1
+
+
+def sig_s314_s291_5d_down8pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S314: S291 (S215+below200MA) + 8% 5-day decline.
+    Bear-trend rapid decline into weekly support.
+    Hypothesis: 8%+ 5-day drop at weekly support in downtrend = max momentum exhaustion."""
+    if sig_s291_s215_below200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    close_now = float(tsla['close'].iloc[i])
+    close_5d  = float(tsla['close'].iloc[i - 5])
+    return 1 if (close_now - close_5d) / close_5d <= -0.08 else 0
+
+
+def sig_s315_s310_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S315: S310 (above200MA+below50MA, 5/5yr WR=86%) + VIX recovery.
+    Uptrend with 50MA pullback + VIX cooling = classic bull-market dip-buy entry.
+    Hypothesis: intermediate pullback in uptrend peaks when VIX starts cooling."""
+    if sig_s310_s292_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s316_s310_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S316: S310 (above200MA+below50MA) + compressed ATR.
+    Bull-trend 50MA pullback + ATR coiling at weekly support.
+    Hypothesis: triple compression (200↑, 50↓, ATR coiled) = coil before spring."""
+    if sig_s310_s292_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s317_s310_5d_down5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S317: S310 (above200MA+below50MA) + 5% 5-day decline.
+    Uptrend 50MA pullback accelerating into weekly support.
+    Hypothesis: uptrend dip + recent selling velocity = highest mean-reversion momentum."""
+    if sig_s310_s292_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    close_now = float(tsla['close'].iloc[i])
+    close_5d  = float(tsla['close'].iloc[i - 5])
+    return 1 if (close_now - close_5d) / close_5d <= -0.05 else 0
+
+
+def sig_s318_s292_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S318: S292 (above200MA) + NR7 (narrowest range of last 7 bars).
+    Uptrend + weekly support + narrowest range = maximum compression in uptrend.
+    S217 (S214+NR7) was 7/8yr WR=85%. Does uptrend context improve it?"""
+    if sig_s292_s215_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 7:
+        return 1
+    cur_range = float(tsla['high'].iloc[i]) - float(tsla['low'].iloc[i])
+    prev_ranges = [float(tsla['high'].iloc[i - j]) - float(tsla['low'].iloc[i - j])
+                   for j in range(1, 7)]
+    return 1 if cur_range <= min(prev_ranges) else 0
+
+
+def sig_s319_s292_persistent_compress(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S319: S292 (above200MA) + persistent compression (3+ days ATR compressed).
+    S189 (persistent compression) achieved 8/9yr. Add uptrend context.
+    Hypothesis: uptrend + weekly support + multi-day ATR compression = sustained coiling."""
+    if sig_s292_s215_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    compress_streak = 0
+    for j in range(5):
+        if i - j < 20:
+            break
+        c = _atr_components(tsla, i - j)
+        if c is None:
+            break
+        _, atr_5, _, atr_20 = c
+        if atr_5 < 0.75 * atr_20:
+            compress_streak += 1
+        else:
+            break
+    return 1 if compress_streak >= 3 else 0
+
+
+def sig_s320_s292_monthly_low(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S320: S292 (above200MA + weekly support + ATR extreme + VIX18) + monthly near lower.
+    3-TF uptrend: TSLA above 200MA but approaching both weekly AND monthly lower channels.
+    Hypothesis: multiple TF convergence in an overall uptrend = extreme dip-buy zone."""
+    if sig_s292_s215_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _monthly_channel_near_lower(tsla, i, n_months=12, frac=0.30) else 0
+
+
+SIGNALS_P8H: List[Tuple] = [
+    # Phase 8H — below200MA bear-trend signals + S310 extensions + S292 new filters
+    ('S311_s291_vix_rec',        sig_s311_s291_vix_rec,       10, 0.20, 50),
+    ('S312_s291_compressed',     sig_s312_s291_compressed,    10, 0.20, 50),
+    ('S313_s291_consec_down',    sig_s313_s291_consec_down,   10, 0.20, 50),
+    ('S314_s291_5d_down8pct',    sig_s314_s291_5d_down8pct,  10, 0.20, 50),
+    ('S315_s310_vix_rec',        sig_s315_s310_vix_rec,       10, 0.20, 50),
+    ('S316_s310_compressed',     sig_s316_s310_compressed,    10, 0.20, 50),
+    ('S317_s310_5d_down5pct',    sig_s317_s310_5d_down5pct,  10, 0.20, 50),
+    ('S318_s292_nr7',            sig_s318_s292_nr7,           10, 0.20, 50),
+    ('S319_s292_persist_compress', sig_s319_s292_persistent_compress, 10, 0.20, 50),
+    ('S320_s292_monthly_low',    sig_s320_s292_monthly_low,   10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
