@@ -10699,6 +10699,133 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T)
 
 
+# ── Phase 9U — S631+VIX (no MACD), S691 precision, S641+VIX (S701-S710) ──────
+# Key question: does removing MACD from S691 → S631+VIX_pct60 give MORE coverage
+# at similar quality? Also: do S691 precision extensions push WR toward 100%?
+
+def sig_s701_s631_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S701: S631 (10%disc + weekly support) + VIX pct>60.
+    Direct: skip MACD filter, just combine peak discount + structural support + fear regime.
+    Should be bigger than S691 since MACD removed."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s702_s631_vix_pct50(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S702: S631 (10%disc + weekly support) + VIX pct>50 (moderate fear).
+    Wider fear filter — captures more trades at peak discount in elevated-VIX market."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.50) else 0
+
+
+def sig_s703_s691_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S703: S691 (S687+VIX_pct60, WR=93%) + TSLA lags SPY 5%+.
+    Add relative underperformance to already-high-quality S691: precision push."""
+    if sig_s691_s687_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s704_s691_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S704: S691 (S687+VIX_pct60, WR=93%) + volume dry-up.
+    Volume dry-up has produced 100% WR in every extension — test on S691."""
+    if sig_s691_s687_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i) else 0
+
+
+def sig_s705_s691_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S705: S691 (S687+VIX_pct60, WR=93%) + ATR compression.
+    VIX fear + MACD turning + peak discount + compressed vol = perfect entry."""
+    if sig_s691_s687_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s706_s701_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S706: S701 (S631+VIX_pct60, no MACD) + TSLA lags SPY 5%+.
+    Triple filter: peak discount + fear + relative underperformance (no MACD)."""
+    if sig_s701_s631_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s707_s701_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S707: S701 (S631+VIX_pct60, no MACD) + ATR compression.
+    Peak discount + structural support + VIX fear + vol squeeze."""
+    if sig_s701_s631_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s708_s700_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S708: S700 milestone (5-way alignment) + volume dry-up.
+    Already WR=92% → add vol exhaustion → expect near 100% WR."""
+    if sig_s700_milestone_max_alignment(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i) else 0
+
+
+def sig_s709_s642_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S709: S642 (5%disc + weekly support, $1.77M IS) + VIX pct>60.
+    Apply VIX fear filter to our highest-coverage IS signal. Loose discount = more trades."""
+    if sig_s642_s215_52wk_disc5(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s710_s642_macd_vix(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S710: S642 (5%disc + weekly) + MACD turning up + VIX pct>50.
+    Maximum coverage variant: loose discount + MACD momentum + moderate fear."""
+    if sig_s642_s215_52wk_disc5(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist_now  = _macd_histogram(tsla, i)
+    hist_prev = _macd_histogram(tsla, i - 1) if i > 0 else None
+    if hist_now is None or hist_prev is None:
+        return 1
+    if hist_now <= hist_prev:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.50) else 0
+
+
+SIGNALS_P9U: List[Tuple] = [
+    # Phase 9U — S631/S641+VIX (no MACD), S691 precision, S700 extensions (S701-S710)
+    ('S701_s631_vix_pct60',      sig_s701_s631_vix_pct60,      10, 0.20, 50),
+    ('S702_s631_vix_pct50',      sig_s702_s631_vix_pct50,      10, 0.20, 50),
+    ('S703_s691_lag5pct',        sig_s703_s691_lag5pct,        10, 0.20, 50),
+    ('S704_s691_vol_dryup',      sig_s704_s691_vol_dryup,      10, 0.20, 50),
+    ('S705_s691_compressed',     sig_s705_s691_compressed,     10, 0.20, 50),
+    ('S706_s701_lag5pct',        sig_s706_s701_lag5pct,        10, 0.20, 50),
+    ('S707_s701_compressed',     sig_s707_s701_compressed,     10, 0.20, 50),
+    ('S708_s700_vol_dryup',      sig_s708_s700_vol_dryup,      10, 0.20, 50),
+    ('S709_s642_vix_pct60',      sig_s709_s642_vix_pct60,      10, 0.20, 50),
+    ('S710_s642_macd_vix',       sig_s710_s642_macd_vix,       10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T + SIGNALS_P9U)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
