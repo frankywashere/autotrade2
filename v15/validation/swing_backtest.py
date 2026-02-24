@@ -13182,6 +13182,142 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10K)
 
 
+# ── Phase 10L — S861 extensions: tight channel + precision filters (S871-S880) ─────────
+
+def sig_s871_s861_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S871: S861 (OR-union+tight_chan10, WR=90%) + ATR compression.
+    Tight channel + volatility squeeze = maximum entry precision.
+    Hypothesis: WR=90% compressed → 95%+, new highest-precision path."""
+    if sig_s861_s801_tight_channel10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s872_s861_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S872: S861 (OR-union+tight_chan10) + TSLA lags SPY ≥5%.
+    Tight channel position + relative weakness confirmation.
+    Hypothesis: very deep in channel + lagging SPY = highest snap-back quality."""
+    if sig_s861_s801_tight_channel10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s873_s861_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S873: S861 (tight_chan10, WR=90%) + VIX elevated pct>60.
+    Fear filter on tight channel signal — already WR=90%, VIX pushes higher?
+    Hypothesis: tight channel + fear context = 95%+ WR."""
+    if sig_s861_s801_tight_channel10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s874_s861_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S874: S861 (tight_chan10) + below 50d MA.
+    Bear phase + deep channel position = defensive oversold setup.
+    Hypothesis: tight channel below 50MA = stronger mean reversion."""
+    if sig_s861_s801_tight_channel10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 0 if _tsla_above_50ma(tsla, i) else 1
+
+
+def sig_s875_s862_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S875: S862 (OR-union+tight_chan15, WR=85%) + ATR compression.
+    Slightly wider channel threshold + squeeze.
+    Compare to S871 (tight_chan10+compressed) — threshold sensitivity."""
+    if sig_s862_s801_tight_channel15(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s876_s862_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S876: S862 (tight_chan15) + lag5pct.
+    Wider channel position threshold version of S872.
+    Tests optimal channel tightness threshold for the lag5pct dimension."""
+    if sig_s862_s801_tight_channel15(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s877_s871_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S877: S871 (tight_chan10+compressed) + lag5pct.
+    Three quality dimensions: tight channel + squeeze + SPY lag.
+    Hypothesis: triple filter on WR=90% base → near-100% WR."""
+    if sig_s871_s861_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s878_s861_macd_up(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S878: S861 (tight_chan10, WR=90%) + MACD turning up.
+    Timing confirmation on the tight channel signal.
+    Hypothesis: WR=90% + MACD = 93%+, improved PF."""
+    if sig_s861_s801_tight_channel10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist_now  = _macd_histogram(tsla, i)
+    hist_prev = _macd_histogram(tsla, i - 1) if i > 0 else None
+    if hist_now is None or hist_prev is None:
+        return 1
+    return 1 if hist_now > hist_prev else 0
+
+
+def sig_s879_s861_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S879: S861 (tight_chan10, WR=90%) + volume dry-up.
+    Seller exhaustion at tight channel support.
+    Hypothesis: every tight_chan+dryup combination = 100% WR."""
+    if sig_s861_s801_tight_channel10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i) else 0
+
+
+def sig_s880_milestone_s871_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S880 MILESTONE: S871 (tight_chan10+compressed) + below50MA.
+    Deep channel position + compressed + bear phase = triple filter precision.
+    Tests if bear-phase filter adds to already-tight compressed channel signal."""
+    if sig_s871_s861_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 0 if _tsla_above_50ma(tsla, i) else 1
+
+
+SIGNALS_P10L: List[Tuple] = [
+    # Phase 10L — S861 extensions: tight channel precision (S871-S880)
+    ('S871_s861_compressed',        sig_s871_s861_compressed,        10, 0.20, 50),
+    ('S872_s861_lag5pct',           sig_s872_s861_lag5pct,           10, 0.20, 50),
+    ('S873_s861_vix_pct60',         sig_s873_s861_vix_pct60,         10, 0.20, 50),
+    ('S874_s861_below50ma',         sig_s874_s861_below50ma,         10, 0.20, 50),
+    ('S875_s862_compressed',        sig_s875_s862_compressed,        10, 0.20, 50),
+    ('S876_s862_lag5pct',           sig_s876_s862_lag5pct,           10, 0.20, 50),
+    ('S877_s871_lag5pct',           sig_s877_s871_lag5pct,           10, 0.20, 50),
+    ('S878_s861_macd_up',           sig_s878_s861_macd_up,           10, 0.20, 50),
+    ('S879_s861_vol_dryup',         sig_s879_s861_vol_dryup,         10, 0.20, 50),
+    ('S880_milestone_s871_b50ma',   sig_s880_milestone_s871_below50ma, 10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E
+           + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I + SIGNALS_P10J
+           + SIGNALS_P10K + SIGNALS_P10L)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
