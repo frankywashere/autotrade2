@@ -9318,6 +9318,212 @@ SIGNALS_P9H: List[Tuple] = [
     ('S580_s567_vix_pct60',    sig_s580_s567_vix_pct60,    10, 0.20, 50),
 ]
 
+# ── Phase 9I — New-dimension pairs: lag+20MA, lag+fear+MA, RSI/MA depth ──────
+# Stack the two new verified dimensions (TSLA_lag_SPY + below_20MA) against each
+# other and against proven filters. Also explore shorter lag thresholds.
+
+def sig_s581_s566_tsla_lag_spy(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S581: S566 (below20MA + weekly support) + TSLA lags SPY 8%+.
+    Two orthogonal new dimensions stacked: MA oversold AND specific TSLA underperformance."""
+    if sig_s566_s215_below20ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.08) else 0
+
+
+def sig_s582_s541_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S582: S541 (below50MA + weekly support) + TSLA lags SPY 5%+ (looser threshold).
+    More trades than 8% lag — tests whether looser lag filter still adds edge."""
+    if sig_s541_s215_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s583_s541_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S583: S541 (below50MA + weekly support, $1.87M) + VIX cooldown.
+    Highest P&L signal + VIX fear receding = two independent strength indicators."""
+    if sig_s541_s215_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_was_elevated_now_cooling(vix, i) else 0
+
+
+def sig_s584_s526_below20ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S584: S526 (MACD+VIX_cooldown, $1.08M, 92% WR) + below 20MA.
+    Short-term MA breakdown + VIX fear receding + MACD turning = multi-layer confirmation."""
+    if sig_s526_s333_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _below_20ma(tsla, i) else 0
+
+
+def sig_s585_s564_below20ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S585: S564 (S215+TSLA_lag_SPY, $1.18M, 86% WR) + below 20MA.
+    TSLA-specific lag + short-term MA breakdown at weekly support = dual new dimensions."""
+    if sig_s564_s215_tsla_lag_spy(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _below_20ma(tsla, i) else 0
+
+
+def sig_s586_s566_rsi_low(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S586: S566 (below20MA + weekly support) + RSI below 40.
+    Short-term MA breakdown at support + quantified oversold level = depth confirmation."""
+    if sig_s566_s215_below20ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    rsi_val = float(rt.iloc[i]) if i < len(rt) else 50.0
+    return 1 if rsi_val < 40.0 else 0
+
+
+def sig_s587_s541_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S587: S541 (below50MA + weekly support) + above 200d MA (long-term uptrend).
+    Golden zone filter: only take below-50MA dips when long-term trend is still bullish."""
+    if sig_s541_s215_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if float(tsla['close'].iloc[i]) > ma200 else 0
+
+
+def sig_s588_s564_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S588: S564 (TSLA_lag_SPY at weekly support) + volume dry-up.
+    TSLA-specific lag catch + sellers exhausted = strong timing for lag reversal."""
+    if sig_s564_s215_tsla_lag_spy(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i) else 0
+
+
+def sig_s589_s566_consec_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S589: S566 (below20MA + weekly support) + 3+ consecutive down days.
+    Recent MA breakdown at support with extended red streak = momentum exhaustion."""
+    if sig_s566_s215_below20ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_consec_down(tsla, i, n=3) else 0
+
+
+def sig_s590_s578_below20ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S590: S578 (S526+below50MA, $966K, 91% WR) + below 20MA.
+    4-way: MACD turning + VIX cooling + below 50MA + below 20MA = maximum depth at support."""
+    if sig_s578_s526_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _below_20ma(tsla, i) else 0
+
+
+SIGNALS_P9I: List[Tuple] = [
+    # Phase 9I — New-dimension pairs + depth combos (S581-S590)
+    ('S581_s566_tsla_lag_spy', sig_s581_s566_tsla_lag_spy, 10, 0.20, 50),
+    ('S582_s541_lag5pct',      sig_s582_s541_lag5pct,      10, 0.20, 50),
+    ('S583_s541_vix_cooldown', sig_s583_s541_vix_cooldown, 10, 0.20, 50),
+    ('S584_s526_below20ma',    sig_s584_s526_below20ma,    10, 0.20, 50),
+    ('S585_s564_below20ma',    sig_s585_s564_below20ma,    10, 0.20, 50),
+    ('S586_s566_rsi_low',      sig_s586_s566_rsi_low,      10, 0.20, 50),
+    ('S587_s541_above200ma',   sig_s587_s541_above200ma,   10, 0.20, 50),
+    ('S588_s564_vol_dryup',    sig_s588_s564_vol_dryup,    10, 0.20, 50),
+    ('S589_s566_consec_down',  sig_s589_s566_consec_down,  10, 0.20, 50),
+    ('S590_s578_below20ma',    sig_s590_s578_below20ma,    10, 0.20, 50),
+]
+
+# ── Phase 9J — S582 extensions + lag parameter sweep + S600 milestone ─────────
+# S582 (S541+lag5pct, $1.376M, 8/8yr) is now the highest-coverage strong signal.
+# Extend it with proven filters: VIX fear, RSI, vol dry-up, below-20MA.
+# Also test: larger lag threshold (12%), shorter lookback (10d).
+
+def sig_s591_s582_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S591: S582 (S541+lag5pct, 8/8yr) + VIX pct>60.
+    Coverage champ + fear regime = precision on the most coverage-proven setup."""
+    if sig_s582_s541_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s592_s582_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S592: S582 (S541+lag5pct) + VIX pct>70 (high fear only).
+    Tighter fear filter on 8/8yr base — tests whether fear regime boosts WR further."""
+    if sig_s582_s541_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.70) else 0
+
+
+def sig_s593_s582_rsi_low(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S593: S582 (S541+lag5pct) + RSI below 40.
+    Below-50MA + TSLA lag + deep RSI oversold = triple quantified depth."""
+    if sig_s582_s541_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    rsi_val = float(rt.iloc[i]) if i < len(rt) else 50.0
+    return 1 if rsi_val < 40.0 else 0
+
+
+def sig_s594_s582_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S594: S582 (S541+lag5pct) + volume dry-up.
+    TSLA lag at support + sellers gone = perfect timing for lag catch."""
+    if sig_s582_s541_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i) else 0
+
+
+def sig_s595_s582_below20ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S595: S582 (S541+lag5pct) + below 20MA.
+    Two MA layers: below 50d (medium) + below 20d (short) while TSLA lags SPY."""
+    if sig_s582_s541_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _below_20ma(tsla, i) else 0
+
+
+def sig_s596_s541_lag12pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S596: S541 (below50MA + weekly support) + TSLA lags SPY 12%+ over 20d.
+    Extreme dislocation: TSLA 12%+ behind SPY at structural low = max urgency."""
+    if sig_s541_s215_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.12) else 0
+
+
+def sig_s597_s215_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S597: S215 (weekly support) + TSLA lags SPY 5%+ over 20d (no 50MA req).
+    Looser lag threshold without 50MA filter — how much does 50MA constraint add?"""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s598_s541_lag10d_5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S598: S541 (below50MA + weekly support) + TSLA lags SPY 5%+ over 10 days.
+    Shorter lookback: recent 10d lag vs SPY — captures faster relative weakness."""
+    if sig_s541_s215_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=10, lag=0.05) else 0
+
+
+def sig_s599_s566_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S599: S566 (below20MA + weekly support) + TSLA lags SPY 5%+ over 20d.
+    Strongest new below-MA signal + looser lag filter — deep short-term oversold + lag."""
+    if sig_s566_s215_below20ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s600_milestone_triple_oversold(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S600 MILESTONE: Triple oversold — below20MA + VIX pct>60 + TSLA lag5pct at weekly support.
+    Maximum multi-dimension alignment: structural low + short-term MA breakdown + fear + lag."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not _below_20ma(tsla, i):
+        return 0
+    if not _vix_elevated_pct(vix, i, window=252, pct=0.60):
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+SIGNALS_P9J: List[Tuple] = [
+    # Phase 9J — S582 extensions + lag sweeps + S600 milestone (S591-S600)
+    ('S591_s582_vix_pct60',       sig_s591_s582_vix_pct60,       10, 0.20, 50),
+    ('S592_s582_vix_pct70',       sig_s592_s582_vix_pct70,       10, 0.20, 50),
+    ('S593_s582_rsi_low',         sig_s593_s582_rsi_low,         10, 0.20, 50),
+    ('S594_s582_vol_dryup',       sig_s594_s582_vol_dryup,       10, 0.20, 50),
+    ('S595_s582_below20ma',       sig_s595_s582_below20ma,       10, 0.20, 50),
+    ('S596_s541_lag12pct',        sig_s596_s541_lag12pct,        10, 0.20, 50),
+    ('S597_s215_lag5pct',         sig_s597_s215_lag5pct,         10, 0.20, 50),
+    ('S598_s541_lag10d_5pct',     sig_s598_s541_lag10d_5pct,     10, 0.20, 50),
+    ('S599_s566_lag5pct',         sig_s599_s566_lag5pct,         10, 0.20, 50),
+    ('S600_milestone_triple_os',  sig_s600_milestone_triple_oversold, 10, 0.20, 50),
+]
+
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
            + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
            + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
@@ -9327,7 +9533,8 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
            + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
            + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
-           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H)
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J)
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
