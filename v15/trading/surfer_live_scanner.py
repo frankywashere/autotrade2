@@ -123,7 +123,8 @@ class SurferLiveScanner:
     ChannelAnalysis, sizes positions, tracks hypothetical entries/exits.
     """
 
-    TRAILING_STOP_PCT = 0.015   # 1.5% trailing from best price
+    # Trailing stop uses profit-tier logic matching surfer_backtest.py (see _calc_trail_price)
+    # TRAILING_STOP_PCT removed — replaced by profit-ratio tiers
     TIMEOUT_MINUTES = 300       # 5 hours
     EOD_CLOSE_HOUR_ET = 15      # Force-close at 3:45 PM ET
     EOD_CLOSE_MINUTE_ET = 45
@@ -414,6 +415,85 @@ class SurferLiveScanner:
     # Exit checks
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _calc_trail_price(pos: 'HypotheticalPosition') -> Optional[float]:
+        """Compute trailing stop price matching surfer_backtest.py profit-tier logic.
+
+        Mirrors evaluate_position() in surfer_backtest.py (simplified: no el_flagged,
+        fast_reversion, or trail_width_mult). Returns the effective trailing stop price,
+        or None if no trail is active yet (price hasn't moved enough to trigger a tier).
+
+        Tiers for bounce trades (profit_ratio = progress toward TP):
+          >= 80% → ultra-tight: initial_stop_dist × 0.005 from best price
+          >= 55% → initial_stop_dist × 0.02 from best price
+          >= 40% → initial_stop_dist × 0.06 from best price
+          < 40%  → None (hard stop only; breakeven managed separately)
+
+        Tiers for break trades (based on absolute % profit from best price):
+          > 1.5% → initial_stop_dist × 0.01 from best price
+          > 0.8% → initial_stop_dist × 0.02 from best price
+          > 0.08% → initial_stop_dist × 0.01 from best price
+          else   → None (hard stop only)
+        """
+        entry = pos.entry_price
+        if entry <= 0:
+            return None
+        initial_stop_dist = abs(pos.stop_price - entry) / entry
+        tp_dist = abs(pos.tp_price - entry) / entry
+        is_breakout = pos.signal_type == 'break'
+
+        if pos.direction == 'long':
+            if pos.best_price <= entry:
+                return None  # Not yet in profit
+            if is_breakout:
+                profit_from_best = (pos.best_price - entry) / entry
+                if profit_from_best > 0.015:
+                    trail_pct = initial_stop_dist * 0.01
+                elif profit_from_best > 0.008:
+                    trail_pct = initial_stop_dist * 0.02
+                elif profit_from_best > 0.0008:
+                    trail_pct = initial_stop_dist * 0.01
+                else:
+                    return None
+            else:  # bounce
+                profit_from_entry = (pos.best_price - entry) / entry
+                profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
+                if profit_ratio >= 0.80:
+                    trail_pct = initial_stop_dist * 0.005
+                elif profit_ratio >= 0.55:
+                    trail_pct = initial_stop_dist * 0.02
+                elif profit_ratio >= 0.40:
+                    trail_pct = initial_stop_dist * 0.06
+                else:
+                    return None
+            return max(pos.stop_price, pos.best_price * (1.0 - trail_pct))
+
+        else:  # short
+            if pos.best_price >= entry:
+                return None  # Not yet in profit
+            if is_breakout:
+                profit_from_best = (entry - pos.best_price) / entry
+                if profit_from_best > 0.015:
+                    trail_pct = initial_stop_dist * 0.01
+                elif profit_from_best > 0.008:
+                    trail_pct = initial_stop_dist * 0.02
+                elif profit_from_best > 0.0008:
+                    trail_pct = initial_stop_dist * 0.01
+                else:
+                    return None
+            else:  # bounce
+                profit_from_entry = (entry - pos.best_price) / entry
+                profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
+                if profit_ratio >= 0.80:
+                    trail_pct = initial_stop_dist * 0.005
+                elif profit_ratio >= 0.55:
+                    trail_pct = initial_stop_dist * 0.02
+                elif profit_ratio >= 0.40:
+                    trail_pct = initial_stop_dist * 0.06
+                else:
+                    return None
+            return min(pos.stop_price, pos.best_price * (1.0 + trail_pct))
+
     def check_exits(self, current_price: float, bar_high: float, bar_low: float) -> List[ScannerAlert]:
         """Check all open positions for exit conditions.
 
@@ -522,18 +602,17 @@ class SurferLiveScanner:
                     exit_reason = 'take_profit'
                     exit_price = pos.tp_price
 
-            # --- Trailing stop (only if in profit) ---
+            # --- Trailing stop (profit-tier based, matching surfer_backtest.py) ---
+            # Tiers based on how far price has moved toward TP (profit_ratio).
+            # Near TP → ultra-tight trail (lock profits). Early profit → wider trail.
+            # Mirrors the bounce trail logic in surfer_backtest.py evaluate_position().
             if exit_reason is None:
-                if pos.direction == 'long':
-                    trail_price = pos.best_price * (1 - self.TRAILING_STOP_PCT)
-                    in_profit = pos.best_price > pos.entry_price
-                    if in_profit and bar_low <= trail_price:
+                trail_price = self._calc_trail_price(pos)
+                if trail_price is not None:
+                    if pos.direction == 'long' and bar_low <= trail_price:
                         exit_reason = 'trailing_stop'
                         exit_price = trail_price
-                else:
-                    trail_price = pos.best_price * (1 + self.TRAILING_STOP_PCT)
-                    in_profit = pos.best_price < pos.entry_price
-                    if in_profit and bar_high >= trail_price:
+                    elif pos.direction == 'short' and bar_high >= trail_price:
                         exit_reason = 'trailing_stop'
                         exit_price = trail_price
 
