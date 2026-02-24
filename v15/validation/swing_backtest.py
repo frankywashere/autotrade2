@@ -8849,6 +8849,133 @@ SIGNALS_P9D: List[Tuple] = [
     ('S540_s526_above200ma',     sig_s540_s526_above200ma,     10, 0.20, 50),
 ]
 
+# ── Phase 9E — Below-50MA golden zone + triple dimension combos ───────────────
+# New dimension: TSLA below its 50d MA at weekly support = deep pullback opportunity.
+# "Golden zone": TSLA above 200MA (bull trend) but below 50MA (medium-term pullback).
+# Also test missing 3-way combos: NR7+vol_dryup, SPY_momentum+vol_dryup.
+
+def _below_50ma(tsla, i) -> bool:
+    """TSLA close is below its 50d simple moving average — medium-term oversold."""
+    if i < 50:
+        return True
+    ma50 = float(tsla['close'].iloc[i - 50:i].mean())
+    return float(tsla['close'].iloc[i]) < ma50
+
+
+def sig_s541_s215_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S541: S215 (weekly support) + TSLA below 50d MA.
+    NEW: Pullback signal — at weekly support AND below medium-term trend = deep discount."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _below_50ma(tsla, i) else 0
+
+
+def sig_s542_s541_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S542: S541 (weekly support + below 50MA) + TSLA above 200d MA.
+    'Golden zone': bull trend (>200MA) + medium-term pullback (<50MA) = maximum discount in uptrend.
+    Price is down from its recent trend but the big trend is still intact."""
+    if sig_s541_s215_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 0
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if float(tsla['close'].iloc[i]) > ma200 else 0
+
+
+def sig_s543_s541_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S543: S541 (below 50MA + weekly support) + ATR compression.
+    Deep pullback + coiling volatility = spring-loaded at support."""
+    if sig_s541_s215_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s544_s541_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S544: S541 (below 50MA + weekly support) + VIX pct>60.
+    Deep pullback + macro fear = maximum discount in elevated-fear regime."""
+    if sig_s541_s215_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s545_s541_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S545: S541 (below 50MA + weekly support) + volume dry-up.
+    Below medium-term MA + quiet accumulation = institutional buying at discount."""
+    if sig_s541_s215_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i, mult=0.70) else 0
+
+
+def sig_s546_s526_spy_momentum(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S546: S526 (MACD+VIX cooldown, $1.079M) + SPY near 10d high.
+    Triple: MACD momentum + VIX fear receding + SPY building = every dimension aligned."""
+    if sig_s526_s333_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _spy_new_nd_high(spy, i, n=10) else 0
+
+
+def sig_s547_s215_nr7_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S547: S215 (weekly support) + NR7 + volume dry-up.
+    Range AND volume both compressed simultaneously = double quiet at support."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not _nr7(tsla, i):
+        return 0
+    return 1 if _volume_below_avg(tsla, i, mult=0.70) else 0
+
+
+def sig_s548_s408_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S548: S408 (MACD+VIX pct>70, WR=93%) + volume dry-up.
+    3-way: MACD momentum + sustained fear + quiet accumulation = maximum precision."""
+    if sig_s408_s333_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i, mult=0.70) else 0
+
+
+def sig_s549_s477_vol_dryup_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S549: S477 (SPY momentum + weekly support) + NR7 + volume dry-up.
+    3-way: SPY at high + NR7 + volume quiet = SPY momentum while TSLA ultra-compressed."""
+    if sig_s477_s215_spy_momentum(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not _nr7(tsla, i):
+        return 0
+    return 1 if _volume_below_avg(tsla, i, mult=0.70) else 0
+
+
+def sig_s550_mega_3way(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S550 MEGA: S215 (weekly support) + NR7 + vol_dryup + VIX pct>70.
+    Three strongest non-MACD dimensions combined:
+    - VIX pct70 (sustained fear regime)
+    - NR7 (narrowest range in 7 days)
+    - Volume dry-up (below-average accumulation)
+    Hypothesis: fear + range compression + volume quiet at weekly support = maximum edge."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not _vix_elevated_pct(vix, i, window=252, pct=0.70):
+        return 0
+    if not _nr7(tsla, i):
+        return 0
+    return 1 if _volume_below_avg(tsla, i, mult=0.70) else 0
+
+
+SIGNALS_P9E: List[Tuple] = [
+    # Phase 9E — Below-50MA golden zone + triple combos (S541-S550)
+    ('S541_s215_below50ma',      sig_s541_s215_below50ma,      10, 0.20, 50),
+    ('S542_s541_above200ma',     sig_s542_s541_above200ma,     10, 0.20, 50),
+    ('S543_s541_compressed',     sig_s543_s541_compressed,     10, 0.20, 50),
+    ('S544_s541_vix_pct60',      sig_s544_s541_vix_pct60,      10, 0.20, 50),
+    ('S545_s541_vol_dryup',      sig_s545_s541_vol_dryup,      10, 0.20, 50),
+    ('S546_s526_spy_momentum',   sig_s546_s526_spy_momentum,   10, 0.20, 50),
+    ('S547_s215_nr7_vol_dryup',  sig_s547_s215_nr7_vol_dryup,  10, 0.20, 50),
+    ('S548_s408_vol_dryup',      sig_s548_s408_vol_dryup,      10, 0.20, 50),
+    ('S549_s477_vol_nr7',        sig_s549_s477_vol_dryup_nr7,  10, 0.20, 50),
+    ('S550_mega_3way',           sig_s550_mega_3way,           10, 0.20, 50),
+]
+
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
            + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
            + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
@@ -8858,7 +8985,7 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
            + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
            + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
-           + SIGNALS_P9D)
+           + SIGNALS_P9D + SIGNALS_P9E)
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
