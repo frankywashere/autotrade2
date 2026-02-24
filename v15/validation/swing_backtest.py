@@ -10826,6 +10826,168 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T + SIGNALS_P9U)
 
 
+# ── Phase 9V — Fresh dimensions: NR4, consec_down, false-break, RSI tiers, capitulation (S711-S720) ──
+# New price-action dimensions not yet tested at S631 level.
+# Goal: find another independent dimension that complements 52wk discount + weekly support.
+
+def _tsla_nr4(tsla, i) -> bool:
+    """True if today's range is the narrowest of the last 4 days (NR4 setup)."""
+    if i < 4:
+        return False
+    today_range = float(tsla['high'].iloc[i]) - float(tsla['low'].iloc[i])
+    for j in range(i - 3, i):
+        prior_range = float(tsla['high'].iloc[j]) - float(tsla['low'].iloc[j])
+        if today_range >= prior_range:
+            return False
+    return True
+
+
+def _tsla_consec_down(tsla, i, n: int = 2) -> bool:
+    """True if TSLA closed down for n consecutive days ending at i-1 (entering today)."""
+    if i < n + 1:
+        return False
+    for j in range(i - n, i):
+        if float(tsla['close'].iloc[j]) >= float(tsla['close'].iloc[j - 1]):
+            return False
+    return True
+
+
+def _tsla_below_prior_week_low(tsla, tw, i) -> bool:
+    """True if today's close is below last week's weekly low (false breakdown setup)."""
+    if i < 7 or len(tw) < 2:
+        return False
+    # Find today's date and get prior week bar
+    today = tsla.index[i]
+    # Get weekly bars up to (not including) current week
+    prior_week_bars = tw[tw.index < today]
+    if len(prior_week_bars) < 1:
+        return False
+    prior_week_low = float(prior_week_bars.iloc[-1]['low'])
+    return float(tsla['close'].iloc[i]) < prior_week_low
+
+
+def _tsla_high_volume(tsla, i, multiplier: float = 1.5) -> bool:
+    """True if today's volume is at least multiplier× the 20-day average (capitulation surge)."""
+    if i < 20:
+        return False
+    avg_vol = float(tsla['volume'].iloc[i - 20:i].mean())
+    if avg_vol <= 0:
+        return False
+    return float(tsla['volume'].iloc[i]) >= multiplier * avg_vol
+
+
+def sig_s711_s631_rsi35(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S711: S631 (10%disc + weekly support) + RSI < 35 (deep oversold).
+    Tighter than S685 (RSI<40) — only the most oversold peak-discount entries."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    rsi_val = float(rt.iloc[i]) if i < len(rt) else 50.0
+    return 1 if rsi_val < 35.0 else 0
+
+
+def sig_s712_s631_consec_down2(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S712: S631 (10%disc + weekly support) + 2 consecutive down days.
+    Back-to-back selling at weekly support with peak discount = exhaustion signal."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_consec_down(tsla, i, n=2) else 0
+
+
+def sig_s713_s701_rsi40(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S713: S701 (S631+VIX_pct60, $1.4M) + RSI < 40.
+    VIX fear regime + peak discount + RSI oversold = 3-way oversold alignment."""
+    if sig_s701_s631_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    rsi_val = float(rt.iloc[i]) if i < len(rt) else 50.0
+    return 1 if rsi_val < 40.0 else 0
+
+
+def sig_s714_s631_nr4(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S714: S631 (10%disc + weekly support) + NR4 (narrowest range in 4 days).
+    Volatility squeeze at peak discount level — energy coiling before bounce."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_nr4(tsla, i) else 0
+
+
+def sig_s715_s631_high_vol(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S715: S631 (10%disc + weekly support) + high volume (1.5× avg capitulation).
+    Capitulation surge at peak discount + structural support = exhaustion bottom."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_high_volume(tsla, i, multiplier=1.5) else 0
+
+
+def sig_s716_s631_consec_down3(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S716: S631 (10%disc + weekly support) + 3 consecutive down days.
+    Three days of selling at peak discount support = momentum exhaustion."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_consec_down(tsla, i, n=3) else 0
+
+
+def sig_s717_s701_consec_down2(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S717: S701 (S631+VIX_pct60) + 2 consecutive down days.
+    VIX fear + peak discount + back-to-back selling = maximum buy-the-dip setup."""
+    if sig_s701_s631_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_consec_down(tsla, i, n=2) else 0
+
+
+def sig_s718_s631_high_vol2x(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S718: S631 (10%disc + weekly support) + high volume (2× avg, extreme capitulation).
+    Even stronger volume surge — panic-level selling at structural support."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_high_volume(tsla, i, multiplier=2.0) else 0
+
+
+def sig_s719_s691_rsi35(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S719: S691 (S687+VIX_pct60, WR=93%) + RSI < 35.
+    4-way alignment: VIX fear + MACD turning + peak discount + RSI deep oversold."""
+    if sig_s691_s687_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    rsi_val = float(rt.iloc[i]) if i < len(rt) else 50.0
+    return 1 if rsi_val < 35.0 else 0
+
+
+def sig_s720_s631_below_pw_low(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S720: S631 (10%disc + weekly support) + below prior week's low (false breakdown).
+    TSLA undercuts prior week low at peak discount = stop-run exhaustion setup."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_below_prior_week_low(tsla, tw, i) else 0
+
+
+SIGNALS_P9V: List[Tuple] = [
+    # Phase 9V — NR4, consec_down, high-vol, RSI tiers, false-break (S711-S720)
+    ('S711_s631_rsi35',          sig_s711_s631_rsi35,          10, 0.20, 50),
+    ('S712_s631_consec_down2',   sig_s712_s631_consec_down2,   10, 0.20, 50),
+    ('S713_s701_rsi40',          sig_s713_s701_rsi40,          10, 0.20, 50),
+    ('S714_s631_nr4',            sig_s714_s631_nr4,            10, 0.20, 50),
+    ('S715_s631_high_vol',       sig_s715_s631_high_vol,       10, 0.20, 50),
+    ('S716_s631_consec_down3',   sig_s716_s631_consec_down3,   10, 0.20, 50),
+    ('S717_s701_consec_down2',   sig_s717_s701_consec_down2,   10, 0.20, 50),
+    ('S718_s631_high_vol2x',     sig_s718_s631_high_vol2x,     10, 0.20, 50),
+    ('S719_s691_rsi35',          sig_s719_s691_rsi35,          10, 0.20, 50),
+    ('S720_s631_below_pw_low',   sig_s720_s631_below_pw_low,   10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T + SIGNALS_P9U
+           + SIGNALS_P9V)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
