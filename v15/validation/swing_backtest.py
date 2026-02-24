@@ -13318,6 +13318,164 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10K + SIGNALS_P10L)
 
 
+# ── Phase 10M — S875 extensions + OR-union+tight_chan combinations (S881-S890) ─────────
+
+def sig_s881_s875_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S881: S875 (tight_chan15+compressed, WR=92%, 9/9yr) + lag5pct.
+    Tests if lag5pct adds to the tight_chan15+compressed signal.
+    Hypothesis: may converge to S821 (100% WR) via tight_chan+compressed subsumption."""
+    if sig_s875_s862_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s882_s875_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S882: S875 (tight_chan15+compressed, WR=92%) + VIX pct>60.
+    Fear filter on the 9/9yr precision signal.
+    Hypothesis: VIX pushes WR from 92% to 96%+."""
+    if sig_s875_s862_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s883_s875_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S883: S875 (tight_chan15+compressed) + below 50d MA.
+    Bear phase filter on 9/9yr signal.
+    Hypothesis: tight_chan15+compressed already includes below50MA trades."""
+    if sig_s875_s862_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 0 if _tsla_above_50ma(tsla, i) else 1
+
+
+def sig_s884_s875_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S884: S875 (tight_chan15+compressed) + volume dry-up.
+    Triple filter: tight channel + compression + seller exhaustion.
+    Hypothesis: 100% WR (every compressed+dryup = 100% WR path)."""
+    if sig_s875_s862_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i) else 0
+
+
+def sig_s885_s801_tight_or_lag(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S885: S801 base + OR(tight_chan15, lag5pct).
+    Broadest quality-gated OR-union: OR-union + (tight_channel OR lag5pct).
+    Hypothesis: union of two quality filters = more trades with higher average quality."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    has_disc = (_tsla_below_52wk_pct(tsla, i, pct=0.10) or
+                _tsla_below_20d_high_pct(tsla, i, pct=0.05))
+    if not has_disc:
+        return 0
+    pos = _weekly_channel_pos(tw, tsla.index[i], window=20)
+    tight_chan = (pos < 0 or pos < 0.15)  # true if tight or no channel
+    has_lag   = _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05)
+    return 1 if (tight_chan or has_lag) else 0
+
+
+def sig_s886_s861_30w_channel(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S886: OR-union discount + tight channel based on 30-WEEK channel (vs 20-week).
+    Longer channel window may identify more robust support levels.
+    Hypothesis: 30-week channel lower band = stronger structural support."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    has_disc = (_tsla_below_52wk_pct(tsla, i, pct=0.10) or
+                _tsla_below_20d_high_pct(tsla, i, pct=0.05))
+    if not has_disc:
+        return 0
+    pos = _weekly_channel_pos(tw, tsla.index[i], window=30)
+    if pos < 0:
+        return 1  # no 30-week channel — keep trade
+    return 1 if pos < 0.10 else 0
+
+
+def sig_s887_s215_30w_channel(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S887: Weekly 30-week channel lower 10% (no discount requirement).
+    Tests if 30-week channel alone (without discount) has signal value.
+    Baseline for comparing 30-week vs 20-week channel approaches."""
+    if tw is None or len(tw) < 30:
+        return 0
+    daily_date = tsla.index[i]
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    if wk_idx < 30:
+        return 0
+    # VIX filter
+    if i < 252:
+        return 0
+    vix_now = float(vix['close'].iloc[i])
+    if not (18 <= vix_now <= 50):
+        return 0
+    # 30-week channel, bottom 25%
+    ch = _channel_at(tw.iloc[wk_idx - 30:wk_idx])
+    if ch is None:
+        return 0
+    return 1 if _near_lower(tw['close'].iloc[wk_idx], ch, 0.25) else 0
+
+
+def sig_s888_s887_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S888: S887 (30-week channel) + OR-union discount filter.
+    30-week channel support + discount anchor.
+    Hypothesis: longer structural channel + discount = stronger signal."""
+    if sig_s887_s215_30w_channel(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    has_disc = (_tsla_below_52wk_pct(tsla, i, pct=0.10) or
+                _tsla_below_20d_high_pct(tsla, i, pct=0.05))
+    return 1 if has_disc else 0
+
+
+def sig_s889_s888_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S889: S888 (30-week channel + OR-union discount) + lag5pct.
+    Full quality stack on 30-week channel base.
+    Hypothesis: 30-week structural support + discount + SPY lag = premium setup."""
+    if sig_s888_s887_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s890_milestone_s888_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S890 MILESTONE: S888 (30-week channel + OR-union) + ATR compression.
+    30-week structural support + discount + volatility squeeze.
+    Tests if 30-week channel adds anything over 20-week when combined with compression."""
+    if sig_s888_s887_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+SIGNALS_P10M: List[Tuple] = [
+    # Phase 10M — S875 extensions + 30-week channel + OR combinations (S881-S890)
+    ('S881_s875_lag5pct',           sig_s881_s875_lag5pct,           10, 0.20, 50),
+    ('S882_s875_vix_pct60',         sig_s882_s875_vix_pct60,         10, 0.20, 50),
+    ('S883_s875_below50ma',         sig_s883_s875_below50ma,         10, 0.20, 50),
+    ('S884_s875_vol_dryup',         sig_s884_s875_vol_dryup,         10, 0.20, 50),
+    ('S885_s801_tight_or_lag',      sig_s885_s801_tight_or_lag,      10, 0.20, 50),
+    ('S886_s861_30w_chan',          sig_s886_s861_30w_channel,        10, 0.20, 50),
+    ('S887_s215_30w_channel',       sig_s887_s215_30w_channel,        10, 0.20, 50),
+    ('S888_s887_disc_or',           sig_s888_s887_disc_or,            10, 0.20, 50),
+    ('S889_s888_lag5pct',           sig_s889_s888_lag5pct,            10, 0.20, 50),
+    ('S890_milestone_s888_comp',    sig_s890_milestone_s888_compressed,10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E
+           + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I + SIGNALS_P10J
+           + SIGNALS_P10K + SIGNALS_P10L + SIGNALS_P10M)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
