@@ -16663,6 +16663,807 @@ SIGNALS_P11D: List[Tuple] = [
     ('S1060_s1041_or_vix20_precision', sig_s1060_s1041_or_vix20_precision,      10, 0.20, 50),
 ]
 
+
+# ── Phase 11E — VIX upper bound + short channels + extreme fear (S1061-S1070) ─
+
+def sig_s1061_vix18_70_or_conditions(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1061: OR(20/30/40/50w) + compressed + VIX 18-70 + S993 OR-conditions.
+    Extends S993's VIX upper bound from 50 to 70 to capture extreme fear bounces.
+    COVID March-April 2020 had VIX 40-82 — these were massive bounce opportunities."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (18 <= vix_now <= 70):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                break
+    else:
+        return 0
+    # S993 OR-conditions
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    if i >= 20:
+        spy_now = float(spy['close'].iloc[i])
+        spy_20d = float(spy['close'].iloc[i - 20])
+        if spy_20d > 0 and spy_now > spy_20d:
+            return 1
+    if i >= 5:
+        spy_now = float(spy['close'].iloc[i])
+        spy_5d = float(spy['close'].iloc[i - 5])
+        if spy_5d > 0 and spy_now > spy_5d:
+            return 1
+    return 0
+
+
+def sig_s1062_vix15_70_3way(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1062: OR(20/30/40/50w) + compressed + VIX 15-70 + S1034 precision conditions.
+    Full extension: lower VIX from 18 to 15, upper from 50 to 70.
+    Hypothesis: captures both low-VIX precision trades AND high-VIX panic bounces."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (15 <= vix_now <= 70):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    found_channel = False
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                found_channel = True
+                break
+    if not found_channel:
+        return 0
+    hist = _macd_histogram(tsla, i)
+    if hist is not None and hist < 0:
+        return 1
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and t_rsi < 40:
+        return 1
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    return 0
+
+
+def sig_s1063_s1041_vix70(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1063: S1041 super-champion with VIX upper bound extended to 70.
+    = (S993 conditions OR S1034 conditions) with VIX 15-70 instead of 15-50.
+    The 3 additional VIX 50-70 trades from 2020-2022 should be massive winners."""
+    # S993 extended to VIX 70
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (15 <= vix_now <= 70):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    found_channel = False
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                found_channel = True
+                break
+    if not found_channel:
+        return 0
+    # S993 OR-conditions
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    if i >= 3:
+        c_now_v = float(tsla['close'].iloc[i])
+        c_3d_v = float(tsla['close'].iloc[i - 3])
+        if c_3d_v > 0 and (c_now_v - c_3d_v) / c_3d_v < -0.03:
+            return 1
+    if i >= 20:
+        spy_now_v = float(spy['close'].iloc[i])
+        spy_20d_v = float(spy['close'].iloc[i - 20])
+        if spy_20d_v > 0 and spy_now_v > spy_20d_v:
+            return 1
+    if i >= 5:
+        spy_now_v = float(spy['close'].iloc[i])
+        spy_5d_v = float(spy['close'].iloc[i - 5])
+        if spy_5d_v > 0 and spy_now_v > spy_5d_v:
+            return 1
+    # S1034 precision conditions (MACD/RSI already checked above for 3d-selloff)
+    hist = _macd_histogram(tsla, i)
+    if hist is not None and hist < 0:
+        return 1
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and t_rsi < 40:
+        return 1
+    return 0
+
+
+def sig_s1064_vix18_100_or_cond(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1064: OR(20/30/40/50w) + compressed + VIX 18-100 + S993 OR-conditions.
+    No upper bound on VIX — catches all fear regimes including COVID extreme (VIX>80)."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if vix_now < 18:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    found = False
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                found = True
+                break
+    if not found:
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    if i >= 3:
+        c_now2 = float(tsla['close'].iloc[i])
+        c_3d2 = float(tsla['close'].iloc[i - 3])
+        if c_3d2 > 0 and (c_now2 - c_3d2) / c_3d2 < -0.03:
+            return 1
+    if i >= 20:
+        s_now2 = float(spy['close'].iloc[i])
+        s_20d2 = float(spy['close'].iloc[i - 20])
+        if s_20d2 > 0 and s_now2 > s_20d2:
+            return 1
+    if i >= 5:
+        s_now2 = float(spy['close'].iloc[i])
+        s_5d2 = float(spy['close'].iloc[i - 5])
+        if s_5d2 > 0 and s_now2 > s_5d2:
+            return 1
+    return 0
+
+
+def sig_s1065_s929_12w_added(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1065: OR(12/20/30/40/50w) + compressed + VIX 18-50 (add 12-week channel).
+    12-week channel = 3-month support. Tests if short-cycle channel adds good trades."""
+    if tw is None or len(tw) < 20:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (18 <= vix_now <= 50):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    for window in (12, 20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                return 1
+    return 0
+
+
+def sig_s1066_s929_15w_added(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1066: OR(15/20/30/40/50w) + compressed + VIX 18-50 (add 15-week channel).
+    15-week = 3.75-month support. Between 12w and 20w."""
+    if tw is None or len(tw) < 20:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (18 <= vix_now <= 50):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    for window in (15, 20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                return 1
+    return 0
+
+
+def sig_s1067_s1041_vix70_super(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1067: S1041 (VIX 15-50) OR VIX 50-70 precision (new extreme fear zone).
+    Extends S1041 by adding high-VIX (50-70) compressed bounces with precision filter."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    # New: VIX 50-70 precision bounces
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (50 <= vix_now <= 70):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                return 1
+    return 0
+
+
+def sig_s1068_vix50plus_base(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1068: OR(20/30/40/50w) + compressed + VIX 50+ only (pure extreme fear).
+    Isolates the panic-bounce regime: VIX > 50 = market crisis (COVID, 2022 peak).
+    Hypothesis: extreme panic bounces are highly reliable at structural support."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if vix_now < 50:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                return 1
+    return 0
+
+
+def sig_s1069_s1065_plus_or_cond(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1069: OR(12/20/30/40/50w) + compressed + VIX 18-50 + S993 OR-conditions.
+    12w channel added to S993 family — what trades does 12w add?"""
+    if sig_s1065_s929_12w_added(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    if i >= 3:
+        c_now3 = float(tsla['close'].iloc[i])
+        c_3d3 = float(tsla['close'].iloc[i - 3])
+        if c_3d3 > 0 and (c_now3 - c_3d3) / c_3d3 < -0.03:
+            return 1
+    if i >= 20:
+        s_now3 = float(spy['close'].iloc[i])
+        s_20d3 = float(spy['close'].iloc[i - 20])
+        if s_20d3 > 0 and s_now3 > s_20d3:
+            return 1
+    if i >= 5:
+        s_now3 = float(spy['close'].iloc[i])
+        s_5d3 = float(spy['close'].iloc[i - 5])
+        if s_5d3 > 0 and s_now3 > s_5d3:
+            return 1
+    return 0
+
+
+def sig_s1070_s1041_or_vix70_3way(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1070: S1041 champion OR S1062 (VIX 15-70 + 3-way precision).
+    Grand extension: S1041 universe + any VIX 50-70 precision bounces."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    return sig_s1062_vix15_70_3way(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+SIGNALS_P11E: List[Tuple] = [
+    # Phase 11E — VIX upper bound + short channels + extreme fear (S1061-S1070)
+    ('S1061_vix18_70_or_cond',         sig_s1061_vix18_70_or_conditions,        10, 0.20, 50),
+    ('S1062_vix15_70_3way',            sig_s1062_vix15_70_3way,                 10, 0.20, 50),
+    ('S1063_s1041_vix70',              sig_s1063_s1041_vix70,                   10, 0.20, 50),
+    ('S1064_vix18_100_or_cond',        sig_s1064_vix18_100_or_cond,             10, 0.20, 50),
+    ('S1065_s929_12w_added',           sig_s1065_s929_12w_added,                10, 0.20, 50),
+    ('S1066_s929_15w_added',           sig_s1066_s929_15w_added,                10, 0.20, 50),
+    ('S1067_s1041_vix70_super',        sig_s1067_s1041_vix70_super,             10, 0.20, 50),
+    ('S1068_vix50plus_base',           sig_s1068_vix50plus_base,                10, 0.20, 50),
+    ('S1069_s1065_12w_or_cond',        sig_s1069_s1065_plus_or_cond,            10, 0.20, 50),
+    ('S1070_s1041_or_vix70_3way',      sig_s1070_s1041_or_vix70_3way,           10, 0.20, 50),
+]
+
+# ── Phase 11F: VIX 50-70 precision filters to recover 100% WR on S1063 ────────
+# S1063 has n=25 WR=92% ($2,064K) — 2 losers from VIX 50-70 zone.
+# Goal: filter those losers with momentum/oscillator conditions → n=24+ 100% WR.
+
+def sig_s1071_vix70_3dselloff(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1071: S1041 OR (VIX 50-70 + compressed + channel + 3d-selloff).
+    VIX 50-70 arm requires 3-day TSLA selloff >3% to confirm panic entry."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (50 <= vix_now <= 70):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    found_channel = False
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                found_channel = True
+                break
+    if not found_channel:
+        return 0
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    return 0
+
+
+def sig_s1072_vix70_macd(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1072: S1041 OR (VIX 50-70 + compressed + channel + MACD<0).
+    VIX 50-70 arm requires bearish MACD histogram to confirm downtrend."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (50 <= vix_now <= 70):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    found_channel = False
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                found_channel = True
+                break
+    if not found_channel:
+        return 0
+    hist = _macd_histogram(tsla, i)
+    if hist is not None and hist < 0:
+        return 1
+    return 0
+
+
+def sig_s1073_vix70_rsi40(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1073: S1041 OR (VIX 50-70 + compressed + channel + RSI<40).
+    VIX 50-70 arm requires oversold RSI<40 to confirm panic-oversold entry."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (50 <= vix_now <= 70):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    found_channel = False
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                found_channel = True
+                break
+    if not found_channel:
+        return 0
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and t_rsi < 40:
+        return 1
+    return 0
+
+
+def sig_s1074_vix70_3way(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1074: S1041 OR (VIX 50-70 + compressed + channel + (3d-selloff OR MACD<0 OR RSI<40)).
+    Full 3-way precision filter on VIX 50-70 arm — same filters as S1034's VIX-15 arm."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (50 <= vix_now <= 70):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    found_channel = False
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                found_channel = True
+                break
+    if not found_channel:
+        return 0
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    hist = _macd_histogram(tsla, i)
+    if hist is not None and hist < 0:
+        return 1
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and t_rsi < 40:
+        return 1
+    return 0
+
+
+def sig_s1075_vix70_lag5(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1075: S1041 OR (VIX 50-70 + compressed + channel + lag5pct).
+    VIX 50-70 arm requires TSLA lagging SPY by 5% (relative weakness filter)."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (50 <= vix_now <= 70):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    found_channel = False
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                found_channel = True
+                break
+    if not found_channel:
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    return 0
+
+
+def sig_s1076_vix45_60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1076: S1041 OR (VIX 45-60 + compressed + channel + any-OR-cond).
+    Extends S1041 into the VIX 45-60 elevated fear zone with full OR conditions."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (45 <= vix_now <= 60):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    found_channel = False
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                found_channel = True
+                break
+    if not found_channel:
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    if i >= 20:
+        spy_now = float(spy['close'].iloc[i])
+        spy_20d = float(spy['close'].iloc[i - 20])
+        if spy_20d > 0 and spy_now > spy_20d:
+            return 1
+    if i >= 5:
+        spy_now = float(spy['close'].iloc[i])
+        spy_5d = float(spy['close'].iloc[i - 5])
+        if spy_5d > 0 and spy_now > spy_5d:
+            return 1
+    hist = _macd_histogram(tsla, i)
+    if hist is not None and hist < 0:
+        return 1
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and t_rsi < 40:
+        return 1
+    return 0
+
+
+def sig_s1077_s1063_vix55(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1077: S1063 with VIX upper bound tightened to 55 (not 70).
+    Test if the 2 S1063 losers are in VIX 55-70 zone — cutting to 55 may recover 100% WR."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (15 <= vix_now <= 55):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    found_channel = False
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                found_channel = True
+                break
+    if not found_channel:
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    if i >= 3:
+        c_now_v = float(tsla['close'].iloc[i])
+        c_3d_v = float(tsla['close'].iloc[i - 3])
+        if c_3d_v > 0 and (c_now_v - c_3d_v) / c_3d_v < -0.03:
+            return 1
+    if i >= 20:
+        spy_now_v = float(spy['close'].iloc[i])
+        spy_20d_v = float(spy['close'].iloc[i - 20])
+        if spy_20d_v > 0 and spy_now_v > spy_20d_v:
+            return 1
+    if i >= 5:
+        spy_now_v = float(spy['close'].iloc[i])
+        spy_5d_v = float(spy['close'].iloc[i - 5])
+        if spy_5d_v > 0 and spy_now_v > spy_5d_v:
+            return 1
+    hist = _macd_histogram(tsla, i)
+    if hist is not None and hist < 0:
+        return 1
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and t_rsi < 40:
+        return 1
+    return 0
+
+
+def sig_s1078_s1063_vix52(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1078: S1063 with VIX upper bound tightened to 52 (just above S1041's 50).
+    Adds minimal VIX 50-52 extension — tests if losers are above 52."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (15 <= vix_now <= 52):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    found_channel = False
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                found_channel = True
+                break
+    if not found_channel:
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    if i >= 3:
+        c_now_v = float(tsla['close'].iloc[i])
+        c_3d_v = float(tsla['close'].iloc[i - 3])
+        if c_3d_v > 0 and (c_now_v - c_3d_v) / c_3d_v < -0.03:
+            return 1
+    if i >= 20:
+        spy_now_v = float(spy['close'].iloc[i])
+        spy_20d_v = float(spy['close'].iloc[i - 20])
+        if spy_20d_v > 0 and spy_now_v > spy_20d_v:
+            return 1
+    if i >= 5:
+        spy_now_v = float(spy['close'].iloc[i])
+        spy_5d_v = float(spy['close'].iloc[i - 5])
+        if spy_5d_v > 0 and spy_now_v > spy_5d_v:
+            return 1
+    hist = _macd_histogram(tsla, i)
+    if hist is not None and hist < 0:
+        return 1
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and t_rsi < 40:
+        return 1
+    return 0
+
+
+def sig_s1079_s1041_atr65(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1079: S1041 with ATR threshold tightened to 0.65 (vs 0.75 in S1041).
+    Stricter compression filter — eliminates more marginal trades to reduce risk."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (15 <= vix_now <= 50):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.65 * atr_20:  # stricter: 0.65 vs 0.75
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    found_channel = False
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                found_channel = True
+                break
+    if not found_channel:
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    if i >= 20:
+        spy_now = float(spy['close'].iloc[i])
+        spy_20d = float(spy['close'].iloc[i - 20])
+        if spy_20d > 0 and spy_now > spy_20d:
+            return 1
+    if i >= 5:
+        spy_now = float(spy['close'].iloc[i])
+        spy_5d = float(spy['close'].iloc[i - 5])
+        if spy_5d > 0 and spy_now > spy_5d:
+            return 1
+    hist = _macd_histogram(tsla, i)
+    if hist is not None and hist < 0:
+        return 1
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and t_rsi < 40:
+        return 1
+    return 0
+
+
+def sig_s1080_s1041_chan20pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1080: S1041 with channel position tightened to lower 20% (vs 25% in S1041).
+    More precise support entry — trades only deepest channel penetration zones."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (15 <= vix_now <= 50):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    found_channel = False
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.20):  # 20% not 25%
+                found_channel = True
+                break
+    if not found_channel:
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    if i >= 20:
+        spy_now = float(spy['close'].iloc[i])
+        spy_20d = float(spy['close'].iloc[i - 20])
+        if spy_20d > 0 and spy_now > spy_20d:
+            return 1
+    if i >= 5:
+        spy_now = float(spy['close'].iloc[i])
+        spy_5d = float(spy['close'].iloc[i - 5])
+        if spy_5d > 0 and spy_now > spy_5d:
+            return 1
+    hist = _macd_histogram(tsla, i)
+    if hist is not None and hist < 0:
+        return 1
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and t_rsi < 40:
+        return 1
+    return 0
+
+
+SIGNALS_P11F: List[Tuple] = [
+    ('S1071_vix70_3dselloff',          sig_s1071_vix70_3dselloff,               10, 0.20, 50),
+    ('S1072_vix70_macd',               sig_s1072_vix70_macd,                    10, 0.20, 50),
+    ('S1073_vix70_rsi40',              sig_s1073_vix70_rsi40,                   10, 0.20, 50),
+    ('S1074_vix70_3way',               sig_s1074_vix70_3way,                    10, 0.20, 50),
+    ('S1075_vix70_lag5',               sig_s1075_vix70_lag5,                    10, 0.20, 50),
+    ('S1076_vix45_60_fullcond',        sig_s1076_vix45_60,                      10, 0.20, 50),
+    ('S1077_s1063_vix55',              sig_s1077_s1063_vix55,                   10, 0.20, 50),
+    ('S1078_s1063_vix52',              sig_s1078_s1063_vix52,                   10, 0.20, 50),
+    ('S1079_s1041_atr65',              sig_s1079_s1041_atr65,                   10, 0.20, 50),
+    ('S1080_s1041_chan20pct',          sig_s1080_s1041_chan20pct,               10, 0.20, 50),
+]
+
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
            + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
            + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
@@ -16681,7 +17482,8 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10K + SIGNALS_P10L + SIGNALS_P10M + SIGNALS_P10N + SIGNALS_P10O
            + SIGNALS_P10P + SIGNALS_P10Q + SIGNALS_P10R + SIGNALS_P10S + SIGNALS_P10T
            + SIGNALS_P10U + SIGNALS_P10V + SIGNALS_P10W + SIGNALS_P10X + SIGNALS_P10Y
-           + SIGNALS_P10Z + SIGNALS_P11A + SIGNALS_P11B + SIGNALS_P11C + SIGNALS_P11D)
+           + SIGNALS_P10Z + SIGNALS_P11A + SIGNALS_P11B + SIGNALS_P11C + SIGNALS_P11D + SIGNALS_P11E
+           + SIGNALS_P11F)
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
