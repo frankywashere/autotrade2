@@ -206,7 +206,7 @@ class YFinanceLiveData:
         for attempt in range(self.max_retries):
             try:
                 ticker = yf.Ticker(symbol)
-                df = ticker.history(period=period, interval=interval)
+                df = ticker.history(period=period, interval=interval, prepost=True)
 
                 if df.empty:
                     raise DataLoadError(
