@@ -12809,6 +12809,176 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I)
 
 
+# ── Phase 10J — Intraday close strength + VIX rolling window + seasonal (S851-S860) ───
+
+def _tsla_strong_close(tsla, i, pct: float = 0.60) -> bool:
+    """True if daily close is in top pct of day's high-low range (bullish close).
+    pct=0.60 means close is at least 60% of the way from low to high."""
+    h = float(tsla['high'].iloc[i])
+    l = float(tsla['low'].iloc[i])
+    c = float(tsla['close'].iloc[i])
+    rng = h - l
+    if rng <= 0:
+        return True  # doji / flat = neutral, pass
+    position = (c - l) / rng
+    return position >= pct
+
+
+def _tsla_weak_close(tsla, i, pct: float = 0.40) -> bool:
+    """True if daily close is in bottom pct of day's high-low range (bearish close).
+    pct=0.40 means close is in the lower 40% of the day's range."""
+    h = float(tsla['high'].iloc[i])
+    l = float(tsla['low'].iloc[i])
+    c = float(tsla['close'].iloc[i])
+    rng = h - l
+    if rng <= 0:
+        return True
+    position = (c - l) / rng
+    return position <= pct
+
+
+def _vix_elevated_pct_63(vix, i, pct: float = 0.60) -> bool:
+    """VIX elevated above pct percentile over rolling 63-day (~3 month) window.
+    Shorter lookback = more responsive to recent fear vs 252-day annual window."""
+    lookback = min(63, i)
+    if lookback < 20:
+        return False
+    vix_vals = vix['close'].iloc[i - lookback:i]
+    vix_now   = float(vix['close'].iloc[i])
+    threshold = float(vix_vals.quantile(pct))
+    return vix_now >= threshold
+
+
+def sig_s851_s801_strong_close(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S851: S801 (OR-union) + strong close (close in top 60% of day's range).
+    Intraday strength = buyers absorbing selling at weekly support.
+    Hypothesis: strong close on signal day = conviction reversal, higher WR."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_strong_close(tsla, i, pct=0.60) else 0
+
+
+def sig_s852_s801_weak_close(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S852: S801 (OR-union) + weak close (close in bottom 40% of range).
+    Tests if entering on weak close (still selling) is better (buy the weakness).
+    Hypothesis: weak close = not yet done selling, buy tomorrow's open instead."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_weak_close(tsla, i, pct=0.40) else 0
+
+
+def sig_s853_s814_strong_close(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S853: S814 (OR-union+lag5pct, 9/9yr) + strong close.
+    Intraday conviction on the lag5pct signal.
+    Hypothesis: strong close + lag + discount = highest daily reversal quality."""
+    if sig_s814_s801_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_strong_close(tsla, i, pct=0.60) else 0
+
+
+def sig_s854_s801_vix_pct60_63d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S854: S801 (OR-union) + VIX pct>60 over 63-day rolling window.
+    Shorter VIX lookback = more responsive to recent fear spikes.
+    Compare to S817 (annual VIX pct60) — which window works better?"""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct_63(vix, i, pct=0.60) else 0
+
+
+def sig_s855_s801_vix_pct80(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S855: S801 (OR-union) + VIX pct>80 over 252-day window.
+    Stricter VIX threshold — only top-20% fear events.
+    Hypothesis: extreme fear + discount = largest bounces."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.80) else 0
+
+
+def sig_s856_s814_strong_close_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S856: S821 (S814+compressed) + strong close.
+    100% WR compressed signal with intraday conviction.
+    Hypothesis: strong close + compressed + lag + discount = maximum setup quality."""
+    if sig_s821_s814_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_strong_close(tsla, i, pct=0.60) else 0
+
+
+def sig_s857_s801_oct_nov(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S857: S801 filtered to October-November entries (seasonal weak period).
+    Oct/Nov historically shows strong TSLA mean-reversion from channel support.
+    Hypothesis: seasonal weakness + discount = better recovery."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= len(tsla):
+        return 0
+    month = tsla.index[i].month
+    return 1 if month in (10, 11) else 0
+
+
+def sig_s858_s801_q1_q4(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S858: S801 filtered to Q1 (Jan-Mar) OR Q4 (Oct-Dec) entries.
+    Historically strongest TSLA reversal periods.
+    Hypothesis: TSLA seasonal strength in Q1 + Q4 amplifies bounce quality."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= len(tsla):
+        return 0
+    month = tsla.index[i].month
+    return 1 if month in (1, 2, 3, 10, 11, 12) else 0
+
+
+def sig_s859_s801_q2_q3(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S859: S801 filtered to Q2-Q3 (Apr-Sep) — typically TSLA's weaker half.
+    Complement to S858 — tests if seasonal effects actually exist in signal.
+    If S859 > S858, seasonal filter is counter-productive."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= len(tsla):
+        return 0
+    month = tsla.index[i].month
+    return 1 if month in (4, 5, 6, 7, 8, 9) else 0
+
+
+def sig_s860_milestone_s853_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S860 MILESTONE: S821 (100% WR base) + strong close.
+    Compressed lag5pct signal with intraday buyer conviction.
+    Maximum quality: OR-union + lag5pct + compressed + strong close = 4 filters."""
+    if sig_s821_s814_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_strong_close(tsla, i, pct=0.60) else 0
+
+
+SIGNALS_P10J: List[Tuple] = [
+    # Phase 10J — Close strength + VIX windows + seasonal (S851-S860)
+    ('S851_s801_strong_close',       sig_s851_s801_strong_close,       10, 0.20, 50),
+    ('S852_s801_weak_close',         sig_s852_s801_weak_close,         10, 0.20, 50),
+    ('S853_s814_strong_close',       sig_s853_s814_strong_close,       10, 0.20, 50),
+    ('S854_s801_vix_pct60_63d',      sig_s854_s801_vix_pct60_63d,      10, 0.20, 50),
+    ('S855_s801_vix_pct80',          sig_s855_s801_vix_pct80,          10, 0.20, 50),
+    ('S856_s821_strong_close',       sig_s856_s814_strong_close_compressed, 10, 0.20, 50),
+    ('S857_s801_oct_nov',            sig_s857_s801_oct_nov,            10, 0.20, 50),
+    ('S858_s801_q1_q4',              sig_s858_s801_q1_q4,              10, 0.20, 50),
+    ('S859_s801_q2_q3',              sig_s859_s801_q2_q3,              10, 0.20, 50),
+    ('S860_milestone_s821_strclose', sig_s860_milestone_s853_compressed,   10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E
+           + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I + SIGNALS_P10J)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
