@@ -3194,7 +3194,150 @@ SIGNALS_P7Q: List[Tuple] = [
 ]
 
 
-SIGNALS = SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q
+# ── Phase 7R — Bollinger, return z-score, vol ratio, MACD ────────────────────
+
+def sig_s174_s91_lower_bb(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S174: S91 + TSLA close near or below its lower Bollinger Band (20d, 2σ).
+    Lower BB = classic mean-reversion entry: price statistically oversold.
+    Combines BB oversold condition with ATR-extreme for dual confirmation.
+    Hypothesis: BB-touch + ATR-extreme = maximum mean-reversion setup."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 20:
+        return 1
+    closes = tsla['close'].iloc[i-19:i+1].values.astype(float)
+    mu  = closes.mean()
+    std = closes.std()
+    bb_lower = mu - 2 * std
+    tsla_c   = float(tsla['close'].iloc[i])
+    return 1 if tsla_c <= bb_lower * 1.02 else 0  # within 2% of lower BB
+
+
+def sig_s175_s91_return_zscore(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S175: S91 + TSLA 3d return z-score below -1.5 (statistically extreme drop).
+    Normalize TSLA's 3d return against its 60d distribution of 3d returns.
+    Z < -1.5 means this 3d decline is in the bottom 7% of historical 3d moves.
+    Hypothesis: statistical extreme drop + ATR extreme = strongest snap-back."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 65:
+        return 1
+    # Rolling 3d returns over last 60 days
+    ret_3d_series = []
+    for j in range(i-60, i-2):
+        r = float(tsla['close'].iloc[j+3]) / float(tsla['close'].iloc[j]) - 1
+        ret_3d_series.append(r)
+    if len(ret_3d_series) < 30:
+        return 1
+    arr  = np.array(ret_3d_series)
+    mu   = arr.mean(); std = arr.std()
+    if std < 1e-10:
+        return 1
+    today_3d = float(tsla['close'].iloc[i]) / float(tsla['close'].iloc[i-3]) - 1
+    z = (today_3d - mu) / std
+    return 1 if z < -1.5 else 0
+
+
+def sig_s176_s91_tsla_calm_vs_vix(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S176: S91 + TSLA realized vol (10d) < VIX (TSLA calmer than market).
+    VIX reflects expected SPY vol. When TSLA realized vol < VIX, the market
+    is MORE fearful than TSLA actually is — TSLA has been suppressed.
+    Hypothesis: market fear > TSLA actual vol = TSLA is being held down artificially."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    rets = tsla['close'].iloc[i-10:i+1].pct_change().dropna().values
+    if len(rets) < 5:
+        return 1
+    tsla_rvol_ann = rets.std() * np.sqrt(252) * 100  # annualized %
+    vix_level = float(vix['close'].iloc[i])
+    return 1 if tsla_rvol_ann < vix_level else 0
+
+
+def sig_s177_s91_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S177: S91 + TSLA MACD histogram turning up (momentum shift to bullish).
+    MACD(12,26,9): if the histogram was negative but is now less negative (turning),
+    short-term momentum is inflecting upward while ATR is at extreme.
+    Hypothesis: MACD turn + ATR extreme = momentum + mean-reversion double signal."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 27:
+        return 1
+    closes = tsla['close'].iloc[i-30:i+1].values.astype(float)
+    # EMA helper
+    def ema(data, n):
+        e = data[0]
+        k = 2 / (n + 1)
+        for x in data[1:]:
+            e = x * k + e * (1 - k)
+        return e
+    ema12_now  = ema(closes[-13:], 12)
+    ema26_now  = ema(closes[-27:], 26)
+    ema12_prev = ema(closes[-14:-1], 12)
+    ema26_prev = ema(closes[-28:-1], 26)
+    macd_now  = ema12_now  - ema26_now
+    macd_prev = ema12_prev - ema26_prev
+    # MACD was negative but is improving (histogram turning up)
+    return 1 if (macd_prev < 0 and macd_now > macd_prev) else 0
+
+
+def sig_s178_s91_consec_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S178: S91 + TSLA has had 3+ consecutive down closes (exhaustion pattern).
+    After 3 consecutive down days, selling exhaustion often sets in.
+    Combined with ATR-extreme (low vol = structured selling, not panic).
+    Hypothesis: quiet 3-day decline + ATR extreme = exhaustion snap-back."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 3:
+        return 1
+    for j in range(3):
+        if float(tsla['close'].iloc[i-j]) >= float(tsla['close'].iloc[i-j-1]):
+            return 0
+    return 1
+
+
+def sig_s179_s152_nr7_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S179: S152 (VIX>=15+ATR extreme) + NR7 + VIX recovery — best combo.
+    Ultimate stacking: high P&L base (S152) + quality filter (NR7) + timing (VIX rec).
+    Hypothesis: all three conditions = maximum compression + recovery setup."""
+    if sig_s152_s91_vix15(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not _nr_n(tsla, i, 7):
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i-5])
+    return 1 if vix_now < vix_5d * 0.95 else 0  # VIX dropped >=5% in 5d
+
+
+def sig_s180_s153_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S180: S153 (best P&L: VIX>=15+3d hold) + VIX recovery.
+    Add the recovery timing to the highest-P&L signal.
+    Hypothesis: best-frequency signal + recovery timing = large P&L + quality."""
+    if sig_s153_s152_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i-5])
+    return 1 if vix_now < vix_5d * 0.95 else 0
+
+
+SIGNALS_P7R: List[Tuple] = [
+    # Phase 7R — Bollinger, return z-score, vol ratio, momentum
+    ('S174_s91_lower_bb',       sig_s174_s91_lower_bb,       10, 0.20, 50),
+    ('S175_s91_return_zscore',  sig_s175_s91_return_zscore,  10, 0.20, 50),
+    ('S176_s91_tsla_calm',      sig_s176_s91_tsla_calm_vs_vix, 10, 0.20, 50),
+    ('S177_s91_macd_turn',      sig_s177_s91_macd_turning,   10, 0.20, 50),
+    ('S178_s91_consec_down',    sig_s178_s91_consec_down,    10, 0.20, 50),
+    ('S179_s152_nr7_vix_rec',   sig_s179_s152_nr7_vix_rec,  10, 0.20, 50),
+    ('S180_s153_vix_rec',       sig_s180_s153_vix_rec,        3, 0.20, 50),
+]
+
+
+SIGNALS = SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
