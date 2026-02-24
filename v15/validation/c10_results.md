@@ -120,6 +120,33 @@ Hypothesis: c9 tuned_params.json was optimized for 189-dim space. Now at 197 dim
 (+8 features vs c9). The optimal num_leaves, learning_rate, feature_fraction may
 differ for the expanded feature set. A new Optuna sweep could unlock better AUC.
 
+Changes from Arch2:
+  - 80-trial Optuna sweep on 2015-2022 train / 2023-2024 test (nested CV)
+  - Saved to: v15/validation/tuned_params_c10.json
+  - New params: n_estimators=428, num_leaves=35 (vs 120), feature_fraction=0.815 (vs 0.44),
+    reg_lambda=5.09 (vs 0.1), min_child_samples=149 (vs 111), max_depth=8 (vs 6)
+  - Inner best AUC=0.800, honest outer AUC=0.745, gap=0.055 (overfit warning)
+
+Status: COMPLETE — WORSE THAN ARCH2
+
+Arch3 (c10 Optuna params):
+  AUC: 0.813  Cal Brier: 0.050  (matches c9 baseline, -0.003 vs Arch2)
+  Per-year AUC: 0.749, 0.742, 0.777, 0.809, 0.821, 0.856, 0.828, 0.820, 0.859, 0.825
+  Model file: v15/validation/signal_quality_model_c10_arch3.pkl
+
+vs Arch2: 6/10 years worse, 2/10 better. Overall -0.003 AUC.
+
+CONCLUSION: c9 tuned params (num_leaves=120, feature_fraction=0.44) remain better
+for the 197-dim space despite Optuna retuning. The overfit warning was accurate.
+The nested CV gap (0.055) means Optuna overfit to 2015-2022 patterns.
+WINNER SO FAR: Arch2 (AUC=0.816, c9 tuned params, lag features).
+
+================================================================================
+PHASE 2: Walk-Forward Validation (Arch2 as winner)
+================================================================================
+Methodology: 5yr IS → 1yr OOS rolling windows, using Arch2 model
+(same as c9 walk-forward but with 197-dim features + c9 params)
+
 Status: PENDING
 
 ================================================================================
