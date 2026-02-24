@@ -66,11 +66,59 @@ NEXT: Arch2 — try lag features (recent trade outcomes) to capture system state
 ================================================================================
 Arch2 — Lag Features (recent trade win/loss history + system state)
 ================================================================================
-Hypothesis: The 4 c9 lag features (recent_win_rate_10, streak, day_pnl_running,
-time_since_last_trade_min) capture SYSTEM STATE that static features miss.
+Hypothesis: The 4 lag features capture SYSTEM STATE that static features miss.
 When system is on a hot streak → quality scores may be higher. When in cold streak →
-lower. These are genuinely novel (can't be derived from existing features).
-No look-ahead bias: only uses trades that closed BEFORE the current signal.
+lower. These are genuinely novel (can't be derived from existing channel features).
+No look-ahead bias: only uses trades that closed BEFORE the current signal entry.
+
+Changes from Arch1b:
+  - TRADE_LAG_FEATURES: 4 new features appended as final section of base vector
+  - recent_win_rate_10: win rate of last 10 closed trades (0.0-1.0)
+  - streak_normalized: current streak +1.0=10 consec wins, -1.0=10 consec losses
+  - day_pnl_normalized: today P&L / equity (captures intraday regime)
+  - recent_avg_pnl_pct: avg pnl_pct of last 10 trades (hot/cold regime signal)
+  - Base feature vector: 173 → 177 dims; trained feature vec: 193 → 197 dims
+  - Data flows: backtest tracks trades[], consecutive_wins/losses, daily_pnl, equity
+    → passed to _extract_signal_features() → extract_trade_lag_features()
+  - Dashboard: uses default zeros (no live trade history yet) — acceptable
+
+Status: COMPLETE — NEUTRAL (tiny AUC gain, no P&L improvement)
+
+Arch2 (tuned params from c9):
+  AUC: 0.816  Cal Brier: 0.050  (+0.003 vs 0.813 baseline — small real gain)
+  Per-year AUC: 0.748, 0.748, 0.786, 0.810, 0.828, 0.868, 0.821, 0.820, 0.868, 0.818
+  Model file: v15/validation/signal_quality_model_c10_arch2.pkl
+  Feature dim: 197 (177 base + 21 extended meta)
+
+New feature importances in Arch2 (win classifier):
+  recent_avg_pnl_pct: rank 13 (209 importance) — genuinely useful (hot/cold regime)
+  recent_win_rate_10, streak_normalized, day_pnl_normalized: not in top 20 (low signal)
+
+11-year backtest (2015-2025, bounce_cap=12x, max_trade_usd=$1M):
+  Baseline:       $16,552,438  (identical — baseline never uses ML)
+  Old-tiers:      $16,746,214  (+$193,776, +1.2%)
+  Upscale-only:   $17,174,732  (+$622,294, +3.8%)
+
+vs Arch1b/c9 upscale-only delta: +$33 difference (negligible, essentially identical)
+
+Per-year upscale-only delta (vs c9 baseline):
+  2015: +$118   2016: +$357   2017: +$1    2018: +$4,839  2019: +$65
+  2020: +$228,992  2021: +$13,212  2022: +$6,855  (+$33 vs Arch1b)
+  2023: +$260,760  2024: +$97,111  2025: +$9,983
+
+CONCLUSION: Lag features give +0.003 AUC but zero P&L impact. The AUC gain is real
+(recent_avg_pnl_pct ranks #13 in win classifier) but position sizing predictions are
+near-identical to Arch1b. The model is at its information ceiling for P&L impact.
+Cap structure (12x bounce + $1M limit) absorbs the small prediction improvements.
+NEXT: Arch3 — re-run Optuna hyperparameter sweep on 197-dim feature space.
+c9 params were tuned for 189 dims. New dimensions may need different tree structure.
+
+================================================================================
+Arch3 — Optuna Hyperparameter Sweep (197-dim feature space)
+================================================================================
+Hypothesis: c9 tuned_params.json was optimized for 189-dim space. Now at 197 dims
+(+8 features vs c9). The optimal num_leaves, learning_rate, feature_fraction may
+differ for the expanded feature set. A new Optuna sweep could unlock better AUC.
 
 Status: PENDING
 

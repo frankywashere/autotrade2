@@ -260,7 +260,10 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
 
 
 def _extract_signal_features(analysis, tsla, bar, closes, spy_df, vix_df,
-                              feature_names, history_buffer, eval_interval):
+                              feature_names, history_buffer, eval_interval,
+                              closed_trades=None, consecutive_wins=0,
+                              consecutive_losses=0, daily_pnl=0.0,
+                              equity=100_000.0):
     """Extract full ML feature vector at signal time.
 
     Shared by both the ML-enhanced backtest path and the feature-capture path.
@@ -272,10 +275,10 @@ def _extract_signal_features(analysis, tsla, bar, closes, spy_df, vix_df,
     from v15.core.surfer_ml import (
         extract_tf_features, extract_cross_tf_features,
         extract_context_features, extract_correlation_features,
-        extract_temporal_features,
+        extract_temporal_features, extract_trade_lag_features,
         ML_TFS, PER_TF_FEATURES,
         CROSS_TF_FEATURES, CONTEXT_FEATURES, CORRELATION_FEATURES,
-        TEMPORAL_FEATURES,
+        TEMPORAL_FEATURES, TRADE_LAG_FEATURES,
     )
 
     num_features = len(feature_names)
@@ -326,6 +329,17 @@ def _extract_signal_features(analysis, tsla, bar, closes, spy_df, vix_df,
         tsla_index=tsla.index,
     )
     feature_vec[offset:offset + len(CORRELATION_FEATURES)] = corr_feats
+    offset += len(CORRELATION_FEATURES)
+
+    # c10 Arch2: Trade lag features (system state — recent trade outcomes)
+    lag_feats = extract_trade_lag_features(
+        closed_trades=closed_trades,
+        consecutive_wins=consecutive_wins,
+        consecutive_losses=consecutive_losses,
+        daily_pnl=daily_pnl,
+        equity=equity,
+    )
+    feature_vec[offset:offset + len(TRADE_LAG_FEATURES)] = lag_feats
 
     # Safety: replace NaN/inf with 0 (physics engine can occasionally produce them)
     np.nan_to_num(feature_vec, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1401,6 +1415,9 @@ def run_backtest(
                     current_signal_features, _ = _extract_signal_features(
                         analysis, tsla, bar, closes, spy_df, vix_df,
                         _capture_feature_names, _capture_history_buffer, eval_interval,
+                        closed_trades=trades, consecutive_wins=consecutive_wins,
+                        consecutive_losses=consecutive_losses, daily_pnl=daily_pnl,
+                        equity=equity,
                     )
                 except Exception as _e:
                     _track_error("feature_extract", _e)
@@ -1414,6 +1431,9 @@ def run_backtest(
                     feature_vec, _ = _extract_signal_features(
                         analysis, tsla, bar, closes, spy_df, vix_df,
                         ml_feature_names, ml_history_buffer, eval_interval,
+                        closed_trades=trades, consecutive_wins=consecutive_wins,
+                        consecutive_losses=consecutive_losses, daily_pnl=daily_pnl,
+                        equity=equity,
                     )
                     if capture_features:
                         current_signal_features = feature_vec.copy()

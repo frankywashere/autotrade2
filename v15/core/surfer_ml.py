@@ -145,6 +145,14 @@ CORRELATION_FEATURES = [
     'spy_vol_ratio_20',          # SPY volume / 20-bar avg (high = market-driven move)
 ]
 
+# c10 Arch2: Trade lag features (system state from recent trade history)
+TRADE_LAG_FEATURES = [
+    'recent_win_rate_10',   # Win rate of last 10 closed trades (0.0 to 1.0)
+    'streak_normalized',    # Current streak: +1.0 = 10 consec wins, -1.0 = 10 consec losses
+    'day_pnl_normalized',   # Today's running P&L / equity (e.g. 0.05 = +5% day so far)
+    'recent_avg_pnl_pct',   # Avg pnl_pct of last 10 trades (hot/cold regime signal)
+]
+
 
 def get_feature_names() -> List[str]:
     """Return ordered list of all feature names."""
@@ -161,6 +169,8 @@ def get_feature_names() -> List[str]:
     names.extend(TEMPORAL_FEATURES)
     # Correlations
     names.extend(CORRELATION_FEATURES)
+    # c10 Arch2: Trade lag features (system state)
+    names.extend(TRADE_LAG_FEATURES)
     return names
 
 
@@ -541,6 +551,52 @@ def extract_correlation_features(
             features[3] = vix_closes[-1]
             if len(vix_closes) >= 6:
                 features[4] = vix_closes[-1] - vix_closes[-6]
+
+    return features
+
+
+def extract_trade_lag_features(
+    closed_trades=None,
+    consecutive_wins: int = 0,
+    consecutive_losses: int = 0,
+    daily_pnl: float = 0.0,
+    equity: float = 100_000.0,
+) -> np.ndarray:
+    """Extract system-state lag features from recent trade history.
+
+    No look-ahead bias: only uses trades closed BEFORE the current signal.
+
+    Args:
+        closed_trades: List of Trade objects already closed (oldest→newest).
+        consecutive_wins: Current consecutive win streak (backtest tracker).
+        consecutive_losses: Current consecutive loss streak (backtest tracker).
+        daily_pnl: Running P&L for today (resets at day boundary).
+        equity: Current account equity (for normalizing day_pnl).
+
+    Returns:
+        Array of shape (4,) matching TRADE_LAG_FEATURES order.
+    """
+    features = np.zeros(len(TRADE_LAG_FEATURES), dtype=np.float32)
+
+    if closed_trades:
+        n = len(closed_trades)
+        # recent_win_rate_10: win rate of last ≤10 trades
+        recent = closed_trades[max(0, n - 10):]
+        wins = sum(1 for t in recent if getattr(t, 'pnl', 0.0) > 0)
+        features[0] = wins / len(recent)
+
+        # recent_avg_pnl_pct: avg pnl_pct of last ≤10 trades
+        pnl_vals = [getattr(t, 'pnl_pct', 0.0) or 0.0 for t in recent]
+        if pnl_vals:
+            features[3] = float(np.mean(pnl_vals))
+
+    # streak_normalized: +1.0 = 10 consec wins, -1.0 = 10 consec losses
+    net = consecutive_wins if consecutive_wins > 0 else -consecutive_losses
+    features[1] = float(max(-1.0, min(1.0, net / 10.0)))
+
+    # day_pnl_normalized: today P&L as fraction of equity
+    if equity > 0:
+        features[2] = float(daily_pnl) / float(equity)
 
     return features
 
