@@ -17987,6 +17987,172 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10Z + SIGNALS_P11A + SIGNALS_P11B + SIGNALS_P11C + SIGNALS_P11D + SIGNALS_P11E
            + SIGNALS_P11F + SIGNALS_P11G + SIGNALS_P11H + SIGNALS_P11I)
 
+# ── Phase 11J: Volume capitulation + Bollinger Bands (new frontiers) ───────────
+# Volume: entry-day high volume = capitulation panic selling → strong bounce candidate.
+# Bollinger Bands: TSLA below lower BB = statistically oversold on absolute basis.
+# These are the two major technical dimensions not yet explored.
+
+def _volume_ratio(tsla_df, i, lookback=20):
+    """Volume ratio: current day's volume vs 20-day average volume."""
+    if i < lookback:
+        return None
+    vol_now = float(tsla_df['volume'].iloc[i])
+    vol_avg = float(tsla_df['volume'].iloc[i - lookback:i].mean())
+    if vol_avg <= 0:
+        return None
+    return vol_now / vol_avg
+
+
+def _below_lower_bb(tsla_df, i, period=20, std_mult=2.0):
+    """Return True if TSLA close is below lower Bollinger Band (period, std_mult)."""
+    if i < period:
+        return False
+    closes = tsla_df['close'].iloc[i - period:i + 1]
+    mean = float(closes.mean())
+    std = float(closes.std())
+    lower_bb = mean - std_mult * std
+    close_now = float(tsla_df['close'].iloc[i])
+    return close_now < lower_bb
+
+
+def sig_s1111_s929_vol15x(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1111: S929 base + high volume (>1.5x 20d avg) — capitulation selling spike.
+    Entry-day elevated volume suggests panic selling at channel support = quality bounce."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    vr = _volume_ratio(tsla, i, lookback=20)
+    if vr is not None and vr > 1.5:
+        return 1
+    return 0
+
+
+def sig_s1112_s929_vol20x(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1112: S929 base + very high volume (>2.0x 20d avg) — extreme capitulation."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    vr = _volume_ratio(tsla, i, lookback=20)
+    if vr is not None and vr > 2.0:
+        return 1
+    return 0
+
+
+def sig_s1113_s929_vol12x(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1113: S929 base + moderate volume (>1.2x 20d avg) — above-average selling."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    vr = _volume_ratio(tsla, i, lookback=20)
+    if vr is not None and vr > 1.2:
+        return 1
+    return 0
+
+
+def sig_s1114_s929_below_bb(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1114: S929 base + TSLA below lower Bollinger Band (20d, 2σ).
+    BB breach = statistically oversold condition on absolute price basis."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _below_lower_bb(tsla, i, period=20, std_mult=2.0):
+        return 1
+    return 0
+
+
+def sig_s1115_s929_below_bb15(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1115: S929 base + TSLA below 1.5σ Bollinger Band (looser, more signals)."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _below_lower_bb(tsla, i, period=20, std_mult=1.5):
+        return 1
+    return 0
+
+
+def sig_s1116_s1041_or_vol20x(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1116: S1041 OR (S929 + extreme volume >2x) — add capitulation arm to champion.
+    Tests if extreme volume panic entries capture new 100% WR trades beyond S1041."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    return sig_s1112_s929_vol20x(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s1117_s1041_or_below_bb(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1117: S1041 OR (S929 + below lower BB) — add Bollinger Band arm to champion.
+    Absolute oversold (BB) vs relative oversold (RSI<40) may capture different bounces."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    return sig_s1114_s929_below_bb(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s1118_s929_selloff_vol15x(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1118: S929 + (3d-selloff >3% AND volume >1.5x) — panic selloff with volume confirmation.
+    Requires BOTH momentum (3d selloff) AND volume (capitulation) for dual confirmation."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 3:
+        return 0
+    c_now = float(tsla['close'].iloc[i])
+    c_3d = float(tsla['close'].iloc[i - 3])
+    if not (c_3d > 0 and (c_now - c_3d) / c_3d < -0.03):
+        return 0
+    vr = _volume_ratio(tsla, i, lookback=20)
+    if vr is not None and vr > 1.5:
+        return 1
+    return 0
+
+
+def sig_s1119_s929_bb_vol15x(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1119: S929 + (below BB AND volume >1.5x) — BB breach with capitulation volume.
+    Both technically oversold AND high selling volume = strongest panic bottom signal."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not _below_lower_bb(tsla, i, period=20, std_mult=2.0):
+        return 0
+    vr = _volume_ratio(tsla, i, lookback=20)
+    if vr is not None and vr > 1.5:
+        return 1
+    return 0
+
+
+def sig_s1120_s1041_or_bb_vol(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1120: S1041 OR (S929 + below BB + volume >1.5x) — combined capitulation arm.
+    Tests if BB+volume panic bottom adds new 100% WR trades to S1041 champion."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    return sig_s1119_s929_bb_vol15x(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+SIGNALS_P11J: List[Tuple] = [
+    ('S1111_s929_vol15x',              sig_s1111_s929_vol15x,                  10, 0.20, 50),
+    ('S1112_s929_vol20x',              sig_s1112_s929_vol20x,                  10, 0.20, 50),
+    ('S1113_s929_vol12x',              sig_s1113_s929_vol12x,                  10, 0.20, 50),
+    ('S1114_s929_below_bb',            sig_s1114_s929_below_bb,                10, 0.20, 50),
+    ('S1115_s929_below_bb15',          sig_s1115_s929_below_bb15,              10, 0.20, 50),
+    ('S1116_s1041_or_vol20x',          sig_s1116_s1041_or_vol20x,              10, 0.20, 50),
+    ('S1117_s1041_or_below_bb',        sig_s1117_s1041_or_below_bb,            10, 0.20, 50),
+    ('S1118_s929_selloff_vol15x',      sig_s1118_s929_selloff_vol15x,          10, 0.20, 50),
+    ('S1119_s929_bb_vol15x',           sig_s1119_s929_bb_vol15x,               10, 0.20, 50),
+    ('S1120_s1041_or_bb_vol',          sig_s1120_s1041_or_bb_vol,              10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E
+           + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I + SIGNALS_P10J
+           + SIGNALS_P10K + SIGNALS_P10L + SIGNALS_P10M + SIGNALS_P10N + SIGNALS_P10O
+           + SIGNALS_P10P + SIGNALS_P10Q + SIGNALS_P10R + SIGNALS_P10S + SIGNALS_P10T
+           + SIGNALS_P10U + SIGNALS_P10V + SIGNALS_P10W + SIGNALS_P10X + SIGNALS_P10Y
+           + SIGNALS_P10Z + SIGNALS_P11A + SIGNALS_P11B + SIGNALS_P11C + SIGNALS_P11D + SIGNALS_P11E
+           + SIGNALS_P11F + SIGNALS_P11G + SIGNALS_P11H + SIGNALS_P11I + SIGNALS_P11J)
+
 # ── sentinel — do not remove ──────────────────────────────────────────────────
 
 
