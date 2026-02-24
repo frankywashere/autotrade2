@@ -11144,6 +11144,132 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P9V + SIGNALS_P9W)
 
 
+# ── Phase 9X — S726 extensions: threshold sweep + precision filters (S731-S740) ──
+# S726 (weekly + 10% below 20d high, $1.68M, 9/9yr) = strong new dimension.
+# Extend: threshold sweep (5-15%), VIX filter, MACD, compression, vol_dryup.
+
+def sig_s731_s215_20d_disc5(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S731: Weekly channel support + 5%+ below 20-day high (loose threshold).
+    More trades at cost of some quality — test the coverage vs precision tradeoff."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_below_20d_high_pct(tsla, i, pct=0.05) else 0
+
+
+def sig_s732_s215_20d_disc7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S732: Weekly channel support + 7%+ below 20-day high."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_below_20d_high_pct(tsla, i, pct=0.07) else 0
+
+
+def sig_s733_s215_20d_disc15(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S733: Weekly channel support + 15%+ below 20-day high (tight threshold).
+    Only deep sharp drops onto weekly support — high-urgency exhaustion."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_below_20d_high_pct(tsla, i, pct=0.15) else 0
+
+
+def sig_s734_s726_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S734: S726 (weekly + 10% below 20d high) + VIX pct>60.
+    Apply fear-regime filter to new strong signal — expect WR boost."""
+    if sig_s726_s215_20d_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s735_s726_macd_up(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S735: S726 (weekly + 10% below 20d high) + MACD turning up.
+    Momentum starting to reverse after sharp 10%+ drop at weekly support."""
+    if sig_s726_s215_20d_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist_now  = _macd_histogram(tsla, i)
+    hist_prev = _macd_histogram(tsla, i - 1) if i > 0 else None
+    if hist_now is None or hist_prev is None:
+        return 1
+    return 1 if hist_now > hist_prev else 0
+
+
+def sig_s736_s726_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S736: S726 (weekly + 10% below 20d high) + ATR compression.
+    Volatility squeeze after sharp drop at support — classic energy-coiling setup."""
+    if sig_s726_s215_20d_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s737_s726_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S737: S726 (weekly + 10% below 20d high) + volume dry-up.
+    After sharp 10% drop at support, sellers exhausted (low vol) = best entry."""
+    if sig_s726_s215_20d_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i) else 0
+
+
+def sig_s738_s726_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S738: S726 (weekly + 10% below 20d high) + TSLA lags SPY 5%+.
+    Sharp drop at support where TSLA is underperforming SPY = stock-specific capitulation."""
+    if sig_s726_s215_20d_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s739_s726_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S739: S726 (weekly + 10% below 20d high) + 52-week high discount 10%+.
+    Combine both discount anchors: short-term (20d) and long-term (52wk) alignment."""
+    if sig_s726_s215_20d_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_below_52wk_pct(tsla, i, pct=0.10) else 0
+
+
+def sig_s740_s726_vix_macd(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S740: S726 (weekly + 10% below 20d high) + VIX pct>50 + MACD turning up.
+    Triple alignment: short-term drop + fear regime + momentum reversal."""
+    if sig_s726_s215_20d_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not _vix_elevated_pct(vix, i, window=252, pct=0.50):
+        return 0
+    hist_now  = _macd_histogram(tsla, i)
+    hist_prev = _macd_histogram(tsla, i - 1) if i > 0 else None
+    if hist_now is None or hist_prev is None:
+        return 1
+    return 1 if hist_now > hist_prev else 0
+
+
+SIGNALS_P9X: List[Tuple] = [
+    # Phase 9X — S726 extensions: threshold sweep + precision filters (S731-S740)
+    ('S731_s215_20d_disc5',      sig_s731_s215_20d_disc5,      10, 0.20, 50),
+    ('S732_s215_20d_disc7',      sig_s732_s215_20d_disc7,      10, 0.20, 50),
+    ('S733_s215_20d_disc15',     sig_s733_s215_20d_disc15,     10, 0.20, 50),
+    ('S734_s726_vix_pct60',      sig_s734_s726_vix_pct60,      10, 0.20, 50),
+    ('S735_s726_macd_up',        sig_s735_s726_macd_up,        10, 0.20, 50),
+    ('S736_s726_compressed',     sig_s736_s726_compressed,     10, 0.20, 50),
+    ('S737_s726_vol_dryup',      sig_s737_s726_vol_dryup,      10, 0.20, 50),
+    ('S738_s726_lag5pct',        sig_s738_s726_lag5pct,        10, 0.20, 50),
+    ('S739_s726_52wk_disc10',    sig_s739_s726_52wk_disc10,    10, 0.20, 50),
+    ('S740_s726_vix_macd',       sig_s740_s726_vix_macd,       10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T + SIGNALS_P9U
+           + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
