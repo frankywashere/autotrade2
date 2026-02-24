@@ -15050,6 +15050,206 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10U + SIGNALS_P10V)
 
 
+# ── Phase 10W — Maximum 100% WR union + RSI + intraday close strength (S981-S990) ──
+
+def sig_s981_s931_or_s979(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S981: S931 OR S979 — union of all known 100% WR conditions on S929.
+    Fires if S929 AND (lag5pct OR 3d-selloff3% OR SPY-20d-up).
+    Hypothesis: 100% WR with n=18-20 — the maximum 100% WR subset of S929."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    # Condition 1: TSLA lagging SPY by ≥5% over 20 days
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    # Condition 2: 3-day TSLA selloff ≥ 3%
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    # Condition 3: SPY 20-day positive (market recovering)
+    if i >= 20:
+        spy_now = float(spy['close'].iloc[i])
+        spy_20d = float(spy['close'].iloc[i - 20])
+        if spy_20d > 0 and spy_now > spy_20d:
+            return 1
+    return 0
+
+
+def sig_s982_s929_close_above_mid(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S982: S929 + close in upper 50% of day's range (not panic close).
+    Intraday close strength: close >= midpoint means buyers absorbed selling.
+    Hypothesis: slightly higher WR — strong close = buyers in control."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    h = float(tsla['high'].iloc[i])
+    l = float(tsla['low'].iloc[i])
+    c = float(tsla['close'].iloc[i])
+    if h <= l:
+        return 1
+    return 1 if c >= (h + l) / 2 else 0
+
+
+def sig_s983_s929_close_below_mid(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S983: S929 + close in lower 50% of day's range (weak/panic close).
+    Tests if weak intraday close (still selling at end of day) matters.
+    Hypothesis: anti-signal or neutral — might be better (shakeout before reversal)."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    h = float(tsla['high'].iloc[i])
+    l = float(tsla['low'].iloc[i])
+    c = float(tsla['close'].iloc[i])
+    if h <= l:
+        return 1
+    return 1 if c < (h + l) / 2 else 0
+
+
+def sig_s984_s929_rsi_lt30(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S984: S929 + RSI < 30 (deeply oversold).
+    RSI is passed as 'rt' (pre-computed series).
+    Hypothesis: RSI<30 is too deep oversold — might indicate broken trend, anti-signal."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    rsi = float(rt.iloc[i])
+    return 1 if rsi < 30 else 0
+
+
+def sig_s985_s929_rsi_30_50(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S985: S929 + RSI between 30 and 50 (pullback but not extreme).
+    Tests if moderate RSI oversold (not panic) is the quality zone.
+    Hypothesis: WR > S929 — moderate pullback to structural support = best entries."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    rsi = float(rt.iloc[i])
+    return 1 if 30 <= rsi < 50 else 0
+
+
+def sig_s986_s981_rsi_lt50(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S986: S981 (max 100% WR union) + RSI < 50 (not overbought).
+    Tests if RSI gate further cleans the union path.
+    Hypothesis: same count (all S981 trades likely have RSI<50 already)."""
+    if sig_s981_s931_or_s979(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    rsi = float(rt.iloc[i])
+    return 1 if rsi < 50 else 0
+
+
+def sig_s987_s979_close_above_mid(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S987: S979 (100% WR union) + strong intraday close (close >= midpoint).
+    Tests intraday close on the precision 100% WR path.
+    Hypothesis: same or fewer trades, WR stays 100%."""
+    if sig_s979_s963_or_s968(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    h = float(tsla['high'].iloc[i])
+    l = float(tsla['low'].iloc[i])
+    c = float(tsla['close'].iloc[i])
+    if h <= l:
+        return 1
+    return 1 if c >= (h + l) / 2 else 0
+
+
+def sig_s988_s929_weekly_low_week(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S988: S929 + price near weekly low (close within bottom 15% of current week's range).
+    Within-week capitulation at structural support.
+    Hypothesis: more precise timing — price at weekly lows within the setup."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    # Find current week's high/low using daily data (look back up to 5 bars for Mon-Fri)
+    # Get the Monday of the current week
+    if i < 4:
+        return 1
+    daily_date = tsla.index[i]
+    dow = daily_date.dayofweek  # 0=Mon, 4=Fri
+    week_start = i - dow  # Go back to Monday
+    if week_start < 0:
+        week_start = 0
+    week_high = float(tsla['high'].iloc[week_start:i + 1].max())
+    week_low = float(tsla['low'].iloc[week_start:i + 1].min())
+    c = float(tsla['close'].iloc[i])
+    rng = week_high - week_low
+    if rng <= 0:
+        return 1
+    # Close in bottom 15% of week's range
+    return 1 if (c - week_low) / rng < 0.15 else 0
+
+
+def sig_s989_s929_weekly_open_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S989: S929 + open is below prior day's close (gap down today).
+    Gap-down open at structural support = fear-driven selling.
+    Hypothesis: gap down = immediate capitulation signal, WR ≥ 95%."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 1:
+        return 0
+    o_today = float(tsla['open'].iloc[i])
+    c_yesterday = float(tsla['close'].iloc[i - 1])
+    return 1 if o_today < c_yesterday * 0.995 else 0  # gap down > 0.5%
+
+
+def sig_s990_milestone_max_100pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S990 MILESTONE: Extended S981 adding gap-down condition.
+    S929 + (lag5pct OR 3d-selloff OR SPY-20d-up OR gap-down).
+    Hypothesis: 100% WR with n=19-20 — approaching maximum 100% WR set."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    # Condition 1: lag5pct
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    # Condition 2: 3-day selloff ≥ 3%
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    # Condition 3: SPY 20-day positive
+    if i >= 20:
+        spy_now = float(spy['close'].iloc[i])
+        spy_20d = float(spy['close'].iloc[i - 20])
+        if spy_20d > 0 and spy_now > spy_20d:
+            return 1
+    # Condition 4: gap-down open (> 0.5% below prior close)
+    if i >= 1:
+        o_today = float(tsla['open'].iloc[i])
+        c_yesterday = float(tsla['close'].iloc[i - 1])
+        if o_today < c_yesterday * 0.995:
+            return 1
+    return 0
+
+
+SIGNALS_P10W: List[Tuple] = [
+    # Phase 10W — Maximum 100% WR union + RSI + intraday/weekly close (S981-S990)
+    ('S981_s931_or_s979',          sig_s981_s931_or_s979,           10, 0.20, 50),
+    ('S982_s929_close_above_mid',  sig_s982_s929_close_above_mid,   10, 0.20, 50),
+    ('S983_s929_close_below_mid',  sig_s983_s929_close_below_mid,   10, 0.20, 50),
+    ('S984_s929_rsi_lt30',         sig_s984_s929_rsi_lt30,          10, 0.20, 50),
+    ('S985_s929_rsi_30_50',        sig_s985_s929_rsi_30_50,         10, 0.20, 50),
+    ('S986_s981_rsi_lt50',         sig_s986_s981_rsi_lt50,          10, 0.20, 50),
+    ('S987_s979_close_above_mid',  sig_s987_s979_close_above_mid,   10, 0.20, 50),
+    ('S988_s929_weekly_low_week',  sig_s988_s929_weekly_low_week,   10, 0.20, 50),
+    ('S989_s929_gap_down',         sig_s989_s929_weekly_open_down,  10, 0.20, 50),
+    ('S990_milestone_max_100pct',  sig_s990_milestone_max_100pct,   10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E
+           + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I + SIGNALS_P10J
+           + SIGNALS_P10K + SIGNALS_P10L + SIGNALS_P10M + SIGNALS_P10N + SIGNALS_P10O
+           + SIGNALS_P10P + SIGNALS_P10Q + SIGNALS_P10R + SIGNALS_P10S + SIGNALS_P10T
+           + SIGNALS_P10U + SIGNALS_P10V + SIGNALS_P10W)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
