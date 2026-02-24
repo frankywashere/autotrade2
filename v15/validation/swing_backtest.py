@@ -8370,6 +8370,226 @@ SIGNALS_P8Z: List[Tuple] = [
     ('S500_milestone_vix_nr7',   sig_s500_milestone_vix_pct_nr7, 10, 0.20, 50),
 ]
 
+# ── Phase 9A — Volume dry-up extensions + inside bar pattern ──────────────────
+# S495 (vol dry-up at weekly support) = 100% WR, n=9, 6/6yr, $842K — BREAKTHROUGH.
+# Extend into: compressed, NR7, VIX regimes, SPY momentum, MACD.
+# Add inside bar (today's range inside yesterday's) as new dimension.
+
+def _inside_bar(tsla, i) -> bool:
+    """Today's high-low range is entirely within yesterday's high-low (inside bar).
+    Extreme compression: market participants unwilling to extend range either direction."""
+    if i < 1:
+        return False
+    today_high = float(tsla['high'].iloc[i])
+    today_low  = float(tsla['low'].iloc[i])
+    prev_high  = float(tsla['high'].iloc[i - 1])
+    prev_low   = float(tsla['low'].iloc[i - 1])
+    return today_high <= prev_high and today_low >= prev_low
+
+
+def sig_s501_s495_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S501: S495 (vol dry-up + weekly support) + ATR compression.
+    Double quiet: low volume AND tight range = maximum capitulation signature."""
+    if sig_s495_s215_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s502_s495_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S502: S495 (vol dry-up + weekly support) + NR7.
+    Volume quiet AND range at 7d minimum = extreme dual compression."""
+    if sig_s495_s215_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr7(tsla, i) else 0
+
+
+def sig_s503_s333_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S503: S333 (MACD turning at weekly support) + below-average volume.
+    MACD momentum shift on quiet day = institutional buying without fanfare."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i, mult=0.70) else 0
+
+
+def sig_s504_s407_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S504: S407 (VIX pct>70 + weekly support, $1.45M) + below-average volume.
+    Fear regime + quiet capitulation = sellers exhausted in high-fear environment."""
+    if sig_s407_s215_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i, mult=0.70) else 0
+
+
+def sig_s505_s477_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S505: S477 (SPY momentum + weekly support) + below-average volume.
+    SPY building + TSLA quiet at support = low-key divergence before catch-up."""
+    if sig_s477_s215_spy_momentum(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i, mult=0.70) else 0
+
+
+def sig_s506_s464_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S506: S464 (SPY>200MA + weekly support, $1.04M) + below-average volume.
+    Bull regime + quiet accumulation at support = low-noise institutional entry."""
+    if sig_s464_s215_spy_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i, mult=0.70) else 0
+
+
+def sig_s507_s495_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S507: S495 (vol dry-up + weekly support) + VIX pct>70.
+    Triple: quiet accumulation + macro fear + multi-TF support."""
+    if sig_s495_s215_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.70) else 0
+
+
+def sig_s508_s495_spy_momentum(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S508: S495 (vol dry-up + weekly support) + SPY near 10d high.
+    Volume capitulation + SPY building = perfect divergence: TSLA silent, SPY loud."""
+    if sig_s495_s215_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _spy_new_nd_high(spy, i, n=10) else 0
+
+
+def sig_s509_s215_inside_bar(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S509: S215 (weekly support) + inside bar (today's range inside yesterday's).
+    NEW: inside bar at weekly support = ultimate range compression before reversal."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _inside_bar(tsla, i) else 0
+
+
+def sig_s510_s495_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S510: S495 (vol dry-up + weekly support) + TSLA above 200d MA.
+    Quiet accumulation in bull uptrend = institutions adding in best context."""
+    if sig_s495_s215_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 0
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if float(tsla['close'].iloc[i]) > ma200 else 0
+
+
+SIGNALS_P9A: List[Tuple] = [
+    # Phase 9A — Vol dry-up extensions + inside bar (S501-S510)
+    ('S501_s495_compressed',     sig_s501_s495_compressed,     10, 0.20, 50),
+    ('S502_s495_nr7',            sig_s502_s495_nr7,            10, 0.20, 50),
+    ('S503_s333_vol_dryup',      sig_s503_s333_vol_dryup,      10, 0.20, 50),
+    ('S504_s407_vol_dryup',      sig_s504_s407_vol_dryup,      10, 0.20, 50),
+    ('S505_s477_vol_dryup',      sig_s505_s477_vol_dryup,      10, 0.20, 50),
+    ('S506_s464_vol_dryup',      sig_s506_s464_vol_dryup,      10, 0.20, 50),
+    ('S507_s495_vix_pct70',      sig_s507_s495_vix_pct70,      10, 0.20, 50),
+    ('S508_s495_spy_momentum',   sig_s508_s495_spy_momentum,   10, 0.20, 50),
+    ('S509_s215_inside_bar',     sig_s509_s215_inside_bar,     10, 0.20, 50),
+    ('S510_s495_above200ma',     sig_s510_s495_above200ma,     10, 0.20, 50),
+]
+
+# ── Phase 9B — Inside bar extensions + 4-way compression combos ───────────────
+# S509 (inside bar at weekly support) = 83% WR, 4/5yr — good new dimension.
+# Extend inside bar with every strong filter. Also test 4-way extreme compression.
+
+def sig_s511_s509_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S511: S509 (inside bar + weekly support) + ATR compression.
+    Double compression: today's range inside yesterday's AND tight vs 20d ATR."""
+    if sig_s509_s215_inside_bar(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s512_s509_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S512: S509 (inside bar + weekly support) + NR7.
+    Inside bar AND narrowest range in 7 days = maximum range compression signal."""
+    if sig_s509_s215_inside_bar(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr7(tsla, i) else 0
+
+
+def sig_s513_s509_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S513: S509 (inside bar + weekly support) + volume dry-up.
+    Inside bar + quiet volume = range AND volume both compressed simultaneously."""
+    if sig_s509_s215_inside_bar(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i, mult=0.70) else 0
+
+
+def sig_s514_s333_inside_bar(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S514: S333 (MACD turning) + inside bar.
+    MACD inflection + inside bar = momentum shift signaled under maximum compression."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _inside_bar(tsla, i) else 0
+
+
+def sig_s515_s407_inside_bar(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S515: S407 (VIX pct>70 + weekly support, $1.45M) + inside bar.
+    Sustained fear + inside bar compression = coiled fear spring."""
+    if sig_s407_s215_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _inside_bar(tsla, i) else 0
+
+
+def sig_s516_s477_inside_bar(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S516: S477 (SPY momentum + weekly support) + inside bar.
+    SPY at 10d high + TSLA inside bar = SPY breaking out while TSLA compresses."""
+    if sig_s477_s215_spy_momentum(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _inside_bar(tsla, i) else 0
+
+
+def sig_s517_s464_inside_bar(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S517: S464 (SPY>200MA + weekly support, $1.04M) + inside bar.
+    Bull macro regime + inside bar compression at support."""
+    if sig_s464_s215_spy_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _inside_bar(tsla, i) else 0
+
+
+def sig_s518_s495_inside_bar(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S518: S495 (vol dry-up + weekly support) + inside bar.
+    Volume quiet AND range inside yesterday = BOTH volume and price fully compressed."""
+    if sig_s495_s215_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _inside_bar(tsla, i) else 0
+
+
+def sig_s519_s509_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S519: S509 (inside bar + weekly support) + VIX pct>60.
+    Inside bar compression + broad fear regime = coiled spring in fear environment."""
+    if sig_s509_s215_inside_bar(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s520_s501_inside_bar(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S520: S501 (vol dry-up + weekly support + ATR compressed) + inside bar.
+    4-way extreme: ATR compression + volume quiet + inside bar + weekly support."""
+    if sig_s501_s495_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _inside_bar(tsla, i) else 0
+
+
+SIGNALS_P9B: List[Tuple] = [
+    # Phase 9B — Inside bar extensions + 4-way compression (S511-S520)
+    ('S511_s509_compressed',     sig_s511_s509_compressed,     10, 0.20, 50),
+    ('S512_s509_nr7',            sig_s512_s509_nr7,            10, 0.20, 50),
+    ('S513_s509_vol_dryup',      sig_s513_s509_vol_dryup,      10, 0.20, 50),
+    ('S514_s333_inside_bar',     sig_s514_s333_inside_bar,     10, 0.20, 50),
+    ('S515_s407_inside_bar',     sig_s515_s407_inside_bar,     10, 0.20, 50),
+    ('S516_s477_inside_bar',     sig_s516_s477_inside_bar,     10, 0.20, 50),
+    ('S517_s464_inside_bar',     sig_s517_s464_inside_bar,     10, 0.20, 50),
+    ('S518_s495_inside_bar',     sig_s518_s495_inside_bar,     10, 0.20, 50),
+    ('S519_s509_vix_pct60',      sig_s519_s509_vix_pct60,      10, 0.20, 50),
+    ('S520_s501_inside_bar',     sig_s520_s501_inside_bar,     10, 0.20, 50),
+]
+
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
            + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
            + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
@@ -8378,7 +8598,7 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
            + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
            + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
-           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z)
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B)
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
