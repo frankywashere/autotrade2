@@ -8738,6 +8738,117 @@ SIGNALS_P9C: List[Tuple] = [
     ('S530_s407_rsi_rising',     sig_s530_s407_rsi_rising,     10, 0.20, 50),
 ]
 
+# ── Phase 9D — VIX cooldown extensions + breakout prediction ──────────────────
+# S526 ($1.079M) and S522 (90% WR) confirmed VIX cooldown is highly predictive.
+# Extend: VIX cooldown + NR7 + vol_dryup 3-ways; breakout prediction (upper channel).
+# Also test shorter and longer VIX cooldown lookbacks.
+
+def sig_s531_s526_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S531: S526 (MACD+VIX cooldown, $1.079M) + ATR compression.
+    MACD turning + VIX fear receding + price still coiled = triple convergence."""
+    if sig_s526_s333_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s532_s526_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S532: S526 (MACD+VIX cooldown) + NR7.
+    MACD + VIX cooldown + narrowest range = all convergence signals firing."""
+    if sig_s526_s333_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr7(tsla, i) else 0
+
+
+def sig_s533_s526_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S533: S526 (MACD+VIX cooldown) + volume dry-up.
+    MACD momentum shift + VIX fear receding + quiet accumulation = ideal entry."""
+    if sig_s526_s333_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i, mult=0.70) else 0
+
+
+def sig_s534_s526_rsi_rising(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S534: S526 (MACD+VIX cooldown) + RSI rising.
+    3-way: MACD turning + VIX receding + RSI accelerating = max momentum signal."""
+    if sig_s526_s333_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _rsi_rising(rt, i, lookback=3, min_rsi=35.0) else 0
+
+
+def sig_s535_s407_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S535: S407 (VIX pct>70 + weekly support, $1.45M) + VIX now cooling.
+    Was in top 30% fear, now receding — catches the exact transition point.
+    Hypothesis: VIX pct70 is a sustained fear filter; adding cooldown = better timing."""
+    if sig_s407_s215_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_was_elevated_now_cooling(vix, i) else 0
+
+
+def sig_s536_s464_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S536: S464 (SPY>200MA + weekly support, $1.04M) + VIX cooldown.
+    Bull regime + VIX fear receding = risk-on rotation into underperforming TSLA."""
+    if sig_s464_s215_spy_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_was_elevated_now_cooling(vix, i) else 0
+
+
+def sig_s537_s495_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S537: S495 (vol dry-up + weekly support, 100% WR) + VIX cooldown.
+    Volume already quiet + VIX cooling confirms sellers fully exhausted."""
+    if sig_s495_s215_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_was_elevated_now_cooling(vix, i) else 0
+
+
+def sig_s538_s522_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S538: S522 (VIX cooldown + RSI rising + weekly support) + NR7.
+    4-way: x18 core finding + narrowest range = maximum precision entry."""
+    if sig_s522_s521_rsi_rising(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr7(tsla, i) else 0
+
+
+def sig_s539_s522_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S539: S522 (VIX cooldown + RSI rising + weekly support) + ATR compression.
+    x18 finding + ATR coiled = double momentum + compression confirmation."""
+    if sig_s522_s521_rsi_rising(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s540_s526_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S540: S526 (MACD+VIX cooldown, $1.079M) + TSLA above 200d MA.
+    Best cooldown signal restricted to bull uptrend only — avoids bear-market traps."""
+    if sig_s526_s333_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 0
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if float(tsla['close'].iloc[i]) > ma200 else 0
+
+
+SIGNALS_P9D: List[Tuple] = [
+    # Phase 9D — VIX cooldown extensions (S531-S540)
+    ('S531_s526_compressed',     sig_s531_s526_compressed,     10, 0.20, 50),
+    ('S532_s526_nr7',            sig_s532_s526_nr7,            10, 0.20, 50),
+    ('S533_s526_vol_dryup',      sig_s533_s526_vol_dryup,      10, 0.20, 50),
+    ('S534_s526_rsi_rising',     sig_s534_s526_rsi_rising,     10, 0.20, 50),
+    ('S535_s407_vix_cooldown',   sig_s535_s407_vix_cooldown,   10, 0.20, 50),
+    ('S536_s464_vix_cooldown',   sig_s536_s464_vix_cooldown,   10, 0.20, 50),
+    ('S537_s495_vix_cooldown',   sig_s537_s495_vix_cooldown,   10, 0.20, 50),
+    ('S538_s522_nr7',            sig_s538_s522_nr7,            10, 0.20, 50),
+    ('S539_s522_compressed',     sig_s539_s522_compressed,     10, 0.20, 50),
+    ('S540_s526_above200ma',     sig_s540_s526_above200ma,     10, 0.20, 50),
+]
+
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
            + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
            + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
@@ -8746,7 +8857,8 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
            + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
            + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
-           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C)
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D)
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
