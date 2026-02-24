@@ -3215,6 +3215,182 @@ def show_channel_surfer_tab(
                         st.plotly_chart(fig_mfe, use_container_width=True)
 
 
+def show_model_comparisons_tab():
+    """Read all model tags from the shared Gist and show a side-by-side performance comparison."""
+    import json
+    import urllib.request
+    import os
+
+    st.header("Model Comparisons")
+    st.caption("Reads the shared Gist to compare live performance across all branches. Refreshes every hour.")
+
+    # --- Load Gist credentials ---
+    gist_id, github_token = '', ''
+    try:
+        gist_id = st.secrets.get('GIST_ID', '')
+        github_token = st.secrets.get('GITHUB_TOKEN', '')
+    except Exception:
+        pass
+    if not gist_id:
+        gist_id = os.environ.get('GIST_ID', '')
+        github_token = os.environ.get('GITHUB_TOKEN', '')
+
+    if not gist_id or not github_token:
+        st.warning("No Gist credentials found (GIST_ID / GITHUB_TOKEN). Add them to .streamlit/secrets.toml or environment variables.")
+        return
+
+    # --- Fetch full Gist ---
+    full_data = {}
+    try:
+        headers = {
+            'Authorization': f'token {github_token}',
+            'Accept': 'application/vnd.github.v3+json',
+        }
+        url = f'https://api.github.com/gists/{gist_id}'
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            gist_data = json.loads(resp.read().decode())
+        content = gist_data.get('files', {}).get('surfer_scanner_state.json', {}).get('content', '')
+        if content:
+            full_data = json.loads(content)
+    except Exception as e:
+        st.error(f"Failed to load Gist: {e}")
+        return
+
+    # Filter to model keys only (skip metadata keys like _last_updated)
+    model_keys = [k for k in full_data if not k.startswith('_')]
+    if not model_keys:
+        st.info("No model data in Gist yet. Start a live scanner session to populate it.")
+        return
+
+    last_updated = full_data.get('_last_updated', 'unknown')
+    st.caption(f"Gist last updated: {last_updated}")
+
+    # --- Compute stats per model ---
+    def compute_stats(mdata: dict) -> dict:
+        trades = mdata.get('closed_trades', [])
+        equity = mdata.get('equity', 100_000.0)
+        positions = mdata.get('positions', {})
+        if not trades:
+            return {
+                'equity': equity, 'total_pnl': 0.0, 'n_trades': 0,
+                'win_rate': 0.0, 'avg_pnl': 0.0, 'best_trade': 0.0,
+                'worst_trade': 0.0, 'avg_hold_min': 0.0,
+                'open_positions': len(positions), 'trades': [],
+            }
+        pnls = [t['pnl'] for t in trades]
+        wins = [p for p in pnls if p > 0]
+        holds = [t.get('hold_minutes', 0) for t in trades]
+        return {
+            'equity': equity,
+            'total_pnl': sum(pnls),
+            'n_trades': len(trades),
+            'win_rate': len(wins) / len(pnls),
+            'avg_pnl': sum(pnls) / len(pnls),
+            'best_trade': max(pnls),
+            'worst_trade': min(pnls),
+            'avg_hold_min': sum(holds) / len(holds) if holds else 0.0,
+            'open_positions': len(positions),
+            'trades': trades,
+        }
+
+    stats = {k: compute_stats(full_data[k]) for k in model_keys}
+
+    # --- Summary table ---
+    st.subheader("Summary")
+    rows = []
+    for tag, s in stats.items():
+        rows.append({
+            'Model': tag,
+            'Equity': f"${s['equity']:,.0f}",
+            'Total P&L': f"${s['total_pnl']:+,.0f}",
+            'Trades': s['n_trades'],
+            'Win Rate': f"{s['win_rate']:.1%}" if s['n_trades'] > 0 else '—',
+            'Avg P&L': f"${s['avg_pnl']:+,.0f}" if s['n_trades'] > 0 else '—',
+            'Best Trade': f"${s['best_trade']:+,.0f}" if s['n_trades'] > 0 else '—',
+            'Worst Trade': f"${s['worst_trade']:+,.0f}" if s['n_trades'] > 0 else '—',
+            'Avg Hold': f"{s['avg_hold_min']:.0f} min" if s['n_trades'] > 0 else '—',
+            'Open': s['open_positions'],
+        })
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    # --- Equity curves ---
+    any_trades = any(s['n_trades'] > 0 for s in stats.values())
+    if any_trades:
+        st.subheader("Equity Curves")
+        try:
+            import plotly.graph_objects as go
+            fig = go.Figure()
+            colors = ['#00c853', '#2196f3', '#ff9800', '#e91e63', '#9c27b0']
+            for i, (tag, s) in enumerate(stats.items()):
+                trades = sorted(s['trades'], key=lambda t: t.get('exit_time', ''))
+                if not trades:
+                    continue
+                initial = 100_000.0
+                times, equity_vals = [], []
+                running = initial
+                for t in trades:
+                    running += t['pnl']
+                    times.append(t.get('exit_time', ''))
+                    equity_vals.append(running)
+                color = colors[i % len(colors)]
+                fig.add_trace(go.Scatter(
+                    x=times, y=equity_vals, name=tag,
+                    mode='lines+markers', line=dict(color=color, width=2),
+                    marker=dict(size=4),
+                    hovertemplate=f'<b>{tag}</b><br>%{{x}}<br>Equity: $%{{y:,.0f}}<extra></extra>',
+                ))
+            fig.update_layout(
+                template='plotly_dark',
+                xaxis_title='Exit Time',
+                yaxis_title='Equity ($)',
+                legend=dict(orientation='h', yanchor='bottom', y=1.02),
+                margin=dict(l=60, r=20, t=40, b=40),
+                height=400,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.warning(f"Equity chart unavailable: {e}")
+
+    # --- Recent trades per model ---
+    st.subheader("Recent Trades")
+    cols = st.columns(len(model_keys))
+    for col, tag in zip(cols, model_keys):
+        s = stats[tag]
+        with col:
+            st.markdown(f"**{tag}**")
+            trades = sorted(s['trades'], key=lambda t: t.get('exit_time', ''), reverse=True)[:10]
+            if not trades:
+                st.caption("No trades yet")
+                continue
+            for t in trades:
+                pnl = t['pnl']
+                color = '#00c853' if pnl >= 0 else '#ff5252'
+                col.markdown(
+                    f"<div style='font-size:12px;border-left:3px solid {color};"
+                    f"padding:3px 8px;margin:2px 0;'>"
+                    f"<b style='color:{color}'>${pnl:+,.0f}</b> "
+                    f"<span style='color:#888'>{t.get('exit_reason','?')} · "
+                    f"{t.get('hold_minutes',0):.0f}m</span></div>",
+                    unsafe_allow_html=True,
+                )
+
+    # --- Open positions ---
+    open_models = [(tag, full_data[tag].get('positions', {})) for tag in model_keys
+                   if full_data[tag].get('positions')]
+    if open_models:
+        st.subheader("Open Positions")
+        for tag, positions in open_models:
+            st.markdown(f"**{tag}** — {len(positions)} open")
+            for pos_id, pos in positions.items():
+                direction_icon = '🟢' if pos.get('direction') == 'long' else '🔴'
+                st.caption(
+                    f"{direction_icon} {pos_id} | Entry ${pos.get('entry_price', 0):.2f} | "
+                    f"TP ${pos.get('tp_price', 0):.2f} | Stop ${pos.get('stop_price', 0):.2f} | "
+                    f"Notional ${pos.get('notional', 0):,.0f}"
+                )
+
+
 def main():
     st.title("X23 Channel Break Predictor")
 
@@ -3363,6 +3539,7 @@ def main():
         "Data Explorer",
         "Trading Monitor",
         "Channel Surfer",
+        "Model Comparisons",
     ]
     if 'active_tab' not in st.session_state:
         st.session_state['active_tab'] = _TAB_NAMES[0]
@@ -4003,6 +4180,10 @@ def main():
             current_spy=current_spy,
             current_vix=current_vix,
         )
+
+    elif selected_tab == "Model Comparisons":
+        st_autorefresh(interval=3_600_000, key="model_comparisons_refresh")
+        show_model_comparisons_tab()
 
 
 if __name__ == "__main__":
