@@ -14706,6 +14706,174 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10P + SIGNALS_P10Q + SIGNALS_P10R + SIGNALS_P10S + SIGNALS_P10T)
 
 
+# ── Phase 10U — S955 extensions + SPY recovery + 20d low + selloff sweep (S961-S970) ──
+
+def sig_s961_s955_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S961: S955 (S929 + 3d selloff) + lag5pct.
+    Combines two 100% WR conditions: recent sharp selloff + momentum lag.
+    Hypothesis: 100% WR, very few but ultra-high-quality trades."""
+    if sig_s955_s929_tsla_3d_selloff(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s962_s955_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S962: S955 (S929 + 3d selloff) + VIX pct>60.
+    Acute selloff at structural support + elevated VIX (external fear).
+    Hypothesis: 100% WR, fewer trades than S955 (n=9)."""
+    if sig_s955_s929_tsla_3d_selloff(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s963_s929_3d_selloff3pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S963: S929 + 3-day return < -3% (more permissive selloff threshold).
+    Compare to S955 (< -5%): does a shallower 3-day drop still indicate quality bounce?
+    Hypothesis: more trades than S955, slightly lower WR."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 3:
+        return 0
+    c_now = float(tsla['close'].iloc[i])
+    c_3d = float(tsla['close'].iloc[i - 3])
+    if c_3d <= 0:
+        return 0
+    return 1 if (c_now - c_3d) / c_3d < -0.03 else 0
+
+
+def sig_s964_s929_spy_5d_up2pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S964: S929 + SPY 5-day return > +2% (meaningful market recovery).
+    Market meaningfully recovered from recent lows while TSLA still lagged.
+    Compare to S959 (any positive 5d SPY return): does a 2%+ threshold matter?"""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 0
+    spy_now = float(spy['close'].iloc[i])
+    spy_5d = float(spy['close'].iloc[i - 5])
+    if spy_5d <= 0:
+        return 0
+    return 1 if (spy_now - spy_5d) / spy_5d > 0.02 else 0
+
+
+def sig_s965_s931_3d_selloff(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S965: S931 (S929+lag5pct) + 3-day selloff < -5%.
+    Triple condition: structural support + squeeze + lag + acute panic.
+    Hypothesis: 100% WR, fewer than S955's 9 but highest individual trade quality."""
+    if sig_s931_s929_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 3:
+        return 0
+    c_now = float(tsla['close'].iloc[i])
+    c_3d = float(tsla['close'].iloc[i - 3])
+    if c_3d <= 0:
+        return 0
+    return 1 if (c_now - c_3d) / c_3d < -0.05 else 0
+
+
+def sig_s966_s929_new_10d_low(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S966: S929 + today's close is a new 10-day low.
+    Fresh capitulation low at structural support = forced seller exhaustion.
+    Hypothesis: WR ≥ 94%, fewer trades — new low = maximum fear at support."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 0
+    c_now = float(tsla['close'].iloc[i])
+    prior_min = float(tsla['close'].iloc[i - 10:i].min())
+    return 1 if c_now <= prior_min else 0
+
+
+def sig_s967_s931_new_10d_low(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S967: S931 (4-chan+compressed+lag5pct) + new 10-day low.
+    Lag + new low at structural support = extremely oversold quality bounce.
+    Hypothesis: 100% WR, very few but extraordinary setups."""
+    if sig_s931_s929_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 0
+    c_now = float(tsla['close'].iloc[i])
+    prior_min = float(tsla['close'].iloc[i - 10:i].min())
+    return 1 if c_now <= prior_min else 0
+
+
+def sig_s968_s929_spy_20d_up(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S968: S929 + SPY 20-day return positive (longer market recovery).
+    SPY has recovered over 20 days while TSLA hasn't — longer divergence.
+    Hypothesis: WR ≥ 94%, covers more of the lag5pct scenarios."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 20:
+        return 0
+    spy_now = float(spy['close'].iloc[i])
+    spy_20d = float(spy['close'].iloc[i - 20])
+    if spy_20d <= 0:
+        return 0
+    return 1 if spy_now > spy_20d else 0
+
+
+def sig_s969_s929_yesterday_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S969: S929 + TSLA closed down yesterday (still selling pressure).
+    Price at structural support after another down day = fresh seller capitulation.
+    Hypothesis: more selective version of S929, higher WR."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 1:
+        return 0
+    c_yesterday = float(tsla['close'].iloc[i - 1])
+    o_yesterday = float(tsla['open'].iloc[i - 1])
+    return 1 if c_yesterday < o_yesterday else 0
+
+
+def sig_s970_milestone_s929_2d_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S970 MILESTONE: S929 + 2 consecutive down days (yesterday AND day before).
+    Two straight red days at structural support = persistent selling before bounce.
+    Hypothesis: WR ≥ 95%, the 2-day selling exhaustion sets up the cleanest bounces."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 2:
+        return 0
+    c1 = float(tsla['close'].iloc[i - 1])
+    o1 = float(tsla['open'].iloc[i - 1])
+    c2 = float(tsla['close'].iloc[i - 2])
+    o2 = float(tsla['open'].iloc[i - 2])
+    return 1 if (c1 < o1 and c2 < o2) else 0
+
+
+SIGNALS_P10U: List[Tuple] = [
+    # Phase 10U — S955 extensions + SPY recovery + new 10d low + selloff sweep (S961-S970)
+    ('S961_s955_lag5pct',          sig_s961_s955_lag5pct,           10, 0.20, 50),
+    ('S962_s955_vix_pct60',        sig_s962_s955_vix_pct60,         10, 0.20, 50),
+    ('S963_s929_3d_selloff3pct',   sig_s963_s929_3d_selloff3pct,    10, 0.20, 50),
+    ('S964_s929_spy5d_up2pct',     sig_s964_s929_spy_5d_up2pct,     10, 0.20, 50),
+    ('S965_s931_3d_selloff',       sig_s965_s931_3d_selloff,        10, 0.20, 50),
+    ('S966_s929_new_10d_low',      sig_s966_s929_new_10d_low,       10, 0.20, 50),
+    ('S967_s931_new_10d_low',      sig_s967_s931_new_10d_low,       10, 0.20, 50),
+    ('S968_s929_spy_20d_up',       sig_s968_s929_spy_20d_up,        10, 0.20, 50),
+    ('S969_s929_yesterday_down',   sig_s969_s929_yesterday_down,    10, 0.20, 50),
+    ('S970_milestone_s929_2ddown', sig_s970_milestone_s929_2d_down, 10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E
+           + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I + SIGNALS_P10J
+           + SIGNALS_P10K + SIGNALS_P10L + SIGNALS_P10M + SIGNALS_P10N + SIGNALS_P10O
+           + SIGNALS_P10P + SIGNALS_P10Q + SIGNALS_P10R + SIGNALS_P10S + SIGNALS_P10T
+           + SIGNALS_P10U)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
