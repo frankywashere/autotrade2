@@ -3395,7 +3395,7 @@ def show_model_comparisons_tab():
 
 
 def main():
-    st.title("X23 Channel Break Predictor — c10")
+    st.title("X23 Channel Break Predictor — c11")
 
     # Sidebar config
     st.sidebar.header("Configuration")
