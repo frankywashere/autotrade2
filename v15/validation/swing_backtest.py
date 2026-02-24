@@ -11675,6 +11675,174 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10A)
 
 
+# ── Phase 10B — BB compression + 3-day RSI + 50MA context + S778 max-precision (S771-S780) ──
+# Explore: Bollinger Band width compression, 3-day RSI extremes, 50d MA context,
+# S778 = S753+VIX (4-way MACD combo), and hold-time extended variants.
+
+def _bb_width(tsla, i, period: int = 20, n_std: float = 2.0) -> float:
+    """Return Bollinger Band width = (upper - lower) / mid. Lower = more compressed."""
+    if i < period:
+        return 0.10
+    closes = tsla['close'].iloc[i - period:i]
+    mid = float(closes.mean())
+    std = float(closes.std())
+    if mid <= 0:
+        return 0.10
+    upper = mid + n_std * std
+    lower = mid - n_std * std
+    return (upper - lower) / mid
+
+
+def _tsla_bb_compressed(tsla, i, width_threshold: float = 0.08) -> bool:
+    """True if Bollinger Band width is below threshold (very compressed)."""
+    return _bb_width(tsla, i) < width_threshold
+
+
+def _rsi_n_day(prices, i, period: int = 3) -> float:
+    """Simple n-period RSI calculation."""
+    if i < period + 1:
+        return 50.0
+    gains, losses = [], []
+    for j in range(i - period, i):
+        change = float(prices.iloc[j]) - float(prices.iloc[j - 1])
+        if change > 0:
+            gains.append(change)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(-change)
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _tsla_3d_rsi_oversold(tsla, i, threshold: float = 20.0) -> bool:
+    """True if 3-day RSI < threshold (extreme short-term oversold)."""
+    rsi_3 = _rsi_n_day(tsla['close'], i, period=3)
+    return rsi_3 < threshold
+
+
+def _tsla_above_50ma(tsla, i) -> bool:
+    """True if TSLA close is above its 50-day SMA."""
+    if i < 50:
+        return True
+    ma50 = float(tsla['close'].iloc[i - 50:i].mean())
+    return float(tsla['close'].iloc[i]) > ma50
+
+
+def sig_s771_s215_bb_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S771: Weekly channel support + Bollinger Band compression (BB width < 8%).
+    BB squeeze at weekly support = energy coiling before bounce."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_bb_compressed(tsla, i) else 0
+
+
+def sig_s772_s631_bb_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S772: S631 (10%disc + weekly) + Bollinger Band compression.
+    Peak discount at support with BB squeeze — compare to S648 (ATR compressed)."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_bb_compressed(tsla, i) else 0
+
+
+def sig_s773_s731_bb_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S773: S731 (weekly + 5% below 20d high) + Bollinger Band compression.
+    Compare BB compressed vs ATR compressed (S741) at 20d discount support."""
+    if sig_s731_s215_20d_disc5(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_bb_compressed(tsla, i) else 0
+
+
+def sig_s774_s631_3d_rsi20(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S774: S631 (10%disc + weekly) + 3-day RSI < 20 (extreme short-term oversold).
+    Three consecutive down days have driven 3d RSI to extreme = momentum exhaustion."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_3d_rsi_oversold(tsla, i, threshold=20.0) else 0
+
+
+def sig_s775_s731_3d_rsi20(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S775: S731 (weekly + 5% below 20d high) + 3-day RSI < 20.
+    20d high discount at weekly support with extreme 3d RSI oversold."""
+    if sig_s731_s215_20d_disc5(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_3d_rsi_oversold(tsla, i, threshold=20.0) else 0
+
+
+def sig_s776_s741_3d_rsi20(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S776: S741 (S731+compressed, WR=93%) + 3-day RSI < 20.
+    Already best WR signal + extreme 3d RSI = push toward 100%."""
+    if sig_s741_s731_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_3d_rsi_oversold(tsla, i, threshold=20.0) else 0
+
+
+def sig_s777_s731_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S777: S731 (weekly + 5% below 20d high) + below 50-day MA.
+    TSLA below medium-term trend at 20d discount + weekly support = bear pullback setup."""
+    if sig_s731_s215_20d_disc5(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 0 if _tsla_above_50ma(tsla, i) else 1
+
+
+def sig_s778_s753_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S778: S753 (S743+lag5pct) + VIX pct>60. 4-way: weekly+20d+MACD+lag+VIX.
+    Maximum MACD combo: all momentum, discount, fear, and relative dimensions aligned."""
+    if sig_s753_s743_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s779_s741_consec_down2(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S779: S741 (S731+compressed, WR=93%) + 2 consecutive down days.
+    ATR compressed + 2 down days entering = selling into tight range = snap-back."""
+    if sig_s741_s731_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_consec_down(tsla, i, n=2) else 0
+
+
+def sig_s780_s631_3d_rsi30(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S780: S631 (10%disc + weekly) + 3-day RSI < 30.
+    Wider 3d RSI threshold (30 vs 20) for more trades at peak discount."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_3d_rsi_oversold(tsla, i, threshold=30.0) else 0
+
+
+SIGNALS_P10B: List[Tuple] = [
+    # Phase 10B — BB compression + 3-day RSI + 50MA context (S771-S780)
+    ('S771_s215_bb_compressed',  sig_s771_s215_bb_compressed,  10, 0.20, 50),
+    ('S772_s631_bb_compressed',  sig_s772_s631_bb_compressed,  10, 0.20, 50),
+    ('S773_s731_bb_compressed',  sig_s773_s731_bb_compressed,  10, 0.20, 50),
+    ('S774_s631_3d_rsi20',       sig_s774_s631_3d_rsi20,       10, 0.20, 50),
+    ('S775_s731_3d_rsi20',       sig_s775_s731_3d_rsi20,       10, 0.20, 50),
+    ('S776_s741_3d_rsi20',       sig_s776_s741_3d_rsi20,       10, 0.20, 50),
+    ('S777_s731_below50ma',      sig_s777_s731_below50ma,      10, 0.20, 50),
+    ('S778_s753_vix_pct60',      sig_s778_s753_vix_pct60,      10, 0.20, 50),
+    ('S779_s741_consec_down2',   sig_s779_s741_consec_down2,   10, 0.20, 50),
+    ('S780_s631_3d_rsi30',       sig_s780_s631_3d_rsi30,       10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
