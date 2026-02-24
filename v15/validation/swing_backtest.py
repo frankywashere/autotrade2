@@ -7216,6 +7216,153 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8R)
 
 
+# ── Phase 8S — VIX-pct 4-way combos + stricter threshold + monthly ────────────
+# S413, S416, S417, S418 are the new top signals. Extend to 4-way combos.
+# Also test VIX pct>80 (stricter threshold) and VIX pct 6-month window.
+
+def sig_s421_s413_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S421: S413 (MACD+VIX pct+SPY weak, 6/6yr, WR=92%) + compressed ATR.
+    4-way: MACD + sustained fear + broad weakness + ATR compression.
+    Hypothesis: all macro/momentum/structure dimensions aligned = highest precision."""
+    if sig_s413_s408_spy_weak(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s422_s413_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S422: S413 (MACD+VIX pct+SPY weak) + NR7.
+    4-way: MACD + sustained fear + SPY weak + tightest day.
+    Hypothesis: best macro signal filtered to optimal entry day."""
+    if sig_s413_s408_spy_weak(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr7(tsla, i) else 0
+
+
+def sig_s423_s416_macd(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S423: S416 (S407+compressed, PF=267, 6/6yr) + MACD turning.
+    4-way: VIX pct + weekly support + compressed + MACD momentum.
+    Hypothesis: adding MACD momentum turn to PF=267 signal = perfect entry."""
+    if sig_s416_s407_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist = _macd_histogram(tsla, i)
+    if hist is None:
+        return 1   # not enough data → allow
+    hist_prev = _macd_histogram(tsla, i - 1)
+    if hist_prev is None:
+        return 1
+    return 1 if (hist > hist_prev and hist < 0) else 0
+
+
+def sig_s424_s417_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S424: S417 (VIX pct+above200MA, WR=92%, PF=39.64) + compressed ATR.
+    4-way: VIX pct + weekly support + uptrend + ATR compression.
+    Hypothesis: fear regime + bull trend + compression = absolute best entry."""
+    if sig_s417_s407_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s425_s417_macd(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S425: S417 (VIX pct+above200MA) + MACD turning.
+    4-way: sustained fear + weekly support + bull trend + MACD momentum.
+    Hypothesis: MACD adds momentum confirmation to the best balanced signal."""
+    if sig_s417_s407_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist = _macd_histogram(tsla, i)
+    if hist is None:
+        return 1
+    hist_prev = _macd_histogram(tsla, i - 1)
+    if hist_prev is None:
+        return 1
+    return 1 if (hist > hist_prev and hist < 0) else 0
+
+
+def sig_s426_s418_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S426: S418 (VIX pct+SPY weak+S215, n=20, WR=80%) + compressed ATR.
+    Best high-volume signal + compression filter.
+    Hypothesis: S418 has n=20 trades; adding compression raises WR significantly."""
+    if sig_s418_s407_spy_weak(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s427_s418_macd(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S427: S418 (VIX pct+SPY weak+S215, n=20) + MACD turning.
+    Add MACD momentum to the highest-n VIX pct signal.
+    Hypothesis: filtering n=20 high-volume signal with MACD = higher precision subset."""
+    if sig_s418_s407_spy_weak(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist = _macd_histogram(tsla, i)
+    if hist is None:
+        return 1
+    hist_prev = _macd_histogram(tsla, i - 1)
+    if hist_prev is None:
+        return 1
+    return 1 if (hist > hist_prev and hist < 0) else 0
+
+
+def sig_s428_s215_vix_pct80(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S428: S215 (weekly support) + VIX > 80th percentile (stricter threshold).
+    Hypothesis: top 20% fear days produce even more extreme bounces than top 30%."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.80) else 0
+
+
+def sig_s429_s333_vix_pct80(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S429: S333 (MACD turning) + VIX > 80th percentile.
+    Stricter fear threshold for MACD signal.
+    Hypothesis: top 20% fear + MACD momentum = tightest macro+momentum combo."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.80) else 0
+
+
+def sig_s430_s407_monthly_low(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S430: S407 (S215+VIX pct>70, $1.45M, 7/7yr) + monthly near lower channel.
+    Multi-TF support at weekly+monthly + sustained fear regime.
+    Hypothesis: 2-TF structural support in fear regime = maximum recovery signal."""
+    if sig_s407_s215_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _monthly_channel_near_lower(tsla, i, n_months=12, frac=0.30) else 0
+
+
+SIGNALS_P8S: List[Tuple] = [
+    # Phase 8S — VIX pct 4-way combos + stricter threshold + monthly
+    ('S421_s413_compressed',    sig_s421_s413_compressed,    10, 0.20, 50),
+    ('S422_s413_nr7',           sig_s422_s413_nr7,           10, 0.20, 50),
+    ('S423_s416_macd',          sig_s423_s416_macd,          10, 0.20, 50),
+    ('S424_s417_compressed',    sig_s424_s417_compressed,    10, 0.20, 50),
+    ('S425_s417_macd',          sig_s425_s417_macd,          10, 0.20, 50),
+    ('S426_s418_compressed',    sig_s426_s418_compressed,    10, 0.20, 50),
+    ('S427_s418_macd',          sig_s427_s418_macd,          10, 0.20, 50),
+    ('S428_s215_vix_pct80',     sig_s428_s215_vix_pct80,     10, 0.20, 50),
+    ('S429_s333_vix_pct80',     sig_s429_s333_vix_pct80,     10, 0.20, 50),
+    ('S430_s407_monthly_low',   sig_s430_s407_monthly_low,   10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
