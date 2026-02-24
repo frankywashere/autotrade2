@@ -11965,6 +11965,171 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C)
 
 
+# ── Phase 10D — DOW sweep + annual underperformance + S786 extensions (S791-S800) ──
+# Test Friday/Wednesday entries, annual TSLA vs SPY underperformance, S786 quality filters.
+# S800 milestone: try to find the single best multi-filter signal combination.
+
+def _is_friday(tsla, i) -> bool:
+    """Signal fires on a Friday."""
+    if i >= len(tsla):
+        return False
+    return tsla.index[i].weekday() == 4  # 4 = Friday
+
+
+def _is_wednesday(tsla, i) -> bool:
+    """Signal fires on a Wednesday."""
+    if i >= len(tsla):
+        return False
+    return tsla.index[i].weekday() == 2  # 2 = Wednesday
+
+
+def _tsla_annual_underperformer(tsla, spy, i, lookback: int = 252, lag: float = 0.10) -> bool:
+    """True if TSLA underperformed SPY by at least lag over the last year (252 days).
+    Annual underperformance = TSLA-specific bear cycle, not just a brief dip."""
+    if i < lookback + 1:
+        return False
+    tsla_ret = float(tsla['close'].iloc[i]) / float(tsla['close'].iloc[i - lookback]) - 1.0
+    spy_ret  = float(spy['close'].iloc[i])  / float(spy['close'].iloc[i - lookback])  - 1.0
+    return (tsla_ret - spy_ret) <= -lag
+
+
+def _recent_support_test(tsla, tw, i, lookback_days: int = 25) -> bool:
+    """True if TSLA tested weekly channel support at least once more in the last lookback_days.
+    Second test of a support level is often stronger (double-bottom setup)."""
+    if i < lookback_days + 1 or len(tw) < 2:
+        return False
+    today = tsla.index[i]
+    recent_start = tsla.index[max(0, i - lookback_days)]
+    # Get weekly bars from lookback window
+    recent_weekly = tw[(tw.index >= recent_start) & (tw.index < today)]
+    if len(recent_weekly) < 1:
+        return False
+    # Get last 3 weekly channel (approximate: use min of recent weekly closes as support proxy)
+    recent_lows = [float(recent_weekly.iloc[j]['low']) for j in range(len(recent_weekly))]
+    support_level = min(recent_lows) * 1.03  # 3% above the recent low = support zone
+    current_close = float(tsla['close'].iloc[i])
+    return current_close <= support_level
+
+
+def sig_s791_s631_friday(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S791: S631 (10%disc + weekly support) + entry on Friday.
+    Best DOW day for week-end bounce entries at peak discount level."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _is_friday(tsla, i) else 0
+
+
+def sig_s792_s731_friday(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S792: S731 (weekly + 5% below 20d high) + entry on Friday.
+    Friday entries at 20d discount support — test DOW effect on this signal."""
+    if sig_s731_s215_20d_disc5(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _is_friday(tsla, i) else 0
+
+
+def sig_s793_s631_wednesday(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S793: S631 (10%disc + weekly support) + entry on Wednesday.
+    Mid-week entries at peak discount — often best for short hold times."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _is_wednesday(tsla, i) else 0
+
+
+def sig_s794_s631_annual_underperf(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S794: S631 (10%disc + weekly) + TSLA underperformed SPY by 10%+ over last year.
+    Annual underperformance = TSLA-specific bear cycle bouncing from structural support."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_annual_underperformer(tsla, spy, i, lag=0.10) else 0
+
+
+def sig_s795_s731_annual_underperf(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S795: S731 (weekly + 5% below 20d high) + TSLA underperformed SPY by 10%+ over 1yr.
+    Annual underperformance + recent momentum drop at support = deep value setup."""
+    if sig_s731_s215_20d_disc5(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_annual_underperformer(tsla, spy, i, lag=0.10) else 0
+
+
+def sig_s796_s786_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S796: S786 (S631+below50MA, $1.87M+2025) + ATR compression.
+    Best 52wk+below50MA signal + volatility squeeze — expect WR=93%."""
+    if sig_s786_s631_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s797_s786_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S797: S786 (S631+below50MA, $1.87M+2025) + volume dry-up.
+    Expect 100% WR: bear context + peak discount at support + sellers exhausted."""
+    if sig_s786_s631_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i) else 0
+
+
+def sig_s798_s786_macd_up(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S798: S786 (S631+below50MA, $1.87M+2025) + MACD turning up.
+    Bear phase bounce + peak 52wk discount at support + MACD reversing."""
+    if sig_s786_s631_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist_now  = _macd_histogram(tsla, i)
+    hist_prev = _macd_histogram(tsla, i - 1) if i > 0 else None
+    if hist_now is None or hist_prev is None:
+        return 1
+    return 1 if hist_now > hist_prev else 0
+
+
+def sig_s799_s786_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S799: S786 (S631+below50MA, $1.87M+2025) + TSLA lags SPY 5%+.
+    Below 50MA + peak discount + TSLA-specific underperformance = 4-way signal."""
+    if sig_s786_s631_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s800_milestone_below50ma_max(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S800 MILESTONE: Maximum below-50MA alignment.
+    S786 (52wk+weekly+below50MA) + ATR compressed + TSLA lags SPY 5%.
+    All bear-phase dimensions aligned: structural, discount, trend, momentum, relative."""
+    if sig_s796_s786_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+SIGNALS_P10D: List[Tuple] = [
+    # Phase 10D — DOW sweep + annual underperf + S786 extensions + S800 milestone (S791-S800)
+    ('S791_s631_friday',            sig_s791_s631_friday,            10, 0.20, 50),
+    ('S792_s731_friday',            sig_s792_s731_friday,            10, 0.20, 50),
+    ('S793_s631_wednesday',         sig_s793_s631_wednesday,         10, 0.20, 50),
+    ('S794_s631_annual_underperf',  sig_s794_s631_annual_underperf,  10, 0.20, 50),
+    ('S795_s731_annual_underperf',  sig_s795_s731_annual_underperf,  10, 0.20, 50),
+    ('S796_s786_compressed',        sig_s796_s786_compressed,        10, 0.20, 50),
+    ('S797_s786_vol_dryup',         sig_s797_s786_vol_dryup,         10, 0.20, 50),
+    ('S798_s786_macd_up',           sig_s798_s786_macd_up,           10, 0.20, 50),
+    ('S799_s786_lag5pct',           sig_s799_s786_lag5pct,           10, 0.20, 50),
+    ('S800_milestone_below50ma_max',sig_s800_milestone_below50ma_max,10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
