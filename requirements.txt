@@ -3,6 +3,7 @@ torch>=2.0.0
 numpy
 pandas
 lightgbm
+scikit-learn
 
 # Model architecture
 ncps
