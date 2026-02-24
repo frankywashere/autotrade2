@@ -12979,6 +12979,209 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I + SIGNALS_P10J)
 
 
+# ── Phase 10K — Weekly channel tightness + SPY co-weakness + VIX momentum (S861-S870) ─
+
+def _weekly_channel_pos(tw, daily_date, window: int = 20) -> float:
+    """Fractional position in weekly channel (0.0 = at lower, 1.0 = at upper).
+    Returns -1.0 if channel not detected or insufficient data."""
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    if wk_idx < window:
+        return -1.0
+    ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+    if ch is None:
+        return -1.0
+    lower = ch.lower_line[-1]
+    upper = ch.upper_line[-1]
+    w = upper - lower
+    if w <= 0:
+        return -1.0
+    price = float(tw['close'].iloc[wk_idx])
+    return (price - lower) / w
+
+
+def _vix_rising(vix, i, pct_rise: float = 0.05) -> bool:
+    """True if today's VIX is at least pct_rise higher than yesterday's.
+    Rising VIX = increasing fear = potentially better entry (fear is peaking)."""
+    if i < 1:
+        return False
+    vix_now  = float(vix['close'].iloc[i])
+    vix_prev = float(vix['close'].iloc[i - 1])
+    if vix_prev <= 0:
+        return False
+    return (vix_now - vix_prev) / vix_prev >= pct_rise
+
+
+def _tsla_5d_return(tsla, i) -> float:
+    """Return TSLA 5-day price change as fraction (-0.10 = down 10%)."""
+    if i < 5:
+        return 0.0
+    c_now  = float(tsla['close'].iloc[i])
+    c_prev = float(tsla['close'].iloc[i - 5])
+    if c_prev <= 0:
+        return 0.0
+    return (c_now - c_prev) / c_prev
+
+
+def sig_s861_s801_tight_channel10(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S861: S801 (OR-union) + weekly channel position < 10% (very close to lower band).
+    Tighter channel filter than S215 default 25% — only bottom-10% entries.
+    Hypothesis: deeper in channel = stronger support test = higher quality bounce."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    pos = _weekly_channel_pos(tw, tsla.index[i], window=20)
+    if pos < 0:
+        return 1  # channel not detected — keep the trade
+    return 1 if pos < 0.10 else 0
+
+
+def sig_s862_s801_tight_channel15(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S862: S801 + weekly channel position < 15% (bottom-15% entries).
+    Intermediate between 10% (S861) and 25% (S215 default).
+    Tests optimal channel position threshold."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    pos = _weekly_channel_pos(tw, tsla.index[i], window=20)
+    if pos < 0:
+        return 1
+    return 1 if pos < 0.15 else 0
+
+
+def sig_s863_s814_tight_channel15(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S863: S814 (OR-union+lag5pct, 9/9yr) + weekly channel position < 15%.
+    Tighter channel position on the best 9/9yr signal.
+    Hypothesis: lag+discount+deep_channel = highest precision."""
+    if sig_s814_s801_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    pos = _weekly_channel_pos(tw, tsla.index[i], window=20)
+    if pos < 0:
+        return 1
+    return 1 if pos < 0.15 else 0
+
+
+def sig_s864_s801_spy_disc5(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S864: S801 (OR-union) + SPY also 5%+ below its 20-day high.
+    Market-wide weakness confirmation — both TSLA and SPY in pullback.
+    Hypothesis: broad market + TSLA weakness = stronger reversal when support holds."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 20:
+        return 1
+    spy_high_20d = float(spy['high'].iloc[i - 20:i].max())
+    if spy_high_20d <= 0:
+        return 1
+    spy_disc = (spy_high_20d - float(spy['close'].iloc[i])) / spy_high_20d
+    return 1 if spy_disc >= 0.05 else 0
+
+
+def sig_s865_s801_vix_rising(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S865: S801 (OR-union) + VIX rising ≥5% from yesterday.
+    Increasing fear = panic selling at support = better entry timing.
+    Hypothesis: VIX spike day at support = selling climax."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_rising(vix, i, pct_rise=0.05) else 0
+
+
+def sig_s866_s801_5d_momentum(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S866: S801 (OR-union) + TSLA down ≥5% over 5 days (momentum exhaustion).
+    Short-term momentum oversold at weekly support.
+    Hypothesis: 5-day drop + channel support = multi-day mean reversion."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    ret_5d = _tsla_5d_return(tsla, i)
+    return 1 if ret_5d <= -0.05 else 0
+
+
+def sig_s867_s814_spy_disc5(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S867: S814 (OR-union+lag5pct, 9/9yr) + SPY also 5%+ below 20d high.
+    SPY co-weakness on the best 9/9yr signal.
+    Hypothesis: when BOTH TSLA lags AND SPY is weak, reversals are strongest."""
+    if sig_s814_s801_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 20:
+        return 1
+    spy_high_20d = float(spy['high'].iloc[i - 20:i].max())
+    if spy_high_20d <= 0:
+        return 1
+    spy_disc = (spy_high_20d - float(spy['close'].iloc[i])) / spy_high_20d
+    return 1 if spy_disc >= 0.05 else 0
+
+
+def sig_s868_s801_spy_disc3(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S868: S801 + SPY also 3%+ below its 20-day high (looser SPY filter).
+    Compare to S864 (5% threshold) — does SPY co-weakness matter at any threshold?
+    If S868 < S801 and S864 < S801, SPY co-weakness = irrelevant."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 20:
+        return 1
+    spy_high_20d = float(spy['high'].iloc[i - 20:i].max())
+    if spy_high_20d <= 0:
+        return 1
+    spy_disc = (spy_high_20d - float(spy['close'].iloc[i])) / spy_high_20d
+    return 1 if spy_disc >= 0.03 else 0
+
+
+def sig_s869_s801_3d_drop5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S869: S801 (OR-union) + TSLA dropped ≥5% in last 3 days.
+    Very short-term momentum crash at weekly support.
+    Hypothesis: 3-day 5%+ drop = acute panic at support = snap-back imminent."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 3:
+        return 1
+    c_now  = float(tsla['close'].iloc[i])
+    c_prev = float(tsla['close'].iloc[i - 3])
+    if c_prev <= 0:
+        return 1
+    ret_3d = (c_now - c_prev) / c_prev
+    return 1 if ret_3d <= -0.05 else 0
+
+
+def sig_s870_milestone_s861_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S870 MILESTONE: Tight channel (bottom 10%) + OR-union + lag5pct.
+    Deepest channel position filter on the best coverage signal.
+    Tests if 'very deep in channel' adds information beyond discount thresholds."""
+    if sig_s814_s801_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    pos = _weekly_channel_pos(tw, tsla.index[i], window=20)
+    if pos < 0:
+        return 1
+    return 1 if pos < 0.10 else 0
+
+
+SIGNALS_P10K: List[Tuple] = [
+    # Phase 10K — Channel tightness + SPY co-weakness + VIX momentum (S861-S870)
+    ('S861_s801_tight_chan10',      sig_s861_s801_tight_channel10,  10, 0.20, 50),
+    ('S862_s801_tight_chan15',      sig_s862_s801_tight_channel15,  10, 0.20, 50),
+    ('S863_s814_tight_chan15',      sig_s863_s814_tight_channel15,  10, 0.20, 50),
+    ('S864_s801_spy_disc5',         sig_s864_s801_spy_disc5,        10, 0.20, 50),
+    ('S865_s801_vix_rising',        sig_s865_s801_vix_rising,       10, 0.20, 50),
+    ('S866_s801_5d_momentum',       sig_s866_s801_5d_momentum,      10, 0.20, 50),
+    ('S867_s814_spy_disc5',         sig_s867_s814_spy_disc5,        10, 0.20, 50),
+    ('S868_s801_spy_disc3',         sig_s868_s801_spy_disc3,        10, 0.20, 50),
+    ('S869_s801_3d_drop5pct',       sig_s869_s801_3d_drop5pct,      10, 0.20, 50),
+    ('S870_milestone_s861_lag5pct', sig_s870_milestone_s861_lag5pct,10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E
+           + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I + SIGNALS_P10J
+           + SIGNALS_P10K)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
