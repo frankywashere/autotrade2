@@ -408,7 +408,7 @@ def run_backtest(
     follow_through_model = None
     ml_stats = {'total_signals': 0, 'ml_filtered': 0, 'ml_boosted': 0, 'ml_agreed': 0,
                  'quality_filtered': 0, 'quality_boosted': 0, 'ensemble_filtered': 0,
-                 'conf_below_min': 0, 'not_buy_sell': 0, 'circuit_breaker': 0,
+                 'conf_below_min': 0, 'not_buy_sell': 0,
                  'anti_pyramid': 0, 'anti_double_type': 0, 'low_volume': 0,
                  'pos_score_weak': 0, 'low_conf_buy_bounce': 0, 'leverage_cap': 0}
     if not ml_active:
@@ -1095,7 +1095,6 @@ def run_backtest(
     last_trade_entry_bar = -100  # Arch 85: Track last trade entry for drought detection
     last_breakout_loss = False  # Track if last loss was a breakout (confirms channel)
     daily_pnl = 0.0         # Running P&L for current trading day
-    daily_breaker_active = False
     current_day = None
     # Walk forward from bar 100 (need lookback)
     start_bar = 100
@@ -1120,7 +1119,6 @@ def run_backtest(
         if bar_date and bar_date != current_day:
             current_day = bar_date
             daily_pnl = 0.0
-            daily_breaker_active = False
 
         # --- Check exits for all open positions ---
         window_highs = highs[max(0, bar - eval_interval):bar + 1]
@@ -1259,8 +1257,6 @@ def run_backtest(
 
                 # Track daily P&L for circuit breaker
                 daily_pnl += pnl
-                if daily_pnl < -500:
-                    daily_breaker_active = True
 
                 closed_indices.append(pi)
                 trade_signals.append(position_signals[pi])
@@ -1940,11 +1936,6 @@ def run_backtest(
                 ml_stats['not_buy_sell'] += 1
 
             if sig.action in ('BUY', 'SELL') and sig.confidence >= min_confidence:
-                # Daily circuit breaker: stop trading if down $500+ today
-                if daily_breaker_active:
-                    ml_stats['circuit_breaker'] += 1
-                    continue
-
                 # 10AM ET skip disabled — testing without in new data window
                 pass
 
