@@ -5592,6 +5592,164 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H)
 
 
+# ── Phase 8I — S319 extensions + S312 bear-regime + cross-family combos ────────
+# S319 (above200MA+persist_compress) avg=$107K/trade is the highest-quality IS signal.
+# S312 (below200MA+compressed, 5/5yr WR=88%) is the best bear-regime signal.
+# Extend both into combinations with VIX, 5-day momentum, and SPY filters.
+
+def sig_s321_s319_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S321: S319 (above200MA+persist_compress, avg=$107K) + VIX recovery.
+    The highest avg/trade signal + optimal VIX timing = ultimate quality filter.
+    Hypothesis: persistent coiling in uptrend + VIX cooling = multi-day supply exhaustion."""
+    if sig_s319_s292_persistent_compress(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s322_s319_5d_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S322: S319 (above200MA+persist_compress) + 5% 5-day decline.
+    3+ days compressed + declining 5% = quiet drift to support with no recovery attempts.
+    Hypothesis: sellers not panicking (compressed) but persistently offering = final flush."""
+    if sig_s319_s292_persistent_compress(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    close_now = float(tsla['close'].iloc[i])
+    close_5d  = float(tsla['close'].iloc[i - 5])
+    return 1 if (close_now - close_5d) / close_5d <= -0.05 else 0
+
+
+def sig_s323_s319_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S323: S319 (above200MA+persist_compress) + below 50d SMA.
+    Uptrend + 50MA pullback + persistent compression at weekly support.
+    Hypothesis: stock dipped below 50MA, compressed for 3+ days → spring release."""
+    if sig_s319_s292_persistent_compress(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 50:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma50  = float(tsla['close'].iloc[i - 50:i].mean())
+    return 1 if close < ma50 else 0
+
+
+def sig_s324_s312_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S324: S312 (below200MA+compressed, 5/5yr WR=88%) + VIX recovery.
+    Best bear-regime signal + VIX timing.
+    Hypothesis: compression in downtrend at weekly support + VIX cooling = temporary bottom."""
+    if sig_s312_s291_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s325_s312_5d_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S325: S312 (below200MA+compressed) + 5% 5-day decline.
+    Bear-trend compressed + short-term decline to weekly support.
+    Hypothesis: bear + compressed + declining into support = multiple seller exhaustion."""
+    if sig_s312_s291_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    close_now = float(tsla['close'].iloc[i])
+    close_5d  = float(tsla['close'].iloc[i - 5])
+    return 1 if (close_now - close_5d) / close_5d <= -0.05 else 0
+
+
+def sig_s326_s312_spy_weak(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S326: S312 (below200MA+compressed) + SPY below 50d SMA.
+    Both TSLA and SPY in downtrend, with TSLA compressed at weekly support.
+    Hypothesis: double-bear + compression = maximum institutional mean-reversion buying."""
+    if sig_s312_s291_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 50:
+        return 1
+    spy_close = float(spy['close'].iloc[i])
+    spy_sma50 = float(spy['close'].iloc[i - 50:i].mean())
+    return 1 if spy_close < spy_sma50 else 0
+
+
+def sig_s327_s315_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S327: S315 (above200MA+below50MA+VIX_rec, 100% WR) + compressed ATR.
+    4-way filter: above200MA + below50MA + VIX recovery + ATR compression.
+    Hypothesis: all 4 factors = absolute premium setup in uptrend with 50MA pullback."""
+    if sig_s315_s310_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s328_s316_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S328: S316 (above200MA+below50MA+compressed, 5/5yr WR=100%) + VIX recovery.
+    Already 100% WR 5/5yr. Adding VIX timing to see if we can raise avg/trade.
+    Hypothesis: keeps only the VIX-timed subset of the 100% WR signal."""
+    if sig_s316_s310_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s329_s316_5d_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S329: S316 (above200MA+below50MA+compressed) + 5% 5-day decline.
+    4-way combo: uptrend + 50MA break + compressed + recent 5% decline.
+    Hypothesis: compressed stock that has been declining to support in uptrend."""
+    if sig_s316_s310_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    close_now = float(tsla['close'].iloc[i])
+    close_5d  = float(tsla['close'].iloc[i - 5])
+    return 1 if (close_now - close_5d) / close_5d <= -0.05 else 0
+
+
+def sig_s330_s291_opex_week(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S330: S291 (S215+below200MA, bear trend) + OPEX week.
+    Bear-trend weekly support bounce during option expiration.
+    Hypothesis: OPEX pinning effect works in downtrends too (creates temporary floor)."""
+    if sig_s291_s215_below200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    dt = tsla.index[i]
+    to_next, from_last = _opex_proximity(dt)
+    return 1 if (to_next <= 5 or from_last <= 5) else 0
+
+
+SIGNALS_P8I: List[Tuple] = [
+    # Phase 8I — S319 extensions + S312 bear-regime + cross-family combos
+    ('S321_s319_vix_rec',       sig_s321_s319_vix_rec,       10, 0.20, 50),
+    ('S322_s319_5d_down',       sig_s322_s319_5d_down,       10, 0.20, 50),
+    ('S323_s319_below50ma',     sig_s323_s319_below50ma,     10, 0.20, 50),
+    ('S324_s312_vix_rec',       sig_s324_s312_vix_rec,       10, 0.20, 50),
+    ('S325_s312_5d_down',       sig_s325_s312_5d_down,       10, 0.20, 50),
+    ('S326_s312_spy_weak',      sig_s326_s312_spy_weak,      10, 0.20, 50),
+    ('S327_s315_compressed',    sig_s327_s315_compressed,    10, 0.20, 50),
+    ('S328_s316_vix_rec',       sig_s328_s316_vix_rec,       10, 0.20, 50),
+    ('S329_s316_5d_down',       sig_s329_s316_5d_down,       10, 0.20, 50),
+    ('S330_s291_opex_week',     sig_s330_s291_opex_week,     10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
