@@ -17821,6 +17821,172 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10Z + SIGNALS_P11A + SIGNALS_P11B + SIGNALS_P11C + SIGNALS_P11D + SIGNALS_P11E
            + SIGNALS_P11F + SIGNALS_P11G + SIGNALS_P11H)
 
+# ── Phase 11I: TSLA-specific weakness + SPY weekly channel + lag depth ─────────
+# New exploration: TSLA falling while SPY flat/up = idiosyncratic selling = highest quality.
+# SPY weekly channel: if SPY also at weekly support, strong macro + micro confluence.
+# Lag depth: 7% and 10% underperformance thresholds (deeper divergence = stronger signal).
+
+def sig_s1101_s929_tsla3d_spy_up(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1101: S929 + (TSLA 3d down >3% while SPY 3d UP) — idiosyncratic weakness.
+    TSLA falls on stock-specific news/pressure while market holds up = highest quality catch-up."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 3:
+        return 0
+    c_now = float(tsla['close'].iloc[i])
+    c_3d = float(tsla['close'].iloc[i - 3])
+    if not (c_3d > 0 and (c_now - c_3d) / c_3d < -0.03):
+        return 0
+    spy_now = float(spy['close'].iloc[i])
+    spy_3d = float(spy['close'].iloc[i - 3])
+    if spy_3d > 0 and spy_now >= spy_3d:
+        return 1
+    return 0
+
+
+def sig_s1102_s929_lag7pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1102: S929 + lag7pct (TSLA lags SPY by 7% over 20d) — deeper underperformance."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.07):
+        return 1
+    return 0
+
+
+def sig_s1103_s929_lag10pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1103: S929 + lag10pct (TSLA lags SPY by 10% over 20d) — extreme underperformance."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.10):
+        return 1
+    return 0
+
+
+def sig_s1104_s929_lag5pct_10d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1104: S929 + lag5pct with 10-day lookback (shorter lag window, more recent divergence)."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=10, lag=0.05):
+        return 1
+    return 0
+
+
+def sig_s1105_s929_lag5pct_30d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1105: S929 + lag5pct with 30-day lookback (longer lag window, sustained divergence)."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=30, lag=0.05):
+        return 1
+    return 0
+
+
+def _spy_near_lower(sw_df, wk_idx, window, frac=0.25):
+    """Check if SPY weekly close is in lower `frac` of its N-week channel."""
+    if wk_idx < window:
+        return False
+    ch = _channel_at(sw_df.iloc[wk_idx - window:wk_idx])
+    if ch is None:
+        return False
+    close_sw = float(sw_df['close'].iloc[wk_idx])
+    return _near_lower(close_sw, ch, frac)
+
+
+def sig_s1106_s929_spy_weekly_chan(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1106: S929 base + SPY weekly also in lower 25% of 20-week channel.
+    Both TSLA and SPY at weekly structural support = strongest macro+micro confluence."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if sw is None or len(sw) < 20:
+        return 0
+    daily_date = tsla.index[i]
+    wk_idx = sw.index.searchsorted(daily_date, side='right') - 1
+    if _spy_near_lower(sw, wk_idx, 20, 0.25):
+        return 1
+    return 0
+
+
+def sig_s1107_s1041_or_spy_weekly(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1107: S1041 OR (S929 + SPY weekly lower channel 20w) — new SPY weekly arm.
+    Tests if adding SPY-at-support as OR arm captures new 100% WR trades."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if sig_s1106_s929_spy_weekly_chan(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    return 0
+
+
+def sig_s1108_s929_tsla3d_spy_flat(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1108: S929 + (TSLA 3d down >3% AND SPY 3d flat ±1%) — TSLA-only decline.
+    More permissive: SPY flat (not necessarily up) while TSLA falls."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 3:
+        return 0
+    c_now = float(tsla['close'].iloc[i])
+    c_3d = float(tsla['close'].iloc[i - 3])
+    if not (c_3d > 0 and (c_now - c_3d) / c_3d < -0.03):
+        return 0
+    spy_now = float(spy['close'].iloc[i])
+    spy_3d = float(spy['close'].iloc[i - 3])
+    if spy_3d > 0 and abs((spy_now - spy_3d) / spy_3d) < 0.01:
+        return 1
+    return 0
+
+
+def sig_s1109_s1041_or_lag7pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1109: S1041 OR (S929 + lag7pct) — add 7% lag arm to S1041 champion.
+    Deeper relative weakness (7% vs 5% in S993) may identify new distinct bounces."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.07):
+        return 1
+    return 0
+
+
+def sig_s1110_s1041_or_tsla_spy_diverge(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1110: S1041 OR (S929 + TSLA 3d down >3% while SPY UP).
+    Adds idiosyncratic-weakness arm: TSLA-specific panic while market holds."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    return sig_s1101_s929_tsla3d_spy_up(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+SIGNALS_P11I: List[Tuple] = [
+    ('S1101_s929_tsla3d_spy_up',       sig_s1101_s929_tsla3d_spy_up,           10, 0.20, 50),
+    ('S1102_s929_lag7pct',             sig_s1102_s929_lag7pct,                  10, 0.20, 50),
+    ('S1103_s929_lag10pct',            sig_s1103_s929_lag10pct,                 10, 0.20, 50),
+    ('S1104_s929_lag5pct_10d',         sig_s1104_s929_lag5pct_10d,             10, 0.20, 50),
+    ('S1105_s929_lag5pct_30d',         sig_s1105_s929_lag5pct_30d,             10, 0.20, 50),
+    ('S1106_s929_spy_weekly_chan',      sig_s1106_s929_spy_weekly_chan,          10, 0.20, 50),
+    ('S1107_s1041_or_spy_weekly',      sig_s1107_s1041_or_spy_weekly,           10, 0.20, 50),
+    ('S1108_s929_tsla3d_spy_flat',     sig_s1108_s929_tsla3d_spy_flat,         10, 0.20, 50),
+    ('S1109_s1041_or_lag7pct',         sig_s1109_s1041_or_lag7pct,             10, 0.20, 50),
+    ('S1110_s1041_or_tsla_spy_div',    sig_s1110_s1041_or_tsla_spy_diverge,    10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E
+           + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I + SIGNALS_P10J
+           + SIGNALS_P10K + SIGNALS_P10L + SIGNALS_P10M + SIGNALS_P10N + SIGNALS_P10O
+           + SIGNALS_P10P + SIGNALS_P10Q + SIGNALS_P10R + SIGNALS_P10S + SIGNALS_P10T
+           + SIGNALS_P10U + SIGNALS_P10V + SIGNALS_P10W + SIGNALS_P10X + SIGNALS_P10Y
+           + SIGNALS_P10Z + SIGNALS_P11A + SIGNALS_P11B + SIGNALS_P11C + SIGNALS_P11D + SIGNALS_P11E
+           + SIGNALS_P11F + SIGNALS_P11G + SIGNALS_P11H + SIGNALS_P11I)
+
 # ── sentinel — do not remove ──────────────────────────────────────────────────
 
 
