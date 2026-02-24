@@ -14356,6 +14356,196 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10P + SIGNALS_P10Q + SIGNALS_P10R)
 
 
+# ── Phase 10S — ATR ratio + lag threshold sweep + S929 position variants (S941-S950) ──
+
+def sig_s941_s929_atr65(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S941: 4-chan union (S929 base logic) with tighter ATR ratio 0.65.
+    Tighter compression threshold: atr_5 < 0.65 * atr_20 (vs 0.75 in S929).
+    Hypothesis: fewer trades, possibly higher WR — more extreme squeeze required."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (18 <= vix_now <= 50):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.65 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                return 1
+    return 0
+
+
+def sig_s942_s929_atr85(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S942: 4-chan union with looser ATR ratio 0.85.
+    Looser compression: atr_5 < 0.85 * atr_20 — captures more mildly-compressed setups.
+    Hypothesis: more trades, lower WR — tests optimal threshold."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (18 <= vix_now <= 50):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.85 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                return 1
+    return 0
+
+
+def sig_s943_s890_lag3pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S943: S890 (30w+compressed) + lag3pct (3% underperformance — more permissive).
+    Tests if lag threshold matters: lag3pct vs lag5pct (current S891).
+    Hypothesis: more trades than S891 (lag5pct), similar or slightly lower WR."""
+    if sig_s890_milestone_s888_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.03) else 0
+
+
+def sig_s944_s890_lag8pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S944: S890 (30w+compressed) + lag8pct (8% underperformance — stricter).
+    Tests stricter lag: lag8pct vs lag5pct (current S891).
+    Hypothesis: fewer trades than S891, possibly higher or same WR."""
+    if sig_s890_milestone_s888_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.08) else 0
+
+
+def sig_s945_s929_lag3pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S945: S929 (4-chan union+compressed) + lag3pct.
+    More permissive lag on champion signal.
+    Hypothesis: n > 17 (vs S931 n=17 with lag5pct), WR might be slightly lower."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.03) else 0
+
+
+def sig_s946_s929_lag8pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S946: S929 (4-chan union+compressed) + lag8pct.
+    Stricter lag on champion signal.
+    Hypothesis: n < 17 (vs S931 n=17), possibly 100% WR maintained."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.08) else 0
+
+
+def sig_s947_s929_frac30pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S947: 4-chan union + compressed with looser position (bottom 30% of channel).
+    More permissive position gate: 30% fraction vs 25% in S929.
+    Hypothesis: more trades (n > 21), WR might dip slightly below 95%."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (18 <= vix_now <= 50):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.30):
+                return 1
+    return 0
+
+
+def sig_s948_s929_lag10pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S948: S929 (4-chan union+compressed) + lag10pct (10% underperformance — very strict).
+    Maximum lag filter — TSLA dramatically underperforming SPY.
+    Hypothesis: very few trades but perfect WR."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.10) else 0
+
+
+def sig_s949_s929_lag5pct_vix50(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S949: S929 + lag5pct + VIX pct>50 (any mild elevation).
+    More permissive VIX threshold (pct>50 = median) on S931.
+    Hypothesis: n > S940 (pct>60), WR = 100%."""
+    if sig_s931_s929_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.50) else 0
+
+
+def sig_s950_milestone_s929_no_vix(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S950 MILESTONE: 4-chan union + compressed with NO VIX filter.
+    Tests S929 without the VIX 18-50 gate — does VIX filter help or hurt?
+    Hypothesis: same or slightly more trades, VIX filter might be redundant."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                return 1
+    return 0
+
+
+SIGNALS_P10S: List[Tuple] = [
+    # Phase 10S — ATR ratio + lag threshold sweep + S929 position variants (S941-S950)
+    ('S941_s929_atr65',            sig_s941_s929_atr65,             10, 0.20, 50),
+    ('S942_s929_atr85',            sig_s942_s929_atr85,             10, 0.20, 50),
+    ('S943_s890_lag3pct',          sig_s943_s890_lag3pct,           10, 0.20, 50),
+    ('S944_s890_lag8pct',          sig_s944_s890_lag8pct,           10, 0.20, 50),
+    ('S945_s929_lag3pct',          sig_s945_s929_lag3pct,           10, 0.20, 50),
+    ('S946_s929_lag8pct',          sig_s946_s929_lag8pct,           10, 0.20, 50),
+    ('S947_s929_frac30pct',        sig_s947_s929_frac30pct,         10, 0.20, 50),
+    ('S948_s929_lag10pct',         sig_s948_s929_lag10pct,          10, 0.20, 50),
+    ('S949_s929_lag5_vix50',       sig_s949_s929_lag5pct_vix50,     10, 0.20, 50),
+    ('S950_milestone_s929_novix',  sig_s950_milestone_s929_no_vix,  10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E
+           + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I + SIGNALS_P10J
+           + SIGNALS_P10K + SIGNALS_P10L + SIGNALS_P10M + SIGNALS_P10N + SIGNALS_P10O
+           + SIGNALS_P10P + SIGNALS_P10Q + SIGNALS_P10R + SIGNALS_P10S)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
