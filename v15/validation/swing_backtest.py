@@ -10069,6 +10069,115 @@ SIGNALS_P9O: List[Tuple] = [
     ('S650_s631_vix_pct70',    sig_s650_s631_vix_pct70,    10, 0.20, 50),
 ]
 
+# ── Phase 9P — WR=93% S648 extensions + above-200MA combos + final 52wk ──────
+# S648 (S631+compressed) = WR=93%, $1M+, 8/8yr — unprecedented precision.
+# Extend it and also explore the 200MA uptrend filter as additive dimension.
+
+def sig_s651_s648_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S651: S648 (WR=93%, compressed + 10% disc + weekly) + VIX pct>60.
+    Best-WR signal + fear regime — can we push WR above 93%?"""
+    if sig_s648_s631_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s652_s648_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S652: S648 (WR=93% compressed) + TSLA lags SPY 5%+.
+    WR=93% base + TSLA-specific lag = max independent signal alignment."""
+    if sig_s648_s631_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s653_s642_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S653: S642 (5% disc + weekly support) + ATR compression.
+    Broadest discount threshold with compression filter: highest trade count at WR=93%."""
+    if sig_s642_s215_52wk_disc5(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s654_s642_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S654: S642 (5% disc + weekly support) + volume dry-up.
+    Most trades (n=34) + sellers exhausted = max throughput 100% WR setups."""
+    if sig_s642_s215_52wk_disc5(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i) else 0
+
+
+def sig_s655_s649_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S655: S649 (above200MA + 10% disc, WR=88%, PF=19) + VIX pct>60.
+    Long-term uptrend confirmed + peak discount + fear regime = highest quality."""
+    if sig_s649_s631_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s656_s649_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S656: S649 (above200MA + 10% disc) + TSLA lags SPY 5%+.
+    Long-term trend healthy + near peak + TSLA-specific lag = bull dip entry."""
+    if sig_s649_s631_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s657_s649_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S657: S649 (above200MA + 10% disc, WR=88%) + ATR compression.
+    Uptrend + peak discount + compression = three-way timing signal."""
+    if sig_s649_s631_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s658_s215_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S658: S215 (weekly support) + above 200d MA.
+    Base weekly support signal restricted to long-term uptrend periods only."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if float(tsla['close'].iloc[i]) > ma200 else 0
+
+
+def sig_s659_s526_52wk_disc15(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S659: S526 (MACD+VIX_cooldown, $1.08M, 92% WR) + 15%+ below 52wk high.
+    Two proven $1M signals stacked: MACD timing + VIX cooldown + peak discount."""
+    if sig_s526_s333_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_below_52wk_pct(tsla, i, pct=0.15) else 0
+
+
+def sig_s660_s407_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S660: S407 (VIX pct>70 + weekly support, $1.80M, 8/8yr) + 10%+ below 52wk.
+    Best historical signals + peak discount = maximum multi-signal confluence."""
+    if sig_s407_s215_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_below_52wk_pct(tsla, i, pct=0.10) else 0
+
+
+SIGNALS_P9P: List[Tuple] = [
+    # Phase 9P — WR=93% extensions + above-200MA + cross-signal combos (S651-S660)
+    ('S651_s648_vix_pct60',    sig_s651_s648_vix_pct60,    10, 0.20, 50),
+    ('S652_s648_lag5pct',      sig_s652_s648_lag5pct,      10, 0.20, 50),
+    ('S653_s642_compressed',   sig_s653_s642_compressed,   10, 0.20, 50),
+    ('S654_s642_vol_dryup',    sig_s654_s642_vol_dryup,    10, 0.20, 50),
+    ('S655_s649_vix_pct60',    sig_s655_s649_vix_pct60,    10, 0.20, 50),
+    ('S656_s649_lag5pct',      sig_s656_s649_lag5pct,      10, 0.20, 50),
+    ('S657_s649_compressed',   sig_s657_s649_compressed,   10, 0.20, 50),
+    ('S658_s215_above200ma',   sig_s658_s215_above200ma,   10, 0.20, 50),
+    ('S659_s526_52wk_disc15',  sig_s659_s526_52wk_disc15,  10, 0.20, 50),
+    ('S660_s407_52wk_disc10',  sig_s660_s407_52wk_disc10,  10, 0.20, 50),
+]
+
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
            + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
            + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
@@ -10079,7 +10188,8 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
            + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
            + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
-           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O)
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P)
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
