@@ -12260,6 +12260,145 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E)
 
 
+# ── Phase 10F — OR-union extensions: MACD combos, precision stacks (S811-S820) ──────────
+
+def sig_s811_s808_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S811: S808 (MACD+OR-union, 9/9yr) + below 50d MA.
+    Best wide-coverage MACD signal filtered to bear-phase entries.
+    Hypothesis: MACD momentum turn below 50MA = highest snap-back quality."""
+    if sig_s808_s801_macd_up(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 0 if _tsla_above_50ma(tsla, i) else 1
+
+
+def sig_s812_s808_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S812: S808 (MACD+OR-union) + ATR compression.
+    MACD turn at OR-union support during volatility squeeze.
+    Hypothesis: compression pushes WR from 82% toward 93%+."""
+    if sig_s808_s801_macd_up(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s813_s809_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S813: S809 (OR-union+below50MA) + ATR compression.
+    Bear-phase OR-union with volatility squeeze.
+    Hypothesis: 3-filter precision on widest base → WR=93%+, 8yr+ coverage."""
+    if sig_s809_s801_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s814_s801_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S814: S801 (OR-union base) + TSLA lags SPY ≥5% over 20 days.
+    Widest discount coverage + relative weakness = classic mean-reversion.
+    Tests if lag5pct adds value beyond existing discount filters."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s815_s808_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S815: S808 (MACD+OR-union, 9/9yr) + TSLA lags SPY ≥5% over 20d.
+    Momentum turn with relative weakness confirmation.
+    Hypothesis: MACD + SPY lag = higher per-trade PnL, possible 9/9yr retention."""
+    if sig_s808_s801_macd_up(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s816_s805_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S816: S805 (OR-union+compressed) + volume dry-up.
+    Double-squeeze: ATR compression + seller exhaustion.
+    Hypothesis: OR-union+compressed+dryup = 100% WR (every compressed path hits 100% with dryup)."""
+    if sig_s805_s801_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i) else 0
+
+
+def sig_s817_s808_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S817: S808 (MACD+OR-union, 9/9yr) + VIX elevated pct>60.
+    Does VIX filter boost the 9/9yr MACD OR-union signal quality?
+    Hypothesis: fear-driven dip + MACD reversal = larger snap-back."""
+    if sig_s808_s801_macd_up(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s818_s801_below200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S818: S801 (OR-union base) + TSLA below 200d MA (long-term downtrend).
+    More extreme bear-phase filter than 50MA.
+    Hypothesis: OR-union in confirmed bear trend = deeper discount, stronger reversal."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close < ma200 else 0
+
+
+def sig_s819_s811_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S819: S811 (MACD+OR-union+below50MA) + ATR compression.
+    Triple precision: MACD turn + bear phase + volatility squeeze.
+    Hypothesis: best quality gate on 9/9yr base → near-100% WR."""
+    if sig_s811_s808_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s820_milestone_s815_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S820 MILESTONE: S815 (MACD+OR-union+lag5pct) + below 50d MA.
+    Three independent quality signals: MACD turn + SPY underperformance + bear phase.
+    OR-union base provides widest trade coverage with max quality filtering."""
+    if sig_s815_s808_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 0 if _tsla_above_50ma(tsla, i) else 1
+
+
+SIGNALS_P10F: List[Tuple] = [
+    # Phase 10F — OR-union extensions: MACD combos, precision stacks (S811-S820)
+    ('S811_s808_below50ma',          sig_s811_s808_below50ma,          10, 0.20, 50),
+    ('S812_s808_compressed',         sig_s812_s808_compressed,         10, 0.20, 50),
+    ('S813_s809_compressed',         sig_s813_s809_compressed,         10, 0.20, 50),
+    ('S814_s801_lag5pct',            sig_s814_s801_lag5pct,            10, 0.20, 50),
+    ('S815_s808_lag5pct',            sig_s815_s808_lag5pct,            10, 0.20, 50),
+    ('S816_s805_vol_dryup',          sig_s816_s805_vol_dryup,          10, 0.20, 50),
+    ('S817_s808_vix_pct60',          sig_s817_s808_vix_pct60,          10, 0.20, 50),
+    ('S818_s801_below200ma',         sig_s818_s801_below200ma,         10, 0.20, 50),
+    ('S819_s811_compressed',         sig_s819_s811_compressed,         10, 0.20, 50),
+    ('S820_milestone_s815_below50ma',sig_s820_milestone_s815_below50ma,10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E
+           + SIGNALS_P10F)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
