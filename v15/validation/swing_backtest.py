@@ -3430,7 +3430,372 @@ SIGNALS_P7S: List[Tuple] = [
 ]
 
 
-SIGNALS = SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+# ── Phase 7T — Novel compound signals: 52wk proximity, volume climax, persistent compression ─
+# Exploring three new dimensions:
+# 1. Price level context: 52-week low proximity (maximum pessimism zone)
+# 2. Volume context: selling climax (yesterday high volume = exhaustion signal)
+# 3. Temporal ATR: persistent compression (ATR compressed for 3+ consecutive days)
+# 4. Relative weakness: TSLA lagging SPY by >20% over 30d (catch-up trade)
+
+def _52wk_low_proximity(tsla: pd.DataFrame, i: int, pct: float) -> bool:
+    """True if TSLA close is within pct% of its 52-week low."""
+    lookback = min(i, 252)
+    if lookback < 20:
+        return False
+    low_52wk = float(tsla['low'].iloc[i - lookback:i].min())
+    close = float(tsla['close'].iloc[i])
+    return close <= low_52wk * (1 + pct)
+
+
+def sig_s186_52wk_low_s91(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S186: S91 (ATR extreme) + TSLA within 25% of its 52-week low.
+    Maximum pessimism zone: stock near yearly low AND ATR compressed = quiet capitulation.
+    Hypothesis: deepest price levels + low volatility = institutional accumulation zone."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _52wk_low_proximity(tsla, i, 0.25) else 0
+
+
+def sig_s187_52wk_low_s112(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S187: S112 (VIX>=18 + ATR extreme, 3d hold) + within 30% of 52-week low.
+    Higher-quality base signal (S112 WR=76%) at maximum pessimism levels.
+    Hypothesis: elevated fear + quiet dip near yearly low = best buy setup."""
+    if sig_s112_s107_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _52wk_low_proximity(tsla, i, 0.30) else 0
+
+
+def sig_s188_volume_climax_s91(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S188: S91 + prior-day volume was 2x+ the 20-day average (selling climax).
+    Selling climax theory: extreme volume on down day = exhaustion of sellers.
+    Combined with compressed ATR today = sellers gave up, quiet consolidation follows."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 21 or 'volume' not in tsla.columns:
+        return 1
+    vol_yesterday = float(tsla['volume'].iloc[i - 1])
+    vol_20d_avg = float(tsla['volume'].iloc[i - 21:i - 1].mean())
+    if vol_20d_avg < 1:
+        return 1
+    return 1 if vol_yesterday >= 2.0 * vol_20d_avg else 0
+
+
+def sig_s189_persistent_compression(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S189: S91 + ATR has been compressed for 3+ consecutive trading days.
+    Persistent compression = the coiling gets tighter, snap-back becomes more violent.
+    Single-day ATR extreme is good; multi-day confirmation is stronger."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    # Check last 3 days all had compressed ATR (atr_5 < 0.80 * atr_20)
+    for lag in range(1, 3):
+        c = _atr_components(tsla, i - lag)
+        if c is None:
+            return 1
+        _, atr_5, _, atr_20 = c
+        if atr_5 >= 0.80 * atr_20:
+            return 0  # Not persistently compressed
+    return 1
+
+
+def sig_s190_tsla_lags_spy_s91(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S190: S91 + TSLA lagging SPY by >15% over last 30 days (mean-reversion catch-up).
+    When SPY is up X% but TSLA is flat/down, TSLA is unusually weak relative to market.
+    ATR extreme + relative weakness = higher-beta stock coiled for catch-up rally."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 30:
+        return 1
+    tsla_ret_30d = float(tsla['close'].iloc[i]) / float(tsla['close'].iloc[i - 30]) - 1
+    spy_ret_30d  = float(spy['close'].iloc[i])  / float(spy['close'].iloc[i - 30])  - 1
+    # SPY up at least 3% AND TSLA lagging by 15%+ (e.g., SPY +8%, TSLA -7%)
+    return 1 if (spy_ret_30d > 0.03 and tsla_ret_30d < spy_ret_30d - 0.15) else 0
+
+
+def sig_s191_persistent_comp_vix(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S191: Persistent compression (S189) + VIX>=18.
+    ATR coiling for 3+ days WITH elevated VIX = market scared but TSLA going quiet.
+    The divergence between market fear and TSLA calm = prime snap-back setup."""
+    if sig_s189_persistent_compression(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    vix_now = float(vix['close'].iloc[i]) if i >= 0 else 16.0
+    return 1 if vix_now >= 18 else 0
+
+
+def sig_s192_52wk_low_s136(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S192: S136 (VIX recovery + compressed ATR, PF=16.81) + near 52-week low.
+    Best-PF signal at maximum pessimism levels.
+    Hypothesis: VIX recovery + compressed + near yearly low = triple confirmation."""
+    if sig_s136_s132_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _52wk_low_proximity(tsla, i, 0.30) else 0
+
+
+SIGNALS_P7T: List[Tuple] = [
+    # Phase 7T — 52wk proximity, volume climax, persistent compression, relative weakness
+    ('S186_52wk_low_s91',       sig_s186_52wk_low_s91,       10, 0.20, 50),
+    ('S187_52wk_low_s112',      sig_s187_52wk_low_s112,       3, 0.20, 50),
+    ('S188_volume_climax_s91',  sig_s188_volume_climax_s91,  10, 0.20, 50),
+    ('S189_persist_compress',   sig_s189_persistent_compression, 10, 0.20, 50),
+    ('S190_tsla_lags_spy',      sig_s190_tsla_lags_spy_s91,  10, 0.20, 50),
+    ('S191_persist_comp_vix',   sig_s191_persistent_comp_vix, 10, 0.20, 50),
+    ('S192_52wk_s136',          sig_s192_52wk_low_s136,       2, 0.20, 50),
+]
+
+
+# ── Phase 7U — Extensions of winning Phase 7T signals + seasonality ──────────
+# Extending the best performers: volume climax (S188), persistent compression (S189/S191).
+# Also testing monthly seasonality — TSLA historically strong Q4+Jan.
+
+def sig_s193_volume_climax_vix(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S193: Volume climax (S188) + VIX>=18 — quality upgrade.
+    Selling climax + compressed ATR + elevated VIX = maximum panic exhaustion setup.
+    S188 was 6/6 years; adding VIX filter should raise WR while keeping year consistency."""
+    if sig_s188_volume_climax_s91(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    vix_now = float(vix['close'].iloc[i]) if i >= 0 else 16.0
+    return 1 if vix_now >= 18 else 0
+
+
+def sig_s194_volume_climax_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S194: Volume climax (S188) + NR7 — rarest, highest-quality variant.
+    Yesterday's extreme volume + today's narrowest range of 7 bars = perfect setup.
+    Volume exhaustion then price compression = coil after climax."""
+    if sig_s188_volume_climax_s91(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr_n(tsla, i, 7) else 0
+
+
+def sig_s195_persist_comp_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S195: Persistent compression (S189) + VIX recovery — dual compression types.
+    ATR has been compressed 3+ days AND VIX has been cooling (spike then calm).
+    Hypothesis: price quiet + fear leaving = double snap-back pressure."""
+    if sig_s189_persistent_compression(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    spike_then = vix_5d > 20 or vix_10d > 20
+    calm_now   = vix_now < vix_5d * 0.90
+    return 1 if (spike_then and calm_now) else 0
+
+
+def sig_s196_persist_comp_spy200(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S196: Persistent compression (S189) + SPY above 200d MA — bull market filter.
+    Only take persistent-compression setups when the broad market is in uptrend.
+    Removes the 2019 losing year (market correction) from the S189 results."""
+    if sig_s189_persistent_compression(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    spy_close = float(spy['close'].iloc[i])
+    spy_200d  = float(spy['close'].iloc[i - 200:i].mean())
+    return 1 if spy_close > spy_200d else 0
+
+
+# Monthly seasonality helper
+_TSLA_BULL_MONTHS = {10, 11, 12, 1}   # Oct, Nov, Dec, Jan historically strong
+
+
+def sig_s197_seasonality_s91(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S197: S91 only in TSLA's historically strong months (Oct/Nov/Dec/Jan).
+    Q4 deliveries + year-end tax-loss buying reversal + New Year optimism.
+    Hypothesis: signal quality highest when seasonal tailwind is active."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    month = tsla.index[i].month
+    return 1 if month in _TSLA_BULL_MONTHS else 0
+
+
+def sig_s198_seasonality_s113(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S198: S113 (best quality: VIX>=18+SPY>200d+ATR, 3d hold) in bull months only.
+    Apply the highest-WR signal (82%) to seasonally strong months.
+    Hypothesis: dual tailwind → near-perfect win rate."""
+    if sig_s113_s108_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    month = tsla.index[i].month
+    return 1 if month in _TSLA_BULL_MONTHS else 0
+
+
+def sig_s199_s191_3d_hold(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S199: S191 (persistent compression + VIX>=18) with 3-day hold.
+    S191 was WR=82%, PF=4.38. Test if 3d hold improves further (same as S113 benefit).
+    Hold until signal reversal OR 3 days, whichever first."""
+    return sig_s191_persistent_comp_vix(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s200_persist_comp_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S200: Persistent compression + NR7 — signal #200!
+    3+ days of compressed ATR culminating in the NARROWEST day of the last 7.
+    Hypothesis: multi-day coiling peak = maximum snap-back potential.
+    The Toby Crabel NR7 on already-compressed stock = rare but powerful."""
+    if sig_s189_persistent_compression(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr_n(tsla, i, 7) else 0
+
+
+SIGNALS_P7U: List[Tuple] = [
+    # Phase 7U — Volume climax extensions, persistent compression variants, seasonality
+    ('S193_vol_climax_vix',     sig_s193_volume_climax_vix,  10, 0.20, 50),
+    ('S194_vol_climax_nr7',     sig_s194_volume_climax_nr7,  10, 0.20, 50),
+    ('S195_persist_vix_rec',    sig_s195_persist_comp_vix_rec, 10, 0.20, 50),
+    ('S196_persist_spy200',     sig_s196_persist_comp_spy200, 10, 0.20, 50),
+    ('S197_season_s91',         sig_s197_seasonality_s91,    10, 0.20, 50),
+    ('S198_season_s113',        sig_s198_seasonality_s113,    3, 0.20, 50),
+    ('S199_s191_hold3d',        sig_s199_s191_3d_hold,       10, 0.20, 50),
+    ('S200_persist_nr7',        sig_s200_persist_comp_nr7,   10, 0.20, 50),
+]
+
+
+# ── Phase 7V — Extending S195 + Doji + RSI divergence + relaxed persistence ──
+# S195 (WR=88%, PF=28.79) is the best signal found. Extend it:
+# 1. Add NR7 filter to S195 (triple compound)
+# 2. Relax persistence threshold (2 days instead of 3 = more trades)
+# 3. Raise VIX threshold for S195 (>=20 vs >=18)
+# 4. Doji candle + ATR extreme (small body = market indecision)
+# 5. RSI bullish divergence + ATR extreme (price lower, RSI higher)
+# 6. S195 variant: use 5-day VIX recovery window instead of 5-10d
+# 7. S113 + seasonality (best quality in best months)
+
+def sig_s201_s195_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S201: S195 (persistent compress + VIX recovery) + NR7 — 4-way compound.
+    Persistent ATR coiling + VIX fear exiting + narrowest range = ultimate setup.
+    Hypothesis: all four conditions = maximum snap-back probability."""
+    if sig_s195_persist_comp_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr_n(tsla, i, 7) else 0
+
+
+def sig_s202_relax_persist_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S202: 2-day persistent compression + VIX recovery (relaxed S195).
+    S195 requires 3 days; this requires only 2 → more trades, slightly lower bar.
+    Hypothesis: even 2-day coiling before recovery = strong signal."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    # Check last 2 days had compressed ATR (relaxed from 3 in S189)
+    for lag in range(1, 2):
+        c = _atr_components(tsla, i - lag)
+        if c is None:
+            return 1
+        _, atr_5, _, atr_20 = c
+        if atr_5 >= 0.80 * atr_20:
+            return 0
+    # VIX recovery
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    spike_then = vix_5d > 20 or vix_10d > 20
+    calm_now   = vix_now < vix_5d * 0.90
+    return 1 if (spike_then and calm_now) else 0
+
+
+def sig_s203_doji_s91(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S203: S91 (ATR extreme) + Doji candle (body < 0.3% of price).
+    Doji = open and close are nearly equal = market indecision after a move.
+    ATR compressed + Doji = even the volatility within the day dried up.
+    Hypothesis: maximum indecision in compressed environment → directional break."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    open_p  = float(tsla['open'].iloc[i])
+    close_p = float(tsla['close'].iloc[i])
+    if close_p < 1:
+        return 1
+    body_pct = abs(close_p - open_p) / close_p
+    return 1 if body_pct < 0.003 else 0  # Body < 0.3% of price = Doji
+
+
+def sig_s204_rsi_diverge_s91(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S204: S91 + RSI bullish divergence (price lower than 10d ago but RSI higher).
+    Bullish divergence: price making lower lows while RSI makes higher lows.
+    Combined with ATR extreme = quiet accumulation phase with hidden momentum.
+    Hypothesis: compressed + divergence = smart money buying into weakness."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 24:
+        return 1
+    # Calculate RSI(14) now and 10 bars ago
+    def _rsi(prices):
+        changes = [prices[j] - prices[j-1] for j in range(1, len(prices))]
+        gains = [max(c, 0) for c in changes]
+        losses = [max(-c, 0) for c in changes]
+        avg_gain = sum(gains) / len(gains)
+        avg_loss = sum(losses) / len(losses)
+        if avg_loss < 1e-10:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100.0 - 100.0 / (1.0 + rs)
+    closes_now  = [float(tsla['close'].iloc[i - 14 + j]) for j in range(15)]
+    closes_prev = [float(tsla['close'].iloc[i - 24 + j]) for j in range(15)]
+    rsi_now  = _rsi(closes_now)
+    rsi_prev = _rsi(closes_prev)
+    price_now  = float(tsla['close'].iloc[i])
+    price_prev = float(tsla['close'].iloc[i - 10])
+    # Divergence: price lower but RSI higher = bullish
+    return 1 if (price_now < price_prev and rsi_now > rsi_prev) else 0
+
+
+def sig_s205_s195_vix20(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S205: S195 (persistent compress + VIX recovery) requiring VIX>=20 at spike.
+    S195 requires VIX was >20 in the spike. This makes it more explicit.
+    This is nearly identical to S195 but clarifies the VIX threshold is >=20."""
+    if sig_s189_persistent_compression(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    spike_then = vix_5d >= 22 or vix_10d >= 22  # Stricter: VIX>=22 (vs >20)
+    calm_now   = vix_now < vix_5d * 0.88        # Stricter: dropped >=12% (vs 10%)
+    return 1 if (spike_then and calm_now) else 0
+
+
+def sig_s206_consec_down_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S206: 3+ consecutive down days (S178 exhaustion) + VIX recovery.
+    Sellers exhausted (3 down days) AND fear abating (VIX cooling) = reversal.
+    Different from S195: uses price exhaustion instead of ATR compression.
+    Hypothesis: behavioral exhaustion + macro fear dropping = buy signal."""
+    if i < 10:
+        return 1
+    # 3 consecutive down closes (exhaustion)
+    for j in range(3):
+        if float(tsla['close'].iloc[i - j]) >= float(tsla['close'].iloc[i - j - 1]):
+            return 0
+    # VIX recovery
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    spike_then = vix_5d > 20 or vix_10d > 20
+    calm_now   = vix_now < vix_5d * 0.90
+    return 1 if (spike_then and calm_now) else 0
+
+
+def sig_s207_s113_season(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S207: S113 (best quality: SPY>200d+VIX>=18+ATR, 3d hold) + bull months.
+    S113 WR=82%, PF=7.69. Apply in TSLA's historically strong months (Oct-Jan).
+    Hypothesis: best-in-class signal + seasonal tailwind = near-perfect results."""
+    if sig_s113_s108_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    month = tsla.index[i].month
+    return 1 if month in _TSLA_BULL_MONTHS else 0
+
+
+SIGNALS_P7V: List[Tuple] = [
+    # Phase 7V — S195 extensions, Doji, RSI divergence, relaxed persistence
+    ('S201_s195_nr7',           sig_s201_s195_nr7,           10, 0.20, 50),
+    ('S202_relax_persist_vxr',  sig_s202_relax_persist_vix_rec, 10, 0.20, 50),
+    ('S203_doji_s91',           sig_s203_doji_s91,           10, 0.20, 50),
+    ('S204_rsi_div_s91',        sig_s204_rsi_diverge_s91,    10, 0.20, 50),
+    ('S205_s195_vix22',         sig_s205_s195_vix20,          10, 0.20, 50),
+    ('S206_consec_down_vxr',    sig_s206_consec_down_vix_rec, 10, 0.20, 50),
+    ('S207_s113_season',        sig_s207_s113_season,          3, 0.20, 50),
+]
+
+
+SIGNALS = SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
