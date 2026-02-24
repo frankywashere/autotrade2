@@ -4638,6 +4638,318 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B)
 
 
+# ── Phase 8C — Extend Phase 8B winners + 5-day momentum dimension ─────────────
+# Deep combinatorial exploration of new signals found in 8A/8B:
+#   S258 (100% WR gap down+VIX rec) + sub-filters
+#   S257/S260/S253 with new combinations
+#   5-day momentum decline: sharp short-term selloff into weekly support
+
+def sig_s261_s258_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S261: S258 (100% WR: gap down+VIX recovery at weekly support) + compressed ATR.
+    4-way filter: gap down + VIX recovery + compressed ATR + weekly low.
+    Hypothesis: all 4 conditions = once-a-year institutional capitulation close."""
+    if sig_s258_s250_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s262_s257_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S262: S257 (SPY<50MA+compressed, 6/6yr WR=89%) + VIX recovery timing.
+    Adding the optimal VIX timing signal to the 6/6 year perfect record.
+    Hypothesis: SPY weakness + compression + VIX cooling = multi-factor confluence."""
+    if sig_s257_s242_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s263_s260_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S263: S260 (3-TF: monthly+weekly+daily near lower channels) + VIX recovery.
+    Adding VIX timing to the 3-TF structural alignment signal.
+    Hypothesis: 3 timeframes all at lower boundary + fear cooling = rare regime bottom."""
+    if sig_s260_s245_weekly_low(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s264_s260_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S264: S260 (3-TF monthly+weekly+daily) + compressed ATR only.
+    3-TF structural support + coiling compression = maximum tension before snap.
+    Hypothesis: all three TFs point to support + daily compression = textbook setup."""
+    if sig_s260_s245_weekly_low(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s265_s215_5d_down8pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S265: S215 (multi-TF 8/8yr) + TSLA down 8%+ over last 5 trading days.
+    Sharp short-term selloff INTO the weekly support level = capitulation velocity.
+    Hypothesis: rapid decline to support (not gradual) = sellers exhausted at key level."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    close_now  = float(tsla['close'].iloc[i])
+    close_5d   = float(tsla['close'].iloc[i - 5])
+    chg_5d = (close_now - close_5d) / close_5d
+    return 1 if chg_5d <= -0.08 else 0
+
+
+def sig_s266_s215_5d_down5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S266: S215 + TSLA down 5%+ over last 5 days (looser threshold than S265).
+    More trades with weaker selectivity. Trade-off: frequency vs purity.
+    Hypothesis: even 5% 5-day decline at weekly support shows directional conviction."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    close_now  = float(tsla['close'].iloc[i])
+    close_5d   = float(tsla['close'].iloc[i - 5])
+    chg_5d = (close_now - close_5d) / close_5d
+    return 1 if chg_5d <= -0.05 else 0
+
+
+def sig_s267_s224_5d_down5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S267: S224 (best purity WR=93%) + TSLA down 5%+ over last 5 days.
+    The 5-day momentum decline on top of compressed ATR at weekly support.
+    Hypothesis: compressed ATR but falling price = steady institutional selling ending."""
+    if sig_s224_s215_compressed_only(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    close_now  = float(tsla['close'].iloc[i])
+    close_5d   = float(tsla['close'].iloc[i - 5])
+    chg_5d = (close_now - close_5d) / close_5d
+    return 1 if chg_5d <= -0.05 else 0
+
+
+def sig_s268_s242_consec_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S268: S242 (S215+SPY<50MA, $1.14M) + 3 consecutive down closes.
+    Broad market weakness + weekly TSLA support + sequential TSLA selling = stacked.
+    Hypothesis: individual stock capitulates while market already weakened = max fear."""
+    if sig_s242_s215_spy_weak(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 3:
+        return 1
+    for j in range(3):
+        if float(tsla['close'].iloc[i - j]) >= float(tsla['close'].iloc[i - j - 1]):
+            return 0
+    return 1
+
+
+def sig_s269_s253_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S269: S253 (monthly near lower + compressed ATR) + VIX >= 18.
+    Adding fear context to the monthly support + compression signal.
+    Hypothesis: monthly support + compression + elevated market fear = high-quality."""
+    if sig_s253_s245_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if float(vix['close'].iloc[i]) >= 18 else 0
+
+
+def sig_s270_s252_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S270: S252 (monthly near lower + VIX recovery) + compressed ATR.
+    Triple: monthly structural support + VIX recovery timing + daily compression.
+    Hypothesis: monthly bottom + fear cooling + coiling = monthly edition of S235."""
+    if sig_s252_s245_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+SIGNALS_P8C: List[Tuple] = [
+    # Phase 8C — 4-way combinatorial filters + 5-day momentum dimension
+    ('S261_s258_compressed',    sig_s261_s258_compressed,    10, 0.20, 50),
+    ('S262_s257_vix_rec',       sig_s262_s257_vix_rec,       10, 0.20, 50),
+    ('S263_s260_vix_rec',       sig_s263_s260_vix_rec,       10, 0.20, 50),
+    ('S264_s260_compressed',    sig_s264_s260_compressed,    10, 0.20, 50),
+    ('S265_s215_5d_down8pct',   sig_s265_s215_5d_down8pct,  10, 0.20, 50),
+    ('S266_s215_5d_down5pct',   sig_s266_s215_5d_down5pct,  10, 0.20, 50),
+    ('S267_s224_5d_down5pct',   sig_s267_s224_5d_down5pct,  10, 0.20, 50),
+    ('S268_s242_consec_down',   sig_s268_s242_consec_down,  10, 0.20, 50),
+    ('S269_s253_vix18',         sig_s269_s253_vix18,         10, 0.20, 50),
+    ('S270_s252_compressed',    sig_s270_s252_compressed,    10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C)
+
+
+# ── Phase 8D — 5-day momentum family + extend 8C top signals ──────────────────
+# S262 (100% WR: SPY<50MA+compressed+VIX rec) is our new highest-quality base.
+# S265/S266 (5-day momentum decline) is a new dimension — extend aggressively.
+# S269 (monthly+compressed+VIX18, 5/5yr) is the best monthly signal — extend further.
+
+def sig_s271_s265_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S271: S265 (S215+8% 5-day decline, 7/8yr WR=86%) + VIX recovery.
+    Sharp 8% decline into weekly support AND VIX cooling simultaneously.
+    Hypothesis: multi-day selling pressure exhausts exactly when macro fear peaks."""
+    if sig_s265_s215_5d_down8pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s272_s265_spy_weak(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S272: S265 (S215+8% 5-day decline) + SPY below 50d SMA.
+    Sharp TSLA decline at weekly support AND broad market weakness.
+    Hypothesis: individual + macro weakness converge → cleanest mean-reversion entry."""
+    if sig_s265_s215_5d_down8pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 50:
+        return 1
+    spy_close = float(spy['close'].iloc[i])
+    spy_sma50 = float(spy['close'].iloc[i - 50:i].mean())
+    return 1 if spy_close < spy_sma50 else 0
+
+
+def sig_s273_s265_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S273: S265 (S215+8% 5-day decline) + compressed ATR.
+    ATR compressed = stock declining QUIETLY (not explosively) over 5 days.
+    Hypothesis: quiet 8% drift down to support + compression = controlled selling ending."""
+    if sig_s265_s215_5d_down8pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s274_s267_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S274: S267 (S224+5d decline, 100% WR) + VIX recovery.
+    S267 = compressed + weekly support + 5% 5-day decline. Now add VIX timing.
+    Hypothesis: all 4 elements = ultra-rare. Should be 100% WR or near-perfect."""
+    if sig_s267_s224_5d_down5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s275_s263_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S275: S263 (3-TF+VIX recovery, avg=$101K) + compressed ATR.
+    3-TF structural alignment + VIX recovery timing + daily compression.
+    Hypothesis: 4-way signal convergence = absolute highest-quality monthly setup."""
+    if sig_s263_s260_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s276_s269_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S276: S269 (monthly+compressed+VIX18, 5/5yr WR=92%) + VIX recovery timing.
+    S269 is perfect year rate with 12 trades. Adding VIX recovery timing refines entry.
+    Hypothesis: monthly structural + compression + fear cooling → strongest monthly setup."""
+    if sig_s269_s253_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s277_s264_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S277: S264 (3-TF+compressed, 7/9yr WR=79%) + VIX >= 18.
+    3-TF structural compression + elevated fear context.
+    Hypothesis: VIX gate removes low-quality low-fear setups from the 3-TF pattern."""
+    if sig_s264_s260_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if float(vix['close'].iloc[i]) >= 18 else 0
+
+
+def sig_s278_s266_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S278: S266 (S215+5% 5-day decline, 7/8yr) + VIX recovery.
+    Combining 5-day momentum (broader threshold) with VIX cooling timing.
+    Hypothesis: 5% steady decline + VIX subsiding = market participants re-entering."""
+    if sig_s266_s215_5d_down5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s279_s260_5d_down5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S279: S260 (3-TF: monthly+weekly+daily channels) + 5% 5-day decline.
+    All three timeframe channels near lower boundary AND recent sharp decline.
+    Hypothesis: 3 structural supports + velocity of decline = textbook capitulation."""
+    if sig_s260_s245_weekly_low(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    close_now = float(tsla['close'].iloc[i])
+    close_5d  = float(tsla['close'].iloc[i - 5])
+    chg_5d = (close_now - close_5d) / close_5d
+    return 1 if chg_5d <= -0.05 else 0
+
+
+def sig_s280_s262_vix22(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S280: S262 (100% WR: SPY<50MA+compressed+VIX_rec) + VIX>=22.
+    S262 has 5 trades 100% WR — all in high-fear periods anyway.
+    Test: does higher VIX threshold (22 vs 18) maintain or improve the signal?"""
+    if sig_s262_s257_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if float(vix['close'].iloc[i]) >= 22 else 0
+
+
+SIGNALS_P8D: List[Tuple] = [
+    # Phase 8D — 5-day momentum extensions + 4-way combinatorial filters
+    ('S271_s265_vix_rec',       sig_s271_s265_vix_rec,       10, 0.20, 50),
+    ('S272_s265_spy_weak',      sig_s272_s265_spy_weak,      10, 0.20, 50),
+    ('S273_s265_compressed',    sig_s273_s265_compressed,    10, 0.20, 50),
+    ('S274_s267_vix_rec',       sig_s274_s267_vix_rec,       10, 0.20, 50),
+    ('S275_s263_compressed',    sig_s275_s263_compressed,    10, 0.20, 50),
+    ('S276_s269_vix_rec',       sig_s276_s269_vix_rec,       10, 0.20, 50),
+    ('S277_s264_vix18',         sig_s277_s264_vix18,         10, 0.20, 50),
+    ('S278_s266_vix_rec',       sig_s278_s266_vix_rec,       10, 0.20, 50),
+    ('S279_s260_5d_down5pct',   sig_s279_s260_5d_down5pct,  10, 0.20, 50),
+    ('S280_s262_vix22',         sig_s280_s262_vix22,         10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
