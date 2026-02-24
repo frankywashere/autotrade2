@@ -7818,6 +7818,171 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V)
 
 
+# ── Phase 8W — SPY-200MA cross + S454 extensions + Bollinger %B ───────────────
+# S454 (SPY near 52wk high+above200MA, 91% WR, n=11) → extend aggressively.
+# New: SPY above its own 200d MA (SPY uptrend filter, different from SPY level).
+# New: Bollinger Band %B (how far price is below lower BB) — oversold on BB basis.
+
+def _spy_above_200ma(spy, i) -> bool:
+    """SPY is in its own uptrend (above 200d MA) — broad market bull regime."""
+    if i < 200:
+        return True   # not enough history → assume bull
+    spy_close = float(spy['close'].iloc[i])
+    spy_ma200 = float(spy['close'].iloc[i - 200:i].mean())
+    return spy_close > spy_ma200
+
+
+def _bb_pct_b(tsla, i, period: int = 20, std_mult: float = 2.0) -> Optional[float]:
+    """Bollinger Band %B: (close - lower_band) / (upper_band - lower_band).
+    %B < 0 = below lower band (oversold). %B near 0 = near lower band."""
+    if i < period:
+        return None
+    closes = tsla['close'].iloc[i - period:i + 1].values.astype(float)
+    mean = closes.mean()
+    std  = float(np.std(closes, ddof=1))
+    if std < 1e-6:
+        return None
+    upper = mean + std_mult * std
+    lower = mean - std_mult * std
+    band_width = upper - lower
+    if band_width < 1e-6:
+        return None
+    return (closes[-1] - lower) / band_width   # %B: 0 = lower band, 1 = upper band
+
+
+def sig_s461_s454_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S461: S454 (SPY high+above200MA+S215, 91% WR) + VIX pct>70.
+    4-way: SPY strength + TSLA uptrend + weekly support + sustained fear.
+    Hypothesis: the contradiction (SPY strong + VIX elevated) = TSLA panic dip target."""
+    if sig_s454_s449_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.70) else 0
+
+
+def sig_s462_s454_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S462: S454 (SPY high+above200MA, 91% WR) + compressed ATR.
+    4-way: SPY strength + TSLA uptrend + weekly support + compression.
+    Hypothesis: lag at annual high + pullback compressed = maximum spring energy."""
+    if sig_s454_s449_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s463_s454_macd(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S463: S454 (SPY high+above200MA) + MACD turning.
+    4-way: SPY strength + TSLA uptrend + weekly support + MACD momentum.
+    Hypothesis: adding MACD to S454 (91% WR) → should push to 100% WR."""
+    if sig_s454_s449_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist = _macd_histogram(tsla, i)
+    if hist is None:
+        return 1
+    hist_prev = _macd_histogram(tsla, i - 1)
+    if hist_prev is None:
+        return 1
+    return 1 if (hist > hist_prev and hist < 0) else 0
+
+
+def sig_s464_s215_spy_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S464: S215 (weekly support) + SPY above its own 200d MA.
+    NEW: SPY in uptrend context (not just near high — sustained bull market).
+    Hypothesis: TSLA weekly support when SPY is in confirmed uptrend = bull dip."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _spy_above_200ma(spy, i) else 0
+
+
+def sig_s465_s333_spy_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S465: S333 (MACD turning at weekly support) + SPY above 200d MA.
+    MACD momentum reversal in SPY uptrend context.
+    Hypothesis: MACD turn at support when SPY is in confirmed bull = cleanest entry."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _spy_above_200ma(spy, i) else 0
+
+
+def sig_s466_s407_spy_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S466: S407 (VIX pct>70+S215, $1.45M) + SPY above 200d MA.
+    VIX fear regime + SPY uptrend simultaneously.
+    Hypothesis: sustained fear within a bull market = TSLA panic selloff in good conditions."""
+    if sig_s407_s215_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _spy_above_200ma(spy, i) else 0
+
+
+def sig_s467_s408_spy_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S467: S408 (MACD+VIX pct>70, 93% WR) + SPY above 200d MA.
+    Best signal filtered to SPY uptrend.
+    Hypothesis: 93% WR signal during bull market = highest precision combo."""
+    if sig_s408_s333_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _spy_above_200ma(spy, i) else 0
+
+
+def sig_s468_s215_bb_pct_low(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S468: S215 (weekly support) + Bollinger %B < 0.15 (near/below lower BB).
+    NEW: Bollinger oversold — price near or below 20d lower Bollinger Band.
+    Hypothesis: weekly channel support + BB oversold = double technical support."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    pct_b = _bb_pct_b(tsla, i)
+    if pct_b is None:
+        return 1
+    return 1 if pct_b < 0.15 else 0
+
+
+def sig_s469_s333_bb_pct_low(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S469: S333 (MACD turning) + Bollinger %B < 0.15.
+    MACD momentum reversal when near Bollinger lower band.
+    Hypothesis: MACD turning at BB oversold = double momentum + structure confirm."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    pct_b = _bb_pct_b(tsla, i)
+    if pct_b is None:
+        return 1
+    return 1 if pct_b < 0.15 else 0
+
+
+def sig_s470_s407_bb_pct_low(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S470: S407 (VIX pct>70+S215, $1.45M) + Bollinger %B < 0.15.
+    Best signal + Bollinger oversold confirmation.
+    Hypothesis: VIX fear + weekly support + BB oversold = 3 layers of support."""
+    if sig_s407_s215_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    pct_b = _bb_pct_b(tsla, i)
+    if pct_b is None:
+        return 1
+    return 1 if pct_b < 0.15 else 0
+
+
+SIGNALS_P8W: List[Tuple] = [
+    # Phase 8W — S454 extensions + SPY-200MA cross + Bollinger %B
+    ('S461_s454_vix_pct70',       sig_s461_s454_vix_pct70,       10, 0.20, 50),
+    ('S462_s454_compressed',      sig_s462_s454_compressed,      10, 0.20, 50),
+    ('S463_s454_macd',            sig_s463_s454_macd,            10, 0.20, 50),
+    ('S464_s215_spy_above200ma',  sig_s464_s215_spy_above200ma,  10, 0.20, 50),
+    ('S465_s333_spy_above200ma',  sig_s465_s333_spy_above200ma,  10, 0.20, 50),
+    ('S466_s407_spy_above200ma',  sig_s466_s407_spy_above200ma,  10, 0.20, 50),
+    ('S467_s408_spy_above200ma',  sig_s467_s408_spy_above200ma,  10, 0.20, 50),
+    ('S468_s215_bb_pct_low',      sig_s468_s215_bb_pct_low,      10, 0.20, 50),
+    ('S469_s333_bb_pct_low',      sig_s469_s333_bb_pct_low,      10, 0.20, 50),
+    ('S470_s407_bb_pct_low',      sig_s470_s407_bb_pct_low,      10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
