@@ -10988,6 +10988,162 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P9V)
 
 
+# ── Phase 9W — NR4 extensions + hammer candle + 20d discount (S721-S730) ──────
+# Best from 9V: NR4 ($809K) and below_pw_low ($762K).
+# Extend NR4 with proven filters. Also test bullish-hammer candle + 20-day discount.
+
+def _tsla_bullish_hammer(tsla, i, body_ratio: float = 0.30) -> bool:
+    """True if today is a bullish hammer: small body in upper portion, long lower shadow.
+    Lower shadow >= 2× body, body in top 30% of bar range. Sign of rejection at lows."""
+    if i < 1:
+        return False
+    o = float(tsla['open'].iloc[i])
+    h = float(tsla['high'].iloc[i])
+    lo = float(tsla['low'].iloc[i])
+    c = float(tsla['close'].iloc[i])
+    bar_range = h - lo
+    if bar_range <= 0:
+        return False
+    body = abs(c - o)
+    lower_shadow = min(o, c) - lo
+    # Bullish: close >= open, body small, lower shadow >= 2× body
+    if c < o:
+        return False
+    if body > body_ratio * bar_range:
+        return False
+    if lower_shadow < 2.0 * body and lower_shadow < 0.5 * bar_range:
+        return False
+    return True
+
+
+def _tsla_below_20d_high_pct(tsla, i, pct: float = 0.08) -> bool:
+    """True if TSLA is at least pct% below its 20-day high (recent momentum decline)."""
+    if i < 20:
+        return False
+    high_20d = float(tsla['high'].iloc[i - 20:i].max())
+    if high_20d <= 0:
+        return False
+    discount = (high_20d - float(tsla['close'].iloc[i])) / high_20d
+    return discount >= pct
+
+
+def sig_s721_s714_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S721: S714 (S631+NR4, $809K) + VIX pct>60.
+    NR4 squeeze at peak discount + fear regime = maximum energy coil."""
+    if sig_s714_s631_nr4(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s722_s714_macd_up(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S722: S714 (S631+NR4, $809K) + MACD histogram turning up.
+    NR4 energy coil at peak discount with momentum turning = precision reversal."""
+    if sig_s714_s631_nr4(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist_now  = _macd_histogram(tsla, i)
+    hist_prev = _macd_histogram(tsla, i - 1) if i > 0 else None
+    if hist_now is None or hist_prev is None:
+        return 1
+    return 1 if hist_now > hist_prev else 0
+
+
+def sig_s723_s720_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S723: S720 (S631+below_pw_low, $762K) + VIX pct>60.
+    False-breakdown below prior week's low during fear regime = high-conviction stop-run."""
+    if sig_s720_s631_below_pw_low(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s724_s631_hammer(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S724: S631 (10%disc + weekly support) + bullish hammer candle.
+    Hammer rejection candle at peak discount structural support = classic reversal."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_bullish_hammer(tsla, i) else 0
+
+
+def sig_s725_s631_20d_disc8(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S725: S631 (10%disc + weekly support) + 8%+ below 20-day high.
+    Short-term momentum drop onto structural support with peak discount = fresh selling."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_below_20d_high_pct(tsla, i, pct=0.08) else 0
+
+
+def sig_s726_s215_20d_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S726: Weekly channel support + 10%+ below 20-day high (standalone, no 52wk).
+    Does 20-day high discount add value without the 52-week anchor?"""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_below_20d_high_pct(tsla, i, pct=0.10) else 0
+
+
+def sig_s727_s714_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S727: S714 (S631+NR4) + ATR compression.
+    NR4 + compressed ATR = double-confirmed volatility squeeze at peak discount."""
+    if sig_s714_s631_nr4(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s728_s701_nr4(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S728: S701 (S631+VIX_pct60, $1.4M) + NR4 squeeze.
+    VIX fear + peak discount + weekly support + NR4 = 4-way energy compression."""
+    if sig_s701_s631_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_nr4(tsla, i) else 0
+
+
+def sig_s729_s631_20d_disc12(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S729: S631 (10%disc + weekly support) + 12%+ below 20-day high.
+    Sharper short-term drop at peak discount — more urgent selling exhaustion."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_below_20d_high_pct(tsla, i, pct=0.12) else 0
+
+
+def sig_s730_s701_hammer(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S730: S701 (S631+VIX_pct60, $1.4M) + bullish hammer candle.
+    Hammer rejection in fear regime at peak discount = high conviction reversal day."""
+    if sig_s701_s631_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_bullish_hammer(tsla, i) else 0
+
+
+SIGNALS_P9W: List[Tuple] = [
+    # Phase 9W — NR4 extensions + hammer candle + 20d discount (S721-S730)
+    ('S721_s714_vix_pct60',      sig_s721_s714_vix_pct60,      10, 0.20, 50),
+    ('S722_s714_macd_up',        sig_s722_s714_macd_up,        10, 0.20, 50),
+    ('S723_s720_vix_pct60',      sig_s723_s720_vix_pct60,      10, 0.20, 50),
+    ('S724_s631_hammer',         sig_s724_s631_hammer,         10, 0.20, 50),
+    ('S725_s631_20d_disc8',      sig_s725_s631_20d_disc8,      10, 0.20, 50),
+    ('S726_s215_20d_disc10',     sig_s726_s215_20d_disc10,     10, 0.20, 50),
+    ('S727_s714_compressed',     sig_s727_s714_compressed,     10, 0.20, 50),
+    ('S728_s701_nr4',            sig_s728_s701_nr4,            10, 0.20, 50),
+    ('S729_s631_20d_disc12',     sig_s729_s631_20d_disc12,     10, 0.20, 50),
+    ('S730_s701_hammer',         sig_s730_s701_hammer,         10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T + SIGNALS_P9U
+           + SIGNALS_P9V + SIGNALS_P9W)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
