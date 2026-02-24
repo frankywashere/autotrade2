@@ -18424,6 +18424,154 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10Z + SIGNALS_P11A + SIGNALS_P11B + SIGNALS_P11C + SIGNALS_P11D + SIGNALS_P11E
            + SIGNALS_P11F + SIGNALS_P11G + SIGNALS_P11H + SIGNALS_P11I + SIGNALS_P11J + SIGNALS_P11K)
 
+# ── Phase 11L: Final segmentation — DOW, 200d SMA trend, VIX slope ─────────────
+# Goal: Understand what makes S1041's 23 trades high quality.
+# These filters segment existing S1041 trades — and test a few new OR arms.
+
+def _tsla_above_200sma(tsla_df, i):
+    """True if TSLA close is above its 200-day simple moving average."""
+    if i < 200:
+        return False
+    sma200 = float(tsla_df['close'].iloc[i - 200:i].mean())
+    return float(tsla_df['close'].iloc[i]) > sma200
+
+
+def _vix_declining(vix_df, i, fast=5, slow=10):
+    """True if short-term VIX avg < longer-term VIX avg (fear abating)."""
+    if i < slow:
+        return False
+    vix_fast = float(vix_df['close'].iloc[i - fast:i].mean())
+    vix_slow = float(vix_df['close'].iloc[i - slow:i].mean())
+    return vix_fast < vix_slow
+
+
+def sig_s1141_s929_above_200sma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1141: S929 + TSLA above 200d SMA (bull market structural support).
+    Entries when TSLA is in uptrend = catching dip in bull run = higher quality."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _tsla_above_200sma(tsla, i):
+        return 1
+    return 0
+
+
+def sig_s1142_s929_below_200sma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1142: S929 + TSLA below 200d SMA (bear/weak trend structural bounce).
+    Tests if channel bounces work in downtrends too."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not _tsla_above_200sma(tsla, i):
+        return 1
+    return 0
+
+
+def sig_s1143_s1041_above_200sma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1143: S1041 filtered to TSLA above 200d SMA only — premium bull-trend trades."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _tsla_above_200sma(tsla, i):
+        return 1
+    return 0
+
+
+def sig_s1144_s1041_below_200sma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1144: S1041 filtered to TSLA below 200d SMA — bear/weak trend support test."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not _tsla_above_200sma(tsla, i):
+        return 1
+    return 0
+
+
+def sig_s1145_s929_vix_declining(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1145: S929 + VIX declining (5d avg < 10d avg) — fear abating = dip with tailwind."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _vix_declining(vix, i):
+        return 1
+    return 0
+
+
+def sig_s1146_s929_vix_rising(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1146: S929 + VIX rising (5d avg > 10d avg) — fear building = buying into fear."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not _vix_declining(vix, i):
+        return 1
+    return 0
+
+
+def sig_s1147_s929_monday(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1147: S929 + Monday entry (day 0) — start-of-week channel support bounce."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if tsla.index[i].weekday() == 0:  # Monday
+        return 1
+    return 0
+
+
+def sig_s1148_s929_tue_wed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1148: S929 + Tuesday or Wednesday entry — mid-week support bounces."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if tsla.index[i].weekday() in (1, 2):  # Tuesday, Wednesday
+        return 1
+    return 0
+
+
+def sig_s1149_s1041_vix_declining(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1149: S1041 filtered to VIX declining days only — 'fear cooling' premium entries."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _vix_declining(vix, i):
+        return 1
+    return 0
+
+
+def sig_s1150_s1041_vix_rising(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1150: S1041 filtered to VIX rising days — 'fear building' entry test."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not _vix_declining(vix, i):
+        return 1
+    return 0
+
+
+SIGNALS_P11L: List[Tuple] = [
+    ('S1141_s929_above_200sma',        sig_s1141_s929_above_200sma,            10, 0.20, 50),
+    ('S1142_s929_below_200sma',        sig_s1142_s929_below_200sma,            10, 0.20, 50),
+    ('S1143_s1041_above_200sma',       sig_s1143_s1041_above_200sma,           10, 0.20, 50),
+    ('S1144_s1041_below_200sma',       sig_s1144_s1041_below_200sma,           10, 0.20, 50),
+    ('S1145_s929_vix_declining',       sig_s1145_s929_vix_declining,           10, 0.20, 50),
+    ('S1146_s929_vix_rising',          sig_s1146_s929_vix_rising,              10, 0.20, 50),
+    ('S1147_s929_monday',              sig_s1147_s929_monday,                  10, 0.20, 50),
+    ('S1148_s929_tue_wed',             sig_s1148_s929_tue_wed,                 10, 0.20, 50),
+    ('S1149_s1041_vix_declining',      sig_s1149_s1041_vix_declining,          10, 0.20, 50),
+    ('S1150_s1041_vix_rising',         sig_s1150_s1041_vix_rising,             10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E
+           + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I + SIGNALS_P10J
+           + SIGNALS_P10K + SIGNALS_P10L + SIGNALS_P10M + SIGNALS_P10N + SIGNALS_P10O
+           + SIGNALS_P10P + SIGNALS_P10Q + SIGNALS_P10R + SIGNALS_P10S + SIGNALS_P10T
+           + SIGNALS_P10U + SIGNALS_P10V + SIGNALS_P10W + SIGNALS_P10X + SIGNALS_P10Y
+           + SIGNALS_P10Z + SIGNALS_P11A + SIGNALS_P11B + SIGNALS_P11C + SIGNALS_P11D + SIGNALS_P11E
+           + SIGNALS_P11F + SIGNALS_P11G + SIGNALS_P11H + SIGNALS_P11I + SIGNALS_P11J + SIGNALS_P11K
+           + SIGNALS_P11L)
+
 # ── sentinel — do not remove ──────────────────────────────────────────────────
 
 
