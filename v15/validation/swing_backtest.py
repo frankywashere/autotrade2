@@ -245,10 +245,14 @@ def run_swing_backtest(
     start_year:    int   = 2015,
     end_year:      int   = 2024,
     compound:      bool  = False,
+    trail_pct:     float = 0.0,    # > 0 enables trailing stop (e.g. 0.03 = 3%)
+    persist_bars:  int   = 1,      # signal must fire N consecutive bars before entry
 ) -> BacktestResult:
-    """Run swing backtest. If compound=True, position size scales with equity growth
-    (same model as c10/c9 surfer: equity_scale = equity / initial_equity).
-    Initial equity = MAX_TRADE_USD * 10 (e.g. $10K trade → $100K starting equity)."""
+    """Run swing backtest.
+    compound:     position scales with equity (c10/c9 model).
+    trail_pct:    trailing stop from highest close since entry (0 = disabled, use fixed stop_pct).
+    persist_bars: require signal to fire N consecutive days before entering (default=1=immediate).
+    """
     result = BacktestResult(signal=signal_name)
 
     # Compounding state
@@ -273,12 +277,14 @@ def run_swing_backtest(
     vix_full  = vix
     trade_start = warmup_bars
 
-    in_trade    = False
-    entry_price = 0.0
-    entry_bar   = 0
-    entry_date  = None
-    direction   = 0
+    in_trade       = False
+    entry_price    = 0.0
+    entry_bar      = 0
+    entry_date     = None
+    direction      = 0
     open_trade_usd = MAX_TRADE_USD   # size locked in at entry
+    highest_close  = 0.0             # for trailing stop
+    consec_signal  = 0               # persistence counter (bars signal has been active)
 
     for i in range(trade_start, n - 1):
         bar_year = tsla_full.index[i].year
@@ -289,9 +295,15 @@ def run_swing_backtest(
         if in_trade:
             price     = tsla_full['close'].iloc[i]
             hold_days = i - entry_bar
+            highest_close = max(highest_close, price)
 
-            # Stop loss (check vs close, exit at next open)
-            if direction == 1 and price < entry_price * (1 - stop_pct):
+            # Stop loss — trailing or fixed
+            if trail_pct > 0:
+                stop_level = highest_close * (1 - trail_pct)
+            else:
+                stop_level = entry_price * (1 - stop_pct)
+
+            if direction == 1 and price < stop_level:
                 exit_price = tsla_full['open'].iloc[i + 1]
                 pnl = _record_trade(result, signal_name, direction,
                                     entry_date, entry_price,
@@ -300,6 +312,7 @@ def run_swing_backtest(
                 if compound:
                     equity = max(equity + pnl, initial_equity * 0.10)
                 in_trade = False
+                consec_signal = 0
                 continue
 
             # Timeout
@@ -312,6 +325,7 @@ def run_swing_backtest(
                 if compound:
                     equity = max(equity + pnl, initial_equity * 0.10)
                 in_trade = False
+                consec_signal = 0
                 continue
 
             # Exit signal (must hold at least 2 days to avoid whipsaw)
@@ -328,6 +342,7 @@ def run_swing_backtest(
                     if compound:
                         equity = max(equity + pnl, initial_equity * 0.10)
                     in_trade = False
+                    consec_signal = 0
                     continue
 
         elif in_window:
@@ -336,6 +351,11 @@ def run_swing_backtest(
                             tsla_weekly, spy_weekly,
                             rsi_tsla, rsi_spy, channel_window)
             if sig != 0:
+                consec_signal += 1
+            else:
+                consec_signal = 0
+
+            if sig != 0 and consec_signal >= persist_bars:
                 # Lock in position size at entry (compounding: scale with equity growth)
                 equity_scale   = (equity / initial_equity) if compound else 1.0
                 open_trade_usd = MAX_TRADE_USD * equity_scale
@@ -344,6 +364,8 @@ def run_swing_backtest(
                 entry_bar      = i + 1
                 direction      = sig
                 in_trade       = True
+                highest_close  = entry_price
+                consec_signal  = 0
 
     # Close any still-open trade at end of data
     if in_trade:
@@ -1181,6 +1203,68 @@ def sig_s61_s51_ma200_vix(i, tsla, spy, vix, tw, sw, rt, rs, w):
     return sig_s51_multi_touch_upper(i, tsla, spy, vix, tw, sw, rt, rs, w)
 
 
+def sig_s64_dynamic_bear_guard(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S64: S32 + dynamic bear guard — require SPY > 100d MA only when VIX > 25.
+    Keeps all calm-market S32 trades; adds uptrend filter during stress."""
+    if sig_s32_union_s29_s25(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    vix_now = vix['close'].iloc[i]
+    if vix_now > 25:
+        if i < 100:
+            return 0
+        spy_ma100 = spy['close'].iloc[i - 100:i].mean()
+        if spy['close'].iloc[i] < spy_ma100:
+            return 0
+    return 1
+
+
+def sig_s65_s32_bullish_candle(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S65: S32 + TSLA closes above its open on signal day (bullish candle).
+    Requires intraday momentum confirmation before entry."""
+    if sig_s32_union_s29_s25(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if tsla['close'].iloc[i] <= tsla['open'].iloc[i]:
+        return 0
+    return 1
+
+
+def sig_s66_s32_volume_surge(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S66: S32 + TSLA volume > 1.2x 10d average (unusual participation = conviction)."""
+    if sig_s32_union_s29_s25(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 0
+    avg_vol = tsla['volume'].iloc[i - 10:i].mean()
+    if avg_vol <= 0 or tsla['volume'].iloc[i] < avg_vol * 1.2:
+        return 0
+    return 1
+
+
+def sig_s67_s32_rsi_exit(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S67: S32 entry + RSI-based exit override.
+    Returns 0 (exit signal) when RSI > 65 (overbought) even if S32 hasn't flipped.
+    This lets us ride momentum but exit at exhaustion rather than waiting for full reversal."""
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and t_rsi > 65:
+        return 0   # overbought — exit or don't enter
+    return sig_s32_union_s29_s25(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s68_s62_dynamic_bear(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S68: S62 (S32+S51/VIX union) + dynamic bear guard (SPY MA100 when VIX > 25).
+    Best combination signal with stress-regime bear protection."""
+    if sig_s62_s32_plus_s51_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    vix_now = vix['close'].iloc[i]
+    if vix_now > 25:
+        if i < 100:
+            return 0
+        spy_ma100 = spy['close'].iloc[i - 100:i].mean()
+        if spy['close'].iloc[i] < spy_ma100:
+            return 0
+    return 1
+
+
 def sig_s63_s62_ma200(i, tsla, spy, vix, tw, sw, rt, rs, w):
     """S63: S62 (S32 + S51/VIX union) + SPY above 200d MA — cuts bear market noise."""
     if i < 200:
@@ -1218,6 +1302,11 @@ SIGNALS_P6D: List[Tuple] = [
     ('S61_s51_ma200_vix',            sig_s61_s51_ma200_vix,                10, 0.05, 50),
     ('S62_s32_plus_s51_vix',         sig_s62_s32_plus_s51_union,            5, 0.04, 50),
     ('S63_s62_ma200',                sig_s63_s62_ma200,                     5, 0.04, 50),
+    ('S64_s32_dynamic_bear_guard',   sig_s64_dynamic_bear_guard,            5, 0.04, 50),
+    ('S65_s32_bullish_candle',       sig_s65_s32_bullish_candle,            5, 0.04, 50),
+    ('S66_s32_volume_surge',         sig_s66_s32_volume_surge,              5, 0.04, 50),
+    ('S67_s32_rsi_exit',             sig_s67_s32_rsi_exit,                  5, 0.04, 50),
+    ('S68_s62_dynamic_bear',         sig_s68_s62_dynamic_bear,              5, 0.04, 50),
 ]
 
 SIGNALS_P5D: List[Tuple] = [
@@ -1614,6 +1703,14 @@ def main():
     parser.add_argument('--compound',   action='store_true',
                         help='Compound equity: position size scales with equity growth, '
                              'same model as c10/c9 surfer. Pair with --trade-usd 10000.')
+    parser.add_argument('--ticker',     default='TSLA',
+                        help='Ticker to trade (default: TSLA). E.g. NVDA, AAPL.')
+    parser.add_argument('--trail-pct',  type=float, default=0.0,
+                        help='Trailing stop %% from highest close (0=disabled, use fixed stop). '
+                             'E.g. 0.03 = 3%% trailing.')
+    parser.add_argument('--persist',    type=int, default=1,
+                        help='Bars signal must fire consecutively before entry (default=1=immediate). '
+                             'E.g. 2 = require 2 consecutive signal days.')
     args = parser.parse_args()
 
     # Apply trade size override globally before any backtest runs
@@ -1672,6 +1769,8 @@ def main():
                 start_year=args.start_year,
                 end_year=args.end_year,
                 compound=args.compound,
+                trail_pct=args.trail_pct,
+                persist_bars=args.persist,
             )
             elapsed = time.time() - t1
             results.append(r)
@@ -1708,6 +1807,8 @@ def main():
                 start_year=args.start_year,
                 end_year=args.end_year,
                 compound=args.compound,
+                trail_pct=args.trail_pct,
+                persist_bars=args.persist,
             )
             elapsed = time.time() - t1
             results.append(r)
@@ -1718,14 +1819,15 @@ def main():
         print("Loading data (yfinance daily) ...")
         fetch_start = f'{args.start_year - 1}-01-01'
         fetch_end   = f'{args.end_year}-12-31'
-        tsla_d = _normalize_tz(fetch_native_tf('TSLA',  'daily', fetch_start, fetch_end))
+        ticker = args.ticker.upper()
+        tsla_d = _normalize_tz(fetch_native_tf(ticker,  'daily', fetch_start, fetch_end))
         spy_d  = _normalize_tz(fetch_native_tf('SPY',   'daily', fetch_start, fetch_end))
         vix_d  = _normalize_tz(fetch_native_tf('^VIX',  'daily', fetch_start, fetch_end))
         tsla_w = _resample_weekly(tsla_d)
         spy_w  = _resample_weekly(spy_d)
-        print(f"TSLA daily: {len(tsla_d)} bars | SPY daily: {len(spy_d)} bars | "
+        print(f"{ticker} daily: {len(tsla_d)} bars | SPY daily: {len(spy_d)} bars | "
               f"VIX daily: {len(vix_d)} bars")
-        print(f"TSLA weekly: {len(tsla_w)} bars | SPY weekly: {len(spy_w)} bars")
+        print(f"{ticker} weekly: {len(tsla_w)} bars | SPY weekly: {len(spy_w)} bars")
         print(f"Data loaded in {time.time()-t0:.1f}s\n")
 
         if args.sweep:
@@ -1747,6 +1849,8 @@ def main():
                 start_year=args.start_year,
                 end_year=args.end_year,
                 compound=args.compound,
+                trail_pct=args.trail_pct,
+                persist_bars=args.persist,
             )
             elapsed = time.time() - t1
             results.append(r)
