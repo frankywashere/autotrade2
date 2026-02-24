@@ -15674,6 +15674,195 @@ SIGNALS_P10Y: List[Tuple] = [
     ('S1010_s993_or_tsla10d_rsi45',    sig_s1010_s993_or_tsla10d_or_rsi45,     10, 0.20, 50),
 ]
 
+# ── Phase 10Z — Precision unions, VIX sweep, channel tightening, spy sweet spot ──
+
+def sig_s1011_s929_macd_or_rsi40(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1011: S929 base + (MACD<0 OR TSLA RSI<40).
+    Union of S1003 and S1009 — two independent 100% WR precision paths.
+    Hypothesis: their union should also be 100% WR with more trades than each alone."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist = _macd_histogram(tsla, i)
+    if hist is not None and hist < 0:
+        return 1
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and t_rsi < 40:
+        return 1
+    return 0
+
+
+def sig_s1012_s929_macd_and_rsi45(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1012: S929 + MACD<0 AND TSLA RSI<45 (double confirmation: falling momentum + oversold).
+    Intersection of two filters — should give highest WR at cost of fewer trades."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist = _macd_histogram(tsla, i)
+    if hist is None or hist >= 0:
+        return 0
+    t_rsi = rt.iloc[i]
+    if pd.isna(t_rsi) or t_rsi >= 45:
+        return 0
+    return 1
+
+
+def sig_s1013_s929_spy5d_mild(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1013: S929 + SPY 5-day return 0 to +2% (mild recovery, not strong).
+    Phase 10Y showed SPY 5d positive good (S993) but SPY 10d > 3% bad (S1008: WR=70%).
+    Hypothesis: 'mild SPY recovery' sweet spot = 0-2% over 5d. Captures quality setups."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 0
+    spy_now = float(spy['close'].iloc[i])
+    spy_5d = float(spy['close'].iloc[i - 5])
+    if spy_5d <= 0:
+        return 0
+    ret5 = (spy_now - spy_5d) / spy_5d
+    # Mild: SPY up 0-2% over 5d (not strongly positive)
+    return 1 if (0 < ret5 <= 0.02) else 0
+
+
+def sig_s1014_s929_vix15_base(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1014: OR(20/30/40/50w) + compressed + VIX 15-50 (relax VIX lower from 18 to 15).
+    S929 uses VIX 18-50. Trades where VIX=15-17 were excluded. Are they good?
+    Hypothesis: calm VIX 15-18 bounces may still work at structural channel support."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (15 <= vix_now <= 50):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                return 1
+    return 0
+
+
+def sig_s1015_s929_tight_channel(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1015: OR(20/30/40/50w) + VIX 18-50 + compressed + bottom 15% channel position.
+    S929 requires bottom 25%. Tightening to 15% = price very close to channel lower.
+    Hypothesis: being in bottom 15% = even stronger structural support → higher WR."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (18 <= vix_now <= 50):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.15):  # 15% vs S929's 25%
+                return 1
+    return 0
+
+
+def sig_s1016_s929_lag_and_macd_neg(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1016: S929 + lag5pct AND MACD<0 (both: TSLA lagged AND momentum still falling).
+    Combining the strongest 100% WR single condition (lag5pct=S931) with MACD confirmation.
+    Hypothesis: lagging + falling momentum = most reliable catch-up setup."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 0
+    hist = _macd_histogram(tsla, i)
+    if hist is None or hist >= 0:
+        return 0
+    return 1
+
+
+def sig_s1017_s993_or_rsi40(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1017: S993 champion + TSLA RSI<40 as 5th OR condition.
+    Attempts to extend champion from n=20 to n=21 while maintaining 100% WR.
+    The deep-oversold path (S1009: 100% WR, n=9) may add trades not in S993."""
+    if sig_s993_s981_or_spy5d(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    # 5th OR: S929 base + RSI < 40
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and t_rsi < 40:
+        return 1
+    return 0
+
+
+def sig_s1018_s929_tsla_7d_pullback(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1018: S929 + TSLA 7-day return < -3% (medium-term pullback, 7d window).
+    Between 3d-selloff (S963: 3 days) and 10d-pullback (S1005: 10 days).
+    Hypothesis: 7d window may hit a sweet spot between too-short and too-long lookback."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 7:
+        return 0
+    c_now = float(tsla['close'].iloc[i])
+    c_7d = float(tsla['close'].iloc[i - 7])
+    if c_7d <= 0:
+        return 0
+    return 1 if (c_now - c_7d) / c_7d < -0.03 else 0
+
+
+def sig_s1019_s929_spy_7d_positive(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1019: S929 + SPY 7-day return positive (recovery over 7 days).
+    Between SPY-5d-up (S993 uses this) and SPY-10d-up (S991).
+    Hypothesis: 7d window may behave similarly to 5d or 10d — interesting to compare."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 7:
+        return 0
+    spy_now = float(spy['close'].iloc[i])
+    spy_7d = float(spy['close'].iloc[i - 7])
+    if spy_7d <= 0:
+        return 0
+    return 1 if spy_now > spy_7d else 0
+
+
+def sig_s1020_s993_and_macd_or_rsi(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1020: S993 champion AND (MACD<0 OR RSI<40) — the champion's highest-confidence subset.
+    Applies the precision filter AFTER S993's quality gate. Should give maximum WR.
+    Hypothesis: best trades = structural support + quality condition + technical confirmation."""
+    if sig_s993_s981_or_spy5d(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    # Must also pass: MACD<0 OR RSI<40
+    hist = _macd_histogram(tsla, i)
+    if hist is not None and hist < 0:
+        return 1
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and t_rsi < 40:
+        return 1
+    return 0
+
+
+SIGNALS_P10Z: List[Tuple] = [
+    # Phase 10Z — Precision unions, VIX sweep, channel tightening, spy sweet spot (S1011-S1020)
+    ('S1011_s929_macd_or_rsi40',       sig_s1011_s929_macd_or_rsi40,            10, 0.20, 50),
+    ('S1012_s929_macd_and_rsi45',      sig_s1012_s929_macd_and_rsi45,           10, 0.20, 50),
+    ('S1013_s929_spy5d_mild',          sig_s1013_s929_spy5d_mild,               10, 0.20, 50),
+    ('S1014_s929_vix15_base',          sig_s1014_s929_vix15_base,               10, 0.20, 50),
+    ('S1015_s929_tight_chan15pct',      sig_s1015_s929_tight_channel,            10, 0.20, 50),
+    ('S1016_s929_lag_and_macd_neg',    sig_s1016_s929_lag_and_macd_neg,         10, 0.20, 50),
+    ('S1017_s993_or_rsi40',            sig_s1017_s993_or_rsi40,                 10, 0.20, 50),
+    ('S1018_s929_tsla_7d_pullback',    sig_s1018_s929_tsla_7d_pullback,         10, 0.20, 50),
+    ('S1019_s929_spy_7d_positive',     sig_s1019_s929_spy_7d_positive,          10, 0.20, 50),
+    ('S1020_s993_and_macd_or_rsi',     sig_s1020_s993_and_macd_or_rsi,          10, 0.20, 50),
+]
+
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
            + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
            + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
@@ -15691,7 +15880,8 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I + SIGNALS_P10J
            + SIGNALS_P10K + SIGNALS_P10L + SIGNALS_P10M + SIGNALS_P10N + SIGNALS_P10O
            + SIGNALS_P10P + SIGNALS_P10Q + SIGNALS_P10R + SIGNALS_P10S + SIGNALS_P10T
-           + SIGNALS_P10U + SIGNALS_P10V + SIGNALS_P10W + SIGNALS_P10X + SIGNALS_P10Y)
+           + SIGNALS_P10U + SIGNALS_P10V + SIGNALS_P10W + SIGNALS_P10X + SIGNALS_P10Y
+           + SIGNALS_P10Z)
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
