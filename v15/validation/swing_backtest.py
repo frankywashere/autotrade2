@@ -12130,6 +12130,136 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D)
 
 
+# ── Phase 10E — Union signals + S796/S741 extensions + max-coverage push (S801-S810) ──
+# Key question: does OR-union of two strong discount anchors beat either alone?
+# Also: can we push WR=93% signals past 8/8yr coverage?
+
+def sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S801: Weekly channel support + (52wk disc10 OR 5% below 20d high) = UNION.
+    Either peak discount OR recent momentum drop at structural support.
+    Tests if combining two strong dimensions in OR logic beats AND logic."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    has_52wk = _tsla_below_52wk_pct(tsla, i, pct=0.10)
+    has_20d  = _tsla_below_20d_high_pct(tsla, i, pct=0.05)
+    return 1 if (has_52wk or has_20d) else 0
+
+
+def sig_s802_s215_disc_and(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S802: Weekly channel support + (52wk disc10 AND 5% below 20d high) = INTERSECTION.
+    Both discount anchors must be true — compare to S739 (same signal, already tested)."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    has_52wk = _tsla_below_52wk_pct(tsla, i, pct=0.10)
+    has_20d  = _tsla_below_20d_high_pct(tsla, i, pct=0.05)
+    return 1 if (has_52wk and has_20d) else 0
+
+
+def sig_s803_s796_vix_pct50(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S803: S796 (S786+compressed, WR=93%, 8/8yr) + VIX pct>50.
+    Can VIX filter push WR=93% signal toward 100% while maintaining 8yr coverage?"""
+    if sig_s796_s786_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.50) else 0
+
+
+def sig_s804_s741_vix_pct50(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S804: S741 (S731+compressed, WR=93%, 7/7yr) + VIX pct>50.
+    VIX filter on WR=93% 20d-disc compressed signal — try to reach 100% WR."""
+    if sig_s741_s731_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.50) else 0
+
+
+def sig_s805_s801_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S805: S801 (OR-union of disc) + ATR compression.
+    Wider discount coverage (OR logic) + volatility squeeze for quality control."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s806_s801_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S806: S801 (OR-union of disc) + volume dry-up.
+    Maximum coverage union signal + seller exhaustion = 100% WR expected."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i) else 0
+
+
+def sig_s807_s786_compressed_vix(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S807: S796 (S786+compressed) + VIX pct>60.
+    Can VIX_pct60 push WR from 93% to 100% at S786 level?"""
+    if sig_s796_s786_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s808_s801_macd_up(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S808: S801 (OR-union, wider coverage) + MACD turning up.
+    Max-coverage signal with momentum timing — test OR logic value."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist_now  = _macd_histogram(tsla, i)
+    hist_prev = _macd_histogram(tsla, i - 1) if i > 0 else None
+    if hist_now is None or hist_prev is None:
+        return 1
+    return 1 if hist_now > hist_prev else 0
+
+
+def sig_s809_s801_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S809: S801 (OR-union of both discounts) + below 50d MA.
+    Widest discount coverage + bear-phase filter."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 0 if _tsla_above_50ma(tsla, i) else 1
+
+
+def sig_s810_milestone_union_max(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S810 MILESTONE: Union discount + compressed + below50MA + lag.
+    OR(52wk_disc + 20d_disc) + ATR compressed + below 50MA + TSLA lags SPY.
+    Maximum coverage precision: wider entry net + quality filters."""
+    if sig_s805_s801_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 0
+    return 0 if _tsla_above_50ma(tsla, i) else 1
+
+
+SIGNALS_P10E: List[Tuple] = [
+    # Phase 10E — Union signals + S796/S741 extensions (S801-S810)
+    ('S801_s215_disc_or',         sig_s801_s215_disc_or,         10, 0.20, 50),
+    ('S802_s215_disc_and',        sig_s802_s215_disc_and,        10, 0.20, 50),
+    ('S803_s796_vix_pct50',       sig_s803_s796_vix_pct50,       10, 0.20, 50),
+    ('S804_s741_vix_pct50',       sig_s804_s741_vix_pct50,       10, 0.20, 50),
+    ('S805_s801_compressed',      sig_s805_s801_compressed,      10, 0.20, 50),
+    ('S806_s801_vol_dryup',       sig_s806_s801_vol_dryup,       10, 0.20, 50),
+    ('S807_s796_compressed_vix',  sig_s807_s786_compressed_vix,  10, 0.20, 50),
+    ('S808_s801_macd_up',         sig_s808_s801_macd_up,         10, 0.20, 50),
+    ('S809_s801_below50ma',       sig_s809_s801_below50ma,       10, 0.20, 50),
+    ('S810_milestone_union_max',  sig_s810_milestone_union_max,  10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
