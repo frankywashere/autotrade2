@@ -5750,6 +5750,318 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I)
 
 
+# ── Phase 8J — Relative strength vs SPY, MACD, persistence confirm, seasonal ──
+# New dimensions:
+#   Relative performance: TSLA vs SPY return divergence (individual vs broad market)
+#   MACD histogram: momentum reversal indicator at weekly support
+#   Persistence confirm: require 2-day signal before entry (reduce noise)
+#   Seasonal: summer (Jul-Aug) and December effects
+
+def _macd_histogram(tsla, i, fast: int = 12, slow: int = 26, signal_period: int = 9) -> Optional[float]:
+    """Return MACD histogram (MACD line - signal line). Positive = bullish momentum."""
+    if i < slow + signal_period:
+        return None
+    closes = tsla['close'].iloc[:i + 1].astype(float)
+    ema_fast = closes.ewm(span=fast, adjust=False).mean()
+    ema_slow = closes.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal_period, adjust=False).mean()
+    return float(macd_line.iloc[-1] - signal_line.iloc[-1])
+
+
+def sig_s331_s215_tsla_rel_weak(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S331: S215 + TSLA underperforming SPY by 5%+ over last 5 trading days.
+    TSLA individual weakness at weekly support while broader market less weak.
+    Hypothesis: excess individual selling = mean-reversion back to market performance."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    tsla_5d = (float(tsla['close'].iloc[i]) - float(tsla['close'].iloc[i-5])) / float(tsla['close'].iloc[i-5])
+    spy_5d  = (float(spy['close'].iloc[i])  - float(spy['close'].iloc[i-5]))  / float(spy['close'].iloc[i-5])
+    return 1 if (tsla_5d - spy_5d) <= -0.05 else 0
+
+
+def sig_s332_s292_tsla_rel_weak(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S332: S292 (above200MA) + TSLA underperforming SPY by 5%+ over 5 days.
+    Uptrend + individual excess weakness vs market = strongest mean-reversion.
+    Hypothesis: TSLA overshooting down vs market in an uptrend = elastic band snapping back."""
+    if sig_s292_s215_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    tsla_5d = (float(tsla['close'].iloc[i]) - float(tsla['close'].iloc[i-5])) / float(tsla['close'].iloc[i-5])
+    spy_5d  = (float(spy['close'].iloc[i])  - float(spy['close'].iloc[i-5]))  / float(spy['close'].iloc[i-5])
+    return 1 if (tsla_5d - spy_5d) <= -0.05 else 0
+
+
+def sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S333: S215 + MACD histogram turning less negative (today > yesterday by 0.5+).
+    MACD histogram rising = momentum starting to shift, even if still negative.
+    Hypothesis: early momentum reversal at weekly support = leading indicator of bounce."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist_now  = _macd_histogram(tsla, i)
+    hist_prev = _macd_histogram(tsla, i - 1) if i > 0 else None
+    if hist_now is None or hist_prev is None:
+        return 1
+    # MACD histogram improving (rising) = bullish momentum shift
+    improvement = hist_now - hist_prev
+    return 1 if improvement > 0 else 0
+
+
+def sig_s334_s292_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S334: S292 (above200MA) + MACD histogram turning positive (improving momentum).
+    Uptrend + weekly support + MACD starting to turn = early bounce signal.
+    Hypothesis: momentum shift in uptrend at support = higher conviction entry."""
+    if sig_s292_s215_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist_now  = _macd_histogram(tsla, i)
+    hist_prev = _macd_histogram(tsla, i - 1) if i > 0 else None
+    if hist_now is None or hist_prev is None:
+        return 1
+    return 1 if hist_now > hist_prev else 0
+
+
+def sig_s335_s215_dec_seasonal(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S335: S215 + December seasonality (tax-loss buying, Santa rally, year-end window).
+    December = historically strong for equities (Santa Claus rally effect).
+    Hypothesis: weekly support bounce in December amplified by seasonal fund flows."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if tsla.index[i].month == 12 else 0
+
+
+def sig_s336_s215_summer(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S336: S215 + summer (July-August) seasonality.
+    Summer = lower volume, mean-reversion driven, trending less.
+    Hypothesis: weekly support bounce in low-volume summer = higher success rate."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    m = tsla.index[i].month
+    return 1 if m in (7, 8) else 0
+
+
+def sig_s337_s292_tsla_rel_strong(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S337: S292 + TSLA outperforming SPY by 2%+ over 5 days (TSLA showing resilience).
+    Uptrend + weekly support + TSLA holding up better than market = institutional support.
+    Hypothesis: relative strength at support = buyers accumulating before breakout up."""
+    if sig_s292_s215_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    tsla_5d = (float(tsla['close'].iloc[i]) - float(tsla['close'].iloc[i-5])) / float(tsla['close'].iloc[i-5])
+    spy_5d  = (float(spy['close'].iloc[i])  - float(spy['close'].iloc[i-5]))  / float(spy['close'].iloc[i-5])
+    return 1 if (tsla_5d - spy_5d) >= 0.02 else 0
+
+
+def sig_s338_s215_q1(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S338: S215 + Q1 seasonality (January-March).
+    Q1 = new year fund deployment, January effect, earnings season.
+    Hypothesis: weekly support bounce in Q1 amplified by fund reallocation buying."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    m = tsla.index[i].month
+    return 1 if m in (1, 2, 3) else 0
+
+
+def sig_s339_s292_q2(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S339: S292 (above200MA) + Q2 (April-June) seasonality.
+    Q2 = earnings season peak, pre-summer. Test if seasonal timing helps.
+    Hypothesis: uptrend dip to weekly support in Q2 = near-term seasonal tailwind."""
+    if sig_s292_s215_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    m = tsla.index[i].month
+    return 1 if m in (4, 5, 6) else 0
+
+
+def sig_s340_s292_q4(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S340: S292 + Q4 (October-December) seasonality.
+    Q4 = year-end performance chasing, tax-loss harvesting reversal.
+    Hypothesis: October dips + November-December rally cycle amplifies weekly support."""
+    if sig_s292_s215_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    m = tsla.index[i].month
+    return 1 if m in (10, 11, 12) else 0
+
+
+SIGNALS_P8J: List[Tuple] = [
+    # Phase 8J — Relative strength, MACD, seasonality
+    ('S331_s215_tsla_rel_weak',  sig_s331_s215_tsla_rel_weak,  10, 0.20, 50),
+    ('S332_s292_tsla_rel_weak',  sig_s332_s292_tsla_rel_weak,  10, 0.20, 50),
+    ('S333_s215_macd_turning',   sig_s333_s215_macd_turning,   10, 0.20, 50),
+    ('S334_s292_macd_turning',   sig_s334_s292_macd_turning,   10, 0.20, 50),
+    ('S335_s215_dec_seasonal',   sig_s335_s215_dec_seasonal,   10, 0.20, 50),
+    ('S336_s215_summer',         sig_s336_s215_summer,         10, 0.20, 50),
+    ('S337_s292_tsla_rel_strong', sig_s337_s292_tsla_rel_strong, 10, 0.20, 50),
+    ('S338_s215_q1',             sig_s338_s215_q1,             10, 0.20, 50),
+    ('S339_s292_q2',             sig_s339_s292_q2,             10, 0.20, 50),
+    ('S340_s292_q4',             sig_s340_s292_q4,             10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J)
+
+
+# ── Phase 8K — MACD + Q4 + relative-weakness extensions ──────────────────────
+# S333 (MACD turning, $1.51M, 8/8yr) is a major new indicator — extend aggressively.
+# S340 (Q4, 100% WR) and S332 (relative weak in uptrend, 100% WR) need extension.
+
+def sig_s341_s333_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S341: S333 (S215+MACD_turning, 8/8yr WR=86%) + compressed ATR.
+    MACD momentum shift + ATR compression at weekly support.
+    Hypothesis: MACD turning + compression = both momentum AND structure confirm bounce."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s342_s333_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S342: S333 (S215+MACD_turning) + VIX recovery.
+    MACD momentum turning at weekly support + macro fear cooling simultaneously.
+    Hypothesis: momentum shift aligned with VIX cooling = both signals confirm reversal."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s343_s333_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S343: S333 (S215+MACD_turning) + above 200d MA.
+    Best MACD signal in uptrend context.
+    Hypothesis: momentum turn at weekly support in bull trend = highest conviction."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close > ma200 else 0
+
+
+def sig_s344_s333_5d_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S344: S333 (S215+MACD_turning) + 5% 5-day decline.
+    MACD turning + recent velocity of decline + weekly support.
+    Hypothesis: stock declining then MACD starts turning = first sign of exhaustion."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    close_now = float(tsla['close'].iloc[i])
+    close_5d  = float(tsla['close'].iloc[i - 5])
+    return 1 if (close_now - close_5d) / close_5d <= -0.05 else 0
+
+
+def sig_s345_s340_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S345: S340 (S292+Q4, 100% WR) + compressed ATR.
+    Q4 uptrend + compression at weekly support.
+    Hypothesis: year-end compression at support in bull trend = spring before Q4 rally."""
+    if sig_s340_s292_q4(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s346_s340_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S346: S340 (S292+Q4, 100% WR) + VIX recovery.
+    Q4 uptrend + VIX cooling = year-end seasonal + macro recovery timing.
+    Hypothesis: institutional rebalancing + VIX drop = strong Q4 entry signal."""
+    if sig_s340_s292_q4(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s347_s332_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S347: S332 (S292+TSLA rel weak, 100% WR) + compressed ATR.
+    Uptrend + relative underperformance + compression at weekly support.
+    Hypothesis: elastic band pulled furthest from SPY + compressed = max return potential."""
+    if sig_s332_s292_tsla_rel_weak(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s348_s332_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S348: S332 (S292+TSLA rel weak) + VIX recovery.
+    Uptrend + individual excess weakness + VIX cooling simultaneously.
+    Hypothesis: individual relative capitulation + macro recovery = snap-back compound."""
+    if sig_s332_s292_tsla_rel_weak(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s349_s333_spyweak(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S349: S333 (S215+MACD_turning) + SPY below 50d SMA.
+    MACD turning at weekly support during macro weakness.
+    Hypothesis: market momentum shift at individual support + broad market weak = excess."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 50:
+        return 1
+    spy_close = float(spy['close'].iloc[i])
+    spy_sma50 = float(spy['close'].iloc[i - 50:i].mean())
+    return 1 if spy_close < spy_sma50 else 0
+
+
+def sig_s350_s333_monthly_low(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S350: S333 (S215+MACD_turning) + monthly near lower channel.
+    MACD momentum turn at weekly support that also aligns with monthly support.
+    Hypothesis: 2-TF structural support + MACD = momentum aligning with structure."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _monthly_channel_near_lower(tsla, i, n_months=12, frac=0.30) else 0
+
+
+SIGNALS_P8K: List[Tuple] = [
+    # Phase 8K — MACD extensions + Q4/relative-weakness combos
+    ('S341_s333_compressed',    sig_s341_s333_compressed,    10, 0.20, 50),
+    ('S342_s333_vix_rec',       sig_s342_s333_vix_rec,       10, 0.20, 50),
+    ('S343_s333_above200ma',    sig_s343_s333_above200ma,    10, 0.20, 50),
+    ('S344_s333_5d_down',       sig_s344_s333_5d_down,       10, 0.20, 50),
+    ('S345_s340_compressed',    sig_s345_s340_compressed,    10, 0.20, 50),
+    ('S346_s340_vix_rec',       sig_s346_s340_vix_rec,       10, 0.20, 50),
+    ('S347_s332_compressed',    sig_s347_s332_compressed,    10, 0.20, 50),
+    ('S348_s332_vix_rec',       sig_s348_s332_vix_rec,       10, 0.20, 50),
+    ('S349_s333_spyweak',       sig_s349_s333_spyweak,       10, 0.20, 50),
+    ('S350_s333_monthly_low',   sig_s350_s333_monthly_low,   10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
