@@ -10301,6 +10301,149 @@ SIGNALS_P9Q: List[Tuple] = [
     ('S670_s648_vix_pct70',    sig_s670_s648_vix_pct70,    10, 0.20, 50),
 ]
 
+# ── Phase 9R — Inverse gap-down + consecutive-week decline + VIX term structure ─
+# Lessons learned: gap-down = bad. No-gap (quiet) OR gap-up to support = better.
+# New: multi-week consecutive decline (weekly chart pattern), 5%+ gap-down filter SKIP.
+
+def _tsla_no_gap_down(tsla, i) -> bool:
+    """Today did NOT gap down more than 1% from yesterday's close (quiet open)."""
+    if i < 1:
+        return True
+    prev_close = float(tsla['close'].iloc[i - 1])
+    today_open = float(tsla['open'].iloc[i]) if 'open' in tsla.columns else prev_close
+    if prev_close <= 0:
+        return True
+    gap = (prev_close - today_open) / prev_close
+    return gap < 0.01  # gap down less than 1% = "quiet" open
+
+
+def sig_s671_s631_no_gap_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S671: S631 (10% disc + weekly support) + no significant gap-down.
+    Best signal excluding gap-down entries — tests if removing gap-down trades helps."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_no_gap_down(tsla, i) else 0
+
+
+def sig_s672_s648_no_gap_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S672: S648 (WR=94%, compressed+disc) + no significant gap-down.
+    Highest WR signal without gap-down entries = further WR improvement."""
+    if sig_s648_s631_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_no_gap_down(tsla, i) else 0
+
+
+def sig_s673_s652_no_gap_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S673: S652 (100% WR) + no significant gap-down.
+    Perfect WR signal without gap-down — should maintain 100% WR."""
+    if sig_s652_s648_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_no_gap_down(tsla, i) else 0
+
+
+def sig_s674_s631_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S674: S631 (10% disc + weekly support) + VIX cooldown timing.
+    Best coverage signal + fear receding = timing confirmation."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_was_elevated_now_cooling(vix, i) else 0
+
+
+def sig_s675_s631_above200ma_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S675: S631 (10% disc + weekly) + above200MA + compressed (3-way filter).
+    Long-term uptrend + discount from peak + volatility squeeze = maximum conviction."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= 200:
+        ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+        if float(tsla['close'].iloc[i]) <= ma200:
+            return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s676_s631_lag5pct_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S676: S631 (10% disc + weekly) + TSLA lag5pct + ATR compression (3-way).
+    Peak discount + relative lag + volatility squeeze = three independent dimensions."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s677_s631_vix_pct60_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S677: S631 (10% disc + weekly) + VIX pct>60 + ATR compression (3-way).
+    Fear regime + peak discount at support + volatility squeeze = max setup alignment."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not _vix_elevated_pct(vix, i, window=252, pct=0.60):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s678_s631_rsi_low_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S678: S631 (10% disc + weekly) + RSI<40 + ATR compression (3-way).
+    Peak discount at support + RSI depth + volatility squeeze = three-way oversold."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    rsi_val = float(rt.iloc[i]) if i < len(rt) else 50.0
+    if rsi_val >= 40.0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s679_s648_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S679: S648 (WR=94%) + volume dry-up.
+    94% WR + sellers exhausted = the highest-purity entry combination."""
+    if sig_s648_s631_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i) else 0
+
+
+def sig_s680_s631_vol_dryup_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S680: S631 (10% disc + weekly) + vol_dryup + compressed (3-way timing).
+    Best base signal + both timing confirmers: sellers gone AND volatility quiet."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not _volume_below_avg(tsla, i):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+SIGNALS_P9R: List[Tuple] = [
+    # Phase 9R — No-gap filter + 3-way combos + timing + S680 (S671-S680)
+    ('S671_s631_no_gap_down',          sig_s671_s631_no_gap_down,          10, 0.20, 50),
+    ('S672_s648_no_gap_down',          sig_s672_s648_no_gap_down,          10, 0.20, 50),
+    ('S673_s652_no_gap_down',          sig_s673_s652_no_gap_down,          10, 0.20, 50),
+    ('S674_s631_vix_cooldown',         sig_s674_s631_vix_cooldown,         10, 0.20, 50),
+    ('S675_s631_above200ma_compressed',sig_s675_s631_above200ma_compressed,10, 0.20, 50),
+    ('S676_s631_lag5pct_compressed',   sig_s676_s631_lag5pct_compressed,   10, 0.20, 50),
+    ('S677_s631_vix60_compressed',     sig_s677_s631_vix_pct60_compressed, 10, 0.20, 50),
+    ('S678_s631_rsi40_compressed',     sig_s678_s631_rsi_low_compressed,   10, 0.20, 50),
+    ('S679_s648_vol_dryup',            sig_s679_s648_vol_dryup,            10, 0.20, 50),
+    ('S680_s631_vol_dryup_compressed', sig_s680_s631_vol_dryup_compressed, 10, 0.20, 50),
+]
+
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
            + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
            + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
@@ -10312,7 +10455,7 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
            + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
            + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
-           + SIGNALS_P9P + SIGNALS_P9Q)
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R)
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
