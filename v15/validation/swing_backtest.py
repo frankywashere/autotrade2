@@ -18924,6 +18924,139 @@ SIGNALS_P11O: List[Tuple] = [
     ('S1180_s1041_atr60pct',        sig_s1180_s1041_atr_extreme_compressed, 10, 0.20, 50),  # ATR < 60%
 ]
 
+# ── Phase 11P — Multi-day confirmation + candle quality filters ───────────────
+# S1181-S1190. Novel territory: does requiring S1041 to fire for ≥2 days improve
+# quality? Do candle-quality filters (hammer, close>open, new low, SPY lag day)
+# select a cleaner subset?
+
+def sig_s1181_s1041_day2_confirm(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1181: S1041 fires today AND fired yesterday (2-day confirmation).
+    Reduces false starts: only enter after the setup has been visible for 2 bars.
+    Hypothesis: a 2nd day of channel-support setup = stronger mean-reversion pressure."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 1:
+        return 0
+    return sig_s1041_s993_or_s1034(i - 1, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s1182_s1041_day3_confirm(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1182: S1041 fires for 3 consecutive days before entry.
+    Maximum confirmation — waiting for deepest compression window.
+    Risk: might enter too late (after partial recovery has started)."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 2:
+        return 0
+    if sig_s1041_s993_or_s1034(i - 1, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return sig_s1041_s993_or_s1034(i - 2, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s1183_s1041_close_up(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1183: S1041 + today closed UP (close > open — bullish candle).
+    Entry on a green bar: momentum has already started turning.
+    Hypothesis: green close at channel support = reversal is initiated."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if float(tsla['close'].iloc[i]) > float(tsla['open'].iloc[i]) else 0
+
+
+def sig_s1184_s1041_close_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1184: S1041 + today closed DOWN (close < open — red candle).
+    Entry on a red bar: still under selling pressure. Complement of S1183.
+    Hypothesis: red bar entries at support actually get BETTER fills for mean-reversion."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if float(tsla['close'].iloc[i]) < float(tsla['open'].iloc[i]) else 0
+
+
+def sig_s1185_s1041_new_5d_low(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1185: S1041 + today's low is a new 5-day low (fresh compression bottom).
+    The most oversold bar in the recent 5-day window — maximum urgency to revert.
+    Hypothesis: new local lows at channel support have the sharpest snap-back."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 0
+    today_low = float(tsla['low'].iloc[i])
+    prior_lows = [float(tsla['low'].iloc[i - j]) for j in range(1, 5)]
+    return 1 if today_low <= min(prior_lows) else 0
+
+
+def sig_s1186_s1041_spy_down_day(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1186: S1041 + SPY closed DOWN today (broad market selling = TSLA gets caught).
+    Market weakness on entry day: TSLA dragged down by SPY, not just TSLA-specific.
+    Hypothesis: cross-market selling creates the best dip-buying opportunities."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if float(spy['close'].iloc[i]) < float(spy['open'].iloc[i]) else 0
+
+
+def sig_s1187_s1041_spy_up_day(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1187: S1041 + SPY closed UP today — broad market green while TSLA weak.
+    Pure TSLA-specific weakness: market green but TSLA still at channel support.
+    Hypothesis: TSLA-only dip on a green market day = highest alpha catch-up trade."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if float(spy['close'].iloc[i]) >= float(spy['open'].iloc[i]) else 0
+
+
+def sig_s1188_s1041_high_close(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1188: S1041 + close in upper 40% of today's range (close near high).
+    Bar closes near its high despite being at channel support = accumulation signal.
+    Hypothesis: high-close at channel floor = smart money absorbing supply."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    bar_low  = float(tsla['low'].iloc[i])
+    bar_high = float(tsla['high'].iloc[i])
+    bar_range = bar_high - bar_low
+    if bar_range <= 0:
+        return 0
+    close_pos = (float(tsla['close'].iloc[i]) - bar_low) / bar_range
+    return 1 if close_pos >= 0.60 else 0  # close in top 40% of range
+
+
+def sig_s1189_s1041_low_close(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1189: S1041 + close in lower 40% of today's range (close near low).
+    Bar closes near its low = still under selling pressure.
+    Hypothesis: low-close at channel support creates more gap-fill potential next day."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    bar_low  = float(tsla['low'].iloc[i])
+    bar_high = float(tsla['high'].iloc[i])
+    bar_range = bar_high - bar_low
+    if bar_range <= 0:
+        return 0
+    close_pos = (float(tsla['close'].iloc[i]) - bar_low) / bar_range
+    return 1 if close_pos <= 0.40 else 0  # close in bottom 40% of range
+
+
+def sig_s1190_s1041_first_day(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1190: S1041 fires today but did NOT fire yesterday (first day of the setup).
+    Enters on the FIRST day the signal activates, before confirmation.
+    Baseline for comparing S1181 (2-day) vs S1190 (1st-day-only) entries."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 1:
+        return 1  # first bars always qualify
+    prev = sig_s1041_s993_or_s1034(i - 1, tsla, spy, vix, tw, sw, rt, rs, w)
+    return 1 if prev == 0 else 0  # only fire on first day of run
+
+
+SIGNALS_P11P: List[Tuple] = [
+    ('S1181_s1041_day2_confirm',  sig_s1181_s1041_day2_confirm,  10, 0.20, 50),   # 2-day confirmation
+    ('S1182_s1041_day3_confirm',  sig_s1182_s1041_day3_confirm,  10, 0.20, 50),   # 3-day confirmation
+    ('S1183_s1041_close_up',      sig_s1183_s1041_close_up,      10, 0.20, 50),   # bullish (green) bar
+    ('S1184_s1041_close_down',    sig_s1184_s1041_close_down,    10, 0.20, 50),   # bearish (red) bar
+    ('S1185_s1041_new_5d_low',    sig_s1185_s1041_new_5d_low,    10, 0.20, 50),   # new 5d low
+    ('S1186_s1041_spy_down_day',  sig_s1186_s1041_spy_down_day,  10, 0.20, 50),   # SPY red day
+    ('S1187_s1041_spy_up_day',    sig_s1187_s1041_spy_up_day,    10, 0.20, 50),   # SPY green day
+    ('S1188_s1041_high_close',    sig_s1188_s1041_high_close,    10, 0.20, 50),   # close near high
+    ('S1189_s1041_low_close',     sig_s1189_s1041_low_close,     10, 0.20, 50),   # close near low
+    ('S1190_s1041_first_day',     sig_s1190_s1041_first_day,     10, 0.20, 50),   # 1st day only
+]
+
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
            + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
            + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
@@ -18944,7 +19077,7 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10U + SIGNALS_P10V + SIGNALS_P10W + SIGNALS_P10X + SIGNALS_P10Y
            + SIGNALS_P10Z + SIGNALS_P11A + SIGNALS_P11B + SIGNALS_P11C + SIGNALS_P11D + SIGNALS_P11E
            + SIGNALS_P11F + SIGNALS_P11G + SIGNALS_P11H + SIGNALS_P11I + SIGNALS_P11J + SIGNALS_P11K
-           + SIGNALS_P11L + SIGNALS_P11M + SIGNALS_P11N + SIGNALS_P11O)
+           + SIGNALS_P11L + SIGNALS_P11M + SIGNALS_P11N + SIGNALS_P11O + SIGNALS_P11P)
 
 # ── sentinel — do not remove ──────────────────────────────────────────────────
 
