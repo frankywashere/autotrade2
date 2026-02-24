@@ -8590,6 +8590,154 @@ SIGNALS_P9B: List[Tuple] = [
     ('S520_s501_inside_bar',     sig_s520_s501_inside_bar,     10, 0.20, 50),
 ]
 
+# ── Phase 9C — VIX cooldown (x18 finding) + RSI recovery signals ──────────────
+# x18 discovery: when VIX was elevated and now DROPPING, high RSI marks the
+# BEGINNING of a run, not exhaustion. Captures the transition from fear→risk-on.
+# Also test RSI rising from oversold as standalone dimension.
+
+def _vix_was_elevated_now_cooling(vix, i, lookback: int = 10,
+                                   spike_pct: float = 0.70,
+                                   recovery_pct: float = 0.90) -> bool:
+    """VIX was above spike_pct-th percentile of trailing year within last lookback days,
+    AND current VIX is below that peak by at least (1-recovery_pct).
+    This is the 'VIX cooldown window' — fear peaked, now receding = re-risking begins."""
+    if i < 252 + lookback:
+        return False
+    vix_hist = vix['close'].iloc[i - 252:i].values.astype(float)
+    threshold = float(np.percentile(vix_hist, spike_pct * 100))
+    vix_window = vix['close'].iloc[max(0, i - lookback):i].values.astype(float)
+    vix_peak = float(vix_window.max())
+    if vix_peak < threshold:
+        return False   # VIX was never elevated in lookback
+    vix_now = float(vix['close'].iloc[i])
+    return vix_now < vix_peak * recovery_pct   # Dropped 10%+ from peak
+
+
+def _rsi_rising(rt, i, lookback: int = 3, min_rsi: float = 35.0) -> bool:
+    """RSI has been rising over last `lookback` days and is above min_rsi.
+    Captures momentum recovery: sellers exhausted, buyers returning."""
+    if i < lookback:
+        return False
+    rsi_now = float(rt.iloc[i])
+    rsi_prev = float(rt.iloc[i - lookback])
+    return rsi_now > rsi_prev and rsi_now >= min_rsi
+
+
+def _rsi_recovering_from_oversold(rt, i, oversold: float = 40.0,
+                                   lookback: int = 5) -> bool:
+    """RSI was below oversold threshold within last lookback days and is now above it.
+    Captures the exact crossing: oversold → recovering = momentum reversal confirmed."""
+    if i < lookback:
+        return False
+    rsi_now = float(rt.iloc[i])
+    if rsi_now < oversold:
+        return False   # still oversold, no recovery yet
+    for j in range(1, lookback + 1):
+        if i - j >= 0 and float(rt.iloc[i - j]) < oversold:
+            return True   # was oversold, now recovered
+    return False
+
+
+def sig_s521_s215_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S521: S215 (weekly support) + VIX cooldown (was elevated, now dropping).
+    VIX spike followed by cooldown at weekly support = transition from panic to recovery."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_was_elevated_now_cooling(vix, i) else 0
+
+
+def sig_s522_s521_rsi_rising(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S522: S521 (VIX cooldown + weekly support) + RSI rising.
+    x18 core finding: VIX fear receding + RSI recovering = BEGINNING of run, not end.
+    High RSI during VIX cooldown is momentum resumption, not overbought."""
+    if sig_s521_s215_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _rsi_rising(rt, i, lookback=3, min_rsi=35.0) else 0
+
+
+def sig_s523_s521_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S523: S521 (VIX cooldown + weekly support) + ATR compression.
+    VIX cooling + price still coiled = spring loading after fear storm passes."""
+    if sig_s521_s215_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s524_s521_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S524: S521 (VIX cooldown + weekly support) + NR7.
+    Fear receding + narrowest range bar = ultimate compression at peak fear exit."""
+    if sig_s521_s215_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr7(tsla, i) else 0
+
+
+def sig_s525_s521_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S525: S521 (VIX cooldown + weekly support) + volume dry-up.
+    VIX fear receding + quiet accumulation = sellers exiting, smart money loading."""
+    if sig_s521_s215_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i, mult=0.70) else 0
+
+
+def sig_s526_s333_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S526: S333 (MACD turning) + VIX cooldown.
+    MACD momentum inflection coincides with VIX fear transition = dual confirmation."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_was_elevated_now_cooling(vix, i) else 0
+
+
+def sig_s527_s477_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S527: S477 (SPY momentum + weekly support) + VIX cooldown.
+    SPY building momentum while VIX recedes = ultimate macro + micro confirmation."""
+    if sig_s477_s215_spy_momentum(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_was_elevated_now_cooling(vix, i) else 0
+
+
+def sig_s528_s215_rsi_recover(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S528: S215 (weekly support) + RSI recovering from oversold (crossed above 40).
+    RSI was below 40 within last 5 days, now above = momentum reversal confirmed."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _rsi_recovering_from_oversold(rt, i, oversold=40.0, lookback=5) else 0
+
+
+def sig_s529_s333_rsi_recover(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S529: S333 (MACD turning) + RSI recovering from oversold.
+    MACD turns + RSI crosses above oversold = double momentum confirmation."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _rsi_recovering_from_oversold(rt, i, oversold=40.0, lookback=5) else 0
+
+
+def sig_s530_s407_rsi_rising(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S530: S407 (VIX pct>70, $1.45M) + RSI rising (not yet overbought).
+    x18 insight: in VIX fear regime, RSI rising = acceleration, not exhaustion.
+    RSI at 45-65 rising during elevated VIX = early momentum, not late-stage."""
+    if sig_s407_s215_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _rsi_rising(rt, i, lookback=3, min_rsi=40.0) else 0
+
+
+SIGNALS_P9C: List[Tuple] = [
+    # Phase 9C — VIX cooldown + RSI recovery signals (S521-S530)
+    ('S521_s215_vix_cooldown',   sig_s521_s215_vix_cooldown,   10, 0.20, 50),
+    ('S522_s521_rsi_rising',     sig_s522_s521_rsi_rising,     10, 0.20, 50),
+    ('S523_s521_compressed',     sig_s523_s521_compressed,     10, 0.20, 50),
+    ('S524_s521_nr7',            sig_s524_s521_nr7,            10, 0.20, 50),
+    ('S525_s521_vol_dryup',      sig_s525_s521_vol_dryup,      10, 0.20, 50),
+    ('S526_s333_vix_cooldown',   sig_s526_s333_vix_cooldown,   10, 0.20, 50),
+    ('S527_s477_vix_cooldown',   sig_s527_s477_vix_cooldown,   10, 0.20, 50),
+    ('S528_s215_rsi_recover',    sig_s528_s215_rsi_recover,    10, 0.20, 50),
+    ('S529_s333_rsi_recover',    sig_s529_s333_rsi_recover,    10, 0.20, 50),
+    ('S530_s407_rsi_rising',     sig_s530_s407_rsi_rising,     10, 0.20, 50),
+]
+
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
            + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
            + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
@@ -8598,7 +8746,7 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
            + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
            + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
-           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B)
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C)
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
