@@ -6930,6 +6930,139 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P)
 
 
+# ── Phase 8Q — SPY RSI + VIX percentile + DOW + TSLA losing streak ────────────
+# Explore macro SPY RSI (market oversold), VIX structurally elevated vs 1yr history,
+# day-of-week effect, and consecutive TSLA down bars (losing streak = exhaustion).
+
+def _tsla_consec_down(tsla, i, n: int = 3) -> bool:
+    """n consecutive TSLA daily closes declining (losing streak = seller exhaustion)."""
+    if i < n:
+        return False
+    for k in range(n):
+        if tsla['close'].iloc[i - k] >= tsla['close'].iloc[i - k - 1]:
+            return False
+    return True
+
+
+def sig_s401_s215_spy_rsi_os(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S401: S215 (weekly support) + SPY RSI < 35 (macro oversold).
+    NEW DIMENSION: SPY itself reaching oversold RSI territory while TSLA at support.
+    Hypothesis: market RSI exhaustion at TSLA weekly support = broadest reversal signal."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    spy_rsi = rs.iloc[i]
+    if pd.isna(spy_rsi):
+        return 0
+    return 1 if spy_rsi < 35 else 0
+
+
+def sig_s402_s333_spy_rsi_os(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S402: S333 (MACD turning at weekly support) + SPY RSI < 40.
+    MACD momentum turn + SPY approaching oversold.
+    Hypothesis: momentum reversal when SPY structurally weak = best macro timing."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    spy_rsi = rs.iloc[i]
+    if pd.isna(spy_rsi):
+        return 0
+    return 1 if spy_rsi < 40 else 0
+
+
+def sig_s403_s215_spy_rsi_turn(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S403: S215 (weekly support) + SPY RSI turning up from < 40.
+    SPY RSI recovery from oversold while TSLA at support.
+    Hypothesis: SPY macro recovery turning + TSLA at support = tide coming in."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _rsi_turning_up(spy, i, rs, oversold=40.0) else 0
+
+
+def sig_s404_s333_spy_rsi_turn(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S404: S333 (MACD turning) + SPY RSI turning up from < 40.
+    Double macro recovery: TSLA MACD turning + SPY RSI turning simultaneously.
+    Hypothesis: both individual and macro momentum reversing = synchronized reversal."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _rsi_turning_up(spy, i, rs, oversold=40.0) else 0
+
+
+def sig_s405_s215_tsla_3down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S405: S215 (weekly support) + 3 consecutive TSLA down days.
+    Losing streak at weekly support = seller exhaustion signal.
+    Hypothesis: 3 consecutive down bars = momentum exhausting, bounce imminent."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_consec_down(tsla, i, n=3) else 0
+
+
+def sig_s406_s333_tsla_3down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S406: S333 (MACD turning at weekly support) + 3 consecutive TSLA down days.
+    MACD turning up on the 3rd consecutive down day = classic reversal candle.
+    Hypothesis: MACD momentum shift confirming on losing streak day = perfect entry."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_consec_down(tsla, i, n=3) else 0
+
+
+def sig_s407_s215_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S407: S215 (weekly support) + VIX > 70th percentile of trailing 1yr.
+    VIX structurally elevated vs its own history — not just a spike but regime fear.
+    Hypothesis: when VIX is structurally high, bounces at support are more violent."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.70) else 0
+
+
+def sig_s408_s333_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S408: S333 (MACD turning) + VIX > 70th percentile of trailing 1yr.
+    MACD momentum reversal when market is in a structurally fearful regime.
+    Hypothesis: MACD turn + persistent fear regime = contrarian momentum signal."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.70) else 0
+
+
+def sig_s409_s215_dow_monday(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S409: S215 (weekly support) + entry on Monday (day-of-week filter).
+    DOW filter: Monday dips often reverse by week end (weekend risk premium unwind).
+    Hypothesis: Monday panic sell at weekly support = best entry timing."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if tsla.index[i].dayofweek == 0 else 0   # 0 = Monday
+
+
+def sig_s410_s333_dow_monday(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S410: S333 (MACD turning) + Monday entry.
+    MACD momentum turn on a Monday — start-of-week reversal.
+    Hypothesis: MACD confirming on Monday = strong signal with 4d momentum window."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if tsla.index[i].dayofweek == 0 else 0   # 0 = Monday
+
+
+SIGNALS_P8Q: List[Tuple] = [
+    # Phase 8Q — SPY RSI + VIX percentile + DOW + losing streak
+    ('S401_s215_spy_rsi_os',    sig_s401_s215_spy_rsi_os,    10, 0.20, 50),
+    ('S402_s333_spy_rsi_os',    sig_s402_s333_spy_rsi_os,    10, 0.20, 50),
+    ('S403_s215_spy_rsi_turn',  sig_s403_s215_spy_rsi_turn,  10, 0.20, 50),
+    ('S404_s333_spy_rsi_turn',  sig_s404_s333_spy_rsi_turn,  10, 0.20, 50),
+    ('S405_s215_tsla_3down',    sig_s405_s215_tsla_3down,    10, 0.20, 50),
+    ('S406_s333_tsla_3down',    sig_s406_s333_tsla_3down,    10, 0.20, 50),
+    ('S407_s215_vix_pct70',     sig_s407_s215_vix_pct70,     10, 0.20, 50),
+    ('S408_s333_vix_pct70',     sig_s408_s333_vix_pct70,     10, 0.20, 50),
+    ('S409_s215_dow_monday',    sig_s409_s215_dow_monday,    10, 0.20, 50),
+    ('S410_s333_dow_monday',    sig_s410_s333_dow_monday,    10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
