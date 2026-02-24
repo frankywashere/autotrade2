@@ -14180,6 +14180,182 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10P + SIGNALS_P10Q)
 
 
+# ── Phase 10R — S929 extensions + granular window sweeps (S931-S940) ──────────
+
+def sig_s931_s929_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S931: S929 (OR(20/30/40/50w)+compressed) + lag5pct.
+    4-chan union + momentum lag — testing 100% WR on the champion signal.
+    Hypothesis: 100% WR, n ≈ 17-18, best P&L + WR combo."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s932_s929_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S932: S929 (4-chan union+compressed) + VIX pct>60.
+    4-chan champion + elevated VIX (any fear).
+    Hypothesis: WR > 94%, n < 21."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s933_s929_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S933: S929 (4-chan union+compressed) + VIX pct>70.
+    4-chan champion + high VIX fear.
+    Hypothesis: WR ≥ 95%, very selective."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.70) else 0
+
+
+def sig_s934_s929_tighter20pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S934: 4-chan union + compressed, tighter position (bottom 20% of channel band).
+    Tests if tightening from 25%→20% fraction improves WR on S929.
+    Hypothesis: slightly fewer trades, maybe WR=95%+."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (18 <= vix_now <= 50):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.20):
+                return 1
+    return 0
+
+
+def sig_s935_s215_5chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S935: OR(20/25/30/35/40w) channel + compressed — 5 windows, no 50w.
+    Granular coverage in the 20-40w range.
+    Compare to S910 (20/30/40w, n=20) — adding 25w and 35w gaps."""
+    if tw is None or len(tw) < 40:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (18 <= vix_now <= 50):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    for window in (20, 25, 30, 35, 40):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                return 1
+    return 0
+
+
+def sig_s936_s215_6chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S936: OR(20/25/30/35/40/50w) channel + compressed — 6 windows, maximum coverage.
+    Full granular sweep from 20w to 50w.
+    Hypothesis: adds further coverage vs S929 (4 windows), WR should be ≥ 94%."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (18 <= vix_now <= 50):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    for window in (20, 25, 30, 35, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                return 1
+    return 0
+
+
+def sig_s937_s924_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S937: S924 (25w+compressed) + lag5pct.
+    25w structural support + squeeze + TSLA momentum lag.
+    Hypothesis: 100% WR — same pattern as all compressed+lag paths."""
+    if sig_s924_s923_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s938_s926_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S938: S926 (35w+compressed) + lag5pct.
+    35w structural support + squeeze + TSLA momentum lag.
+    Hypothesis: 100% WR — same convergence as 20w/30w/40w+lag5pct paths."""
+    if sig_s926_s925_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s939_s929_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S939: S929 (4-chan union+compressed) + below 50MA.
+    Convergence check: expect S939=S929 (below50MA redundant on all channel+compressed paths).
+    Hypothesis: same n=21, confirming redundancy of 50MA filter."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 0 if _tsla_above_50ma(tsla, i) else 1
+
+
+def sig_s940_milestone_s931_vix(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S940 MILESTONE: S929 + lag5pct + VIX_pct60 — triple precision on champion signal.
+    4-chan union + compressed + TSLA lag + elevated VIX.
+    Hypothesis: 100% WR, very selective, n ≈ 10-13."""
+    if sig_s931_s929_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+SIGNALS_P10R: List[Tuple] = [
+    # Phase 10R — S929 extensions + granular window sweeps (S931-S940)
+    ('S931_s929_lag5pct',          sig_s931_s929_lag5pct,           10, 0.20, 50),
+    ('S932_s929_vix_pct60',        sig_s932_s929_vix_pct60,         10, 0.20, 50),
+    ('S933_s929_vix_pct70',        sig_s933_s929_vix_pct70,         10, 0.20, 50),
+    ('S934_s929_tighter20pct',     sig_s934_s929_tighter20pct,      10, 0.20, 50),
+    ('S935_s215_5chan_union',       sig_s935_s215_5chan_union,        10, 0.20, 50),
+    ('S936_s215_6chan_union',       sig_s936_s215_6chan_union,        10, 0.20, 50),
+    ('S937_s924_lag5pct',          sig_s937_s924_lag5pct,           10, 0.20, 50),
+    ('S938_s926_lag5pct',          sig_s938_s926_lag5pct,           10, 0.20, 50),
+    ('S939_s929_below50ma',        sig_s939_s929_below50ma,         10, 0.20, 50),
+    ('S940_milestone_s931_vix',    sig_s940_milestone_s931_vix,     10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E
+           + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I + SIGNALS_P10J
+           + SIGNALS_P10K + SIGNALS_P10L + SIGNALS_P10M + SIGNALS_P10N + SIGNALS_P10O
+           + SIGNALS_P10P + SIGNALS_P10Q + SIGNALS_P10R)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
