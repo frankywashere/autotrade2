@@ -15884,6 +15884,221 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10Z)
 
 
+# ── Phase 11A — VIX 15-50 base sweep + quality filters (S1021-S1030) ─────────
+
+def sig_s1021_s1014_plus_or_conditions(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1021: VIX 15-50 base (S1014) + S993 four OR-conditions.
+    Champion quality gate applied to extended VIX range.
+    Hypothesis: captures 20 S929 trades + some VIX 15-18 trades that pass conditions → n=22+."""
+    if sig_s1014_s929_vix15_base(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    # S993 OR-conditions (4 paths)
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    if i >= 20:
+        spy_now = float(spy['close'].iloc[i])
+        spy_20d = float(spy['close'].iloc[i - 20])
+        if spy_20d > 0 and spy_now > spy_20d:
+            return 1
+    if i >= 5:
+        spy_now = float(spy['close'].iloc[i])
+        spy_5d = float(spy['close'].iloc[i - 5])
+        if spy_5d > 0 and spy_now > spy_5d:
+            return 1
+    return 0
+
+
+def sig_s1022_vix17_base(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1022: OR(20/30/40/50w) + compressed + VIX 17-50 (threshold 17 instead of 18).
+    Sweeps VIX lower bound: 15=S1014, 16=S1023, 17=here, 18=S929.
+    Hypothesis: VIX 17 may give better risk/reward than 15-16."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (17 <= vix_now <= 50):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                return 1
+    return 0
+
+
+def sig_s1023_vix16_base(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1023: OR(20/30/40/50w) + compressed + VIX 16-50 (threshold 16).
+    VIX threshold sweep between 15 and 17."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (16 <= vix_now <= 50):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                return 1
+    return 0
+
+
+def sig_s1024_s1014_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1024: VIX 15-50 base + lag5pct (TSLA lagging SPY 5%+ over 20d).
+    Applies the strongest 100% WR single condition to the extended VIX base.
+    Hypothesis: VIX 15-18 lag trades may be winners → could extend to n=19+."""
+    if sig_s1014_s929_vix15_base(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s1025_s1014_3d_selloff(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1025: VIX 15-50 base + 3-day TSLA return < -3% (short-term selloff).
+    Tests the S963 condition on the extended VIX 15-50 base."""
+    if sig_s1014_s929_vix15_base(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 3:
+        return 0
+    c_now = float(tsla['close'].iloc[i])
+    c_3d = float(tsla['close'].iloc[i - 3])
+    if c_3d <= 0:
+        return 0
+    return 1 if (c_now - c_3d) / c_3d < -0.03 else 0
+
+
+def sig_s1026_s1014_spy5d_positive(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1026: VIX 15-50 base + SPY 5-day positive (key S993 condition).
+    Tests how the SPY-5d filter performs on the extended VIX base."""
+    if sig_s1014_s929_vix15_base(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 0
+    spy_now = float(spy['close'].iloc[i])
+    spy_5d = float(spy['close'].iloc[i - 5])
+    if spy_5d <= 0:
+        return 0
+    return 1 if spy_now > spy_5d else 0
+
+
+def sig_s1027_vix12_base(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1027: OR(20/30/40/50w) + compressed + VIX 12-50 (extreme lower, very calm market).
+    Tests whether bounces in extremely calm VIX environments have any edge."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (12 <= vix_now <= 50):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                return 1
+    return 0
+
+
+def sig_s1028_s1021_or_spy7d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1028: S1021 (VIX 15-50 + S993 conditions) + SPY 7d positive as 5th OR.
+    Extends S1021 to catch additional trades via the SPY 7-day window."""
+    if sig_s1021_s1014_plus_or_conditions(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if sig_s1014_s929_vix15_base(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 7:
+        return 0
+    spy_now = float(spy['close'].iloc[i])
+    spy_7d = float(spy['close'].iloc[i - 7])
+    if spy_7d <= 0:
+        return 0
+    return 1 if spy_now > spy_7d else 0
+
+
+def sig_s1029_s1014_macd_neg(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1029: VIX 15-50 base + MACD<0 (precision filter on extended VIX range).
+    Tests whether falling-momentum bounces at VIX 15-50 maintain 100% WR."""
+    if sig_s1014_s929_vix15_base(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist = _macd_histogram(tsla, i)
+    if hist is None or hist >= 0:
+        return 0
+    return 1
+
+
+def sig_s1030_s1014_rsi40(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1030: VIX 15-50 base + TSLA RSI<40 (deep oversold at extended VIX base).
+    Tests whether the deep-oversold path works at lower VIX levels."""
+    if sig_s1014_s929_vix15_base(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    t_rsi = rt.iloc[i]
+    if pd.isna(t_rsi) or t_rsi >= 40:
+        return 0
+    return 1
+
+
+SIGNALS_P11A: List[Tuple] = [
+    # Phase 11A — VIX 15-50 base sweep + quality filters (S1021-S1030)
+    ('S1021_s1014_vix15_or_conditions', sig_s1021_s1014_plus_or_conditions,     10, 0.20, 50),
+    ('S1022_vix17_base',                sig_s1022_vix17_base,                   10, 0.20, 50),
+    ('S1023_vix16_base',                sig_s1023_vix16_base,                   10, 0.20, 50),
+    ('S1024_s1014_lag5pct',             sig_s1024_s1014_lag5pct,                10, 0.20, 50),
+    ('S1025_s1014_3d_selloff',          sig_s1025_s1014_3d_selloff,             10, 0.20, 50),
+    ('S1026_s1014_spy5d_positive',      sig_s1026_s1014_spy5d_positive,         10, 0.20, 50),
+    ('S1027_vix12_base',                sig_s1027_vix12_base,                   10, 0.20, 50),
+    ('S1028_s1021_or_spy7d',            sig_s1028_s1021_or_spy7d,               10, 0.20, 50),
+    ('S1029_s1014_macd_neg',            sig_s1029_s1014_macd_neg,               10, 0.20, 50),
+    ('S1030_s1014_rsi40',               sig_s1030_s1014_rsi40,                  10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E
+           + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I + SIGNALS_P10J
+           + SIGNALS_P10K + SIGNALS_P10L + SIGNALS_P10M + SIGNALS_P10N + SIGNALS_P10O
+           + SIGNALS_P10P + SIGNALS_P10Q + SIGNALS_P10R + SIGNALS_P10S + SIGNALS_P10T
+           + SIGNALS_P10U + SIGNALS_P10V + SIGNALS_P10W + SIGNALS_P10X + SIGNALS_P10Y
+           + SIGNALS_P10Z + SIGNALS_P11A)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
