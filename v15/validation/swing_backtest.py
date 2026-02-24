@@ -10178,6 +10178,129 @@ SIGNALS_P9P: List[Tuple] = [
     ('S660_s407_52wk_disc10',  sig_s660_s407_52wk_disc10,  10, 0.20, 50),
 ]
 
+# ── Phase 9Q — Precision signal extensions + uptrend filter + gap-down ────────
+# Extend the best precision signals. New: gap-down to support, above-200MA combos.
+
+def _tsla_gap_down_pct(tsla, i, min_gap: float = 0.02) -> bool:
+    """Today's open is at least min_gap% below yesterday's close (gap down)."""
+    if i < 1:
+        return False
+    prev_close = float(tsla['close'].iloc[i - 1])
+    today_open = float(tsla['open'].iloc[i]) if 'open' in tsla.columns else prev_close
+    if prev_close <= 0:
+        return False
+    gap = (prev_close - today_open) / prev_close
+    return gap >= min_gap
+
+
+def sig_s661_s631_gap_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S661: S631 (10% disc + weekly support) + gap down >2% today.
+    Panic open to structural support with 10% from peak = extreme fear selling."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_gap_down_pct(tsla, i, min_gap=0.02) else 0
+
+
+def sig_s662_s658_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S662: S658 (above200MA + weekly support) + 10% below 52wk high.
+    Long-term uptrend + structural support + meaningful peak discount = quality dip-buy."""
+    if sig_s658_s215_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_below_52wk_pct(tsla, i, pct=0.10) else 0
+
+
+def sig_s663_s658_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S663: S658 (above200MA + weekly support) + TSLA lags SPY 5%+.
+    Uptrend + structural support + TSLA-specific lag = bull market lag catch."""
+    if sig_s658_s215_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s664_s658_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S664: S658 (above200MA + weekly support) + ATR compression.
+    Long-term uptrend + structural support + volatility squeeze = breakout incoming."""
+    if sig_s658_s215_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s665_s648_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S665: S648 (WR=94%, compressed + 10% disc + weekly) + above 200MA.
+    Best-WR signal restricted to long-term uptrend: can we push to 97%+ WR?"""
+    if sig_s648_s631_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if float(tsla['close'].iloc[i]) > ma200 else 0
+
+
+def sig_s666_s652_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S666: S652 (100% WR: compressed+lag+disc) + above 200MA.
+    Perfect WR signal restricted to long-term uptrend = maximum conviction."""
+    if sig_s652_s648_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if float(tsla['close'].iloc[i]) > ma200 else 0
+
+
+def sig_s667_s631_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S667: S631 (10% disc + weekly support) + NR7 (narrowest range in 7 days).
+    Peak discount at support + tightest compression = pre-expansion coiling."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr7(tsla, i) else 0
+
+
+def sig_s668_s629_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S668: S629 (15% disc + weekly support, 9/9yr) + ATR compression.
+    Best-coverage signal + compression = S627 variant at 15% disc threshold."""
+    if sig_s629_s215_52wk_disc15(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s669_s526_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S669: S526 (MACD+VIX_cooldown, $1.08M, 92% WR) + 10% below 52wk.
+    Slight relaxation of S659 (15% disc) — more trades at same quality?"""
+    if sig_s526_s333_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_below_52wk_pct(tsla, i, pct=0.10) else 0
+
+
+def sig_s670_s648_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S670: S648 (WR=94% compressed+disc) + VIX pct>70 (highest fear).
+    Near-perfect WR base + extreme fear = maximally distressed but highest-quality entry."""
+    if sig_s648_s631_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.70) else 0
+
+
+SIGNALS_P9Q: List[Tuple] = [
+    # Phase 9Q — Precision extensions + uptrend + gap-down (S661-S670)
+    ('S661_s631_gap_down',     sig_s661_s631_gap_down,     10, 0.20, 50),
+    ('S662_s658_52wk_disc10',  sig_s662_s658_52wk_disc10,  10, 0.20, 50),
+    ('S663_s658_lag5pct',      sig_s663_s658_lag5pct,      10, 0.20, 50),
+    ('S664_s658_compressed',   sig_s664_s658_compressed,   10, 0.20, 50),
+    ('S665_s648_above200ma',   sig_s665_s648_above200ma,   10, 0.20, 50),
+    ('S666_s652_above200ma',   sig_s666_s652_above200ma,   10, 0.20, 50),
+    ('S667_s631_nr7',          sig_s667_s631_nr7,          10, 0.20, 50),
+    ('S668_s629_compressed',   sig_s668_s629_compressed,   10, 0.20, 50),
+    ('S669_s526_52wk_disc10',  sig_s669_s526_52wk_disc10,  10, 0.20, 50),
+    ('S670_s648_vix_pct70',    sig_s670_s648_vix_pct70,    10, 0.20, 50),
+]
+
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
            + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
            + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
@@ -10189,7 +10312,7 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
            + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
            + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
-           + SIGNALS_P9P)
+           + SIGNALS_P9P + SIGNALS_P9Q)
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
