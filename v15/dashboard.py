@@ -1337,16 +1337,17 @@ def show_trading_monitor_tab(
                 st.error(f"Missing data for {len(missing_tfs)} TFs — cannot evaluate.")
 
     # Get current price and VIX
-    # Prefer Finnhub real-time for TSLA/SPY, fall back to last yfinance candle
+    # Prefer yfinance last 5-min bar (prepost=True, includes pre/post market).
+    # Finnhub free tier returns yesterday's close during extended hours — use as fallback only.
     current_price = 0.0
     vix_level = 20.0
     rt_prices = _get_realtime_prices()
-    if rt_prices.get('TSLA'):
-        current_price = rt_prices['TSLA']
-        _price_source = "Finnhub (real-time)"
-    elif len(current_tsla) > 0 and 'close' in current_tsla.columns:
+    if len(current_tsla) > 0 and 'close' in current_tsla.columns:
         current_price = float(current_tsla.iloc[-1]['close'])
-        _price_source = "yfinance (delayed)"
+        _price_source = "yfinance (live)"
+    elif rt_prices.get('TSLA'):
+        current_price = rt_prices['TSLA']
+        _price_source = "Finnhub"
     else:
         _price_source = "unavailable"
     if len(current_vix) > 0 and 'close' in current_vix.columns:
@@ -1984,7 +1985,7 @@ def _show_surfer_chart(tsla_df, analysis):
         showlegend=False,
         margin=dict(l=50, r=20, t=40, b=30),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def _show_ml_predictions(analysis, current_tsla, native_tf_data):
@@ -2613,7 +2614,7 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
                         'AUC': f"{m['auc']:.3f}",
                         'Brier': f"{m['brier']:.3f}",
                     })
-                st.dataframe(rows, use_container_width=True, hide_index=True)
+                st.dataframe(rows, width="stretch", hide_index=True)
 
     # Debug log expander
     if log:
@@ -2755,7 +2756,7 @@ def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
                 'Hold (min)': f"{t.hold_minutes:.0f}",
                 'Reason': t.exit_reason,
             } for t in reversed(scanner.closed_trades[-50:])]
-            st.dataframe(pd.DataFrame(hist_rows), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(hist_rows), hide_index=True, width="stretch")
 
     # Reset button
     if st.button("Reset Scanner (clear all positions/history)", key="surfer_scanner_reset"):
@@ -3003,7 +3004,7 @@ def show_channel_surfer_tab(
                     'Width%': f"{state.width_pct:.2f}",
                 })
             if table_data:
-                st.dataframe(pd.DataFrame(table_data), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(table_data), hide_index=True, width="stretch")
 
         # --- Section 5: Confluence Matrix ---
         with st.expander("Multi-TF Confluence", expanded=False):
@@ -3046,7 +3047,7 @@ def show_channel_surfer_tab(
                     template='plotly_dark',
                     height=350,
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
                 st.caption(
                     "When total energy (PE+KE) exceeds binding energy, channel breakout is likely."
                 )
@@ -3080,7 +3081,7 @@ def show_channel_surfer_tab(
         history = st.session_state.get('surfer_history', [])
         if history:
             hist_df = pd.DataFrame(reversed(history))
-            st.dataframe(hist_df, hide_index=True, use_container_width=True)
+            st.dataframe(hist_df, hide_index=True, width="stretch")
         else:
             st.info("No BUY/SELL signals recorded yet.")
 
@@ -3138,7 +3139,7 @@ def show_channel_surfer_tab(
                     template='plotly_dark', height=300,
                     margin=dict(l=50, r=20, t=40, b=30),
                 )
-                st.plotly_chart(fig_eq, use_container_width=True)
+                st.plotly_chart(fig_eq, width="stretch")
 
             # Signal type breakdown
             if trades:
@@ -3166,7 +3167,7 @@ def show_channel_surfer_tab(
                     'Conf': f"{t.confidence:.2f}",
                     'Size': f"${getattr(t, 'trade_size', 10000):,.0f}",
                 } for t in trades]
-                st.dataframe(pd.DataFrame(trade_data), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(trade_data), hide_index=True, width="stretch")
 
                 # --- MAE/MFE Scatter Plot ---
                 maes = [getattr(t, 'mae_pct', 0) for t in trades]
@@ -3203,7 +3204,7 @@ def show_channel_surfer_tab(
                             template='plotly_dark', height=350,
                             margin=dict(l=50, r=20, t=40, b=30),
                         )
-                        st.plotly_chart(fig_mfe, use_container_width=True)
+                        st.plotly_chart(fig_mfe, width="stretch")
 
 
 def show_model_comparisons_tab():
@@ -3303,7 +3304,7 @@ def show_model_comparisons_tab():
             'Avg Hold': f"{s['avg_hold_min']:.0f} min" if s['n_trades'] > 0 else '—',
             'Open': s['open_positions'],
         })
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.dataframe(rows, width="stretch", hide_index=True)
 
     # --- Equity curves ---
     any_trades = any(s['n_trades'] > 0 for s in stats.values())
@@ -3339,7 +3340,7 @@ def show_model_comparisons_tab():
                 margin=dict(l=60, r=20, t=40, b=40),
                 height=400,
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         except Exception as e:
             st.warning(f"Equity chart unavailable: {e}")
 
