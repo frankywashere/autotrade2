@@ -18153,6 +18153,277 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10Z + SIGNALS_P11A + SIGNALS_P11B + SIGNALS_P11C + SIGNALS_P11D + SIGNALS_P11E
            + SIGNALS_P11F + SIGNALS_P11G + SIGNALS_P11H + SIGNALS_P11I + SIGNALS_P11J)
 
+# ── Phase 11K: Final sweep — channel depth, MACD cross, weekly reversal ────────
+# Last unexplored corners: looser channel position (30%), MACD bullish crossover,
+# weekly bar recovery (prev week lower than current), and S1041 sub-signal analysis.
+
+def sig_s1121_s929_chan30pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1121: S929 base with looser channel position 30% (vs 25% in S929/S1041).
+    More trades from deeper channel zone but possibly lower quality."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (18 <= vix_now <= 50):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.30):  # 30% not 25%
+                return 1
+    return 0
+
+
+def sig_s1122_s993_chan30pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1122: S993 conditions with channel 30% (looser) — tests quality at wider zone."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (18 <= vix_now <= 50):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    found = False
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.30):
+                found = True
+                break
+    if not found:
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    if i >= 20:
+        spy_now = float(spy['close'].iloc[i])
+        spy_20d = float(spy['close'].iloc[i - 20])
+        if spy_20d > 0 and spy_now > spy_20d:
+            return 1
+    if i >= 5:
+        spy_now = float(spy['close'].iloc[i])
+        spy_5d = float(spy['close'].iloc[i - 5])
+        if spy_5d > 0 and spy_now > spy_5d:
+            return 1
+    return 0
+
+
+def _macd_cross_up(tsla_df, i, fast=12, slow=26, signal=9):
+    """Return True if MACD histogram crosses from negative to positive at bar i."""
+    if i < slow + signal + 1:
+        return False
+    # Current histogram
+    hist_now = _macd_histogram(tsla_df, i)
+    # Previous bar histogram
+    if i - 1 < slow + signal:
+        return False
+    # Compute histogram at i-1 directly
+    closes_prev = tsla_df['close'].iloc[:i]
+    if len(closes_prev) < slow + signal:
+        return False
+    try:
+        ema_fast_prev = closes_prev.ewm(span=fast, adjust=False).mean().iloc[-1]
+        ema_slow_prev = closes_prev.ewm(span=slow, adjust=False).mean().iloc[-1]
+        macd_line_prev = ema_fast_prev - ema_slow_prev
+        # Signal line
+        macd_series_prev = (closes_prev.ewm(span=fast, adjust=False).mean()
+                            - closes_prev.ewm(span=slow, adjust=False).mean())
+        sig_prev = macd_series_prev.ewm(span=signal, adjust=False).mean().iloc[-1]
+        hist_prev = float(macd_line_prev - sig_prev)
+    except Exception:
+        return False
+    return hist_prev < 0 and hist_now is not None and hist_now >= 0
+
+
+def sig_s1123_s929_macd_crossup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1123: S929 + MACD histogram bullish cross (negative → positive today).
+    MACD crossover = momentum shift from bearish to bullish AT channel support."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _macd_cross_up(tsla, i):
+        return 1
+    return 0
+
+
+def sig_s1124_s929_rsi_cross30(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1124: S929 + RSI crosses back above 30 (was oversold, now recovering).
+    RSI oversold recovery = high quality reversal signal at channel support."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 1:
+        return 0
+    rsi_now = rt.iloc[i]
+    rsi_prev = rt.iloc[i - 1]
+    if pd.isna(rsi_now) or pd.isna(rsi_prev):
+        return 0
+    if rsi_prev < 30 and rsi_now >= 30:
+        return 1
+    return 0
+
+
+def sig_s1125_s929_weekly_reversal(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1125: S929 + weekly close rising (this week higher than last week).
+    Weekly upward reversal at support = confirmed bounce beginning."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if tw is None or len(tw) < 2:
+        return 0
+    daily_date = tsla.index[i]
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    if wk_idx < 1:
+        return 0
+    close_now_w = float(tw['close'].iloc[wk_idx])
+    close_prev_w = float(tw['close'].iloc[wk_idx - 1])
+    if close_prev_w > 0 and close_now_w > close_prev_w:
+        return 1
+    return 0
+
+
+def sig_s1126_s929_3d_recovery(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1126: S929 + TSLA close today > 3-day low (recovering off recent bottom).
+    Price bouncing off 3-day low = intraday/short-term reversal at support."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 3:
+        return 0
+    close_now = float(tsla['close'].iloc[i])
+    low_3d = float(tsla['low'].iloc[i - 3:i + 1].min())
+    open_now = float(tsla['open'].iloc[i])
+    # Today closed above the 3-day low AND closed up from open
+    if close_now > low_3d and close_now > open_now:
+        return 1
+    return 0
+
+
+def sig_s1127_s1041_or_chan30_cond(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1127: S1041 OR (S929 30% channel + precise conditions) — looser channel with precision.
+    Test if the 30% channel zone with MACD+RSI filters adds 100% WR new trades."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (18 <= vix_now <= 50):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    found = False
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.30):
+                found = True
+                break
+    if not found:
+        return 0
+    hist = _macd_histogram(tsla, i)
+    if hist is not None and hist < 0:
+        t_rsi = rt.iloc[i]
+        if not pd.isna(t_rsi) and t_rsi < 40:
+            return 1
+    return 0
+
+
+def sig_s1128_s929_and_lag_macd(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1128: S929 AND (lag5pct AND MACD<0) — 3-way AND intersection.
+    Most restrictive: S929 base + both lag5pct AND MACD bearish simultaneously."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 0
+    hist = _macd_histogram(tsla, i)
+    if hist is not None and hist < 0:
+        return 1
+    return 0
+
+
+def sig_s1129_s929_rsi30_cross(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1129: S929 + RSI was <30 anytime in last 5 days (extreme oversold recovery).
+    Not requiring the EXACT cross day, but the recent state of extreme oversold."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 0
+    recent_rsi = rt.iloc[i - 5:i + 1]
+    if not recent_rsi.isna().all() and (recent_rsi < 30).any():
+        return 1
+    return 0
+
+
+def sig_s1130_s929_macd_cross_and_rsi(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1130: S929 + (MACD cross up OR RSI was <30 in last 5d) — reversal signals.
+    Either MACD turns bullish OR RSI was extremely oversold recently."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _macd_cross_up(tsla, i):
+        return 1
+    if i >= 5:
+        recent_rsi = rt.iloc[i - 5:i + 1]
+        if not recent_rsi.isna().all() and (recent_rsi < 30).any():
+            return 1
+    return 0
+
+
+SIGNALS_P11K: List[Tuple] = [
+    ('S1121_s929_chan30pct',            sig_s1121_s929_chan30pct,               10, 0.20, 50),
+    ('S1122_s993_chan30pct',            sig_s1122_s993_chan30pct,               10, 0.20, 50),
+    ('S1123_s929_macd_crossup',         sig_s1123_s929_macd_crossup,            10, 0.20, 50),
+    ('S1124_s929_rsi_cross30',          sig_s1124_s929_rsi_cross30,             10, 0.20, 50),
+    ('S1125_s929_weekly_reversal',      sig_s1125_s929_weekly_reversal,         10, 0.20, 50),
+    ('S1126_s929_3d_recovery',          sig_s1126_s929_3d_recovery,             10, 0.20, 50),
+    ('S1127_s1041_or_chan30_cond',      sig_s1127_s1041_or_chan30_cond,         10, 0.20, 50),
+    ('S1128_s929_and_lag_macd',         sig_s1128_s929_and_lag_macd,            10, 0.20, 50),
+    ('S1129_s929_rsi30_recent',         sig_s1129_s929_rsi30_cross,             10, 0.20, 50),
+    ('S1130_s929_macd_cross_rsi',       sig_s1130_s929_macd_cross_and_rsi,     10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E
+           + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I + SIGNALS_P10J
+           + SIGNALS_P10K + SIGNALS_P10L + SIGNALS_P10M + SIGNALS_P10N + SIGNALS_P10O
+           + SIGNALS_P10P + SIGNALS_P10Q + SIGNALS_P10R + SIGNALS_P10S + SIGNALS_P10T
+           + SIGNALS_P10U + SIGNALS_P10V + SIGNALS_P10W + SIGNALS_P10X + SIGNALS_P10Y
+           + SIGNALS_P10Z + SIGNALS_P11A + SIGNALS_P11B + SIGNALS_P11C + SIGNALS_P11D + SIGNALS_P11E
+           + SIGNALS_P11F + SIGNALS_P11G + SIGNALS_P11H + SIGNALS_P11I + SIGNALS_P11J + SIGNALS_P11K)
+
 # ── sentinel — do not remove ──────────────────────────────────────────────────
 
 
