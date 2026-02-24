@@ -13620,6 +13620,206 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10K + SIGNALS_P10L + SIGNALS_P10M + SIGNALS_P10N)
 
 
+# ── Phase 10O — 30w channel pure variations + 40w channel (S901-S910) ───────────────────
+
+def _weekly_channel_lower_30w(tw, daily_date, frac: float = 0.25) -> bool:
+    """True if weekly bar at daily_date is in bottom frac of 30-week channel."""
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    if wk_idx < 30:
+        return False
+    ch = _channel_at(tw.iloc[wk_idx - 30:wk_idx])
+    if ch is None:
+        return False
+    return _near_lower(float(tw['close'].iloc[wk_idx]), ch, frac)
+
+
+def sig_s901_s895_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S901: S895 (30w base+compressed, WR=94%=S890) + lag5pct.
+    Same result as S891 — verifies convergence (S895=S890, so S895+lag=S891).
+    Tests that S895 path is truly identical to S890 path."""
+    if sig_s895_s887_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s902_s895_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S902: S895 (30w+compressed, WR=94%) + VIX pct>60.
+    Same as S892 (S890+VIX) — verifies convergence.
+    Both should give WR=91%, 7/7yr."""
+    if sig_s895_s887_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s903_s215_40w_channel(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S903: 40-week channel lower 25% + VIX 18-50.
+    Even longer structural channel — tests if 40-week channel finds better support.
+    Hypothesis: 40-week channel lower band = multi-month structural floor."""
+    if tw is None or len(tw) < 40:
+        return 0
+    daily_date = tsla.index[i]
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    if wk_idx < 40:
+        return 0
+    vix_now = float(vix['close'].iloc[i])
+    if not (18 <= vix_now <= 50):
+        return 0
+    ch = _channel_at(tw.iloc[wk_idx - 40:wk_idx])
+    if ch is None:
+        return 0
+    return 1 if _near_lower(tw['close'].iloc[wk_idx], ch, 0.25) else 0
+
+
+def sig_s904_s903_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S904: 40-week channel + ATR compression.
+    40-week structural support + volatility squeeze.
+    Hypothesis: even longer channel = more selective but higher quality per trade."""
+    if sig_s903_s215_40w_channel(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s905_s903_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S905: 40-week channel + OR-union discount.
+    Tests if OR-union discount adds to 40-week channel (compare to S895: adds nothing to 30w).
+    Hypothesis: still redundant for 40-week (channel position is the dominant filter)."""
+    if sig_s903_s215_40w_channel(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    has_disc = (_tsla_below_52wk_pct(tsla, i, pct=0.10) or
+                _tsla_below_20d_high_pct(tsla, i, pct=0.05))
+    return 1 if has_disc else 0
+
+
+def sig_s906_s905_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S906: 40-week channel + OR-union discount + compressed.
+    Direct comparison to S890 (30w version) — does 40-week improve further?
+    Hypothesis: WR > 94%, P&L similar but fewer trades."""
+    if sig_s905_s903_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s907_s887_below50ma_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S907: 30w channel + below50MA + ATR compression.
+    Tests if below50MA adds to the 30w+compressed signal (S895).
+    Hypothesis: redundant (S893≈S890 showed below50MA doesn't change 30w compressed trades)."""
+    if sig_s887_s215_30w_channel(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if _tsla_above_50ma(tsla, i):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s908_s215_15w_channel(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S908: 15-week channel lower 25% + VIX 18-50.
+    Shorter than S215 default 20-week — tests if shorter window is better.
+    Hypothesis: 15-week is too noisy and gives fewer valid channel detections."""
+    if tw is None or len(tw) < 15:
+        return 0
+    daily_date = tsla.index[i]
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    if wk_idx < 15:
+        return 0
+    vix_now = float(vix['close'].iloc[i])
+    if not (18 <= vix_now <= 50):
+        return 0
+    ch = _channel_at(tw.iloc[wk_idx - 15:wk_idx])
+    if ch is None:
+        return 0
+    return 1 if _near_lower(tw['close'].iloc[wk_idx], ch, 0.25) else 0
+
+
+def sig_s909_s908_disc_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S909: 15-week channel + OR-union discount + compressed.
+    Direct comparison to S890 (30w) and S224 (20w).
+    Tests if 15-week is weaker or stronger than 20/30 weeks."""
+    if sig_s908_s215_15w_channel(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    has_disc = (_tsla_below_52wk_pct(tsla, i, pct=0.10) or
+                _tsla_below_20d_high_pct(tsla, i, pct=0.05))
+    if not has_disc:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s910_milestone_channel_sweep(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S910 MILESTONE: Best of all channel windows — OR(20w, 30w, 40w) channel lower 25%.
+    Union of all channel window sizes + compressed.
+    Tests if the union of all window lengths adds coverage beyond 30w alone."""
+    if tw is None or len(tw) < 40:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (18 <= vix_now <= 50):
+        return 0
+    has_disc = (_tsla_below_52wk_pct(tsla, i, pct=0.10) or
+                _tsla_below_20d_high_pct(tsla, i, pct=0.05))
+    if not has_disc:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    # Any of the channel windows fires
+    for window in (20, 30, 40):
+        wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(float(tw['close'].iloc[wk_idx]), ch, 0.25):
+                return 1
+    return 0
+
+
+SIGNALS_P10O: List[Tuple] = [
+    # Phase 10O — 30w convergence + 40w channel + 15w channel sweep (S901-S910)
+    ('S901_s895_lag5pct',          sig_s901_s895_lag5pct,          10, 0.20, 50),
+    ('S902_s895_vix_pct60',        sig_s902_s895_vix_pct60,        10, 0.20, 50),
+    ('S903_s215_40w_channel',      sig_s903_s215_40w_channel,       10, 0.20, 50),
+    ('S904_s903_compressed',       sig_s904_s903_compressed,        10, 0.20, 50),
+    ('S905_s903_disc_or',          sig_s905_s903_disc_or,           10, 0.20, 50),
+    ('S906_s905_compressed',       sig_s906_s905_compressed,        10, 0.20, 50),
+    ('S907_s887_b50ma_compressed', sig_s907_s887_below50ma_compressed, 10, 0.20, 50),
+    ('S908_s215_15w_channel',      sig_s908_s215_15w_channel,       10, 0.20, 50),
+    ('S909_s908_disc_compressed',  sig_s909_s908_disc_compressed,   10, 0.20, 50),
+    ('S910_milestone_chan_sweep',   sig_s910_milestone_channel_sweep,10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E
+           + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I + SIGNALS_P10J
+           + SIGNALS_P10K + SIGNALS_P10L + SIGNALS_P10M + SIGNALS_P10N + SIGNALS_P10O)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
