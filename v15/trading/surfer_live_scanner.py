@@ -17,6 +17,7 @@ from typing import Dict, List, Optional
 STATE_PATH = Path.home() / ".x14" / "surfer_scanner_state.json"
 MAX_SIGNAL_HISTORY = 200
 GIST_FILE_NAME = 'surfer_scanner_state.json'
+MODEL_TAG = 'c9_arch418'  # Identifies this branch in the multi-model Gist
 
 # Slippage + commission assumptions
 SLIPPAGE_PCT = 0.0005     # 0.05% slippage per side
@@ -149,7 +150,12 @@ class SurferLiveScanner:
         }
 
     def _gist_load(self) -> Optional[dict]:
-        """Load state from GitHub Gist. Returns parsed dict or None on failure."""
+        """Load this model's state from GitHub Gist.
+
+        The Gist holds a multi-model dict keyed by MODEL_TAG so multiple
+        branches can share one Gist without overwriting each other.
+        Returns our model's state dict, or None on failure / first run.
+        """
         if not self.gist_id or not self.github_token:
             return None
         try:
@@ -158,25 +164,51 @@ class SurferLiveScanner:
             with urllib.request.urlopen(req, timeout=8) as resp:
                 gist_data = json.loads(resp.read().decode())
             content = gist_data.get('files', {}).get(GIST_FILE_NAME, {}).get('content', '')
-            return json.loads(content) if content else None
+            if not content:
+                return None
+            full = json.loads(content)
+            # Multi-model format: top-level keys are model tags
+            return full.get(MODEL_TAG)
         except Exception as e:
             print(f"[SCANNER] Gist load failed: {e}")
             return None
 
+    def _gist_load_full(self) -> dict:
+        """Load the complete multi-model dict from Gist (for read-modify-write saves)."""
+        if not self.gist_id or not self.github_token:
+            return {}
+        try:
+            url = f'https://api.github.com/gists/{self.gist_id}'
+            req = urllib.request.Request(url, headers=self._gist_headers())
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                gist_data = json.loads(resp.read().decode())
+            content = gist_data.get('files', {}).get(GIST_FILE_NAME, {}).get('content', '')
+            return json.loads(content) if content else {}
+        except Exception:
+            return {}
+
     def _gist_save(self, data: dict):
-        """Push state to GitHub Gist (non-blocking best-effort)."""
+        """Push this model's state to GitHub Gist (read-modify-write, non-blocking best-effort).
+
+        Reads existing Gist, updates only our MODEL_TAG slot, writes back.
+        Other models' data is preserved.
+        """
         if not self.gist_id or not self.github_token:
             return
         try:
+            full = self._gist_load_full()
+            full[MODEL_TAG] = data
+            full['_last_updated'] = datetime.now().isoformat()
             url = f'https://api.github.com/gists/{self.gist_id}'
             payload = json.dumps({
-                'files': {GIST_FILE_NAME: {'content': json.dumps(data, indent=2)}}
+                'files': {GIST_FILE_NAME: {'content': json.dumps(full, indent=2)}}
             }).encode()
             req = urllib.request.Request(
                 url, data=payload, headers=self._gist_headers(), method='PATCH'
             )
             with urllib.request.urlopen(req, timeout=8):
                 pass
+            print(f"[SCANNER] Gist saved ({MODEL_TAG})")
         except Exception as e:
             print(f"[SCANNER] Gist save failed: {e}")
 
