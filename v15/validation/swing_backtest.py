@@ -12538,6 +12538,153 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10F + SIGNALS_P10G)
 
 
+# ── Phase 10H — Wider discount thresholds + DOW timing + OR-union combos (S831-S840) ──
+
+def sig_s831_s801_disc15_or(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S831: Weekly + OR(52wk_disc15, 20d_disc8).
+    Wider discount thresholds than S801 (10%/5%) — trades deeper pullbacks.
+    Hypothesis: deeper discount = fewer but higher-quality trades."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    has_52wk = _tsla_below_52wk_pct(tsla, i, pct=0.15)
+    has_20d  = _tsla_below_20d_high_pct(tsla, i, pct=0.08)
+    return 1 if (has_52wk or has_20d) else 0
+
+
+def sig_s832_s801_disc7_or(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S832: Weekly + OR(52wk_disc7, 20d_disc3).
+    Tighter discount thresholds than S801 (10%/5%) — more trades, shallower pullbacks.
+    Hypothesis: wider coverage = more trades but lower per-trade quality."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    has_52wk = _tsla_below_52wk_pct(tsla, i, pct=0.07)
+    has_20d  = _tsla_below_20d_high_pct(tsla, i, pct=0.03)
+    return 1 if (has_52wk or has_20d) else 0
+
+
+def sig_s833_s801_monday(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S833: S801 (OR-union, best signal) filtered to Monday entries only.
+    Monday = fresh week energy, most gap-fills happen Monday morning.
+    Tests if DOW has meaningful impact on OR-union signal quality."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= len(tsla):
+        return 0
+    return 1 if tsla.index[i].weekday() == 0 else 0  # 0 = Monday
+
+
+def sig_s834_s801_tuesday(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S834: S801 filtered to Tuesday entries (second-best DOW candidate).
+    Tuesday = post-Monday reversal window in mean-reversion."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= len(tsla):
+        return 0
+    return 1 if tsla.index[i].weekday() == 1 else 0  # 1 = Tuesday
+
+
+def sig_s835_s801_mon_tue(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S835: S801 filtered to Monday OR Tuesday entries.
+    First half of week = best DOW window for mean-reversion.
+    Hypothesis: Mon+Tue entries = strongest reversal window."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= len(tsla):
+        return 0
+    dow = tsla.index[i].weekday()
+    return 1 if dow in (0, 1) else 0
+
+
+def sig_s836_s814_macd_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S836: S824 (S814+MACD) + ATR compression = S830 explored path.
+    Triple filter on 9/9yr lag5pct base: MACD turn + discount + squeeze.
+    Tests if MACD+compressed adds to lag5pct beyond plain compressed."""
+    if sig_s824_s814_macd_up(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s837_s801_rsi30(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S837: S801 (OR-union) + RSI14 < 30 (oversold).
+    Classic oversold filter on the best discount signal.
+    Hypothesis: RSI oversold + deep discount at weekly support = strong reversal."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= len(rt) or pd.isna(rt.iloc[i]):
+        return 1
+    return 1 if rt.iloc[i] < 30.0 else 0
+
+
+def sig_s838_s801_rsi40(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S838: S801 (OR-union) + RSI14 < 40 (approaching oversold).
+    Slightly looser RSI threshold — captures more trades than RSI<30.
+    Tests optimal RSI threshold for OR-union discount signal."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= len(rt) or pd.isna(rt.iloc[i]):
+        return 1
+    return 1 if rt.iloc[i] < 40.0 else 0
+
+
+def sig_s839_s814_rsi40(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S839: S814 (OR-union+lag5pct, 9/9yr) + RSI14 < 40.
+    Does RSI oversold add to the lag5pct signal?
+    Hypothesis: lag5pct already implies RSI weakness — may be redundant."""
+    if sig_s814_s801_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= len(rt) or pd.isna(rt.iloc[i]):
+        return 1
+    return 1 if rt.iloc[i] < 40.0 else 0
+
+
+def sig_s840_milestone_s831_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S840 MILESTONE: S831 (wider OR-union 15%/8%) + ATR compression.
+    Deeper discount thresholds + volatility squeeze.
+    Tests if wider discount + compression finds higher-quality deep-value setups."""
+    if sig_s831_s801_disc15_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+SIGNALS_P10H: List[Tuple] = [
+    # Phase 10H — Discount threshold sweep + DOW + RSI (S831-S840)
+    ('S831_s801_disc15_or',        sig_s831_s801_disc15_or,        10, 0.20, 50),
+    ('S832_s801_disc7_or',         sig_s832_s801_disc7_or,         10, 0.20, 50),
+    ('S833_s801_monday',           sig_s833_s801_monday,           10, 0.20, 50),
+    ('S834_s801_tuesday',          sig_s834_s801_tuesday,          10, 0.20, 50),
+    ('S835_s801_mon_tue',          sig_s835_s801_mon_tue,          10, 0.20, 50),
+    ('S836_s814_macd_compressed',  sig_s836_s814_macd_compressed,  10, 0.20, 50),
+    ('S837_s801_rsi30',            sig_s837_s801_rsi30,            10, 0.20, 50),
+    ('S838_s801_rsi40',            sig_s838_s801_rsi40,            10, 0.20, 50),
+    ('S839_s814_rsi40',            sig_s839_s814_rsi40,            10, 0.20, 50),
+    ('S840_milestone_s831_comp',   sig_s840_milestone_s831_compressed, 10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E
+           + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
