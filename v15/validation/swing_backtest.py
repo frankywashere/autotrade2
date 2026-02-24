@@ -7363,6 +7363,153 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8R + SIGNALS_P8S)
 
 
+# ── Phase 8T — VIX-pct 3-way extensions + VIX trend approach + pct60 ──────────
+# Continue extending top signals. Also test: VIX above its 20d MA (trend approach)
+# and VIX pct>60 (looser) to see frequency vs quality trade-off.
+
+def _vix_above_ma(vix, i, period: int = 20, mult: float = 1.10) -> bool:
+    """VIX is above its own 20d MA by mult factor — VIX in rising trend (fear regime)."""
+    if i < period:
+        return True
+    vix_now = float(vix['close'].iloc[i])
+    vix_ma  = float(vix['close'].iloc[i - period:i].mean())
+    return vix_now > vix_ma * mult
+
+
+def sig_s431_s429_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S431: S429 (MACD+VIX pct>80, 5/5yr, WR=92%) + compressed ATR.
+    3-way strict: MACD + top 20% fear + ATR compression.
+    Hypothesis: strictest fear threshold + MACD + compression = maximum precision."""
+    if sig_s429_s333_vix_pct80(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s432_s429_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S432: S429 (MACD+VIX pct>80) + above 200d MA.
+    3-way: MACD + top 20% fear + bull regime.
+    Hypothesis: fear regime within bull trend = panic dip at its worst (best entry)."""
+    if sig_s429_s333_vix_pct80(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close > ma200 else 0
+
+
+def sig_s433_s429_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S433: S429 (MACD+VIX pct>80) + NR7.
+    3-way: MACD + top fear threshold + tightest day.
+    Hypothesis: momentum turning on structurally fearful + tightest day = perfect timing."""
+    if sig_s429_s333_vix_pct80(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr7(tsla, i) else 0
+
+
+def sig_s434_s428_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S434: S428 (S215+VIX pct>80) + compressed ATR.
+    3-way: weekly support + top 20% fear + ATR compression.
+    Hypothesis: structural support + extreme fear + compression = spring-load in fear."""
+    if sig_s428_s215_vix_pct80(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s435_s428_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S435: S428 (S215+VIX pct>80) + NR7.
+    3-way: weekly support + top 20% fear + tightest day.
+    Hypothesis: strictest fear + tightest day at support = most precise fear entry."""
+    if sig_s428_s215_vix_pct80(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr7(tsla, i) else 0
+
+
+def sig_s436_s427_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S436: S427 (MACD+VIX pct+SPY weak, 100% WR 5/5yr) + above 200d MA.
+    4-way: MACD + fear + SPY weak + bull regime simultaneously.
+    Hypothesis: SPY below 50MA but TSLA above 200MA = TSLA stronger than index."""
+    if sig_s427_s418_macd(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close > ma200 else 0
+
+
+def sig_s437_s427_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S437: S427 (MACD+VIX pct+SPY weak, 100% WR 5/5yr) + compressed ATR.
+    4-way: MACD + fear + SPY weak + ATR compression.
+    Hypothesis: best 100% WR signal + compression = 4-layer maximum filter."""
+    if sig_s427_s418_macd(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s438_s215_vix_above_ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S438: S215 (weekly support) + VIX above its 20d MA by 10%.
+    NEW APPROACH: VIX trend (above own MA) vs VIX percentile.
+    Hypothesis: VIX trending up (above 20d MA) = fear in acceleration = better bounces."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_above_ma(vix, i, period=20, mult=1.10) else 0
+
+
+def sig_s439_s333_vix_above_ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S439: S333 (MACD turning at weekly support) + VIX above its 20d MA by 10%.
+    VIX trend approach: MACD + VIX trending upward.
+    Hypothesis: MACD turn + VIX in rising trend = momentum reversal in fear phase."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_above_ma(vix, i, period=20, mult=1.10) else 0
+
+
+def sig_s440_s215_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S440: S215 (weekly support) + VIX > 60th percentile (broader fear threshold).
+    Looser threshold: how many trades does 60th pct give vs 70th (S407) vs 80th (S428)?
+    Hypothesis: lower threshold = more trades, check if quality degrades."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+SIGNALS_P8T: List[Tuple] = [
+    # Phase 8T — VIX pct 3-way + VIX trend approach + pct60 comparison
+    ('S431_s429_compressed',    sig_s431_s429_compressed,    10, 0.20, 50),
+    ('S432_s429_above200ma',    sig_s432_s429_above200ma,    10, 0.20, 50),
+    ('S433_s429_nr7',           sig_s433_s429_nr7,           10, 0.20, 50),
+    ('S434_s428_compressed',    sig_s434_s428_compressed,    10, 0.20, 50),
+    ('S435_s428_nr7',           sig_s435_s428_nr7,           10, 0.20, 50),
+    ('S436_s427_above200ma',    sig_s436_s427_above200ma,    10, 0.20, 50),
+    ('S437_s427_compressed',    sig_s437_s427_compressed,    10, 0.20, 50),
+    ('S438_s215_vix_above_ma',  sig_s438_s215_vix_above_ma,  10, 0.20, 50),
+    ('S439_s333_vix_above_ma',  sig_s439_s333_vix_above_ma,  10, 0.20, 50),
+    ('S440_s215_vix_pct60',     sig_s440_s215_vix_pct60,     10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
