@@ -12685,6 +12685,130 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H)
 
 
+# ── Phase 10I — Hold sweep on top signals + new OR dimensions (S841-S850) ──────────────
+
+def sig_s841_s801_hold5(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S841: S801 (OR-union, best) with 5-day max hold (vs default 10).
+    Tests if shorter hold improves precision for the top signal.
+    Hypothesis: OR-union bounces often reverse within 5 days."""
+    return sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s842_s801_hold15(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S842: S801 (OR-union) with 15-day max hold.
+    Tests if longer hold captures more of the bounce move.
+    Hypothesis: bigger channel bounces take >10 days to play out."""
+    return sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s843_s814_hold5(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S843: S814 (OR-union+lag5pct, 9/9yr) with 5-day hold.
+    Shorter hold for the lag5pct signal — does lag signal resolve faster?"""
+    return sig_s814_s801_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s844_s821_hold5(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S844: S821 (OR-union+lag5pct+compressed, 100% WR) with 5-day hold.
+    Does the 100% WR signal resolve faster than 10 days?
+    Hypothesis: compressed signals mean imminent move → 5d might capture it fully."""
+    return sig_s821_s814_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s845_s801_or_spy_lag(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S845: OR(S801 discount union, TSLA-lags-SPY-5pct).
+    Broadens the OR logic: buy if EITHER discount criteria OR relative weakness.
+    Hypothesis: maximum coverage union = highest total P&L."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    has_disc = (_tsla_below_52wk_pct(tsla, i, pct=0.10) or
+                _tsla_below_20d_high_pct(tsla, i, pct=0.05))
+    has_lag  = _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05)
+    return 1 if (has_disc or has_lag) else 0
+
+
+def sig_s846_s801_and_spy_lag(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S846: AND(S801 discount union, TSLA-lags-SPY-5pct) = S814 re-verification.
+    Both discount AND lag must be true — should equal S814 result ($1,377K).
+    Confirms S814's implicit path."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    has_disc = (_tsla_below_52wk_pct(tsla, i, pct=0.10) or
+                _tsla_below_20d_high_pct(tsla, i, pct=0.05))
+    has_lag  = _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05)
+    return 1 if (has_disc and has_lag) else 0
+
+
+def sig_s847_s801_consec_down3(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S847: S801 (OR-union) + 3 consecutive down days.
+    Classic oversold filter: TSLA down 3 days in a row at weekly support.
+    Hypothesis: multi-day selling exhaustion = snap-back catalyst."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_consec_down(tsla, i, n=3) else 0
+
+
+def sig_s848_s801_consec_down2(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S848: S801 (OR-union) + 2 consecutive down days.
+    Slightly looser than 3-day; more trades but same directional exhaustion.
+    Hypothesis: 2-day down more common, better coverage."""
+    if sig_s801_s215_disc_or(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_consec_down(tsla, i, n=2) else 0
+
+
+def sig_s849_s814_consec_down2(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S849: S814 (OR-union+lag5pct, 9/9yr) + 2 consecutive down days.
+    Selling exhaustion confirmation on the lag signal.
+    Hypothesis: 2-day down + lagging SPY = maximum mean-reversion pressure."""
+    if sig_s814_s801_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_consec_down(tsla, i, n=2) else 0
+
+
+def sig_s850_milestone_s845_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S850 MILESTONE: S845 (OR-union OR lag5pct — widest base) + compressed.
+    Maximum possible trade coverage + volatility squeeze quality gate.
+    Hypothesis: widest valid OR-union + squeeze = highest P&L with 93%+ WR."""
+    if sig_s845_s801_or_spy_lag(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+SIGNALS_P10I: List[Tuple] = [
+    # Phase 10I — Hold sweep + OR expansions + consec down (S841-S850)
+    ('S841_s801_hold5',            sig_s841_s801_hold5,            5,  0.20, 50),
+    ('S842_s801_hold15',           sig_s842_s801_hold15,           15, 0.20, 50),
+    ('S843_s814_hold5',            sig_s843_s814_hold5,            5,  0.20, 50),
+    ('S844_s821_hold5',            sig_s844_s821_hold5,            5,  0.20, 50),
+    ('S845_s801_or_spy_lag',       sig_s845_s801_or_spy_lag,       10, 0.20, 50),
+    ('S846_s801_and_spy_lag',      sig_s846_s801_and_spy_lag,      10, 0.20, 50),
+    ('S847_s801_consec_down3',     sig_s847_s801_consec_down3,     10, 0.20, 50),
+    ('S848_s801_consec_down2',     sig_s848_s801_consec_down2,     10, 0.20, 50),
+    ('S849_s814_consec_down2',     sig_s849_s814_consec_down2,     10, 0.20, 50),
+    ('S850_milestone_s845_comp',   sig_s850_milestone_s845_compressed, 10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E
+           + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
