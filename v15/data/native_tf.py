@@ -217,7 +217,7 @@ def _fetch_yfinance_data(
                 end=end_inclusive,
                 interval=interval,
                 auto_adjust=True,  # Adjust for splits/dividends
-                prepost=False,     # Exclude pre/post market
+                prepost=True,      # Include pre/post market (consistent with TSLAMin.txt backtest data)
                 actions=False,     # Exclude dividends/splits columns
                 timeout=request_timeout,
                 raise_errors=True,
