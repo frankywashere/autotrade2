@@ -8976,6 +8976,114 @@ SIGNALS_P9E: List[Tuple] = [
     ('S550_mega_3way',           sig_s550_mega_3way,           10, 0.20, 50),
 ]
 
+# ── Phase 9F — Below-50MA deeper extensions + energy at support ───────────────
+# S541 ($1.87M) and S543 ($1.24M, WR=94%) are elite tier. Push further:
+# - Extend below50MA with NR7, VIX cooldown, SPY momentum
+# - Add "energy at support" concept: use ATR expansion at support as BUY (energy counter-indicator)
+# - Test below-20MA (extreme oversold) for even deeper discount setups
+
+def sig_s551_s541_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S551: S541 (below50MA + weekly support) + NR7.
+    Below medium-term MA + narrowest range in 7d = deep pullback with compression."""
+    if sig_s541_s215_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr7(tsla, i) else 0
+
+
+def sig_s552_s541_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S552: S541 (below50MA + weekly support) + VIX cooldown.
+    Medium-term oversold + VIX fear receding = double confirmation of recovery."""
+    if sig_s541_s215_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_was_elevated_now_cooling(vix, i) else 0
+
+
+def sig_s553_s541_spy_momentum(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S553: S541 (below50MA + weekly support) + SPY near 10d high.
+    TSLA medium-term oversold + SPY momentum = lag-catch at discount."""
+    if sig_s541_s215_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _spy_new_nd_high(spy, i, n=10) else 0
+
+
+def sig_s554_s541_macd(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S554: S541 (below50MA + weekly support) + MACD histogram turning.
+    Below 50MA + MACD momentum shift = medium-term oversold with momentum reversing."""
+    if sig_s541_s215_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist_now  = _macd_histogram(tsla, i)
+    hist_prev = _macd_histogram(tsla, i - 1) if i > 0 else None
+    if hist_now is None or hist_prev is None:
+        return 1
+    return 1 if hist_now > hist_prev else 0
+
+
+def sig_s555_s543_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S555: S543 (below50MA + compressed, WR=94%) + VIX pct>60.
+    Adds fear regime to the highest-WR signal: 3 dimensions in perfect alignment."""
+    if sig_s543_s541_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s556_s543_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S556: S543 (below50MA + compressed) + NR7.
+    WR=94% base + NR7 = triple compression at medium-term oversold level."""
+    if sig_s543_s541_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr7(tsla, i) else 0
+
+
+def sig_s557_s543_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S557: S543 (below50MA + compressed) + volume dry-up.
+    Triple compression: below50MA + ATR tight + volume quiet = maximum exhaustion."""
+    if sig_s543_s541_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i, mult=0.70) else 0
+
+
+def sig_s558_s541_rsi_rising(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S558: S541 (below50MA + weekly support) + RSI rising.
+    Below medium-term MA + RSI recovering = early-stage reversal confirmation."""
+    if sig_s541_s215_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _rsi_rising(rt, i, lookback=3, min_rsi=35.0) else 0
+
+
+def sig_s559_s541_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S559: S541 (below50MA + weekly support) + VIX pct>70.
+    Below medium-term MA at weekly support + sustained fear = max discount in high-fear."""
+    if sig_s541_s215_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.70) else 0
+
+
+def sig_s560_s543_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S560: S543 (below50MA + compressed, WR=94%) + TSLA above 200d MA.
+    'Perfect golden zone': bull trend (>200MA) + medium oversold (<50MA) + ATR coiled.
+    All three conditions simultaneously = maximum precision entry in bull cycle."""
+    if sig_s543_s541_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 0
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if float(tsla['close'].iloc[i]) > ma200 else 0
+
+
+SIGNALS_P9F: List[Tuple] = [
+    # Phase 9F — Below-50MA deeper extensions (S551-S560)
+    ('S551_s541_nr7',            sig_s551_s541_nr7,            10, 0.20, 50),
+    ('S552_s541_vix_cooldown',   sig_s552_s541_vix_cooldown,   10, 0.20, 50),
+    ('S553_s541_spy_momentum',   sig_s553_s541_spy_momentum,   10, 0.20, 50),
+    ('S554_s541_macd',           sig_s554_s541_macd,           10, 0.20, 50),
+    ('S555_s543_vix_pct60',      sig_s555_s543_vix_pct60,      10, 0.20, 50),
+    ('S556_s543_nr7',            sig_s556_s543_nr7,            10, 0.20, 50),
+    ('S557_s543_vol_dryup',      sig_s557_s543_vol_dryup,      10, 0.20, 50),
+    ('S558_s541_rsi_rising',     sig_s558_s541_rsi_rising,     10, 0.20, 50),
+    ('S559_s541_vix_pct70',      sig_s559_s541_vix_pct70,      10, 0.20, 50),
+    ('S560_s543_above200ma',     sig_s560_s543_above200ma,     10, 0.20, 50),
+]
+
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
            + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
            + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
@@ -8985,7 +9093,7 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
            + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
            + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
-           + SIGNALS_P9D + SIGNALS_P9E)
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F)
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
