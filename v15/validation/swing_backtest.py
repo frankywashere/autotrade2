@@ -2,27 +2,23 @@
 """
 c11 Swing Backtest — multi-day/week TSLA trading via channel + SPY/RSI patterns.
 
-All signals use daily bars (11 years of history from yfinance).
-Entry: next bar open after signal fires. No look-ahead bias.
-Sizing: fixed $1M per trade (consistent with intraday system).
-Costs: 0.05% slippage + 0.01% commission per side.
+Three modes:
+  daily  — S01-S40 on daily bars, 10yr history (2015-2025). IS=2015-2024, OOS=2025.
+  weekly — W01-W10 on weekly bars, 10yr history. Wider stops, multi-week holds.
+  hourly — H01-H10 on 1h bars, ~2yr yfinance data (2023-2025). IS=2023-2024, OOS=2025.
 
-Signals:
-  S01  TSLA daily channel bounce (baseline)
-  S02  TSLA daily bounce + SPY uptrend filter
-  S03  RSI divergence (TSLA oversold, SPY healthy)
-  S04  SPY-TSLA lag (SPY breaks high, TSLA hasn't caught up)
-  S05  High-quality channel bounce (r² > 0.85)
-  S06  Multi-window bounce (near lower band on 30d + 50d + 70d)
-  S07  Combined: channel bottom + RSI div + SPY above MA  [user idea]
-  S08  VIX spike + channel bounce (buy fear)
-  S09  TSLA weekly channel bounce
-  S10  SPY channel break up → TSLA entry
+Entry: next bar open after signal fires. No look-ahead bias.
+Sizing: fixed $1M per trade. Costs: 0.05% slippage + 0.01% commission per side.
 
 Usage:
-    python3 -m v15.validation.swing_backtest
-    python3 -m v15.validation.swing_backtest --start-year 2025 --end-year 2025
-    python3 -m v15.validation.swing_backtest --sweep S01   # param sweep on one signal
+    python3 -m v15.validation.swing_backtest                          # daily IS
+    python3 -m v15.validation.swing_backtest --end-year 2025          # daily full
+    python3 -m v15.validation.swing_backtest --mode weekly            # weekly IS
+    python3 -m v15.validation.swing_backtest --mode weekly --end-year 2025
+    python3 -m v15.validation.swing_backtest --mode hourly            # 1h IS 2023-2024
+    python3 -m v15.validation.swing_backtest --mode hourly --end-year 2025
+    python3 -m v15.validation.swing_backtest --sweep S32              # param sweep
+    python3 -m v15.validation.swing_backtest --detail S32_union       # trade detail
 """
 
 import argparse
@@ -162,11 +158,40 @@ def _near_upper(price: float, ch, frac: float = 0.25) -> bool:
 
 
 def _normalize_tz(df: pd.DataFrame) -> pd.DataFrame:
-    """Strip timezone info from index (convert to UTC first, then tz-naive date)."""
+    """Strip timezone info from index (convert to UTC first, then tz-naive date).
+    Use for daily/weekly/monthly bars — normalises each bar to midnight UTC."""
     df = df.copy()
     if df.index.tz is not None:
         df.index = df.index.tz_convert('UTC').normalize().tz_localize(None)
     return df
+
+
+def _strip_tz_intraday(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip timezone from sub-daily (1h/5m) bars — preserves intraday time."""
+    df = df.copy()
+    if df.index.tz is not None:
+        df.index = df.index.tz_convert('UTC').tz_localize(None)
+    return df
+
+
+def _align_daily_to_hourly(vix_daily: pd.DataFrame,
+                            hourly_index: pd.DatetimeIndex) -> pd.DataFrame:
+    """Forward-fill daily VIX close to match hourly bar timestamps.
+
+    Both inputs must be tz-naive (vix_daily after _normalize_tz,
+    hourly_index after _strip_tz_intraday).
+    """
+    # Get UTC midnight date for each hourly bar
+    daily_dates = hourly_index.floor('D')
+    # Forward-fill daily VIX onto the hourly grid
+    aligned = vix_daily['close'].reindex(daily_dates, method='ffill').values
+    return pd.DataFrame({
+        'open':   aligned,
+        'high':   aligned,
+        'low':    aligned,
+        'close':  aligned,
+        'volume': 0.0,
+    }, index=hourly_index)
 
 
 def _resample_weekly(daily_df: pd.DataFrame) -> pd.DataFrame:
@@ -241,9 +266,10 @@ def run_swing_backtest(
 
     for i in range(trade_start, n - 1):
         bar_year = tsla_full.index[i].year
-        if bar_year < start_year or bar_year > end_year:
-            continue
+        in_window = (bar_year >= start_year and bar_year <= end_year)
 
+        # Always manage open trades regardless of year window
+        # (a trade entered in Dec 2024 must be stopped/timed-out on Jan 2025 bars)
         if in_trade:
             price     = tsla_full['close'].iloc[i]
             hold_days = i - entry_bar
@@ -282,7 +308,8 @@ def run_swing_backtest(
                     in_trade = False
                     continue
 
-        else:
+        elif in_window:
+            # Only open new trades within the trading window
             sig = signal_fn(i, tsla_full, spy_full, vix_full,
                             tsla_weekly, spy_weekly,
                             rsi_tsla, rsi_spy, channel_window)
@@ -810,6 +837,269 @@ SIGNALS_P4: List[Tuple] = [
 SIGNALS = SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4
 
 
+# ── Phase 5 — Weekly bar signals ──────────────────────────────────────────────
+# Primary bars are weekly OHLCV (resampled from daily).
+# "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
+# Wider stops (8-10%) appropriate for multi-week candles.
+# Full 10yr history (2015-2025) — same as daily phases.
+
+def sig_w01_weekly_channel_bounce(i, tsla, spy, vix, tw, sw, rt, rs, win):
+    """W01: TSLA weekly channel bounce — near lower 25% of 20-week channel."""
+    if i < win:
+        return 0
+    ch = _channel_at(tsla.iloc[i - win:i])
+    if ch is None:
+        return 0
+    return 1 if _near_lower(tsla['close'].iloc[i], ch, 0.25) else 0
+
+
+def sig_w02_spy_weekly_lag(i, tsla, spy, vix, tw, sw, rt, rs, win):
+    """W02: SPY near 52-week high, TSLA lagging ≥8% (weekly lag effect)."""
+    lookback = 52
+    if i < lookback:
+        return 0
+    spy_now      = spy['close'].iloc[i]
+    spy_high     = spy['high'].iloc[i - lookback:i].max()
+    tsla_now     = tsla['close'].iloc[i]
+    tsla_high    = tsla['high'].iloc[i - lookback:i].max()
+    spy_strong   = spy_now >= spy_high * 0.95   # within 5% of 52w high
+    tsla_lagging = tsla_now < tsla_high * 0.92  # lagging ≥8%
+    return 1 if (spy_strong and tsla_lagging) else 0
+
+
+def sig_w03_weekly_rsi_divergence(i, tsla, spy, vix, tw, sw, rt, rs, win):
+    """W03: TSLA weekly RSI < 40 + SPY weekly RSI > 50 (RSI divergence)."""
+    if i < 20:
+        return 0
+    t_rsi = rt.iloc[i]
+    s_rsi = rs.iloc[i]
+    if pd.isna(t_rsi) or pd.isna(s_rsi):
+        return 0
+    return 1 if (t_rsi < 40 and s_rsi > 50) else 0
+
+
+def sig_w04_weekly_channel_vix_moderate(i, tsla, spy, vix, tw, sw, rt, rs, win):
+    """W04: Weekly channel bounce + VIX weekly close < 30 (no extreme panic)."""
+    if sig_w01_weekly_channel_bounce(i, tsla, spy, vix, tw, sw, rt, rs, win) == 0:
+        return 0
+    if vix['close'].iloc[i] >= 30:
+        return 0
+    return 1
+
+
+def sig_w05_weekly_channel_spy_uptrend(i, tsla, spy, vix, tw, sw, rt, rs, win):
+    """W05: Weekly channel bounce + SPY above 20-week MA (broad uptrend)."""
+    if sig_w01_weekly_channel_bounce(i, tsla, spy, vix, tw, sw, rt, rs, win) == 0:
+        return 0
+    if i < 20:
+        return 0
+    spy_ma20w = spy['close'].iloc[i - 20:i].mean()
+    if spy['close'].iloc[i] < spy_ma20w:
+        return 0
+    return 1
+
+
+def sig_w06_spy_weekly_lag_vix_regime(i, tsla, spy, vix, tw, sw, rt, rs, win):
+    """W06: Weekly SPY lag + VIX weekly 15–35 (same sweet spot as daily S29)."""
+    if sig_w02_spy_weekly_lag(i, tsla, spy, vix, tw, sw, rt, rs, win) == 0:
+        return 0
+    vix_now = vix['close'].iloc[i]
+    if not (15 <= vix_now <= 35):
+        return 0
+    return 1
+
+
+def sig_w07_weekly_channel_rsi_oversold(i, tsla, spy, vix, tw, sw, rt, rs, win):
+    """W07: Weekly channel bounce + TSLA weekly RSI < 45."""
+    if sig_w01_weekly_channel_bounce(i, tsla, spy, vix, tw, sw, rt, rs, win) == 0:
+        return 0
+    t_rsi = rt.iloc[i]
+    if pd.isna(t_rsi) or t_rsi > 45:
+        return 0
+    return 1
+
+
+def sig_w08_spy_weekly_lag_no_bear(i, tsla, spy, vix, tw, sw, rt, rs, win):
+    """W08: Weekly SPY lag + SPY not in bear (not >15% below 52w high)."""
+    if sig_w02_spy_weekly_lag(i, tsla, spy, vix, tw, sw, rt, rs, win) == 0:
+        return 0
+    spy_52w_high = spy['high'].iloc[max(0, i - 52):i].max()
+    if spy['close'].iloc[i] < spy_52w_high * 0.85:
+        return 0
+    return 1
+
+
+def sig_w09_union_weekly(i, tsla, spy, vix, tw, sw, rt, rs, win):
+    """W09: Union of W06 (VIX-gated lag) + W05 (channel+SPY trend)."""
+    if sig_w06_spy_weekly_lag_vix_regime(i, tsla, spy, vix, tw, sw, rt, rs, win) == 1:
+        return 1
+    if sig_w05_weekly_channel_spy_uptrend(i, tsla, spy, vix, tw, sw, rt, rs, win) == 1:
+        return 1
+    return 0
+
+
+def sig_w10_best_weekly(i, tsla, spy, vix, tw, sw, rt, rs, win):
+    """W10: W09 union + TSLA weekly RSI not overbought (< 60)."""
+    if sig_w09_union_weekly(i, tsla, spy, vix, tw, sw, rt, rs, win) == 0:
+        return 0
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and t_rsi > 60:
+        return 0
+    return 1
+
+
+# Phase 5: (name, fn, max_hold_weeks, stop_pct, channel_window_weeks)
+SIGNALS_P5: List[Tuple] = [
+    ('W01_weekly_channel_bounce',       sig_w01_weekly_channel_bounce,       8, 0.08, 20),
+    ('W02_spy_weekly_lag',              sig_w02_spy_weekly_lag,              8, 0.08, 20),
+    ('W03_weekly_rsi_divergence',       sig_w03_weekly_rsi_divergence,      10, 0.10, 20),
+    ('W04_weekly_channel_vix_moderate', sig_w04_weekly_channel_vix_moderate, 8, 0.08, 20),
+    ('W05_weekly_channel_spy_uptrend',  sig_w05_weekly_channel_spy_uptrend,  8, 0.08, 20),
+    ('W06_spy_weekly_lag_vix_regime',   sig_w06_spy_weekly_lag_vix_regime,   8, 0.08, 20),
+    ('W07_weekly_channel_rsi_oversold', sig_w07_weekly_channel_rsi_oversold, 8, 0.08, 20),
+    ('W08_spy_weekly_lag_no_bear',      sig_w08_spy_weekly_lag_no_bear,      8, 0.08, 20),
+    ('W09_union_lag_channel',           sig_w09_union_weekly,                8, 0.08, 20),
+    ('W10_best_weekly_composite',       sig_w10_best_weekly,                 8, 0.08, 20),
+]
+
+
+# ── Phase 6 — Hourly bar signals ──────────────────────────────────────────────
+# Primary bars are 1h OHLCV (yfinance, ~2yr history: 2023-2025).
+# IS: 2023-2024 | OOS: 2025.
+# "max_hold_days" = max hold in 1h bars (~33 bars = 5 trading days).
+# VIX: daily close forward-filled to hourly timestamps.
+# Lookbacks scaled: 1 trading day ≈ 6.5 hourly bars.
+
+def sig_h01_spy_hourly_lag(i, tsla, spy, vix, tw, sw, rt, rs, win):
+    """H01: SPY near 5d high (33h bars), TSLA lagging ≥3%."""
+    lookback = 33   # ~5 trading days
+    if i < lookback:
+        return 0
+    spy_now      = spy['close'].iloc[i]
+    spy_high     = spy['high'].iloc[i - lookback:i].max()
+    tsla_now     = tsla['close'].iloc[i]
+    tsla_high    = tsla['high'].iloc[i - lookback:i].max()
+    spy_strong   = spy_now >= spy_high * 0.98
+    tsla_lagging = tsla_now < tsla_high * 0.97
+    return 1 if (spy_strong and tsla_lagging) else 0
+
+
+def sig_h02_hourly_channel_bounce(i, tsla, spy, vix, tw, sw, rt, rs, win):
+    """H02: TSLA 1h channel bounce — near lower 25% of 40-bar (~6d) channel."""
+    if i < win:
+        return 0
+    ch = _channel_at(tsla.iloc[i - win:i])
+    if ch is None:
+        return 0
+    return 1 if _near_lower(tsla['close'].iloc[i], ch, 0.25) else 0
+
+
+def sig_h03_hourly_rsi_divergence(i, tsla, spy, vix, tw, sw, rt, rs, win):
+    """H03: TSLA 1h RSI < 35 + SPY 1h RSI > 50 (intraday RSI divergence)."""
+    if i < 20:
+        return 0
+    t_rsi = rt.iloc[i]
+    s_rsi = rs.iloc[i]
+    if pd.isna(t_rsi) or pd.isna(s_rsi):
+        return 0
+    return 1 if (t_rsi < 35 and s_rsi > 50) else 0
+
+
+def sig_h04_hourly_lag_vix(i, tsla, spy, vix, tw, sw, rt, rs, win):
+    """H04: H01 + daily VIX 15–35 (forward-filled to hourly)."""
+    if sig_h01_spy_hourly_lag(i, tsla, spy, vix, tw, sw, rt, rs, win) == 0:
+        return 0
+    vix_now = vix['close'].iloc[i]
+    if pd.isna(vix_now) or not (15 <= vix_now <= 35):
+        return 0
+    return 1
+
+
+def sig_h05_hourly_channel_spy_ma(i, tsla, spy, vix, tw, sw, rt, rs, win):
+    """H05: H02 + SPY above 20d MA (~130 hourly bars) — bounce in uptrend."""
+    if sig_h02_hourly_channel_bounce(i, tsla, spy, vix, tw, sw, rt, rs, win) == 0:
+        return 0
+    lookback_ma = 130   # ~20 trading days
+    if i < lookback_ma:
+        return 0
+    spy_ma = spy['close'].iloc[i - lookback_ma:i].mean()
+    if spy['close'].iloc[i] < spy_ma:
+        return 0
+    return 1
+
+
+def sig_h06_hourly_vix_spike_bounce(i, tsla, spy, vix, tw, sw, rt, rs, win):
+    """H06: Daily VIX > 25 + TSLA 1h channel bounce (fear + channel support)."""
+    vix_now = vix['close'].iloc[i]
+    if pd.isna(vix_now) or vix_now < 25:
+        return 0
+    return sig_h02_hourly_channel_bounce(i, tsla, spy, vix, tw, sw, rt, rs, win)
+
+
+def sig_h07_union_h01_h02(i, tsla, spy, vix, tw, sw, rt, rs, win):
+    """H07: Union of H01 (5d lag) + H02 (channel bounce)."""
+    if sig_h01_spy_hourly_lag(i, tsla, spy, vix, tw, sw, rt, rs, win) == 1:
+        return 1
+    if sig_h02_hourly_channel_bounce(i, tsla, spy, vix, tw, sw, rt, rs, win) == 1:
+        return 1
+    return 0
+
+
+def sig_h08_union_vix_regime(i, tsla, spy, vix, tw, sw, rt, rs, win):
+    """H08: H07 union + daily VIX 15–35 regime filter."""
+    if sig_h07_union_h01_h02(i, tsla, spy, vix, tw, sw, rt, rs, win) == 0:
+        return 0
+    vix_now = vix['close'].iloc[i]
+    if pd.isna(vix_now) or not (15 <= vix_now <= 35):
+        return 0
+    return 1
+
+
+def sig_h09_spy_momentum_tsla_lag(i, tsla, spy, vix, tw, sw, rt, rs, win):
+    """H09: SPY makes new 3d high (20h bars) AND closes up — TSLA still lagging."""
+    lookback = 20   # ~3 trading days
+    if i < lookback + 1:
+        return 0
+    spy_now  = spy['close'].iloc[i]
+    spy_prev = spy['close'].iloc[i - 1]
+    spy_high = spy['high'].iloc[i - lookback:i].max()
+    if spy_now < spy_high * 0.99:   # SPY at/near 3d high
+        return 0
+    if spy_now <= spy_prev:         # SPY must be up bar
+        return 0
+    tsla_now  = tsla['close'].iloc[i]
+    tsla_high = tsla['high'].iloc[i - lookback:i].max()
+    if tsla_now >= tsla_high * 0.97:  # TSLA lagging ≥3%
+        return 0
+    return 1
+
+
+def sig_h10_best_hourly(i, tsla, spy, vix, tw, sw, rt, rs, win):
+    """H10: H08 + TSLA 1h RSI not overbought (< 65)."""
+    if sig_h08_union_vix_regime(i, tsla, spy, vix, tw, sw, rt, rs, win) == 0:
+        return 0
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and t_rsi > 65:
+        return 0
+    return 1
+
+
+# Phase 6: (name, fn, max_hold_bars, stop_pct, channel_window_bars)
+# max_hold_bars here = hourly bars; 33 bars ≈ 5 trading days
+SIGNALS_P6: List[Tuple] = [
+    ('H01_hourly_spy_lag',            sig_h01_spy_hourly_lag,          33, 0.04, 40),
+    ('H02_hourly_channel_bounce',     sig_h02_hourly_channel_bounce,   33, 0.04, 40),
+    ('H03_hourly_rsi_divergence',     sig_h03_hourly_rsi_divergence,   40, 0.04, 40),
+    ('H04_hourly_lag_vix',            sig_h04_hourly_lag_vix,          33, 0.04, 40),
+    ('H05_hourly_channel_spy_ma',     sig_h05_hourly_channel_spy_ma,   33, 0.04, 40),
+    ('H06_hourly_vix_spike_bounce',   sig_h06_hourly_vix_spike_bounce, 33, 0.04, 40),
+    ('H07_union_lag_channel_1h',      sig_h07_union_h01_h02,           33, 0.04, 40),
+    ('H08_union_vix_regime_1h',       sig_h08_union_vix_regime,        33, 0.04, 40),
+    ('H09_spy_momentum_tsla_lag_1h',  sig_h09_spy_momentum_tsla_lag,   33, 0.04, 40),
+    ('H10_best_hourly_composite',     sig_h10_best_hourly,             33, 0.04, 40),
+]
+
+
 # ── Reporting ─────────────────────────────────────────────────────────────────
 def _fmt_result_line(r: BacktestResult) -> str:
     if not r.trades:
@@ -904,78 +1194,162 @@ def run_param_sweep(tsla_d, spy_d, vix_d, tw, sw, signal_name: str) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description='c11 Swing Backtest Explorer')
-    parser.add_argument('--start-year', type=int, default=2015,
-                        help='First year to trade (default: 2015)')
+    parser.add_argument('--start-year', type=int, default=None,
+                        help='First year to trade (default: 2015 daily/weekly, 2023 hourly)')
     parser.add_argument('--end-year',   type=int, default=2024,
                         help='Last year to trade (default: 2024)')
     parser.add_argument('--signal',     default='all',
                         help='Signal ID/name to run, or "all" (default: all)')
     parser.add_argument('--sweep',      default=None,
-                        help='Run param sweep on this signal name')
+                        help='Run param sweep on this signal name (daily mode only)')
     parser.add_argument('--detail',     default=None,
                         help='Show year breakdown + trade samples for this signal')
+    parser.add_argument('--mode',       default='daily',
+                        choices=['daily', 'weekly', 'hourly'],
+                        help='Bar frequency: daily (S01-S40, 10yr), '
+                             'weekly (W01-W10, 10yr), hourly (H01-H10, ~2yr). '
+                             'Default: daily')
     args = parser.parse_args()
 
+    # Resolve default start year by mode
+    if args.start_year is None:
+        args.start_year = 2023 if args.mode == 'hourly' else 2015
+
     print(f"\n{'='*80}")
-    print(f"c11 Swing Backtest — daily bars | {args.start_year}–{args.end_year}")
+    print(f"c11 Swing Backtest — {args.mode} bars | {args.start_year}–{args.end_year}")
     print(f"MAX_TRADE_USD=${MAX_TRADE_USD:,.0f}  COST={COST_PER_SIDE*2*100:.2f}% round-trip")
     print(f"{'='*80}")
 
     t0 = time.time()
-    print("Loading data (yfinance daily) ...")
-    fetch_start = f'{args.start_year - 1}-01-01'   # 1 extra year for warmup
-    fetch_end   = f'{args.end_year}-12-31'
 
-    tsla_d = _normalize_tz(fetch_native_tf('TSLA',  'daily', fetch_start, fetch_end))
-    spy_d  = _normalize_tz(fetch_native_tf('SPY',   'daily', fetch_start, fetch_end))
-    vix_d  = _normalize_tz(fetch_native_tf('^VIX',  'daily', fetch_start, fetch_end))
+    # ── Hourly mode ────────────────────────────────────────────────────────────
+    if args.mode == 'hourly':
+        from datetime import date, timedelta
+        print("Loading data (yfinance 1h, ~2yr history) ...")
+        # yfinance 1h limit: 729 days from today
+        hourly_end   = date.today().strftime('%Y-%m-%d')
+        hourly_start = (date.today() - timedelta(days=728)).strftime('%Y-%m-%d')
+        tsla_h = _strip_tz_intraday(
+            fetch_native_tf('TSLA', '1h', hourly_start, hourly_end))
+        spy_h  = _strip_tz_intraday(
+            fetch_native_tf('SPY',  '1h', hourly_start, hourly_end))
+        # Align on common 1h timestamps first
+        common_h = tsla_h.index.intersection(spy_h.index)
+        tsla_h = tsla_h.loc[common_h]
+        spy_h  = spy_h.loc[common_h]
+        # Load daily VIX and forward-fill to hourly grid
+        vix_d_raw = _normalize_tz(
+            fetch_native_tf('^VIX', 'daily', hourly_start, hourly_end))
+        vix_h = _align_daily_to_hourly(vix_d_raw, common_h)
+        print(f"TSLA 1h: {len(tsla_h)} bars | SPY 1h: {len(spy_h)} bars | "
+              f"VIX (daily→1h): {len(vix_h)} bars")
+        print(f"Data loaded in {time.time()-t0:.1f}s\n")
 
-    # Build weekly bars by resampling daily
-    tsla_w = _resample_weekly(tsla_d)
-    spy_w  = _resample_weekly(spy_d)
+        sig_list = SIGNALS_P6
+        results  = []
+        for (name, fn, max_hold, stop, window) in sig_list:
+            if args.signal != 'all' and args.signal not in name:
+                continue
+            t1 = time.time()
+            r  = run_swing_backtest(
+                tsla=tsla_h, spy=spy_h, vix=vix_h,
+                tsla_weekly=None, spy_weekly=None,
+                signal_fn=fn, signal_name=name,
+                max_hold_days=max_hold, stop_pct=stop,
+                channel_window=window,
+                warmup_bars=200,          # ~1 month of hourly bars
+                start_year=args.start_year,
+                end_year=args.end_year,
+            )
+            elapsed = time.time() - t1
+            results.append(r)
+            print(f"  {name:<46s} done in {elapsed:.1f}s → {r.n_trades} trades")
 
-    print(f"TSLA daily: {len(tsla_d)} bars | SPY daily: {len(spy_d)} bars | "
-          f"VIX daily: {len(vix_d)} bars")
-    print(f"TSLA weekly: {len(tsla_w)} bars | SPY weekly: {len(spy_w)} bars")
-    print(f"Data loaded in {time.time()-t0:.1f}s\n")
+    # ── Weekly mode ────────────────────────────────────────────────────────────
+    elif args.mode == 'weekly':
+        print("Loading data (yfinance daily → resample weekly) ...")
+        fetch_start = f'{args.start_year - 1}-01-01'
+        fetch_end   = f'{args.end_year}-12-31'
+        tsla_d = _normalize_tz(fetch_native_tf('TSLA', 'daily', fetch_start, fetch_end))
+        spy_d  = _normalize_tz(fetch_native_tf('SPY',  'daily', fetch_start, fetch_end))
+        vix_d  = _normalize_tz(fetch_native_tf('^VIX', 'daily', fetch_start, fetch_end))
+        tsla_w = _resample_weekly(tsla_d)
+        spy_w  = _resample_weekly(spy_d)
+        vix_w  = _resample_weekly(vix_d)
+        print(f"TSLA weekly: {len(tsla_w)} bars | SPY weekly: {len(spy_w)} bars | "
+              f"VIX weekly: {len(vix_w)} bars")
+        print(f"Data loaded in {time.time()-t0:.1f}s\n")
 
-    # Param sweep mode
-    if args.sweep:
-        run_param_sweep(tsla_d, spy_d, vix_d, tsla_w, spy_w, args.sweep)
-        return
+        sig_list = SIGNALS_P5
+        results  = []
+        for (name, fn, max_hold, stop, window) in sig_list:
+            if args.signal != 'all' and args.signal not in name:
+                continue
+            t1 = time.time()
+            r  = run_swing_backtest(
+                tsla=tsla_w, spy=spy_w, vix=vix_w,
+                tsla_weekly=None, spy_weekly=None,
+                signal_fn=fn, signal_name=name,
+                max_hold_days=max_hold, stop_pct=stop,
+                channel_window=window,
+                warmup_bars=60,           # ~1yr of weekly bars
+                start_year=args.start_year,
+                end_year=args.end_year,
+            )
+            elapsed = time.time() - t1
+            results.append(r)
+            print(f"  {name:<46s} done in {elapsed:.1f}s → {r.n_trades} trades")
 
-    # Run all (or selected) signals
-    results = []
-    for (name, fn, max_hold, stop, window) in SIGNALS:
-        if args.signal != 'all' and args.signal not in name:
-            continue
-        t1 = time.time()
-        r  = run_swing_backtest(
-            tsla=tsla_d, spy=spy_d, vix=vix_d,
-            tsla_weekly=tsla_w, spy_weekly=spy_w,
-            signal_fn=fn, signal_name=name,
-            max_hold_days=max_hold, stop_pct=stop,
-            channel_window=window,
-            start_year=args.start_year,
-            end_year=args.end_year,
-        )
-        elapsed = time.time() - t1
-        results.append(r)
-        print(f"  {name:<42s} done in {elapsed:.1f}s → {r.n_trades} trades")
+    # ── Daily mode (default) ────────────────────────────────────────────────────
+    else:
+        print("Loading data (yfinance daily) ...")
+        fetch_start = f'{args.start_year - 1}-01-01'
+        fetch_end   = f'{args.end_year}-12-31'
+        tsla_d = _normalize_tz(fetch_native_tf('TSLA',  'daily', fetch_start, fetch_end))
+        spy_d  = _normalize_tz(fetch_native_tf('SPY',   'daily', fetch_start, fetch_end))
+        vix_d  = _normalize_tz(fetch_native_tf('^VIX',  'daily', fetch_start, fetch_end))
+        tsla_w = _resample_weekly(tsla_d)
+        spy_w  = _resample_weekly(spy_d)
+        print(f"TSLA daily: {len(tsla_d)} bars | SPY daily: {len(spy_d)} bars | "
+              f"VIX daily: {len(vix_d)} bars")
+        print(f"TSLA weekly: {len(tsla_w)} bars | SPY weekly: {len(spy_w)} bars")
+        print(f"Data loaded in {time.time()-t0:.1f}s\n")
 
+        if args.sweep:
+            run_param_sweep(tsla_d, spy_d, vix_d, tsla_w, spy_w, args.sweep)
+            return
+
+        sig_list = SIGNALS
+        results  = []
+        for (name, fn, max_hold, stop, window) in sig_list:
+            if args.signal != 'all' and args.signal not in name:
+                continue
+            t1 = time.time()
+            r  = run_swing_backtest(
+                tsla=tsla_d, spy=spy_d, vix=vix_d,
+                tsla_weekly=tsla_w, spy_weekly=spy_w,
+                signal_fn=fn, signal_name=name,
+                max_hold_days=max_hold, stop_pct=stop,
+                channel_window=window,
+                start_year=args.start_year,
+                end_year=args.end_year,
+            )
+            elapsed = time.time() - t1
+            results.append(r)
+            print(f"  {name:<46s} done in {elapsed:.1f}s → {r.n_trades} trades")
+
+    # ── Common reporting ────────────────────────────────────────────────────────
     print(f"\n{'='*80}")
-    print(f"RESULTS  (sorted by total P&L):")
+    print(f"RESULTS  (sorted by total P&L)  [{args.mode} mode]:")
     print(f"{'='*80}")
     print_results_table(results)
 
-    # Detail mode
     if args.detail:
         for r in results:
             if args.detail in r.signal:
                 print_year_breakdown(r)
                 print_trade_samples(r, n=10)
 
-    # Auto-detail top signal
     if results:
         best = max(results, key=lambda r: r.total_pnl)
         if best.n_trades > 0:

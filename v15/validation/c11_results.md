@@ -177,9 +177,107 @@ The two signals are complementary: S29 fires in moderate vol regimes, S25 adds w
 
 ---
 
+---
+
+## Phase 5 Findings — Weekly Bar Signals (W01-W10)
+
+**Mode:** `--mode weekly` | Primary bars: weekly OHLCV (resampled from daily)
+**Hold unit:** weekly bars (hold=2.6 = ~2.6 weeks) | **Stops:** 8-10%
+**Data:** 10yr full history (same as daily phases)
+
+| Signal | IS P&L (2015-24) | IS Yrs | OOS 2025 | PF | Notes |
+|--------|-----------------|--------|-----------|-----|-------|
+| **W06** SPY weekly lag + VIX 15-35 | **$1.43M** | **7/9** | **+$17-204K** | **1.62** | **WINNER** |
+| W05 weekly channel + SPY trend | $1.56M | 7/10 | -$5K | 2.16 | OOS fail |
+| W02/W08 SPY weekly lag | $2.53M | 7/10 | -$53K | 1.77 | OOS fail |
+| W09 union lag+channel | $2.36M | 7/11 | +$11K | 1.89 | Marginal OOS |
+| W01 weekly channel | $1.37M | 7/10 | +$47K | 1.69 | Modest OOS |
+| W07 channel + RSI oversold | $470K | 6/8 | -$107K | 1.42 | OOS fail |
+| W03 RSI divergence | $390K | 4/6 | NO TRADES | 1.72 | Too few |
+
+**Key insight:** Same pattern as daily — VIX 15-35 filter is mandatory for OOS robustness.
+W02 (52-week high lag) looks great IS but fires during high VIX events in 2025 → stops blow.
+W06 adds VIX 15-35 gate → survives 2025 tariff volatility.
+
+**W06 full run (IS+OOS 2015-2025):** $1.65M total, 7/9 years profitable
+- 2020: +$930K (COVID recovery, massive catch-up)
+- 2018: -$410K (rate-hike panic — the only major loss year)
+- 2025: +$17K (tariff volatility — scraped by)
+- **Best trade:** Oct 2024: TSLA lag entry → +$571K (+57%) in 3 weeks
+- **Avg trade:** ~$34K at $1M position — much larger than daily ($9-16K) due to weekly moves
+
+**Weekly conclusion:** Same SPY-TSLA lag edge exists on weekly bars. Average winner is 3× larger
+than daily but only ~48 trades over 10 years (vs ~200+ daily). Weekly complements daily, not replaces.
+
+---
+
+## Phase 6 Findings — 1h Bar Signals (H01-H10)
+
+**Mode:** `--mode hourly` | Primary bars: 1h OHLCV from yfinance (~2yr: Feb 2024 – Feb 2026)
+**Hold unit:** hourly bars (hold=14.7 = ~14.7 bars ≈ 1 calendar day; timeout=33 bars ≈ 2.5 days)
+**Data limitation:** yfinance 1h only provides ~729 days — IS: 2024 only (~10 months)
+
+| Signal | IS 2024 | OOS 2025 | PF | Notes |
+|--------|---------|-----------|-----|-------|
+| **H01** SPY hourly lag | **+$551K** | **+$99K** | **1.16** | **WINNER — 2/2 years** |
+| H07 union lag+channel | +$531K | -$52K | 1.25/0.98 | Fails OOS |
+| H04 lag + VIX regime | +$16K | +$82K | 1.01/1.04 | Barely positive |
+| H03 RSI divergence 1h | -$27K | +$213K | — | Reversal between years |
+| H02 channel bounce 1h | -$14K | +$43K | — | Noisy, barely positive |
+| H10 best composite | -$135K | -$157K | 0.90/0.94 | Both years negative |
+| H09 momentum (3d high) | +$166K | -$685K | 1.09/0.72 | Catastrophic OOS fail |
+| H05 channel + SPY MA | -$106K | -$220K | 0.82/0.85 | Both years negative |
+
+**H01 combined IS+OOS:** $650K total, 2/2 years profitable
+- Avg hold: ~14.7 hourly bars ≈ 1-1.5 calendar days (intraday momentum + overnight)
+- WR=50%, PF=1.16 — modest but both years positive
+- Best trades: Large TSLA moves caught on timeout (max 33h hold = ~2.5 days)
+
+**Key insights for hourly:**
+
+1. **Same lag edge works on 1h bars** — SPY-TSLA catch-up effect is visible intraday too.
+   H01 is the only signal that passes BOTH IS and OOS. All multi-condition composites fail OOS.
+
+2. **2025 is harder on 1h than daily** — tariff volatility creates more whipsaws on hourly bars.
+   The 1h SPY lag fires correctly but exits are frequently stopped out.
+
+3. **1h channels are too noisy** — H02 barely profitable in OOS, H05 fails both years.
+   The hourly channel is mean-reversion on a 7-day window; TSLA breaks these easily.
+
+4. **H09 (momentum) is overfit** — 367 trades/yr is too high, -$685K OOS is a warning sign.
+
+5. **Data limitation is real** — only 2yr of 1h data. IS is just 1 year (~10 months).
+   Daily has 10yr IS. Hourly results are much less statistically robust.
+
+**Hourly conclusion:** H01 shows the lag edge is real at 1h resolution, but weaker (PF=1.16 vs
+daily PF=1.54). Limited to 2yr data. For live use, daily S32 remains superior. Hourly could
+be used for entry timing within a daily S32 signal (enter at optimal 1h moment).
+
+---
+
+## Cross-Timeframe Summary
+
+| Timeframe | Best Signal | IS P&L | OOS 2025 | PF | Trades/yr | Avg/trade |
+|-----------|-------------|--------|-----------|-----|-----------|-----------|
+| **Daily** | **S32** | **$3.12M/10yr** | **+$639K** | **1.54** | **~20-25** | **$15K** |
+| Weekly | W06 | $1.43M/10yr | +$17-204K | 1.62 | ~5 | **$34K** |
+| Hourly | H01 | $551K/1yr | +$99K | 1.16 | ~140 | $4K |
+
+**The SPY-TSLA lag effect operates across all timeframes:**
+- Daily S32: Best IS+OOS consistency, full 10yr validation
+- Weekly W06: Fewer trades, larger individual wins, same VIX regime requirement
+- Hourly H01: Edge exists but weaker, limited history, good for entry timing only
+
+**VIX regime filter (15-35) is universal:** Required across daily (S29→S32), weekly (W06),
+and partially for hourly (H04 adds VIX but only modestly improves H01).
+
+---
+
 ## Next Steps
 
-- [ ] 1h-bar variant: test if same SPY-TSLA lag works on hourly data (shorter holds, more trades)
-- [ ] ML overlay: train signal quality model on swing trades (enter=1 if S32 fires, features=RSI/VIX/channel state)
-- [ ] Portfolio sizing: test with dynamic sizing (larger position in VIX 20-30, smaller at 15-20)
+- [x] 1h-bar variant: tested H01 — works (PF=1.16, 2/2 years) but weaker than daily
+- [x] Weekly variant: tested W06 — works (PF=1.62, 7/9 years), larger avg wins
 - [ ] Multi-instrument: test SPY-NVDA lag (NVDA often lags SPY moves even more than TSLA)
+- [ ] Entry timing: use H01 signal to pick optimal intraday entry within a daily S32 signal
+- [ ] ML overlay: train signal quality model on swing trades (S32 features for quality scoring)
+- [ ] Portfolio sizing: daily S32 + weekly W06 combined (run both, scale down when both fire)
