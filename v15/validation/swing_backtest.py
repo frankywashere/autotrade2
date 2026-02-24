@@ -10444,6 +10444,133 @@ SIGNALS_P9R: List[Tuple] = [
     ('S680_s631_vol_dryup_compressed', sig_s680_s631_vol_dryup_compressed, 10, 0.20, 50),
 ]
 
+# ── Phase 9S — RSI divergence, DOW, inside bar, multi-vol patterns (S681-S690) ─
+# Explore day-of-week effects, RSI divergence vs SPY, and alternative combinations.
+
+def _tsla_rsi_below_spy_rsi(rt, rs, i, spread: float = 15.0) -> bool:
+    """TSLA RSI is at least spread points below SPY RSI — TSLA-specific oversold vs market."""
+    if i >= len(rt) or i >= len(rs):
+        return False
+    tsla_rsi = float(rt.iloc[i])
+    spy_rsi = float(rs.iloc[i])
+    return (spy_rsi - tsla_rsi) >= spread
+
+
+def _is_monday(tsla, i) -> bool:
+    """Signal fires on a Monday (weekly fresh-start buying pressure)."""
+    try:
+        return tsla.index[i].weekday() == 0
+    except Exception:
+        return False
+
+
+def _is_friday(tsla, i) -> bool:
+    """Signal fires on a Friday (position squaring before weekend)."""
+    try:
+        return tsla.index[i].weekday() == 4
+    except Exception:
+        return False
+
+
+def sig_s681_s631_rsi_divergence(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S681: S631 (10% disc + weekly support) + TSLA RSI ≥15 pts below SPY RSI.
+    TSLA-specific oversold vs market: TSLA falling while SPY holds = catch-up."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_rsi_below_spy_rsi(rt, rs, i, spread=15.0) else 0
+
+
+def sig_s682_s631_monday(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S682: S631 (10% disc + weekly support) + Monday entry.
+    Weekly fresh-start effect: Monday at structural support = highest weekly urgency."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _is_monday(tsla, i) else 0
+
+
+def sig_s683_s648_rsi_divergence(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S683: S648 (WR=94%, compressed+disc) + TSLA RSI ≥15pts below SPY RSI.
+    Best WR base + specific TSLA-oversold-vs-market divergence."""
+    if sig_s648_s631_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_rsi_below_spy_rsi(rt, rs, i, spread=15.0) else 0
+
+
+def sig_s684_s631_inside_bar(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S684: S631 (10% disc + weekly support) + inside bar (range inside yesterday).
+    Consolidation at peak discount at support = coiling before bounce."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _inside_bar(tsla, i) else 0
+
+
+def sig_s685_s648_rsi_low(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S685: S648 (WR=94%, compressed+disc) + RSI < 40.
+    Best-WR base + deep RSI oversold = multi-layer depth confirmation."""
+    if sig_s648_s631_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    rsi_val = float(rt.iloc[i]) if i < len(rt) else 50.0
+    return 1 if rsi_val < 40.0 else 0
+
+
+def sig_s686_s526_no_gap_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S686: S526 (MACD+VIX_cooldown, $1.08M, 92% WR) + no gap down.
+    VIX cooling + MACD turning without gap-down panic = controlled recovery."""
+    if sig_s526_s333_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_no_gap_down(tsla, i) else 0
+
+
+def sig_s687_s631_macd_up(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S687: S631 (10% disc + weekly support) + MACD histogram turning up.
+    Peak discount at support + momentum turning = momentum confirmation."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist_now  = _macd_histogram(tsla, i)
+    hist_prev = _macd_histogram(tsla, i - 1) if i > 0 else None
+    if hist_now is None or hist_prev is None:
+        return 1
+    return 1 if hist_now > hist_prev else 0
+
+
+def sig_s688_s631_vix_pct50(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S688: S631 (10% disc + weekly support) + VIX pct>50 (any elevated fear).
+    More trades than pct60: captures any above-median fear with 10%_disc at support."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.50) else 0
+
+
+def sig_s689_s658_rsi_divergence(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S689: S658 (above200MA + weekly support, $1.32M, WR=89%) + TSLA RSI divergence.
+    Long-term uptrend + structural support + TSLA-specific RSI weakness."""
+    if sig_s658_s215_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_rsi_below_spy_rsi(rt, rs, i, spread=15.0) else 0
+
+
+def sig_s690_s631_consec_down3(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S690: S631 (10% disc + weekly support) + 3+ consecutive down days.
+    Extended red streak at peak discount at support = momentum exhaustion setup."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_consec_down(tsla, i, n=3) else 0
+
+
+SIGNALS_P9S: List[Tuple] = [
+    # Phase 9S — RSI divergence + DOW + inside bar + MACD (S681-S690)
+    ('S681_s631_rsi_divergence',  sig_s681_s631_rsi_divergence,  10, 0.20, 50),
+    ('S682_s631_monday',          sig_s682_s631_monday,          10, 0.20, 50),
+    ('S683_s648_rsi_divergence',  sig_s683_s648_rsi_divergence,  10, 0.20, 50),
+    ('S684_s631_inside_bar',      sig_s684_s631_inside_bar,      10, 0.20, 50),
+    ('S685_s648_rsi_low',         sig_s685_s648_rsi_low,         10, 0.20, 50),
+    ('S686_s526_no_gap_down',     sig_s686_s526_no_gap_down,     10, 0.20, 50),
+    ('S687_s631_macd_up',         sig_s687_s631_macd_up,         10, 0.20, 50),
+    ('S688_s631_vix_pct50',       sig_s688_s631_vix_pct50,       10, 0.20, 50),
+    ('S689_s658_rsi_divergence',  sig_s689_s658_rsi_divergence,  10, 0.20, 50),
+    ('S690_s631_consec_down3',    sig_s690_s631_consec_down3,    10, 0.20, 50),
+]
+
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
            + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
            + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
@@ -10455,7 +10582,7 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
            + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
            + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
-           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R)
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S)
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
