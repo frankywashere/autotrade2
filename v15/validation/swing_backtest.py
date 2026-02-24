@@ -10571,6 +10571,120 @@ SIGNALS_P9S: List[Tuple] = [
     ('S690_s631_consec_down3',    sig_s690_s631_consec_down3,    10, 0.20, 50),
 ]
 
+# ── Phase 9T — S687 extensions + S700 milestone (extreme multi-filter) ────────
+# S687 (MACD up + 10%disc + weekly, $1.46M, 8/9yr) is our newest strong signal.
+# Extend with top proven filters. S700 = maximum multi-filter alignment.
+
+def sig_s691_s687_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S691: S687 (MACD up + 10%disc + weekly, 8/9yr) + VIX pct>60.
+    MACD momentum + peak discount + support + fear regime = 4-way alignment."""
+    if sig_s687_s631_macd_up(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s692_s687_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S692: S687 (MACD up + 10%disc + weekly) + ATR compression.
+    MACD turning up while volatility still compressed = early-mover setup."""
+    if sig_s687_s631_macd_up(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s693_s687_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S693: S687 (MACD up + 10%disc + weekly) + TSLA lags SPY 5%+.
+    MACD turning + peak discount + TSLA underperformance = timing + depth + specificity."""
+    if sig_s687_s631_macd_up(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s694_s687_rsi_low(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S694: S687 (MACD up + 10%disc + weekly) + RSI < 40.
+    MACD turning up from RSI oversold territory = strongest momentum reversal."""
+    if sig_s687_s631_macd_up(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    rsi_val = float(rt.iloc[i]) if i < len(rt) else 50.0
+    return 1 if rsi_val < 40.0 else 0
+
+
+def sig_s695_s687_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S695: S687 (MACD up + 10%disc + weekly) + volume dry-up.
+    MACD turning + peak discount at support + sellers exhausted = ideal entry."""
+    if sig_s687_s631_macd_up(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i) else 0
+
+
+def sig_s696_s631_rsi30(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S696: S631 (10%disc + weekly support) + RSI < 30 (extreme oversold).
+    Peak discount at structural support with RSI in capitulation territory."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    rsi_val = float(rt.iloc[i]) if i < len(rt) else 50.0
+    return 1 if rsi_val < 30.0 else 0
+
+
+def sig_s697_s526_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S697: S526 (MACD+VIX_cooldown, 92% WR) + ATR compression.
+    VIX fear receding + MACD turning + volatility squeeze = maximum timing precision."""
+    if sig_s526_s333_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s698_s687_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S698: S687 (MACD up + 10%disc + weekly) + above 200d MA.
+    Best new signal restricted to long-term uptrend: MACD momentum in bull market."""
+    if sig_s687_s631_macd_up(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if float(tsla['close'].iloc[i]) > ma200 else 0
+
+
+def sig_s699_s687_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S699: S687 (MACD up + 10%disc + weekly) + VIX pct>70 (high fear tier).
+    MACD timing in extreme fear environment at peak discount = maximum opportunity."""
+    if sig_s687_s631_macd_up(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.70) else 0
+
+
+def sig_s700_milestone_max_alignment(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S700 MILESTONE: Maximum signal alignment — all top filters at once.
+    Weekly support + 10%_52wk + MACD up + VIX pct>60 + lag5pct.
+    Every dimension must agree: structural, momentum, fear, and relative value."""
+    if sig_s687_s631_macd_up(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not _vix_elevated_pct(vix, i, window=252, pct=0.60):
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+SIGNALS_P9T: List[Tuple] = [
+    # Phase 9T — S687 extensions + S700 milestone (S691-S700)
+    ('S691_s687_vix_pct60',           sig_s691_s687_vix_pct60,           10, 0.20, 50),
+    ('S692_s687_compressed',          sig_s692_s687_compressed,          10, 0.20, 50),
+    ('S693_s687_lag5pct',             sig_s693_s687_lag5pct,             10, 0.20, 50),
+    ('S694_s687_rsi_low',             sig_s694_s687_rsi_low,             10, 0.20, 50),
+    ('S695_s687_vol_dryup',           sig_s695_s687_vol_dryup,           10, 0.20, 50),
+    ('S696_s631_rsi30',               sig_s696_s631_rsi30,               10, 0.20, 50),
+    ('S697_s526_compressed',          sig_s697_s526_compressed,          10, 0.20, 50),
+    ('S698_s687_above200ma',          sig_s698_s687_above200ma,          10, 0.20, 50),
+    ('S699_s687_vix_pct70',           sig_s699_s687_vix_pct70,           10, 0.20, 50),
+    ('S700_milestone_max_alignment',  sig_s700_milestone_max_alignment,  10, 0.20, 50),
+]
+
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
            + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
            + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
@@ -10582,7 +10696,7 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
            + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
            + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
-           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S)
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T)
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
