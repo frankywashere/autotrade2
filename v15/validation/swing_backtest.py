@@ -4011,7 +4011,119 @@ SIGNALS_P7X: List[Tuple] = [
 ]
 
 
-SIGNALS = SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X
+# ── Phase 7Y — Oversold-vs-MA, end-of-quarter, month-end, S215 compressed ────
+# Exploring: deeply oversold vs MA + compressed, end-of-quarter effects,
+# month-end/month-start patterns, and S215 compressed-only variant.
+
+def sig_s222_below_50ma_s91(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S222: S91 (ATR extreme) + TSLA >15% below its 50-day MA.
+    Deep MA undershoot = extreme negative sentiment vs trend.
+    ATR compressed at this level = institutional accumulation, not panic.
+    Hypothesis: deeply oversold vs trend + quiet = best value entry."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 50:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma50 = float(tsla['close'].iloc[i - 50:i].mean())
+    return 1 if close < ma50 * 0.85 else 0  # >15% below 50d MA
+
+
+def sig_s223_below_50ma_s215(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S223: S215 (multi-TF + VIX>=18) + TSLA >10% below 50d MA.
+    Best consistency signal (8/8 years) applied when stock is deep below trend.
+    Hypothesis: weekly support + daily ATR + fear + deeply undervalued = ideal."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 50:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma50 = float(tsla['close'].iloc[i - 50:i].mean())
+    return 1 if close < ma50 * 0.90 else 0  # >10% below 50d MA
+
+
+def sig_s224_s215_compressed_only(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S224: S215 (multi-TF + VIX>=18) with ATR compressed-only filter.
+    S91 fires on both compressed AND expanding ATR. This keeps only compressed.
+    Hypothesis: compressed ATR at weekly support = better than expanding."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0  # Compressed only
+
+
+def sig_s225_qtr_end_s91(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S225: S91 (ATR extreme) in last 5 trading days of a quarter.
+    Quarter-end: index rebalancing creates temporary dislocations.
+    TSLA often gets oversold/undersold by forced rebalancing flows.
+    Hypothesis: compression during quarter-end = post-rebalancing snap-back."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    month = tsla.index[i].month
+    day = tsla.index[i].day
+    # Last 5 trading days of Mar, Jun, Sep, Dec (estimated via >22nd of month)
+    is_qtr_end_month = month in {3, 6, 9, 12}
+    return 1 if (is_qtr_end_month and day >= 22) else 0
+
+
+def sig_s226_month_end_s91(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S226: S91 + last 3 trading days of any month (month-end effect).
+    Month-end rebalancing by funds creates similar dislocations as quarter-end.
+    Hypothesis: signal during rebalancing window = faster resolution."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    month = tsla.index[i].month
+    # Find last 3 trading days of current month
+    all_month = tsla[tsla.index.month == month]
+    this_year_month = tsla[(tsla.index.month == month) & (tsla.index.year == tsla.index[i].year)]
+    if len(this_year_month) < 3:
+        return 1
+    # If current date is among last 3 trading days
+    last_3 = this_year_month.index[-3:]
+    return 1 if tsla.index[i] in last_3 else 0
+
+
+def sig_s227_s215_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S227: S215 (multi-TF + VIX>=18) + NR7.
+    The best all-around signal with the NR7 Crabel compression peak filter.
+    Hypothesis: S215 8/8 years → add NR7 → approach 100% WR with good trade count."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr_n(tsla, i, 7) else 0
+
+
+def sig_s228_s215_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S228: S215 (multi-TF + VIX>=18) + VIX recovery (spike then calm).
+    S215 requires VIX>=18 now. This adds: VIX was elevated 5-10d ago AND is now cooling.
+    Hypothesis: S215 identifies setup, VIX recovery adds timing precision."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    spike_then = vix_5d > 20 or vix_10d > 20
+    calm_now   = vix_now < vix_5d * 0.92  # 8% drop = VIX cooling
+    return 1 if (spike_then and calm_now) else 0
+
+
+SIGNALS_P7Y: List[Tuple] = [
+    # Phase 7Y — MA oversold, quarter-end, month-end, S215 variants
+    ('S222_below50ma_s91',      sig_s222_below_50ma_s91,     10, 0.20, 50),
+    ('S223_below50ma_s215',     sig_s223_below_50ma_s215,    10, 0.20, 50),
+    ('S224_s215_compress_only', sig_s224_s215_compressed_only, 10, 0.20, 50),
+    ('S225_qtr_end_s91',        sig_s225_qtr_end_s91,        10, 0.20, 50),
+    ('S226_month_end_s91',      sig_s226_month_end_s91,      10, 0.20, 50),
+    ('S227_s215_nr7',           sig_s227_s215_nr7,           10, 0.20, 50),
+    ('S228_s215_vix_rec',       sig_s228_s215_vix_rec,       10, 0.20, 50),
+]
+
+
+SIGNALS = SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
