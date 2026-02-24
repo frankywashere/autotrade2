@@ -9860,6 +9860,109 @@ SIGNALS_P9M: List[Tuple] = [
     ('S630_s215_52wk_disc40',  sig_s630_s215_52wk_disc40,  10, 0.20, 50),
 ]
 
+# ── Phase 9N — Complete threshold sweep + S629 extensions (optimal signal) ───
+# S629 ($2M, 9/9yr) = best signal. Test 10%/12.5% thresholds to confirm 15% optimal.
+# Extend S629 with proven top filters.
+
+def sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S631: S215 (weekly support) + TSLA 10%+ below 52-week high.
+    Very loose threshold: captures even modest pullbacks at structural support."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_below_52wk_pct(tsla, i, pct=0.10) else 0
+
+
+def sig_s632_s215_52wk_disc12(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S632: S215 (weekly support) + TSLA 12%+ below 52-week high.
+    12.5% threshold between 10% and 15% — fine-tuning the optimal point."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_below_52wk_pct(tsla, i, pct=0.12) else 0
+
+
+def sig_s633_s629_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S633: S629 (15% disc + weekly support, $2M, 9/9yr) + VIX pct>60.
+    Best signal + fear regime = highest conviction entries from record signal."""
+    if sig_s629_s215_52wk_disc15(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s634_s629_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S634: S629 (15% disc + weekly support) + TSLA lags SPY 5%+.
+    Best signal + TSLA-specific underperformance = dual independent oversold."""
+    if sig_s629_s215_52wk_disc15(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+def sig_s635_s629_below20ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S635: S629 (15% disc + weekly support) + below 20d MA.
+    Best signal + short-term MA breakdown = multi-layer oversold at peak discount."""
+    if sig_s629_s215_52wk_disc15(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _below_20ma(tsla, i) else 0
+
+
+def sig_s636_s629_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S636: S629 (15% disc + weekly support) + volume dry-up.
+    Best signal + sellers exhausted = lowest-risk entry timing."""
+    if sig_s629_s215_52wk_disc15(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i) else 0
+
+
+def sig_s637_s629_rsi_low(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S637: S629 (15% disc + weekly support) + RSI < 40.
+    Best signal + RSI quantified oversold = depth confirmation."""
+    if sig_s629_s215_52wk_disc15(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    rsi_val = float(rt.iloc[i]) if i < len(rt) else 50.0
+    return 1 if rsi_val < 40.0 else 0
+
+
+def sig_s638_s629_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S638: S629 (15% disc + weekly support) + ATR compression.
+    Best signal + low volatility compression = breakout about to happen."""
+    if sig_s629_s215_52wk_disc15(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s639_s629_vix_pct70(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S639: S629 (15% disc + weekly support) + VIX pct>70 (high fear).
+    Best signal + highest fear tier = deepest discount + maximum fear = max mean-reversion."""
+    if sig_s629_s215_52wk_disc15(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.70) else 0
+
+
+def sig_s640_s629_vix_cooldown(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S640: S629 (15% disc + weekly support) + VIX cooldown.
+    Best signal + VIX fear receding = timing confirmation for 52wk discount entries."""
+    if sig_s629_s215_52wk_disc15(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_was_elevated_now_cooling(vix, i) else 0
+
+
+SIGNALS_P9N: List[Tuple] = [
+    # Phase 9N — threshold sweep completion + S629 extensions (S631-S640)
+    ('S631_s215_52wk_disc10',  sig_s631_s215_52wk_disc10,  10, 0.20, 50),
+    ('S632_s215_52wk_disc12',  sig_s632_s215_52wk_disc12,  10, 0.20, 50),
+    ('S633_s629_vix_pct60',    sig_s633_s629_vix_pct60,    10, 0.20, 50),
+    ('S634_s629_lag5pct',      sig_s634_s629_lag5pct,      10, 0.20, 50),
+    ('S635_s629_below20ma',    sig_s635_s629_below20ma,    10, 0.20, 50),
+    ('S636_s629_vol_dryup',    sig_s636_s629_vol_dryup,    10, 0.20, 50),
+    ('S637_s629_rsi_low',      sig_s637_s629_rsi_low,      10, 0.20, 50),
+    ('S638_s629_compressed',   sig_s638_s629_compressed,   10, 0.20, 50),
+    ('S639_s629_vix_pct70',    sig_s639_s629_vix_pct70,    10, 0.20, 50),
+    ('S640_s629_vix_cooldown', sig_s640_s629_vix_cooldown, 10, 0.20, 50),
+]
+
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
            + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
            + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
@@ -9870,7 +9973,7 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
            + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
            + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
-           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M)
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N)
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
