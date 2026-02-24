@@ -11539,6 +11539,142 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z)
 
 
+# ── Phase 10A — S757 extensions + near-52wk-low + S755 wider coverage (S761-S770) ──
+# Extend 5-day discount signal S757. Test 52-week LOW proximity.
+# Try to get S755 (100% WR) to cover 9 years vs 8.
+
+def _tsla_near_52wk_low(tsla, i, pct: float = 0.10) -> bool:
+    """True if TSLA close is within pct% of its 52-week (252-day) low.
+    Near annual low at weekly support = maximum buy-the-dip scenario."""
+    lookback = min(252, i)
+    if lookback < 20:
+        return False
+    low_52wk = float(tsla['low'].iloc[i - lookback:i].min())
+    if low_52wk <= 0:
+        return False
+    proximity = (float(tsla['close'].iloc[i]) - low_52wk) / low_52wk
+    return proximity <= pct
+
+
+def sig_s761_s757_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S761: S757 (weekly + 5% below 5d high) + ATR compression.
+    Short-term 5d momentum drop at weekly support + volatility squeeze."""
+    if sig_s757_s215_5d_disc5(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s762_s757_macd_up(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S762: S757 (weekly + 5% below 5d high) + MACD turning up.
+    Very fresh momentum (5d drop) + MACD reversal at weekly support."""
+    if sig_s757_s215_5d_disc5(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist_now  = _macd_histogram(tsla, i)
+    hist_prev = _macd_histogram(tsla, i - 1) if i > 0 else None
+    if hist_now is None or hist_prev is None:
+        return 1
+    return 1 if hist_now > hist_prev else 0
+
+
+def sig_s763_s757_vol_dryup(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S763: S757 (weekly + 5% below 5d high) + volume dry-up.
+    Fresh 5d drop on fading volume at weekly support = clean exhaustion setup."""
+    if sig_s757_s215_5d_disc5(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_below_avg(tsla, i) else 0
+
+
+def sig_s764_s215_near_52wk_low(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S764: Weekly channel support + within 10% of 52-week low.
+    TSLA near annual low at structural support = maximum value + exhaustion setup."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_near_52wk_low(tsla, i, pct=0.10) else 0
+
+
+def sig_s765_s631_near_52wk_low(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S765: S631 (10%disc + weekly) + within 10% of 52-week low.
+    Peak discount from high AND near annual low at weekly support."""
+    if sig_s631_s215_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_near_52wk_low(tsla, i, pct=0.10) else 0
+
+
+def sig_s766_s215_near_52wk_low5(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S766: Weekly channel support + within 5% of 52-week low (very close to annual low).
+    TSLA essentially AT its annual low at structural support = deep capitulation."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_near_52wk_low(tsla, i, pct=0.05) else 0
+
+
+def sig_s767_s741_rsi35(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S767: S741 (S731+compressed, WR=93%) + RSI < 35 (deep oversold).
+    Compressed + 20d discount at support AND RSI in capitulation territory."""
+    if sig_s741_s731_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    rsi_val = float(rt.iloc[i]) if i < len(rt) else 50.0
+    return 1 if rsi_val < 35.0 else 0
+
+
+def sig_s768_s741_vix_pct60(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S768: S741 (S731+compressed, WR=93%) + VIX pct>60.
+    S741 is already 93% WR — adding VIX might push toward 100%."""
+    if sig_s741_s731_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _vix_elevated_pct(vix, i, window=252, pct=0.60) else 0
+
+
+def sig_s769_s757_52wk_disc10(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S769: S757 (weekly + 5% below 5d high) + 52-week high discount 10%+.
+    Short-term (5d) drop combined with long-term (52wk) discount at weekly support."""
+    if sig_s757_s215_5d_disc5(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_below_52wk_pct(tsla, i, pct=0.10) else 0
+
+
+def sig_s770_s757_lag5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S770: S757 (weekly + 5% below 5d high) + TSLA lags SPY 5%+.
+    Very fresh TSLA drop at support where TSLA is underperforming SPY."""
+    if sig_s757_s215_5d_disc5(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05) else 0
+
+
+SIGNALS_P10A: List[Tuple] = [
+    # Phase 10A — S757 extensions + near-52wk-low + precision push (S761-S770)
+    ('S761_s757_compressed',     sig_s761_s757_compressed,     10, 0.20, 50),
+    ('S762_s757_macd_up',        sig_s762_s757_macd_up,        10, 0.20, 50),
+    ('S763_s757_vol_dryup',      sig_s763_s757_vol_dryup,      10, 0.20, 50),
+    ('S764_s215_near_52wk_low',  sig_s764_s215_near_52wk_low,  10, 0.20, 50),
+    ('S765_s631_near_52wk_low',  sig_s765_s631_near_52wk_low,  10, 0.20, 50),
+    ('S766_s215_near_52wk_low5', sig_s766_s215_near_52wk_low5, 10, 0.20, 50),
+    ('S767_s741_rsi35',          sig_s767_s741_rsi35,          10, 0.20, 50),
+    ('S768_s741_vix_pct60',      sig_s768_s741_vix_pct60,      10, 0.20, 50),
+    ('S769_s757_52wk_disc10',    sig_s769_s757_52wk_disc10,    10, 0.20, 50),
+    ('S770_s757_lag5pct',        sig_s770_s757_lag5pct,        10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
