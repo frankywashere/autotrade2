@@ -4123,7 +4123,97 @@ SIGNALS_P7Y: List[Tuple] = [
 ]
 
 
-SIGNALS = SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+# ── Phase 7Z — Final batch: S215 with week-number/day filters, S224 combos ───
+# Last exploration phase: remaining ideas not yet tested.
+# Focus on S215-family improvements and a few structural market patterns.
+
+def sig_s229_s215_week1_month(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S229: S215 (multi-TF + VIX>=18) only in first 2 weeks of any month.
+    Thesis: fund allocations typically deploy in first half of month.
+    If S215 fires early in month, new money may be entering simultaneously.
+    Hypothesis: removes late-month noise (end-of-month rebalancing selling)."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    day = tsla.index[i].day
+    return 1 if day <= 15 else 0
+
+
+def sig_s230_s224_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S230: S224 (multi-TF + compressed-only, WR=93%, PF=334) with 3-day hold.
+    S224 has 15 trades, 8/8 years, WR=93%. Test if holding longer changes results.
+    Hypothesis: same setup quality, slightly longer mean-reversion completion."""
+    return sig_s224_s215_compressed_only(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s231_s228_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S231: S228 (multi-TF + VIX recovery, WR=93%, PF=14.85) with 3-day hold.
+    S228 was 15 trades, 6/7 years, WR=93%. Test hold period variation.
+    Hypothesis: VIX recovery setups take slightly longer to fully develop."""
+    return sig_s228_s215_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s232_s215_sma20cross(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S232: S215 (multi-TF + VIX>=18) + TSLA below 20d SMA (momentum bearish).
+    When TSLA is in the weekly channel support zone AND below 20d MA = deeper dip.
+    Hypothesis: deeper into correction + multi-TF support = stronger reversal."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 20:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    sma20 = float(tsla['close'].iloc[i - 20:i].mean())
+    return 1 if close < sma20 else 0
+
+
+def sig_s233_s218_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S233: S218 (multi-TF + 3d hold, best P&L $2.18M) + VIX>=18 filter.
+    S218 is 9/10 years, $2.18M but WR=71%. Adding VIX>=18 should raise WR.
+    Hypothesis: removing low-VIX trades from S218 → approach S215's 8/8 record."""
+    if sig_s218_s214_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    vix_now = float(vix['close'].iloc[i])
+    return 1 if vix_now >= 18 else 0
+
+
+def sig_s234_s215_vix25(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S234: S215 (multi-TF) with higher VIX threshold (VIX>=25 vs VIX>=18).
+    Hypothesis: even higher fear = even stronger reversal from weekly support.
+    Trade-off: fewer trades but potentially higher WR and avg/trade."""
+    if sig_s214_weekly_low_daily_s91(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    vix_now = float(vix['close'].iloc[i])
+    return 1 if vix_now >= 25 else 0
+
+
+def sig_s235_s224_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S235: S224 (multi-TF+compressed) + VIX recovery — ultimate combo.
+    S224 is WR=93%, PF=334. Add VIX recovery timing → should be near-perfect.
+    Hypothesis: weekly support + compressed ATR + VIX cooling = perfect setup."""
+    if sig_s224_s215_compressed_only(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    spike_then = vix_5d > 20 or vix_10d > 20
+    calm_now   = vix_now < vix_5d * 0.90
+    return 1 if (spike_then and calm_now) else 0
+
+
+SIGNALS_P7Z: List[Tuple] = [
+    # Phase 7Z — Final batch: S215/S224/S228 variations, hold period tests
+    ('S229_s215_week1_month',   sig_s229_s215_week1_month,   10, 0.20, 50),
+    ('S230_s224_hold3d',        sig_s230_s224_hold3d,         3, 0.20, 50),
+    ('S231_s228_hold3d',        sig_s231_s228_hold3d,         3, 0.20, 50),
+    ('S232_s215_below20sma',    sig_s232_s215_sma20cross,    10, 0.20, 50),
+    ('S233_s218_vix18',         sig_s233_s218_vix18,          3, 0.20, 50),
+    ('S234_s215_vix25',         sig_s234_s215_vix25,         10, 0.20, 50),
+    ('S235_s224_vix_rec',       sig_s235_s224_vix_rec,       10, 0.20, 50),
+]
+
+
+SIGNALS = SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y + SIGNALS_P7Z
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
