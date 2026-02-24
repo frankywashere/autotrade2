@@ -17636,6 +17636,191 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10Z + SIGNALS_P11A + SIGNALS_P11B + SIGNALS_P11C + SIGNALS_P11D + SIGNALS_P11E
            + SIGNALS_P11F + SIGNALS_P11G)
 
+# ── Phase 11H: SPY RSI conditions + 10d TSLA pullback + new OR arms ────────────
+# Testing the `rs` variable (SPY RSI 14-period daily) — never used before.
+# Goal: find new 100% WR OR arms to add to S1041 (currently n=23 ceiling).
+# Key hypothesis: SPY RSI < 50 + TSLA RSI < 40 = market + stock both oversold.
+
+def sig_s1091_s929_spy_rsi45(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1091: S929 base + SPY RSI<45 — whole market somewhat oversold."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not pd.isna(rs.iloc[i]) and rs.iloc[i] < 45:
+        return 1
+    return 0
+
+
+def sig_s1092_s929_spy_rsi40(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1092: S929 base + SPY RSI<40 — whole market very oversold (market bottom)."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not pd.isna(rs.iloc[i]) and rs.iloc[i] < 40:
+        return 1
+    return 0
+
+
+def sig_s1093_s929_tsla_rsi40_spy_above40(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1093: S929 + (TSLA RSI<40 AND SPY RSI>40) — TSLA-specific weakness.
+    TSLA oversold while market still neutral/healthy = highest quality catch-up."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    tsla_rsi = rt.iloc[i]
+    spy_rsi = rs.iloc[i]
+    if pd.isna(tsla_rsi) or pd.isna(spy_rsi):
+        return 0
+    if tsla_rsi < 40 and spy_rsi > 40:
+        return 1
+    return 0
+
+
+def sig_s1094_s929_10d_selloff3pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1094: S929 base + 10-day TSLA pullback >3% — medium-term extended decline."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= 10:
+        c_now = float(tsla['close'].iloc[i])
+        c_10d = float(tsla['close'].iloc[i - 10])
+        if c_10d > 0 and (c_now - c_10d) / c_10d < -0.03:
+            return 1
+    return 0
+
+
+def sig_s1095_s929_spy5d_down1pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1095: S929 + SPY 5d down >1% — short-term market pullback during TSLA bounce zone."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= 5:
+        spy_now = float(spy['close'].iloc[i])
+        spy_5d = float(spy['close'].iloc[i - 5])
+        if spy_5d > 0 and (spy_now - spy_5d) / spy_5d < -0.01:
+            return 1
+    return 0
+
+
+def sig_s1096_s929_spy3d_down1pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1096: S929 + SPY 3d down >1% — very short-term market pullback."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= 3:
+        spy_now = float(spy['close'].iloc[i])
+        spy_3d = float(spy['close'].iloc[i - 3])
+        if spy_3d > 0 and (spy_now - spy_3d) / spy_3d < -0.01:
+            return 1
+    return 0
+
+
+def sig_s1097_s1041_spy_rsi45(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1097: S1041 OR (S929 VIX 18-50 + SPY RSI<45) — add SPY RSI arm to champion.
+    SPY somewhat oversold but not necessarily in fear zone may add 2017/2023 trades."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not pd.isna(rs.iloc[i]) and rs.iloc[i] < 45:
+        return 1
+    return 0
+
+
+def sig_s1098_s929_macd_spy_rsi50(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1098: S929 + (MACD<0 AND SPY RSI<50) — TSLA downtrend + market below midpoint.
+    Dual technical confirmation: TSLA bearish momentum + SPY not in overbought."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    hist = _macd_histogram(tsla, i)
+    if hist is None or hist >= 0:
+        return 0
+    if not pd.isna(rs.iloc[i]) and rs.iloc[i] < 50:
+        return 1
+    return 0
+
+
+def sig_s1099_s1041_10d_pullback(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1099: S1041 OR (S929 VIX 18-50 + 10d TSLA down >3%) — add 10d pullback arm.
+    Tests whether a medium-term 10-day pullback captures new trades beyond S1041."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= 10:
+        c_now = float(tsla['close'].iloc[i])
+        c_10d = float(tsla['close'].iloc[i - 10])
+        if c_10d > 0 and (c_now - c_10d) / c_10d < -0.03:
+            return 1
+    return 0
+
+
+def sig_s1100_s1034_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1100: S1034 variant with VIX 18-50 (not 15-50) — test the 15-18 contribution.
+    S1034 = VIX 15-50 + (3d-selloff OR MACD<0 OR RSI<40). VIX 18-50 version = S1034 minus VIX 15-18."""
+    if tw is None or len(tw) < 50:
+        return 0
+    daily_date = tsla.index[i]
+    vix_now = float(vix['close'].iloc[i])
+    if not (18 <= vix_now <= 50):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 0
+    _, atr_5, _, atr_20 = c
+    if atr_5 >= 0.75 * atr_20:
+        return 0
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    close_w = float(tw['close'].iloc[wk_idx])
+    for window in (20, 30, 40, 50):
+        if wk_idx >= window:
+            ch = _channel_at(tw.iloc[wk_idx - window:wk_idx])
+            if ch is not None and _near_lower(close_w, ch, 0.25):
+                break
+    else:
+        return 0
+    hist = _macd_histogram(tsla, i)
+    if hist is not None and hist < 0:
+        return 1
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and t_rsi < 40:
+        return 1
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.03:
+            return 1
+    return 0
+
+
+SIGNALS_P11H: List[Tuple] = [
+    ('S1091_s929_spy_rsi45',           sig_s1091_s929_spy_rsi45,               10, 0.20, 50),
+    ('S1092_s929_spy_rsi40',           sig_s1092_s929_spy_rsi40,               10, 0.20, 50),
+    ('S1093_s929_tsla40_spy_above40',  sig_s1093_s929_tsla_rsi40_spy_above40,  10, 0.20, 50),
+    ('S1094_s929_10d_selloff3pct',     sig_s1094_s929_10d_selloff3pct,         10, 0.20, 50),
+    ('S1095_s929_spy5d_down1pct',      sig_s1095_s929_spy5d_down1pct,          10, 0.20, 50),
+    ('S1096_s929_spy3d_down1pct',      sig_s1096_s929_spy3d_down1pct,          10, 0.20, 50),
+    ('S1097_s1041_spy_rsi45',          sig_s1097_s1041_spy_rsi45,              10, 0.20, 50),
+    ('S1098_s929_macd_spy_rsi50',      sig_s1098_s929_macd_spy_rsi50,          10, 0.20, 50),
+    ('S1099_s1041_10d_pullback',       sig_s1099_s1041_10d_pullback,           10, 0.20, 50),
+    ('S1100_s1034_vix18',              sig_s1100_s1034_vix18,                  10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P + SIGNALS_P8Q
+           + SIGNALS_P8R + SIGNALS_P8S + SIGNALS_P8T + SIGNALS_P8U + SIGNALS_P8V + SIGNALS_P8W
+           + SIGNALS_P8X + SIGNALS_P8Y + SIGNALS_P8Z + SIGNALS_P9A + SIGNALS_P9B + SIGNALS_P9C
+           + SIGNALS_P9D + SIGNALS_P9E + SIGNALS_P9F + SIGNALS_P9G + SIGNALS_P9H + SIGNALS_P9I
+           + SIGNALS_P9J + SIGNALS_P9K + SIGNALS_P9L + SIGNALS_P9M + SIGNALS_P9N + SIGNALS_P9O
+           + SIGNALS_P9P + SIGNALS_P9Q + SIGNALS_P9R + SIGNALS_P9S + SIGNALS_P9T
+           + SIGNALS_P9U + SIGNALS_P9V + SIGNALS_P9W + SIGNALS_P9X + SIGNALS_P9Y + SIGNALS_P9Z
+           + SIGNALS_P10A + SIGNALS_P10B + SIGNALS_P10C + SIGNALS_P10D + SIGNALS_P10E
+           + SIGNALS_P10F + SIGNALS_P10G + SIGNALS_P10H + SIGNALS_P10I + SIGNALS_P10J
+           + SIGNALS_P10K + SIGNALS_P10L + SIGNALS_P10M + SIGNALS_P10N + SIGNALS_P10O
+           + SIGNALS_P10P + SIGNALS_P10Q + SIGNALS_P10R + SIGNALS_P10S + SIGNALS_P10T
+           + SIGNALS_P10U + SIGNALS_P10V + SIGNALS_P10W + SIGNALS_P10X + SIGNALS_P10Y
+           + SIGNALS_P10Z + SIGNALS_P11A + SIGNALS_P11B + SIGNALS_P11C + SIGNALS_P11D + SIGNALS_P11E
+           + SIGNALS_P11F + SIGNALS_P11G + SIGNALS_P11H)
+
 # ── sentinel — do not remove ──────────────────────────────────────────────────
 
 
