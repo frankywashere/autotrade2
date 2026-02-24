@@ -17464,6 +17464,157 @@ SIGNALS_P11F: List[Tuple] = [
     ('S1080_s1041_chan20pct',          sig_s1080_s1041_chan20pct,               10, 0.20, 50),
 ]
 
+# ── Phase 11G: Intersection precision + alternative entry filters ──────────────
+# Champion S1041 (n=23, 100% WR, $2,037K) uses OR-conditions. Testing:
+# (a) AND-intersections of S1041's OR arms → ultra-precision, fewer trades, higher avg
+# (b) New candidate filters: 5d selloff, deeper selloff, RSI sweeps, TSLA/SPY SMA
+# (c) Selloff depth variants: 3d>5%, 5d>3%, 7d>5%
+
+def sig_s1081_s929_and_selloff_lag(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1081: S929 base AND (3d-selloff AND lag5pct) — intersection of 2 OR conditions.
+    Requires BOTH 3-day selloff AND TSLA lagging SPY — most precise dual-condition entry."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 3:
+        return 0
+    c_now = float(tsla['close'].iloc[i])
+    c_3d = float(tsla['close'].iloc[i - 3])
+    if not (c_3d > 0 and (c_now - c_3d) / c_3d < -0.03):
+        return 0
+    if _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 1
+    return 0
+
+
+def sig_s1082_s929_and_selloff_macd(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1082: S929 base AND (3d-selloff AND MACD<0) — selloff confirmed by MACD downtrend."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 3:
+        return 0
+    c_now = float(tsla['close'].iloc[i])
+    c_3d = float(tsla['close'].iloc[i - 3])
+    if not (c_3d > 0 and (c_now - c_3d) / c_3d < -0.03):
+        return 0
+    hist = _macd_histogram(tsla, i)
+    if hist is not None and hist < 0:
+        return 1
+    return 0
+
+
+def sig_s1083_s929_and_lag_rsi40(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1083: S929 base AND (lag5pct AND RSI<40) — relative weakness confirmed by oversold RSI."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if not _tsla_lagging_spy(tsla, spy, i, lookback=20, lag=0.05):
+        return 0
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and t_rsi < 40:
+        return 1
+    return 0
+
+
+def sig_s1084_s929_5d_selloff(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1084: S929 base + 5-day selloff >3% (extended selloff vs S993's 3-day).
+    Tests if a longer selloff window identifies more reliable entry points."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= 5:
+        c_now = float(tsla['close'].iloc[i])
+        c_5d = float(tsla['close'].iloc[i - 5])
+        if c_5d > 0 and (c_now - c_5d) / c_5d < -0.03:
+            return 1
+    return 0
+
+
+def sig_s1085_s929_3d_selloff5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1085: S929 base + 3d selloff >5% (deeper drop threshold vs 3% in S993).
+    More severe 3-day drop may select panic-bottom entries of higher quality."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= 3:
+        c_now = float(tsla['close'].iloc[i])
+        c_3d = float(tsla['close'].iloc[i - 3])
+        if c_3d > 0 and (c_now - c_3d) / c_3d < -0.05:
+            return 1
+    return 0
+
+
+def sig_s1086_s929_7d_selloff5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1086: S929 base + 7d selloff >5% — week-long significant drawdown."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= 7:
+        c_now = float(tsla['close'].iloc[i])
+        c_7d = float(tsla['close'].iloc[i - 7])
+        if c_7d > 0 and (c_now - c_7d) / c_7d < -0.05:
+            return 1
+    return 0
+
+
+def sig_s1087_s929_rsi45(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1087: S929 base + RSI<45 (looser than RSI<40 in S1030).
+    RSI 40-45 zone captures near-oversold entries — may add 2-3 trades from 2017/2023."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and t_rsi < 45:
+        return 1
+    return 0
+
+
+def sig_s1088_s929_rsi35(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1088: S929 base + RSI<35 — strictly oversold, tighter than RSI<40.
+    Tests if the RSI<40 trades in S1030 are concentrated in the RSI<35 zone."""
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and t_rsi < 35:
+        return 1
+    return 0
+
+
+def sig_s1089_s1041_rsi45(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1089: S1041 OR (S929 VIX 18-50 + RSI 40-45) — add RSI 40-45 as new OR arm.
+    S1041 already uses RSI<40 via S1034; this adds looser RSI 40-45 coverage."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    t_rsi = rt.iloc[i]
+    if not pd.isna(t_rsi) and 40 <= t_rsi < 45:
+        return 1
+    return 0
+
+
+def sig_s1090_s1041_5d_selloff(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1090: S1041 OR (S929 VIX 18-50 + 5d-selloff) — add 5d-selloff as new OR arm.
+    Tests if a 5-day selloff (vs 3d in S993) captures distinct high-quality trades."""
+    if sig_s1041_s993_or_s1034(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if sig_s929_s215_4chan_union(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i >= 5:
+        c_now = float(tsla['close'].iloc[i])
+        c_5d = float(tsla['close'].iloc[i - 5])
+        if c_5d > 0 and (c_now - c_5d) / c_5d < -0.03:
+            return 1
+    return 0
+
+
+SIGNALS_P11G: List[Tuple] = [
+    ('S1081_s929_and_selloff_lag',     sig_s1081_s929_and_selloff_lag,          10, 0.20, 50),
+    ('S1082_s929_and_selloff_macd',    sig_s1082_s929_and_selloff_macd,         10, 0.20, 50),
+    ('S1083_s929_and_lag_rsi40',       sig_s1083_s929_and_lag_rsi40,            10, 0.20, 50),
+    ('S1084_s929_5d_selloff',          sig_s1084_s929_5d_selloff,               10, 0.20, 50),
+    ('S1085_s929_3d_selloff5pct',      sig_s1085_s929_3d_selloff5pct,           10, 0.20, 50),
+    ('S1086_s929_7d_selloff5pct',      sig_s1086_s929_7d_selloff5pct,           10, 0.20, 50),
+    ('S1087_s929_rsi45',               sig_s1087_s929_rsi45,                    10, 0.20, 50),
+    ('S1088_s929_rsi35',               sig_s1088_s929_rsi35,                    10, 0.20, 50),
+    ('S1089_s1041_rsi45',              sig_s1089_s1041_rsi45,                   10, 0.20, 50),
+    ('S1090_s1041_5d_selloff',         sig_s1090_s1041_5d_selloff,              10, 0.20, 50),
+]
+
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
            + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
            + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
@@ -17483,7 +17634,9 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10P + SIGNALS_P10Q + SIGNALS_P10R + SIGNALS_P10S + SIGNALS_P10T
            + SIGNALS_P10U + SIGNALS_P10V + SIGNALS_P10W + SIGNALS_P10X + SIGNALS_P10Y
            + SIGNALS_P10Z + SIGNALS_P11A + SIGNALS_P11B + SIGNALS_P11C + SIGNALS_P11D + SIGNALS_P11E
-           + SIGNALS_P11F)
+           + SIGNALS_P11F + SIGNALS_P11G)
+
+# ── sentinel — do not remove ──────────────────────────────────────────────────
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
