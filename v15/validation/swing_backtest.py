@@ -3337,7 +3337,100 @@ SIGNALS_P7R: List[Tuple] = [
 ]
 
 
-SIGNALS = SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R
+# ── Phase 7S — January Effect (First 5 / First 3 trading days of year) ────────
+# Theory: if SPY's first 5 (or 3) trading days of the year close UP vs prior
+# year-end, the full year tends to be bullish. Filter existing signals by this.
+# Implemented strictly with NO look-ahead: signal is inactive until after day 5
+# (or day 3) of the new year has closed.
+
+def _jan_effect_n(spy: pd.DataFrame, bar_date, n_days: int) -> bool:
+    """True if SPY closed UP over first n_days trading days of bar_date's year.
+    Returns False if we haven't yet passed day n yet (strict no look-ahead).
+    Returns True if data is unavailable (conservative default = allow trades)."""
+    year = bar_date.year
+    year_bars = spy[spy.index.year == year]
+    if len(year_bars) < n_days:
+        return True  # Too early in year or no data — default allow
+    day_n_date = year_bars.index[n_days - 1]
+    if bar_date < day_n_date:
+        return False  # Haven't reached day N yet — suspend trading
+    # Compare day-N close to prior year's last close
+    prev_bars = spy[spy.index.year == year - 1]
+    if len(prev_bars) == 0:
+        return True
+    prev_close = float(prev_bars['close'].iloc[-1])
+    day_n_close = float(year_bars['close'].iloc[n_days - 1])
+    return day_n_close > prev_close
+
+
+def sig_s181_jan5d_s91(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S181: S91 (ATR extreme) only in bull years per SPY first-5-day rule.
+    January Effect: year predicted bullish if days 1-5 close UP vs Dec 31.
+    Hypothesis: regime filter eliminates losing years entirely."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _jan_effect_n(spy, tsla.index[i], 5) else 0
+
+
+def sig_s182_jan3d_s91(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S182: S91 only in bull years per SPY first-3-day rule (tighter).
+    3-day variant: quicker signal, resumes trading sooner in year.
+    Hypothesis: shorter lookback = less predictive but more trades."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _jan_effect_n(spy, tsla.index[i], 3) else 0
+
+
+def sig_s183_jan5d_s91_bear(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S183: S91 ONLY in BEAR years (SPY first 5 days DOWN) — inverse filter.
+    Test: does the signal still work even in bearish-opening years?
+    Or does it *only* work in bull years? This proves/disproves the theory."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    year = tsla.index[i].year
+    year_bars = spy[spy.index.year == year]
+    if len(year_bars) < 5:
+        return 0  # Not yet past day 5
+    day5_date = year_bars.index[4]
+    if tsla.index[i] < day5_date:
+        return 0  # Before day 5
+    prev_bars = spy[spy.index.year == year - 1]
+    if len(prev_bars) == 0:
+        return 0
+    prev_close = float(prev_bars['close'].iloc[-1])
+    day5_close = float(year_bars['close'].iloc[4])
+    return 1 if day5_close <= prev_close else 0  # Bear year
+
+
+def sig_s184_jan5d_s113(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S184: S113 (SPY>200d+VIX>=18+ATR, 3d hold) + Jan-5d bull-year filter.
+    Apply best quality signal (S113: PF=7.69, WR=82%) only in bull-opening years.
+    Hypothesis: already high-quality signal becomes nearly perfect with year filter."""
+    if sig_s113_s108_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _jan_effect_n(spy, tsla.index[i], 5) else 0
+
+
+def sig_s185_jan5d_s136(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S185: S136 (VIX recovery + compressed, PF=16.81) + Jan-5d bull-year filter.
+    Apply highest-PF signal only in bull-opening years.
+    Hypothesis: if the filter eliminates bear years, PF could approach perfection."""
+    if sig_s136_s132_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _jan_effect_n(spy, tsla.index[i], 5) else 0
+
+
+SIGNALS_P7S: List[Tuple] = [
+    # Phase 7S — January Effect year filter (first 5 and 3 trading days)
+    ('S181_jan5d_s91',          sig_s181_jan5d_s91,          10, 0.20, 50),
+    ('S182_jan3d_s91',          sig_s182_jan3d_s91,          10, 0.20, 50),
+    ('S183_jan5d_s91_bear',     sig_s183_jan5d_s91_bear,     10, 0.20, 50),
+    ('S184_jan5d_s113',         sig_s184_jan5d_s113,          3, 0.20, 50),
+    ('S185_jan5d_s136',         sig_s185_jan5d_s136,          2, 0.20, 50),
+]
+
+
+SIGNALS = SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
