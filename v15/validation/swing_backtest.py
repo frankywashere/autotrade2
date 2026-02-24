@@ -6446,6 +6446,490 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P8L + SIGNALS_P8M)
 
 
+# ── Phase 8N — ADX top extensions + NR7 + volume spike + gap-down ─────────────
+# S362 (ADX+compressed, 6/6yr) and S361 (ADX+VIX, PF=269, 4/4yr) are the new leaders.
+# New dimensions: NR7 (narrowest-range day), volume spike, gap-down >3%.
+# Also extend S365 (best bear signal: MACD+below200MA+compressed → 100% WR).
+
+def _nr7(tsla, i) -> bool:
+    """Narrowest Range in 7 days: today's (high-low) < all of last 6 days.
+    NR7 = stock about to make a directional move. At channel support → expect up."""
+    if i < 7:
+        return False
+    today_range = float(tsla['high'].iloc[i]) - float(tsla['low'].iloc[i])
+    for k in range(1, 7):
+        prev_range = float(tsla['high'].iloc[i - k]) - float(tsla['low'].iloc[i - k])
+        if today_range >= prev_range:
+            return False
+    return True
+
+
+def _volume_spike(tsla, i, mult: float = 2.0, period: int = 20) -> bool:
+    """Today's volume >= mult × 20d average (capitulation/exhaustion volume)."""
+    if i < period:
+        return False
+    avg_vol = float(tsla['volume'].iloc[i - period:i].mean())
+    if avg_vol < 1:
+        return False
+    return float(tsla['volume'].iloc[i]) >= mult * avg_vol
+
+
+def _gap_down(tsla, i, pct: float = 0.02) -> bool:
+    """Today's open < yesterday's close by >= pct (gap-down = panic open)."""
+    if i < 1:
+        return False
+    prev_close = float(tsla['close'].iloc[i - 1])
+    today_open = float(tsla['open'].iloc[i])
+    return (prev_close - today_open) / prev_close >= pct
+
+
+def sig_s371_s362_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S371: S362 (ADX+compressed, 6/6yr) + VIX recovery.
+    4-way: MACD + low ADX + compressed + VIX cooling.
+    Hypothesis: all 4 structure/momentum/macro dimensions aligned simultaneously."""
+    if sig_s362_s360_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s372_s362_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S372: S362 (ADX+compressed) + above 200d MA.
+    Best ADX extension in uptrend context.
+    Hypothesis: range-bound + compressed in bull regime = spring-load setup."""
+    if sig_s362_s360_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close > ma200 else 0
+
+
+def sig_s373_s361_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S373: S361 (ADX+VIX rec, PF=269) + above 200d MA.
+    Extreme-PF signal filtered to uptrend.
+    Hypothesis: ADX+VIX signal most powerful in confirmed bull trend."""
+    if sig_s361_s360_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close > ma200 else 0
+
+
+def sig_s374_s365_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S374: S365 (bear MACD+compressed, 100% WR, 5/5yr) + VIX recovery.
+    3-way bear: MACD turn + compression + VIX cooling in bear regime.
+    Hypothesis: tightest bear signal with all 3 layers = maximum precision."""
+    if sig_s365_s355_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s375_s215_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S375: S215 (weekly support + VIX>=18) + NR7 (narrowest range in 7d).
+    NEW DIMENSION: NR7 at channel support = range contraction before directional move.
+    Hypothesis: tightest day at weekly support = maximum compression before bounce."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr7(tsla, i) else 0
+
+
+def sig_s376_s333_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S376: S333 (MACD turning at weekly support) + NR7.
+    NR7 + MACD turn = structure AND momentum converge on same day.
+    Hypothesis: momentum turning on narrowest day = highest-precision entry."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr7(tsla, i) else 0
+
+
+def sig_s377_s215_vol_spike(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S377: S215 (weekly support) + volume spike (2× 20d avg).
+    Volume capitulation at weekly support — smart-money absorption.
+    Hypothesis: panic selling volume at support = seller exhaustion, reversal imminent."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_spike(tsla, i, mult=2.0) else 0
+
+
+def sig_s378_s333_vol_spike(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S378: S333 (MACD turning) + volume spike.
+    MACD turn on capitulation volume at weekly support = strongest reversal signal.
+    Hypothesis: momentum confirming with high-conviction institutional volume."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _volume_spike(tsla, i, mult=2.0) else 0
+
+
+def sig_s379_s215_gap_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S379: S215 (weekly support) + gap-down open ≥2%.
+    Weekly support + panic gap open = extreme entry opportunity.
+    Hypothesis: institutional gap-fill tendency at weekly support = 1-2d snap-back."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _gap_down(tsla, i, pct=0.02) else 0
+
+
+def sig_s380_s333_gap_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S380: S333 (MACD turning) + gap-down open ≥2%.
+    MACD momentum turn + gap-down at weekly support = gap-fill + momentum confluence.
+    Hypothesis: MACD confirms buy side + gap below creates gap-fill target."""
+    if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _gap_down(tsla, i, pct=0.02) else 0
+
+
+SIGNALS_P8N: List[Tuple] = [
+    # Phase 8N — ADX top extensions + NR7 + volume spike + gap-down
+    ('S371_s362_vix_rec',       sig_s371_s362_vix_rec,       10, 0.20, 50),
+    ('S372_s362_above200ma',    sig_s372_s362_above200ma,    10, 0.20, 50),
+    ('S373_s361_above200ma',    sig_s373_s361_above200ma,    10, 0.20, 50),
+    ('S374_s365_vix_rec',       sig_s374_s365_vix_rec,       10, 0.20, 50),
+    ('S375_s215_nr7',           sig_s375_s215_nr7,           10, 0.20, 50),
+    ('S376_s333_nr7',           sig_s376_s333_nr7,           10, 0.20, 50),
+    ('S377_s215_vol_spike',     sig_s377_s215_vol_spike,     10, 0.20, 50),
+    ('S378_s333_vol_spike',     sig_s378_s333_vol_spike,     10, 0.20, 50),
+    ('S379_s215_gap_down',      sig_s379_s215_gap_down,      10, 0.20, 50),
+    ('S380_s333_gap_down',      sig_s380_s333_gap_down,      10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N)
+
+
+# ── Phase 8O — NR7 extensions + volume-absorption + VIX percentile ────────────
+# S375 (S215+NR7, 5/6yr, WR=89%, PF=33) is the breakout from Phase 8N.
+# Extend NR7 aggressively. Also: volume absorption (vol spike + NR7 together).
+# New: VIX structurally elevated (>70th percentile trailing 1yr) as regime filter.
+
+def _persistent_nr(tsla, i, n: int = 2) -> bool:
+    """NR for n consecutive days — price compressing for multiple sessions."""
+    if i < n + 6:
+        return False
+    for d in range(n):
+        if not _nr7(tsla, i - d):
+            return False
+    return True
+
+
+def sig_s381_s375_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S381: S375 (S215+NR7, 5/6yr) + VIX recovery.
+    3-way: weekly support + NR7 + macro fear cooling.
+    Hypothesis: tightest day at support + VIX cooling = highest precision subset of S375."""
+    if sig_s375_s215_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s382_s375_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S382: S375 (S215+NR7) + compressed ATR.
+    Double compression: NR7 says today tightest in 7d + ATR says 5d tight vs 20d.
+    Hypothesis: two independent compression measures both flagging = maximum squeeze."""
+    if sig_s375_s215_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s383_s376_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S383: S376 (MACD+NR7, 4/5yr) + VIX recovery.
+    3-way: MACD turning + NR7 + macro cooling.
+    Hypothesis: momentum+structure+macro triple convergence on tightest day."""
+    if sig_s376_s333_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s384_s376_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S384: S376 (MACD+NR7) + above 200d MA.
+    Best MACD+NR7 signal in uptrend.
+    Hypothesis: momentum+structure both confirm in bull trend = highest WR."""
+    if sig_s376_s333_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close > ma200 else 0
+
+
+def sig_s385_s375_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S385: S375 (S215+NR7) + above 200d MA.
+    NR7 at weekly support in bull trend.
+    Hypothesis: weekly support + tightest day + bull regime = spring-load in uptrend."""
+    if sig_s375_s215_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close > ma200 else 0
+
+
+def sig_s386_s377_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S386: S377 (S215+volume spike) + VIX recovery.
+    3-way: weekly support + capitulation volume + VIX cooling.
+    Hypothesis: heavy selling at support + VIX cooling = both sellers exhausted."""
+    if sig_s377_s215_vol_spike(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s387_s377_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S387: S377 (S215+vol spike) + above 200d MA.
+    Volume capitulation at weekly support in bull trend.
+    Hypothesis: panic volume at support in uptrend = fast recovery."""
+    if sig_s377_s215_vol_spike(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close > ma200 else 0
+
+
+def sig_s388_s215_nr7_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S388: S215 (weekly support) + NR7 + compressed ATR.
+    Triple compression: weekly support + today tightest + ATR compressed.
+    Hypothesis: all three compression layers = maximum coiling energy."""
+    if sig_s375_s215_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s389_s333_nr7_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S389: S333 (MACD turning) + NR7 + compressed ATR.
+    4-way: weekly support + MACD momentum + NR7 + ATR compressed.
+    Hypothesis: momentum turning on tightest compressed day = most precise entry ever."""
+    if sig_s376_s333_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s390_s333_nr7_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S390: S333 (MACD turning) + NR7 + VIX recovery.
+    4-way: MACD + weekly support + NR7 + macro cooling.
+    Hypothesis: tightest momentum day at support + VIX cooling = 4-layer convergence."""
+    if sig_s376_s333_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+SIGNALS_P8O: List[Tuple] = [
+    # Phase 8O — NR7 extensions + volume absorption + multi-compression
+    ('S381_s375_vix_rec',        sig_s381_s375_vix_rec,        10, 0.20, 50),
+    ('S382_s375_compressed',     sig_s382_s375_compressed,     10, 0.20, 50),
+    ('S383_s376_vix_rec',        sig_s383_s376_vix_rec,        10, 0.20, 50),
+    ('S384_s376_above200ma',     sig_s384_s376_above200ma,     10, 0.20, 50),
+    ('S385_s375_above200ma',     sig_s385_s375_above200ma,     10, 0.20, 50),
+    ('S386_s377_vix_rec',        sig_s386_s377_vix_rec,        10, 0.20, 50),
+    ('S387_s377_above200ma',     sig_s387_s377_above200ma,     10, 0.20, 50),
+    ('S388_s215_nr7_compressed', sig_s388_s215_nr7_compressed, 10, 0.20, 50),
+    ('S389_s333_nr7_compressed', sig_s389_s333_nr7_compressed, 10, 0.20, 50),
+    ('S390_s333_nr7_vix_rec',    sig_s390_s333_nr7_vix_rec,    10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O)
+
+
+# ── Phase 8P — NR7 cross-signals + milestone S400 ─────────────────────────────
+# S382 (NR7+compressed 100% WR 5/5), S389 (MACD+NR7+compressed, 4/4yr, $111K avg).
+# Now cross NR7 with high-n signals (S349, S292, S341) for larger trade counts.
+# Milestone: S400 = 4-way in uptrend (MACD+compressed+NR7+above200MA).
+
+def sig_s391_s382_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S391: S382 (NR7+compressed, 100% WR) + VIX recovery.
+    3-way compression: NR7 + ATR compressed + VIX cooling.
+    Hypothesis: triple-compressed + macro improvement = tightest precision signal."""
+    if sig_s382_s375_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s392_s382_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S392: S382 (NR7+compressed, 100% WR) + above 200d MA.
+    Double compression in confirmed uptrend.
+    Hypothesis: NR7+ATR compressed in bull trend = coiled spring with tailwind."""
+    if sig_s382_s375_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close > ma200 else 0
+
+
+def sig_s393_s382_spy_weak(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S393: S382 (NR7+compressed) + SPY below 50d SMA.
+    Double compression at weekly support during broad market weakness.
+    Hypothesis: maximum range compression in bear market = snap-back potential."""
+    if sig_s382_s375_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 50:
+        return 1
+    spy_close = float(spy['close'].iloc[i])
+    spy_sma50 = float(spy['close'].iloc[i - 50:i].mean())
+    return 1 if spy_close < spy_sma50 else 0
+
+
+def sig_s394_s349_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S394: S349 (MACD+SPY weak, 6/6yr, n=14) + NR7.
+    Cross high-frequency signal with NR7 compression filter.
+    Hypothesis: MACD+SPY weak fires often (14 trades) → NR7 filters to best entries."""
+    if sig_s349_s333_spyweak(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr7(tsla, i) else 0
+
+
+def sig_s395_s376_spy_weak(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S395: S376 (MACD+NR7, 4/5yr) + SPY below 50d SMA.
+    NR7 momentum signal during broad market weakness.
+    Hypothesis: MACD+NR7 confluence + SPY weakness = excess discount entry."""
+    if sig_s376_s333_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 50:
+        return 1
+    spy_close = float(spy['close'].iloc[i])
+    spy_sma50 = float(spy['close'].iloc[i - 50:i].mean())
+    return 1 if spy_close < spy_sma50 else 0
+
+
+def sig_s396_s215_nr7_vix22(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S396: S215 (weekly support) + NR7 + VIX >= 22 (elevated fear).
+    NR7 at weekly support with VIX elevated (not just recovering).
+    Hypothesis: structured tightest day at support when market structurally fearful."""
+    if sig_s375_s215_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    vix_now = float(vix['close'].iloc[i])
+    return 1 if vix_now >= 22 else 0
+
+
+def sig_s397_s375_5d_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S397: S375 (S215+NR7) + 5% 5-day decline.
+    NR7 at weekly support after a meaningful pullback.
+    Hypothesis: stock declined 5%+ then tightest day at support = seller exhaustion."""
+    if sig_s375_s215_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    close_now = float(tsla['close'].iloc[i])
+    close_5d  = float(tsla['close'].iloc[i - 5])
+    return 1 if (close_now - close_5d) / close_5d <= -0.05 else 0
+
+
+def sig_s398_s375_monthly_low(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S398: S375 (S215+NR7) + monthly near lower channel.
+    NR7 at weekly support that also aligns with monthly support.
+    Hypothesis: 2-TF support (weekly+monthly) + NR7 = highest structural precision."""
+    if sig_s375_s215_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _monthly_channel_near_lower(tsla, i, n_months=12, frac=0.30) else 0
+
+
+def sig_s399_s362_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S399: S362 (ADX+compressed, 6/6yr) + NR7.
+    Cross ADX signal with NR7 — both structural indicators.
+    Hypothesis: ADX (non-trending) + ATR compressed + NR7 = triple structure convergence."""
+    if sig_s362_s360_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr7(tsla, i) else 0
+
+
+def sig_s400_s333_nr7_compressed_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S400 MILESTONE: MACD turning + NR7 + compressed ATR + above 200d MA.
+    4-layer uptrend signal: weekly support + MACD momentum + NR7 structure + bull regime.
+    Hypothesis: all four layers in uptrend = maximum precision in best market conditions."""
+    if sig_s389_s333_nr7_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close > ma200 else 0
+
+
+SIGNALS_P8P: List[Tuple] = [
+    # Phase 8P — NR7 cross-combos + S400 milestone
+    ('S391_s382_vix_rec',              sig_s391_s382_vix_rec,              10, 0.20, 50),
+    ('S392_s382_above200ma',           sig_s392_s382_above200ma,           10, 0.20, 50),
+    ('S393_s382_spy_weak',             sig_s393_s382_spy_weak,             10, 0.20, 50),
+    ('S394_s349_nr7',                  sig_s394_s349_nr7,                  10, 0.20, 50),
+    ('S395_s376_spy_weak',             sig_s395_s376_spy_weak,             10, 0.20, 50),
+    ('S396_s215_nr7_vix22',            sig_s396_s215_nr7_vix22,            10, 0.20, 50),
+    ('S397_s375_5d_down',              sig_s397_s375_5d_down,              10, 0.20, 50),
+    ('S398_s375_monthly_low',          sig_s398_s375_monthly_low,          10, 0.20, 50),
+    ('S399_s362_nr7',                  sig_s399_s362_nr7,                  10, 0.20, 50),
+    ('S400_macd_nr7_comp_above200ma',  sig_s400_s333_nr7_compressed_above200ma, 10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G + SIGNALS_P8H + SIGNALS_P8I + SIGNALS_P8J + SIGNALS_P8K
+           + SIGNALS_P8L + SIGNALS_P8M + SIGNALS_P8N + SIGNALS_P8O + SIGNALS_P8P)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
