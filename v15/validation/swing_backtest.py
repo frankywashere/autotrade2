@@ -3795,7 +3795,223 @@ SIGNALS_P7V: List[Tuple] = [
 ]
 
 
-SIGNALS = SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V
+# ── Phase 7W — S206 extensions + Hammer candle + gap reversal + multi-TF ─────
+# Extending the S206 (consecutive down + VIX recovery) signal family.
+# Also: classical candlestick reversal patterns that haven't been tested.
+
+def sig_s208_s206_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S208: S206 (3 consec down + VIX recovery) + NR7.
+    After 3 down days the range is also narrowest of the week = maximum exhaustion.
+    Hypothesis: S206 was WR=80%, PF=12.49. Adding NR7 should push WR even higher."""
+    if sig_s206_consec_down_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr_n(tsla, i, 7) else 0
+
+
+def sig_s209_s206_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S209: S206 (3 consec down + VIX recovery) + compressed ATR.
+    3 consecutive down days with quiet volatility (not a panic crash) + VIX cooling.
+    Hypothesis: calm orderly selling exhaustion + VIX recovery = cleaner reversal."""
+    if sig_s206_consec_down_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.80 * atr_20 else 0
+
+
+def sig_s210_s206_spy200(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S210: S206 + SPY above 200d MA (bull market filter).
+    Only trade consecutive-down-days exhaustion when overall market is in uptrend.
+    Hypothesis: removes bear market instances where bounces are weaker."""
+    if sig_s206_consec_down_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    spy_close = float(spy['close'].iloc[i])
+    spy_200d  = float(spy['close'].iloc[i - 200:i].mean())
+    return 1 if spy_close > spy_200d else 0
+
+
+def sig_s211_hammer_s91(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S211: S91 (ATR extreme) + Hammer candle (long lower wick, small body at top).
+    Hammer: lower wick >= 2x body AND body in upper 1/3 of range.
+    Hypothesis: long wick shows rejection of lower prices + ATR compressed = reversal."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    op = float(tsla['open'].iloc[i])
+    cl = float(tsla['close'].iloc[i])
+    hi = float(tsla['high'].iloc[i])
+    lo = float(tsla['low'].iloc[i])
+    total_range = hi - lo
+    if total_range < 0.001:
+        return 0
+    body = abs(cl - op)
+    lower_wick = min(op, cl) - lo
+    upper_wick = hi - max(op, cl)
+    # Hammer: lower wick >= 2x body, upper wick small, bullish close
+    if body < 0.0001:
+        return 0
+    return 1 if (lower_wick >= 2 * body and upper_wick <= 0.5 * body and cl > op) else 0
+
+
+def sig_s212_gap_down_recovery(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S212: TSLA gapped down >1.5% at open (fear) but closed UP vs prior day.
+    Gap down then recovery = intraday reversal = buyers overwhelmed initial sellers.
+    Combined with VIX elevated = macro fear was the driver, already correcting."""
+    if i < 5:
+        return 1
+    today_open  = float(tsla['open'].iloc[i])
+    prev_close  = float(tsla['close'].iloc[i - 1])
+    today_close = float(tsla['close'].iloc[i])
+    gap_down_pct = (today_open - prev_close) / prev_close
+    recovery = today_close > prev_close
+    if not (gap_down_pct < -0.015 and recovery):
+        return 0
+    vix_now = float(vix['close'].iloc[i])
+    return 1 if vix_now >= 18 else 0
+
+
+def sig_s213_4_consec_down_vix(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S213: 4 consecutive down closes (extreme exhaustion) + VIX recovery.
+    Stricter version of S206 (3 days → 4 days) = rarer but higher-conviction.
+    Hypothesis: 4-day orderly decline + fear cooling = even stronger reversal."""
+    if i < 14:
+        return 1
+    for j in range(4):
+        if float(tsla['close'].iloc[i - j]) >= float(tsla['close'].iloc[i - j - 1]):
+            return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    spike_then = vix_5d > 20 or vix_10d > 20
+    calm_now   = vix_now < vix_5d * 0.90
+    return 1 if (spike_then and calm_now) else 0
+
+
+def sig_s214_weekly_low_daily_s91(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S214: Multi-TF alignment — weekly TSLA near lower channel + daily ATR extreme.
+    When weekly chart is also at support AND daily is quiet = dual-timeframe setup.
+    Uses the weekly bars (tw) to check channel position."""
+    if sig_s91_s32_atr_extreme(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if tw is None or len(tw) < 25:
+        return 1
+    daily_date = tsla.index[i]
+    weekly_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    if weekly_idx < 20:
+        return 1
+    ch = _channel_at(tw.iloc[weekly_idx - 20:weekly_idx])
+    if ch is None:
+        return 1
+    wk_close = float(tw['close'].iloc[weekly_idx])
+    return 1 if _near_lower(wk_close, ch, 0.30) else 0
+
+
+SIGNALS_P7W: List[Tuple] = [
+    # Phase 7W — S206 extensions + hammer candle + gap recovery + multi-TF
+    ('S208_s206_nr7',           sig_s208_s206_nr7,           10, 0.20, 50),
+    ('S209_s206_compressed',    sig_s209_s206_compressed,    10, 0.20, 50),
+    ('S210_s206_spy200',        sig_s210_s206_spy200,        10, 0.20, 50),
+    ('S211_hammer_s91',         sig_s211_hammer_s91,         10, 0.20, 50),
+    ('S212_gap_down_recovery',  sig_s212_gap_down_recovery,  10, 0.20, 50),
+    ('S213_4down_vix_rec',      sig_s213_4_consec_down_vix,  10, 0.20, 50),
+    ('S214_weekly_low_daily',   sig_s214_weekly_low_daily_s91, 10, 0.20, 50),
+]
+
+
+# ── Phase 7X — S214 extensions (multi-TF breakthrough) + S210 enhancements ───
+# S214 (weekly near lower channel + daily ATR extreme) hit $2.16M, 9/10 years.
+# This is the best consistency of any new signal. Extend it aggressively.
+
+def sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S215: S214 (multi-TF) + VIX>=18.
+    Multi-TF weekly support + daily ATR extreme + elevated VIX = triple confirmation.
+    S214 was 9/10 years; VIX filter should remove the one losing year (2019).
+    Hypothesis: VIX>=18 during weekly support visit = institutional accumulation."""
+    if sig_s214_weekly_low_daily_s91(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    vix_now = float(vix['close'].iloc[i])
+    return 1 if vix_now >= 18 else 0
+
+
+def sig_s216_s214_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S216: S214 (multi-TF) + VIX recovery (spike-then-calm).
+    Weekly support + daily ATR extreme + VIX cooling from elevated levels.
+    Hypothesis: the one losing year (2019 -$94K) had no VIX spike → this removes it."""
+    if sig_s214_weekly_low_daily_s91(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    spike_then = vix_5d > 20 or vix_10d > 20
+    calm_now   = vix_now < vix_5d * 0.90
+    return 1 if (spike_then and calm_now) else 0
+
+
+def sig_s217_s214_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S217: S214 (multi-TF) + NR7.
+    Weekly support + daily ATR extreme + narrowest range of last 7 days.
+    Hypothesis: weekly and daily both at compression peak = maximum coil."""
+    if sig_s214_weekly_low_daily_s91(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr_n(tsla, i, 7) else 0
+
+
+def sig_s218_s214_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S218: S214 (multi-TF) with 3-day hold — test if holding longer improves.
+    S214 avg hold was 2.5d; try 3d max hold with same signal.
+    Hypothesis: weekly support visits take a few days to develop fully."""
+    return sig_s214_weekly_low_daily_s91(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s219_s210_nr7(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S219: S210 (3-consec-down + VIX recovery + SPY>200d) + NR7.
+    S210 was 5/5 years, WR=83%, PF=27.88. Adding NR7 = rareer but higher-conviction.
+    Hypothesis: exhaustion + VIX calm + bull market + narrowest range = perfect setup."""
+    if sig_s210_s206_spy200(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if _nr_n(tsla, i, 7) else 0
+
+
+def sig_s220_s214_spy200(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S220: S214 (multi-TF) + SPY>200d MA.
+    Multi-TF weekly support + daily ATR extreme + broad market in uptrend.
+    Should remove 2019 miss (market was in correction) while keeping bull years."""
+    if sig_s214_weekly_low_daily_s91(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    spy_close = float(spy['close'].iloc[i])
+    spy_200d  = float(spy['close'].iloc[i - 200:i].mean())
+    return 1 if spy_close > spy_200d else 0
+
+
+def sig_s221_s214_vix18_hold3d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S221: S215 (S214+VIX>=18) with 3-day hold.
+    Multi-TF + elevated VIX + 3d hold = test of optimal hold period.
+    Hypothesis: fear-driven setups need a day or two to resolve = longer hold better."""
+    return sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+SIGNALS_P7X: List[Tuple] = [
+    # Phase 7X — S214 multi-TF extensions + S210 enhancements
+    ('S215_s214_vix18',         sig_s215_s214_vix18,         10, 0.20, 50),
+    ('S216_s214_vix_rec',       sig_s216_s214_vix_rec,       10, 0.20, 50),
+    ('S217_s214_nr7',           sig_s217_s214_nr7,           10, 0.20, 50),
+    ('S218_s214_hold3d',        sig_s218_s214_hold3d,         3, 0.20, 50),
+    ('S219_s210_nr7',           sig_s219_s210_nr7,           10, 0.20, 50),
+    ('S220_s214_spy200',        sig_s220_s214_spy200,        10, 0.20, 50),
+    ('S221_s215_hold3d',        sig_s221_s214_vix18_hold3d,   3, 0.20, 50),
+]
+
+
+SIGNALS = SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X
 
 
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
