@@ -453,20 +453,361 @@ def sig_s10_spy_channel_break_tsla_entry(i, tsla, spy, vix, tw, sw, rt, rs, w):
     return 1
 
 
+# ── Phase 2 signals ───────────────────────────────────────────────────────────
+
+def sig_s11_spy_lag_rsi(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S11: SPY-TSLA lag + TSLA RSI < 55 (not already overbought)."""
+    if sig_s04_spy_lag(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    t_rsi = rt.iloc[i]
+    if pd.isna(t_rsi) or t_rsi > 55:
+        return 0
+    return 1
+
+
+def sig_s12_weekly_bounce_spy_filter(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S12: Weekly bounce + SPY above 20d MA (trend confirmation)."""
+    if sig_s09_weekly_bounce(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    spy_ma20 = spy['close'].iloc[max(0, i - 20):i].mean()
+    if spy['close'].iloc[i] < spy_ma20:
+        return 0
+    return 1
+
+
+def sig_s13_either_s04_or_s09(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S13: Fire on S04 OR S09 — union of two best signals."""
+    if sig_s04_spy_lag(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if sig_s09_weekly_bounce(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    return 0
+
+
+def sig_s14_both_s04_and_s09(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S14: Both S04 AND S09 agree — intersection, higher confidence."""
+    if sig_s04_spy_lag(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if sig_s09_weekly_bounce(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1
+
+
+def sig_s15_spy_lag_high_vix(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S15: SPY-TSLA lag when VIX is elevated (>18) — more volatile, bigger moves."""
+    if sig_s04_spy_lag(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if vix['close'].iloc[i] < 18:
+        return 0
+    return 1
+
+
+def sig_s16_spy_lag_low_vix(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S16: SPY-TSLA lag when VIX is low (<18) — calm markets, steady catch-up."""
+    if sig_s04_spy_lag(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if vix['close'].iloc[i] >= 18:
+        return 0
+    return 1
+
+
+def sig_s17_spy_lag_tighter(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S17: SPY-TSLA lag tighter: SPY within 1% of 30d high, TSLA 5%+ behind."""
+    lookback = 30
+    if i < lookback:
+        return 0
+    spy_now   = spy['close'].iloc[i]
+    spy_high  = spy['high'].iloc[i - lookback:i].max()
+    tsla_now  = tsla['close'].iloc[i]
+    tsla_high = tsla['high'].iloc[i - lookback:i].max()
+    spy_strong   = spy_now >= spy_high * 0.99
+    tsla_lagging = tsla_now < tsla_high * 0.95  # 5% lag threshold
+    return 1 if (spy_strong and tsla_lagging) else 0
+
+
+def sig_s18_weekly_rsi_divergence(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S18: Weekly channel bounce + TSLA daily RSI < 40."""
+    if sig_s09_weekly_bounce(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    t_rsi = rt.iloc[i]
+    if pd.isna(t_rsi) or t_rsi > 40:
+        return 0
+    return 1
+
+
+def sig_s19_spy_lag_momentum(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S19: SPY lag + SPY itself bouncing (SPY RSI 50-65, not overbought)."""
+    if sig_s04_spy_lag(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    s_rsi = rs.iloc[i]
+    if pd.isna(s_rsi) or not (50 <= s_rsi <= 65):
+        return 0
+    return 1
+
+
+def sig_s20_spy_channel_break_rsi(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S20: SPY channel break up + TSLA RSI oversold (<50)."""
+    if sig_s10_spy_channel_break_tsla_entry(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    t_rsi = rt.iloc[i]
+    if pd.isna(t_rsi) or t_rsi > 50:
+        return 0
+    return 1
+
+
 # ── Experiment registry ───────────────────────────────────────────────────────
-# (name, fn, max_hold_days, stop_pct, channel_window)
-SIGNALS: List[Tuple] = [
+# Phase 1: (name, fn, max_hold_days, stop_pct, channel_window)
+SIGNALS_P1: List[Tuple] = [
     ('S01_daily_bounce_baseline',    sig_s01_daily_bounce,            10, 0.05, 50),
     ('S02_bounce_spy_uptrend',       sig_s02_bounce_spy_filter,       10, 0.05, 50),
     ('S03_rsi_divergence',           sig_s03_rsi_divergence,          15, 0.05, 50),
-    ('S04_spy_tsla_lag',             sig_s04_spy_lag,                 10, 0.05, 50),
+    ('S04_spy_tsla_lag',             sig_s04_spy_lag,                  5, 0.03, 50),  # best params
     ('S05_high_quality_channel',     sig_s05_high_quality_channel,    10, 0.05, 50),
     ('S06_multi_window_bounce',      sig_s06_multi_window,            10, 0.05, 50),
     ('S07_combined_rsi_channel_spy', sig_s07_combined,                15, 0.05, 50),
     ('S08_vix_spike_bounce',         sig_s08_vix_spike_bounce,        10, 0.05, 50),
-    ('S09_weekly_bounce',            sig_s09_weekly_bounce,           20, 0.07, 50),
-    ('S10_spy_channel_break_entry',  sig_s10_spy_channel_break_tsla_entry, 10, 0.05, 50),
+    ('S09_weekly_bounce',            sig_s09_weekly_bounce,            5, 0.05, 50),  # best params
+    ('S10_spy_channel_break_entry',  sig_s10_spy_channel_break_tsla_entry, 7, 0.07, 50),  # best params
 ]
+
+# Phase 2: combinations and refinements
+SIGNALS_P2: List[Tuple] = [
+    ('S11_spy_lag_rsi_filter',       sig_s11_spy_lag_rsi,              5, 0.03, 50),
+    ('S12_weekly_bounce_spy_filter', sig_s12_weekly_bounce_spy_filter,  5, 0.05, 50),
+    ('S13_union_s04_or_s09',         sig_s13_either_s04_or_s09,        5, 0.04, 50),
+    ('S14_intersect_s04_and_s09',    sig_s14_both_s04_and_s09,         5, 0.03, 50),
+    ('S15_spy_lag_high_vix',         sig_s15_spy_lag_high_vix,         5, 0.03, 50),
+    ('S16_spy_lag_low_vix',          sig_s16_spy_lag_low_vix,          5, 0.03, 50),
+    ('S17_spy_lag_tighter_5pct',     sig_s17_spy_lag_tighter,          5, 0.03, 50),
+    ('S18_weekly_rsi_div',           sig_s18_weekly_rsi_divergence,    10, 0.05, 50),
+    ('S19_spy_lag_momentum_rsi',     sig_s19_spy_lag_momentum,          5, 0.03, 50),
+    ('S20_spy_break_rsi_filter',     sig_s20_spy_channel_break_rsi,    7, 0.07, 50),
+]
+
+# ── Phase 3 signals — VIX regime gating + trend guards ───────────────────────
+
+def sig_s21_union_high_vix(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S21: S13 (union) but only when VIX > 15 (exclude very calm markets)."""
+    if vix['close'].iloc[i] <= 15:
+        return 0
+    return sig_s13_either_s04_or_s09(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s22_spy_lag_tsla_uptrend(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S22: SPY lag + TSLA above its 50d MA (avoid catching falling knife)."""
+    if sig_s04_spy_lag(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    tsla_ma50 = tsla['close'].iloc[max(0, i - 50):i].mean()
+    if tsla['close'].iloc[i] < tsla_ma50 * 0.97:
+        return 0
+    return 1
+
+
+def sig_s23_spy_lag_spy_not_collapsing(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S23: SPY lag but SPY not in freefall (SPY not >10% below 50d high)."""
+    if sig_s04_spy_lag(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    spy_50d_high = spy['high'].iloc[max(0, i - 50):i].max()
+    if spy['close'].iloc[i] < spy_50d_high * 0.90:
+        return 0
+    return 1
+
+
+def sig_s24_high_vix_lag_longer(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S24: Same entry as S15 (high VIX lag) — for sweep with longer hold."""
+    return sig_s15_spy_lag_high_vix(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s25_weekly_no_bear(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S25: Weekly bounce but SPY not making new 20d lows (no bear crash)."""
+    if sig_s09_weekly_bounce(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    spy_20d_low = spy['low'].iloc[max(0, i - 20):i].min()
+    if spy['close'].iloc[i] <= spy_20d_low * 1.02:
+        return 0
+    return 1
+
+
+def sig_s26_spy_lag_recovery(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S26: SPY lag + TSLA already showing 1-day recovery (close > prior close)."""
+    if sig_s04_spy_lag(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 1:
+        return 0
+    if tsla['close'].iloc[i] <= tsla['close'].iloc[i - 1]:
+        return 0
+    return 1
+
+
+def sig_s27_spy_lag_both_rsi(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S27: SPY lag + TSLA RSI 30-55 + SPY RSI 45-65 (sweet spot ranges)."""
+    if sig_s04_spy_lag(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    t_rsi = rt.iloc[i]
+    s_rsi = rs.iloc[i]
+    if pd.isna(t_rsi) or pd.isna(s_rsi):
+        return 0
+    if not (30 <= t_rsi <= 55):
+        return 0
+    if not (45 <= s_rsi <= 65):
+        return 0
+    return 1
+
+
+def sig_s28_vix_extreme_bounce(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S28: VIX > 25 + TSLA RSI < 40 (extreme fear + oversold = strong bounce)."""
+    if vix['close'].iloc[i] < 25:
+        return 0
+    t_rsi = rt.iloc[i]
+    if pd.isna(t_rsi) or t_rsi > 40:
+        return 0
+    return 1
+
+
+def sig_s29_spy_lag_vix_regime(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S29: SPY lag tiered by VIX — 20d high lag (any VIX), but VIX must be 15-35."""
+    if sig_s04_spy_lag(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    vix_now = vix['close'].iloc[i]
+    if not (15 <= vix_now <= 35):
+        return 0
+    return 1
+
+
+def sig_s30_union_spy_filter(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S30: Union of S04+S09 + SPY in medium-term uptrend (above 50d MA)."""
+    if sig_s13_either_s04_or_s09(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    spy_ma50 = spy['close'].iloc[max(0, i - 50):i].mean()
+    if spy['close'].iloc[i] < spy_ma50:
+        return 0
+    return 1
+
+
+# Phase 3: VIX regime + trend guards
+SIGNALS_P3: List[Tuple] = [
+    ('S21_union_vix_gt15',           sig_s21_union_high_vix,           5, 0.03, 50),
+    ('S22_spy_lag_tsla_above_50ma',  sig_s22_spy_lag_tsla_uptrend,     5, 0.03, 50),
+    ('S23_spy_lag_spy_not_crashing', sig_s23_spy_lag_spy_not_collapsing, 5, 0.03, 50),
+    ('S24_high_vix_lag_10d_hold',    sig_s24_high_vix_lag_longer,     10, 0.05, 50),
+    ('S25_weekly_no_bear_guard',     sig_s25_weekly_no_bear,            5, 0.05, 50),
+    ('S26_spy_lag_tsla_recovering',  sig_s26_spy_lag_recovery,          5, 0.03, 50),
+    ('S27_spy_lag_dual_rsi_sweet',   sig_s27_spy_lag_both_rsi,          5, 0.03, 50),
+    ('S28_vix_extreme_rsi_oversold', sig_s28_vix_extreme_bounce,       10, 0.05, 50),
+    ('S29_spy_lag_vix_15_35',        sig_s29_spy_lag_vix_regime,        5, 0.03, 50),
+    ('S30_union_spy_uptrend',        sig_s30_union_spy_filter,          5, 0.04, 50),
+]
+
+# ── Phase 4 signals — robust composite + crash guards ────────────────────────
+
+def sig_s31_s29_crash_guard(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S31: S29 + SPY not in freefall (not >8% below 30d high)."""
+    if sig_s29_spy_lag_vix_regime(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    spy_30d_high = spy['high'].iloc[max(0, i - 30):i].max()
+    if spy['close'].iloc[i] < spy_30d_high * 0.92:
+        return 0
+    return 1
+
+
+def sig_s32_union_s29_s25(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S32: Union of S29 (VIX-gated lag) + S25 (weekly no-bear) — best IS+OOS combo."""
+    if sig_s29_spy_lag_vix_regime(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if sig_s25_weekly_no_bear(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    return 0
+
+
+def sig_s33_s29_spy_rsi_healthy(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S33: S29 + SPY RSI > 45 (SPY not deeply oversold when we enter)."""
+    if sig_s29_spy_lag_vix_regime(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    s_rsi = rs.iloc[i]
+    if pd.isna(s_rsi) or s_rsi < 45:
+        return 0
+    return 1
+
+
+def sig_s34_spy_lag_vix_18_28(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S34: Narrower VIX band 18-28 (core moderate-stress zone)."""
+    if sig_s04_spy_lag(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    vix_now = vix['close'].iloc[i]
+    if not (18 <= vix_now <= 28):
+        return 0
+    return 1
+
+
+def sig_s35_s21_vix_cap30(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S35: Union (S04 or S09) with VIX 15-30 only (cap at 30, not 35)."""
+    if vix['close'].iloc[i] < 15 or vix['close'].iloc[i] > 30:
+        return 0
+    return sig_s13_either_s04_or_s09(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+def sig_s36_s29_tsla_not_downtrend(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S36: S29 + TSLA not in severe downtrend (TSLA above 20d low * 0.90)."""
+    if sig_s29_spy_lag_vix_regime(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    tsla_20d_low = tsla['low'].iloc[max(0, i - 20):i].min()
+    if tsla['close'].iloc[i] < tsla_20d_low * 0.92:
+        return 0
+    return 1
+
+
+def sig_s37_union_s29_s25_s15(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S37: Triple union — S29 + S25 + S15 (high VIX lag). All three regimes covered."""
+    if sig_s29_spy_lag_vix_regime(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if sig_s25_weekly_no_bear(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    if sig_s15_spy_lag_high_vix(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1:
+        return 1
+    return 0
+
+
+def sig_s38_intersect_s29_s09(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S38: Both S29 (lag) AND S09 (weekly bounce) agree — high confidence."""
+    if sig_s29_spy_lag_vix_regime(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if sig_s09_weekly_bounce(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1
+
+
+def sig_s39_s29_vix_any(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S39: SPY lag with any VIX but split by regime — VIX<20 use tight, VIX>20 normal."""
+    # Just test SPY lag with VIX > 20 (rising volatility = better odds)
+    if sig_s04_spy_lag(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if vix['close'].iloc[i] < 20:
+        return 0
+    return 1
+
+
+def sig_s40_best_composite(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S40: Best composite — S32 (S29+S25 union) with VIX < 35 overall cap."""
+    if vix['close'].iloc[i] >= 35:
+        return 0
+    return sig_s32_union_s29_s25(i, tsla, spy, vix, tw, sw, rt, rs, w)
+
+
+# Phase 4
+SIGNALS_P4: List[Tuple] = [
+    ('S31_s29_crash_guard',          sig_s31_s29_crash_guard,           5, 0.03, 50),
+    ('S32_union_s29_s25',            sig_s32_union_s29_s25,             5, 0.04, 50),
+    ('S33_s29_spy_rsi_healthy',      sig_s33_s29_spy_rsi_healthy,       5, 0.03, 50),
+    ('S34_spy_lag_vix_18_28',        sig_s34_spy_lag_vix_18_28,         5, 0.03, 50),
+    ('S35_union_vix_15_30',          sig_s35_s21_vix_cap30,             5, 0.03, 50),
+    ('S36_s29_tsla_not_downtrend',   sig_s36_s29_tsla_not_downtrend,    5, 0.03, 50),
+    ('S37_triple_union_s29_s25_s15', sig_s37_union_s29_s25_s15,         5, 0.04, 50),
+    ('S38_intersect_s29_s09',        sig_s38_intersect_s29_s09,         5, 0.03, 50),
+    ('S39_spy_lag_vix_gt20',         sig_s39_s29_vix_any,               5, 0.03, 50),
+    ('S40_best_composite',           sig_s40_best_composite,            5, 0.04, 50),
+]
+
+SIGNALS = SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4
 
 
 # ── Reporting ─────────────────────────────────────────────────────────────────
