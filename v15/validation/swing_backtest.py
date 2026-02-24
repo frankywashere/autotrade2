@@ -4950,6 +4950,483 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D)
 
 
+# ── Phase 8E — S277 family + 10d momentum + volume dimensions ─────────────────
+# S277 (3-TF+compressed+VIX18, 5/5yr WR=90%) is our best-coverage signal — extend it.
+# New dimension: 10-day momentum (down 12%+ over 2 weeks = serious correction).
+# New dimension: volume expansion at entry (2× avg → institutional accumulation signal).
+
+def sig_s281_s277_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S281: S277 (3-TF+compressed+VIX18, 5/5yr) + VIX recovery timing.
+    Adding the best timing signal to the best structure signal.
+    Hypothesis: 3-TF structural + compression + VIX gate + VIX cooling = ultra-rare."""
+    if sig_s277_s264_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s282_s277_5d_down5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S282: S277 (3-TF+compressed+VIX18) + 5% 5-day decline.
+    Adds momentum direction confirmation: stock has been falling into the support zone.
+    Hypothesis: directional decline + 3-TF structural support = entries with momentum."""
+    if sig_s277_s264_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    close_now = float(tsla['close'].iloc[i])
+    close_5d  = float(tsla['close'].iloc[i - 5])
+    return 1 if (close_now - close_5d) / close_5d <= -0.05 else 0
+
+
+def sig_s283_s277_spy_weak(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S283: S277 (3-TF+compressed+VIX18) + SPY below 50d SMA.
+    Adding broad market context: 3-TF structural support during macro downturn.
+    Hypothesis: all structural TFs point down + SPY weak = maximum risk-off reversal."""
+    if sig_s277_s264_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 50:
+        return 1
+    spy_close = float(spy['close'].iloc[i])
+    spy_sma50 = float(spy['close'].iloc[i - 50:i].mean())
+    return 1 if spy_close < spy_sma50 else 0
+
+
+def sig_s284_s215_10d_down12pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S284: S215 (multi-TF 8/8yr) + TSLA down 12%+ over last 10 trading days.
+    2-week significant correction into weekly support zone.
+    Hypothesis: sustained 2-week decline to weekly support = sellers running out."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    close_now = float(tsla['close'].iloc[i])
+    close_10d = float(tsla['close'].iloc[i - 10])
+    return 1 if (close_now - close_10d) / close_10d <= -0.12 else 0
+
+
+def sig_s285_s215_vol2x(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S285: S215 (multi-TF 8/8yr) + today's volume >= 2× 20-day average.
+    High volume at weekly support = potential institutional accumulation day.
+    Hypothesis: volume surge at support = smart money entering, not just panic selling."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 20:
+        return 1
+    vol_today = float(tsla['volume'].iloc[i])
+    vol_avg   = float(tsla['volume'].iloc[i - 20:i].mean())
+    if vol_avg <= 0:
+        return 1
+    return 1 if vol_today >= 2.0 * vol_avg else 0
+
+
+def sig_s286_s215_vol15x(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S286: S215 + volume >= 1.5× 20-day average (looser threshold than S285).
+    More trades vs S285's 2× threshold. Trade-off: frequency vs quality."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 20:
+        return 1
+    vol_today = float(tsla['volume'].iloc[i])
+    vol_avg   = float(tsla['volume'].iloc[i - 20:i].mean())
+    if vol_avg <= 0:
+        return 1
+    return 1 if vol_today >= 1.5 * vol_avg else 0
+
+
+def sig_s287_s224_vol2x(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S287: S224 (WR=93%, PF=334) + today's volume >= 2× 20-day average.
+    Best purity signal with institutional accumulation volume.
+    Hypothesis: compressed at weekly support + high volume = final accumulation day."""
+    if sig_s224_s215_compressed_only(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 20:
+        return 1
+    vol_today = float(tsla['volume'].iloc[i])
+    vol_avg   = float(tsla['volume'].iloc[i - 20:i].mean())
+    if vol_avg <= 0:
+        return 1
+    return 1 if vol_today >= 2.0 * vol_avg else 0
+
+
+def sig_s288_s257_5d_down5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S288: S257 (SPY<50MA+compressed, 6/6yr WR=89%) + 5% 5-day decline.
+    Adding momentum to the 6/6 perfect coverage signal.
+    Hypothesis: macro weak + compressed at support + declining stock = peak capitulation."""
+    if sig_s257_s242_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    close_now = float(tsla['close'].iloc[i])
+    close_5d  = float(tsla['close'].iloc[i - 5])
+    return 1 if (close_now - close_5d) / close_5d <= -0.05 else 0
+
+
+def sig_s289_s265_vol15x(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S289: S265 (S215+8% 5-day decline) + volume >= 1.5× average.
+    Sharp price decline + above-average volume = institutional position-taking.
+    Hypothesis: volume confirms the decline is a buying opportunity, not continuation."""
+    if sig_s265_s215_5d_down8pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 20:
+        return 1
+    vol_today = float(tsla['volume'].iloc[i])
+    vol_avg   = float(tsla['volume'].iloc[i - 20:i].mean())
+    if vol_avg <= 0:
+        return 1
+    return 1 if vol_today >= 1.5 * vol_avg else 0
+
+
+def sig_s290_s215_rsi30(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S290: S215 (multi-TF 8/8yr) + RSI < 30 (deeply oversold).
+    Stricter than S236 (RSI<35). S215 + deep oversold = maximum fear at weekly support.
+    Hypothesis: standard oversold (30) vs panic (35) — does deeper oversold help?"""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    rsi = rt.iloc[i]
+    if pd.isna(rsi):
+        return 1
+    return 1 if rsi < 30 else 0
+
+
+SIGNALS_P8E: List[Tuple] = [
+    # Phase 8E — S277 extensions + 10d momentum + volume dimensions
+    ('S281_s277_vix_rec',       sig_s281_s277_vix_rec,       10, 0.20, 50),
+    ('S282_s277_5d_down5pct',   sig_s282_s277_5d_down5pct,  10, 0.20, 50),
+    ('S283_s277_spy_weak',      sig_s283_s277_spy_weak,      10, 0.20, 50),
+    ('S284_s215_10d_down12pct', sig_s284_s215_10d_down12pct, 10, 0.20, 50),
+    ('S285_s215_vol2x',         sig_s285_s215_vol2x,         10, 0.20, 50),
+    ('S286_s215_vol15x',        sig_s286_s215_vol15x,        10, 0.20, 50),
+    ('S287_s224_vol2x',         sig_s287_s224_vol2x,         10, 0.20, 50),
+    ('S288_s257_5d_down5pct',   sig_s288_s257_5d_down5pct,  10, 0.20, 50),
+    ('S289_s265_vol15x',        sig_s289_s265_vol15x,        10, 0.20, 50),
+    ('S290_s215_rsi30',         sig_s290_s215_rsi30,         10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E)
+
+
+# ── Phase 8F — Fresh dimensions: 200MA, OPEX, 52wk proximity, VIX-rise ────────
+# Unexplored structural context: long-term trend (200d MA), calendar patterns
+# (OPEX week), 52-week channel position, VIX building before cooling.
+
+def sig_s291_s215_below200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S291: S215 (multi-TF 8/8yr) + TSLA currently below 200-day SMA.
+    Tests if mean-reversion from weekly support works better in long-term downtrends.
+    Hypothesis: weekly support bounce in bear-trend = counter-trend with oversold bounce."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close < ma200 else 0
+
+
+def sig_s292_s215_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S292: S215 + TSLA above 200-day SMA (long-term uptrend).
+    Tests if weekly support bounces work better when stock is in long-term uptrend.
+    Hypothesis: dip to weekly support in bull-trend = higher-quality entry."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close > ma200 else 0
+
+
+def sig_s293_s215_opex_week(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S293: S215 + within OPEX week (option expiration ±5 calendar days).
+    OPEX creates pinning and volatility effects. Test if multi-TF signal fires well here.
+    Hypothesis: market makers pin price near max pain → support bounces reinforced."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    dt = tsla.index[i]
+    to_next, from_last = _opex_proximity(dt)
+    in_opex_week = (to_next <= 5) or (from_last <= 5)
+    return 1 if in_opex_week else 0
+
+
+def sig_s294_s215_52wk_low20pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S294: S215 + TSLA within 20% of its 52-week low.
+    Price near annual low = maximum long-term pessimism. Weekly support at yearly bottom.
+    Hypothesis: 52wk low proximity + weekly structural support = major long-term bottom."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 252:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    lo_52 = float(tsla['low'].iloc[i - 252:i].min())
+    if lo_52 <= 0:
+        return 1
+    return 1 if close <= lo_52 * 1.20 else 0
+
+
+def sig_s295_s215_52wk_low30pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S295: S215 + TSLA within 30% of its 52-week low (looser than S294).
+    More trades, weaker selectivity but more frequency of 52-week vicinity signals."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 252:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    lo_52 = float(tsla['low'].iloc[i - 252:i].min())
+    if lo_52 <= 0:
+        return 1
+    return 1 if close <= lo_52 * 1.30 else 0
+
+
+def sig_s296_s215_vix_rising3d(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S296: S215 + VIX has risen 3 consecutive days (fear building, not yet peaking).
+    VIX rising into the weekly support setup = fear still building, not yet reverting.
+    Hypothesis: fear at peak is better entry than fear already cooling (complements VIX rec)."""
+    if sig_s215_s214_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 3:
+        return 1
+    for j in range(3):
+        if float(vix['close'].iloc[i - j]) <= float(vix['close'].iloc[i - j - 1]):
+            return 0
+    return 1
+
+
+def sig_s297_s277_below200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S297: S277 (3-TF+compressed+VIX18, 5/5yr) + TSLA below 200d MA.
+    3-TF structural support during long-term downtrend.
+    Hypothesis: monthly+weekly+daily lower channels + bear trend = maximum structural fear."""
+    if sig_s277_s264_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close < ma200 else 0
+
+
+def sig_s298_s277_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S298: S277 (3-TF+compressed+VIX18) + TSLA above 200d MA.
+    3-TF support bounce in long-term uptrend = quality dip-buy setup.
+    Hypothesis: fear-elevated compression at 3-TF support in uptrend = cleanest entry."""
+    if sig_s277_s264_vix18(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close > ma200 else 0
+
+
+def sig_s299_s265_below200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S299: S265 (S215+8% 5-day decline) + TSLA below 200d MA.
+    Sharp decline at weekly support AND in a long-term downtrend.
+    Hypothesis: bouncing from weekly support in a bear market = strongest counter-trend."""
+    if sig_s265_s215_5d_down8pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close < ma200 else 0
+
+
+def sig_s300_s265_52wk_low30pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S300: S265 (S215+8% 5-day decline) + within 30% of 52-week low.
+    Sharp decline AT annual low proximity + weekly support = double bottom potential.
+    Hypothesis: fastest way down + near annual low at weekly support = maximum pessimism."""
+    if sig_s265_s215_5d_down8pct(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 252:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    lo_52 = float(tsla['low'].iloc[i - 252:i].min())
+    if lo_52 <= 0:
+        return 1
+    return 1 if close <= lo_52 * 1.30 else 0
+
+
+SIGNALS_P8F: List[Tuple] = [
+    # Phase 8F — 200MA context, OPEX, 52wk low proximity, VIX-rising
+    ('S291_s215_below200ma',    sig_s291_s215_below200ma,    10, 0.20, 50),
+    ('S292_s215_above200ma',    sig_s292_s215_above200ma,    10, 0.20, 50),
+    ('S293_s215_opex_week',     sig_s293_s215_opex_week,     10, 0.20, 50),
+    ('S294_s215_52wk_low20pct', sig_s294_s215_52wk_low20pct, 10, 0.20, 50),
+    ('S295_s215_52wk_low30pct', sig_s295_s215_52wk_low30pct, 10, 0.20, 50),
+    ('S296_s215_vix_rising3d',  sig_s296_s215_vix_rising3d,  10, 0.20, 50),
+    ('S297_s277_below200ma',    sig_s297_s277_below200ma,    10, 0.20, 50),
+    ('S298_s277_above200ma',    sig_s298_s277_above200ma,    10, 0.20, 50),
+    ('S299_s265_below200ma',    sig_s299_s265_below200ma,    10, 0.20, 50),
+    ('S300_s265_52wk_low30pct', sig_s300_s265_52wk_low30pct, 10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F)
+
+
+# ── Phase 8G — 200MA breakthrough: extend S292 + OPEX combos ──────────────────
+# S292 (S215+above200MA) = WR=89%, PF=23.15, $1.32M, 6/6yr — BEST balanced signal.
+# Key finding: bounces from weekly support in a long-term UPTREND = dramatically better.
+# Extend this dimension: above200MA × every major sub-filter.
+
+def sig_s301_s292_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S301: S292 (S215+above200MA, WR=89%) + VIX recovery timing.
+    Best balanced signal + best timing signal = premium entry quality.
+    Hypothesis: uptrend + weekly support + VIX cooling = cleanest swing entry."""
+    if sig_s292_s215_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 10:
+        return 1
+    vix_now = float(vix['close'].iloc[i])
+    vix_5d  = float(vix['close'].iloc[i - 5])
+    vix_10d = float(vix['close'].iloc[i - 10])
+    return 1 if ((vix_5d > 20 or vix_10d > 20) and vix_now < vix_5d * 0.90) else 0
+
+
+def sig_s302_s292_compressed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S302: S292 (S215+above200MA) + compressed ATR only.
+    Uptrend + weekly lower channel + coiling ATR = spring setup in bull trend.
+    Hypothesis: compression in an uptrend at weekly support = highest-quality bounce."""
+    if sig_s292_s215_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s303_s292_5d_down5pct(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S303: S292 (S215+above200MA) + 5% 5-day decline.
+    Long-term uptrend + short-term 5% decline to weekly support = dip-buy.
+    Hypothesis: uptrend intact + weekly support touched after 5% dip = textbook entry."""
+    if sig_s292_s215_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 5:
+        return 1
+    close_now = float(tsla['close'].iloc[i])
+    close_5d  = float(tsla['close'].iloc[i - 5])
+    return 1 if (close_now - close_5d) / close_5d <= -0.05 else 0
+
+
+def sig_s304_s292_opex_week(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S304: S292 (S215+above200MA) + OPEX week.
+    Uptrend + weekly support + OPEX pinning effect simultaneously.
+    Hypothesis: 3 independent forces create extremely high-probability bounce."""
+    if sig_s292_s215_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    dt = tsla.index[i]
+    to_next, from_last = _opex_proximity(dt)
+    return 1 if (to_next <= 5 or from_last <= 5) else 0
+
+
+def sig_s305_s292_consec_down(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S305: S292 (S215+above200MA) + 3+ consecutive down closes.
+    Uptrend dip: 3 days of consecutive selling into weekly support in a bull trend.
+    Hypothesis: short-term panic in a long-term bull = strongest reversal signal."""
+    if sig_s292_s215_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 3:
+        return 1
+    for j in range(3):
+        if float(tsla['close'].iloc[i - j]) >= float(tsla['close'].iloc[i - j - 1]):
+            return 0
+    return 1
+
+
+def sig_s306_s224_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S306: S224 (WR=93%, PF=334, best purity) + TSLA above 200d MA.
+    Best purity signal + uptrend context.
+    Hypothesis: compressed + weekly support + VIX18 + uptrend = all-star combo."""
+    if sig_s224_s215_compressed_only(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close > ma200 else 0
+
+
+def sig_s307_s235_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S307: S235 (100% WR: S224+VIX_recovery) + TSLA above 200d MA.
+    S235 already achieved 100% WR (6/6yr). Adding uptrend context.
+    Hypothesis: very rare. Should maintain or improve WR when in uptrend."""
+    if sig_s235_s224_vix_rec(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close > ma200 else 0
+
+
+def sig_s308_s293_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S308: S293 (S215+OPEX week, 8/8yr) + TSLA above 200d MA.
+    OPEX week signal filtered to uptrend-only.
+    Hypothesis: OPEX pinning + uptrend = the best OPEX bounces are in bull markets."""
+    if sig_s293_s215_opex_week(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 200:
+        return 1
+    close = float(tsla['close'].iloc[i])
+    ma200 = float(tsla['close'].iloc[i - 200:i].mean())
+    return 1 if close > ma200 else 0
+
+
+def sig_s309_s292_vix25(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S309: S292 (S215+above200MA) + VIX >= 25 (elevated fear in uptrend).
+    Uptrend + weekly support + high fear (VIX25+) = panic dip in bull market.
+    Hypothesis: high VIX dip in an uptrend = fastest bounce (fear overcorrection)."""
+    if sig_s292_s215_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    return 1 if float(vix['close'].iloc[i]) >= 25 else 0
+
+
+def sig_s310_s292_below50ma(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S310: S292 (S215+above200MA) + TSLA below 50d SMA.
+    200d MA uptrend but currently dipped below 50d MA — intermediate correction.
+    Hypothesis: TSLA in bull-trend but 50d broken = momentum seller exhaustion."""
+    if sig_s292_s215_above200ma(i, tsla, spy, vix, tw, sw, rt, rs, w) == 0:
+        return 0
+    if i < 50:
+        return 1
+    close  = float(tsla['close'].iloc[i])
+    ma50   = float(tsla['close'].iloc[i - 50:i].mean())
+    return 1 if close < ma50 else 0
+
+
+SIGNALS_P8G: List[Tuple] = [
+    # Phase 8G — 200MA breakthrough extensions + OPEX combos
+    ('S301_s292_vix_rec',       sig_s301_s292_vix_rec,       10, 0.20, 50),
+    ('S302_s292_compressed',    sig_s302_s292_compressed,    10, 0.20, 50),
+    ('S303_s292_5d_down5pct',   sig_s303_s292_5d_down5pct,  10, 0.20, 50),
+    ('S304_s292_opex_week',     sig_s304_s292_opex_week,     10, 0.20, 50),
+    ('S305_s292_consec_down',   sig_s305_s292_consec_down,   10, 0.20, 50),
+    ('S306_s224_above200ma',    sig_s306_s224_above200ma,    10, 0.20, 50),
+    ('S307_s235_above200ma',    sig_s307_s235_above200ma,    10, 0.20, 50),
+    ('S308_s293_above200ma',    sig_s308_s293_above200ma,    10, 0.20, 50),
+    ('S309_s292_vix25',         sig_s309_s292_vix25,         10, 0.20, 50),
+    ('S310_s292_below50ma',     sig_s310_s292_below50ma,     10, 0.20, 50),
+]
+
+SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
+           + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
+           + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
+           + SIGNALS_P7T + SIGNALS_P7U + SIGNALS_P7V + SIGNALS_P7W + SIGNALS_P7X + SIGNALS_P7Y
+           + SIGNALS_P7Z + SIGNALS_P8A + SIGNALS_P8B + SIGNALS_P8C + SIGNALS_P8D + SIGNALS_P8E
+           + SIGNALS_P8F + SIGNALS_P8G)
+
+
 # ── Phase 5 (weekly) — Weekly bar signals ─────────────────────────────────────
 # Primary bars are weekly OHLCV (resampled from daily).
 # "max_hold_days" = max hold in weeks (same engine, weekly bars passed).
