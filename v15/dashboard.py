@@ -1337,16 +1337,17 @@ def show_trading_monitor_tab(
                 st.error(f"Missing data for {len(missing_tfs)} TFs — cannot evaluate.")
 
     # Get current price and VIX
-    # Prefer Finnhub real-time for TSLA/SPY, fall back to last yfinance candle
+    # Prefer yfinance last 5-min bar (prepost=True, includes pre/post market).
+    # Finnhub free tier returns yesterday's close during extended hours — use as fallback only.
     current_price = 0.0
     vix_level = 20.0
     rt_prices = _get_realtime_prices()
-    if rt_prices.get('TSLA'):
-        current_price = rt_prices['TSLA']
-        _price_source = "Finnhub (real-time)"
-    elif len(current_tsla) > 0 and 'close' in current_tsla.columns:
+    if len(current_tsla) > 0 and 'close' in current_tsla.columns:
         current_price = float(current_tsla.iloc[-1]['close'])
-        _price_source = "yfinance (delayed)"
+        _price_source = "yfinance (live)"
+    elif rt_prices.get('TSLA'):
+        current_price = rt_prices['TSLA']
+        _price_source = "Finnhub"
     else:
         _price_source = "unavailable"
     if len(current_vix) > 0 and 'close' in current_vix.columns:
