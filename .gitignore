@@ -1,3 +1,6 @@
+# Streamlit secrets (API keys)
+.streamlit/secrets.toml
+
 # Data folder
 /data
 
