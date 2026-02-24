@@ -53,6 +53,7 @@ class HypotheticalPosition:
     confidence: float
     best_price: float        # For trailing stop
     reason: str = ''
+    breakeven_applied: bool = False  # True once stop moved to entry after 30 min
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -124,6 +125,14 @@ class SurferLiveScanner:
 
     TRAILING_STOP_PCT = 0.015   # 1.5% trailing from best price
     TIMEOUT_MINUTES = 300       # 5 hours
+    EOD_CLOSE_HOUR_ET = 15      # Force-close at 3:45 PM ET
+    EOD_CLOSE_MINUTE_ET = 45
+    EQUITY_CEILING_PCT = 0.05   # Close if unrealized >= 5% of equity
+    NEAR_TP_PCT = 0.01          # Close early if within 1% of TP price
+    NEAR_TP_MIN_GAIN = 100.0    # Minimum dollar gain for near-TP early close
+    NEAR_TP_WINDOW_MIN = 30     # Near-TP rule only active within first 30 min
+    BREAKEVEN_TRIGGER_MIN = 30  # Move stop to entry after 30 min if in profit
+    OUTLIER_MULT = 2.0          # Close if unrealized >= 2x expected TP gain
 
     def __init__(self, config: ScannerConfig, gist_id: str = '', github_token: str = ''):
         self.config = config
@@ -417,9 +426,48 @@ class SurferLiveScanner:
         to_close: List[str] = []
         now = datetime.now()
 
+        # Compute ET time once for EOD check
+        _is_eod = False
+        try:
+            import pytz
+            _et = pytz.timezone('US/Eastern')
+            _now_et = datetime.now(_et)
+            _is_eod = (
+                _now_et.hour > self.EOD_CLOSE_HOUR_ET or
+                (_now_et.hour == self.EOD_CLOSE_HOUR_ET and
+                 _now_et.minute >= self.EOD_CLOSE_MINUTE_ET)
+            )
+        except Exception:
+            pass
+
         for pos_id, pos in self.positions.items():
             exit_reason = None
             exit_price = current_price
+
+            # Compute hold time and unrealized PnL (used by multiple rules below)
+            hold_minutes = 0.0
+            try:
+                entry_dt = datetime.fromisoformat(pos.entry_time)
+                hold_minutes = (now - entry_dt).total_seconds() / 60
+            except (ValueError, TypeError):
+                pass
+
+            if pos.direction == 'long':
+                unrealized_pnl = (current_price - pos.entry_price) * pos.shares
+            else:
+                unrealized_pnl = (pos.entry_price - current_price) * pos.shares
+
+            # --- Breakeven stop adjustment (not an exit — move stop to entry) ---
+            # After 30 min in profit, stop can never be a loss again.
+            if (not pos.breakeven_applied
+                    and hold_minutes >= self.BREAKEVEN_TRIGGER_MIN
+                    and unrealized_pnl > 0):
+                if pos.direction == 'long':
+                    pos.stop_price = max(pos.stop_price, pos.entry_price)
+                else:
+                    pos.stop_price = min(pos.stop_price, pos.entry_price)
+                pos.breakeven_applied = True
+                print(f"[SCANNER] Breakeven stop set for {pos_id} @ ${pos.entry_price:.2f}")
 
             # Update best price (for trailing stop)
             if pos.direction == 'long':
@@ -429,15 +477,43 @@ class SurferLiveScanner:
                 if bar_low < pos.best_price:
                     pos.best_price = bar_low
 
-            # Stop loss
-            if pos.direction == 'long' and bar_low <= pos.stop_price:
-                exit_reason = 'stop_loss'
-                exit_price = pos.stop_price
-            elif pos.direction == 'short' and bar_high >= pos.stop_price:
-                exit_reason = 'stop_loss'
-                exit_price = pos.stop_price
+            # --- EOD force close (3:45 PM ET) ---
+            if exit_reason is None and _is_eod:
+                exit_reason = 'eod_close'
 
-            # Take profit
+            # --- Near-TP early close (within first 30 min) ---
+            # If within 1% of TP price and already up $100+, don't wait for the last tick
+            if exit_reason is None and hold_minutes < self.NEAR_TP_WINDOW_MIN:
+                if unrealized_pnl >= self.NEAR_TP_MIN_GAIN:
+                    if (pos.direction == 'long' and bar_high >= pos.tp_price * (1 - self.NEAR_TP_PCT)):
+                        exit_reason = 'near_tp'
+                    elif (pos.direction == 'short' and bar_low <= pos.tp_price * (1 + self.NEAR_TP_PCT)):
+                        exit_reason = 'near_tp'
+
+            # --- Equity ceiling (unrealized >= 5% of account equity) ---
+            if exit_reason is None:
+                if unrealized_pnl >= self.equity * self.EQUITY_CEILING_PCT:
+                    exit_reason = 'equity_ceiling'
+
+            # --- Outlier winner (unrealized >= 2x expected TP gain) ---
+            if exit_reason is None:
+                if pos.direction == 'long':
+                    expected_tp_gain = (pos.tp_price - pos.entry_price) * pos.shares
+                else:
+                    expected_tp_gain = (pos.entry_price - pos.tp_price) * pos.shares
+                if expected_tp_gain > 0 and unrealized_pnl >= self.OUTLIER_MULT * expected_tp_gain:
+                    exit_reason = 'outlier_winner'
+
+            # --- Stop loss ---
+            if exit_reason is None:
+                if pos.direction == 'long' and bar_low <= pos.stop_price:
+                    exit_reason = 'stop_loss'
+                    exit_price = pos.stop_price
+                elif pos.direction == 'short' and bar_high >= pos.stop_price:
+                    exit_reason = 'stop_loss'
+                    exit_price = pos.stop_price
+
+            # --- Take profit ---
             if exit_reason is None:
                 if pos.direction == 'long' and bar_high >= pos.tp_price:
                     exit_reason = 'take_profit'
@@ -446,7 +522,7 @@ class SurferLiveScanner:
                     exit_reason = 'take_profit'
                     exit_price = pos.tp_price
 
-            # Trailing stop (only if in profit)
+            # --- Trailing stop (only if in profit) ---
             if exit_reason is None:
                 if pos.direction == 'long':
                     trail_price = pos.best_price * (1 - self.TRAILING_STOP_PCT)
@@ -461,15 +537,10 @@ class SurferLiveScanner:
                         exit_reason = 'trailing_stop'
                         exit_price = trail_price
 
-            # Timeout
+            # --- Timeout (5 hours) ---
             if exit_reason is None:
-                try:
-                    entry_dt = datetime.fromisoformat(pos.entry_time)
-                    hold_minutes = (now - entry_dt).total_seconds() / 60
-                    if hold_minutes > self.TIMEOUT_MINUTES:
-                        exit_reason = 'timeout'
-                except (ValueError, TypeError):
-                    pass
+                if hold_minutes > self.TIMEOUT_MINUTES:
+                    exit_reason = 'timeout'
 
             if exit_reason:
                 alert = self._close_position(pos_id, pos, exit_price, exit_reason)
