@@ -371,6 +371,7 @@ def run_backtest(
     capture_features: bool = False,     # Save ML feature vectors per trade
     signal_quality_model=None,          # SignalQualityModel for ML position sizing
     ml_size_fn=None,                    # Callable(quality_score) -> scale_factor
+    signal_filters=None,                # SignalFilterCascade for unified trade gating
 ) -> tuple:
     """
     Run Channel Surfer backtest on historical 5-min TSLA data.
@@ -410,7 +411,8 @@ def run_backtest(
                  'quality_filtered': 0, 'quality_boosted': 0, 'ensemble_filtered': 0,
                  'conf_below_min': 0, 'not_buy_sell': 0, 'circuit_breaker': 0,
                  'anti_pyramid': 0, 'anti_double_type': 0, 'low_volume': 0,
-                 'pos_score_weak': 0, 'low_conf_buy_bounce': 0, 'leverage_cap': 0}
+                 'pos_score_weak': 0, 'low_conf_buy_bounce': 0, 'leverage_cap': 0,
+                 'filter_rejected': 0, 'filter_evaluated': 0}
     if not ml_active:
         print("⚠️  WARNING: ML MODEL NOT LOADED — trading without ML filtering!")
         print("⚠️  All signals will pass through unfiltered by ML models.")
@@ -921,13 +923,17 @@ def run_backtest(
     # Feature capture mode (signal quality model training OR ML position sizing)
     _capture_feature_names = None
     _capture_history_buffer: List[Dict] = []
-    if (capture_features or signal_quality_model is not None) and not ml_active:
+    _need_features = (capture_features or signal_quality_model is not None or
+                       (signal_filters is not None and signal_filters.sq_gate_threshold > 0))
+    if _need_features and not ml_active:
         from v15.core.surfer_ml import get_feature_names
         _capture_feature_names = get_feature_names()
         if capture_features:
             print(f"[CAPTURE] Feature capture enabled ({len(_capture_feature_names)} features)")
         if signal_quality_model is not None:
             print(f"[ML-SIZING] Signal quality model loaded ({len(_capture_feature_names)} base features)")
+        if signal_filters is not None:
+            print(f"[FILTER] Signal filter cascade enabled ({len(_capture_feature_names)} base features)")
 
     # Use pre-loaded data if provided (skip yfinance entirely)
     if tsla_df is not None:
@@ -1408,9 +1414,9 @@ def run_backtest(
 
             sig = analysis.signal
 
-            # --- Feature Capture (signal quality model / ML sizing) ---
+            # --- Feature Capture (signal quality model / ML sizing / filter cascade) ---
             current_signal_features = None
-            if (capture_features or signal_quality_model is not None) and not ml_active and sig.action in ('BUY', 'SELL'):
+            if _need_features and not ml_active and sig.action in ('BUY', 'SELL'):
                 try:
                     current_signal_features, _ = _extract_signal_features(
                         analysis, tsla, bar, closes, spy_df, vix_df,
@@ -1957,6 +1963,19 @@ def run_backtest(
                 if sig.signal_type in existing_types:
                     ml_stats['anti_double_type'] += 1
                     continue  # No double-bounce or double-break
+
+                # --- Signal Filter Cascade (unified trade gating) ---
+                if signal_filters is not None:
+                    _bar_dt = tsla.index[bar] if bar < len(tsla) else None
+                    _sf_ok, _sf_conf, _sf_reasons = signal_filters.evaluate(
+                        sig, analysis, current_signal_features, _bar_dt,
+                        higher_tf_data=higher_tf_data, spy_df=spy_df, vix_df=vix_df,
+                    )
+                    ml_stats['filter_evaluated'] += 1
+                    if not _sf_ok:
+                        ml_stats['filter_rejected'] += 1
+                        continue
+                    sig.confidence = _sf_conf
 
                 # Volume tracking: log low-volume breakouts (ultra-tight stop protects)
                 if sig.signal_type == 'break' and 'volume' in tsla.columns:
