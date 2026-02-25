@@ -31,9 +31,6 @@ lightgbm
 python-dateutil
 tqdm
 
-# C++ extension build dependency
-pybind11>=2.11
-
-# Build and install the C++ feature extractor extension (v15scanner_cpp).
-# Requires: packages.txt apt deps (libeigen3-dev, build-essential)
-.
+# C++ extension build dependency (local dev only — not needed on Streamlit Cloud)
+# pybind11>=2.11
+# To build locally: pip install .
