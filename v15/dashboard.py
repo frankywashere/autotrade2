@@ -757,14 +757,22 @@ def _get_realtime_prices() -> Dict[str, Optional[float]]:
     Premarket/afterhours: returns {} — callers fall back to 5m bar close
     (which already includes extended-hours candles via prepost=True).
     VIX is never fetched (not on free tier of either API).
+    Cached for 30s in session_state to avoid burning API budget (4 callers/cycle).
     """
     import os
+    import time as _time
     import requests
 
     # Only fetch during regular market hours
     market_status = get_market_status()
     if not market_status.get('is_open', False):
         return {}
+
+    # --- 30s cache: reuse across the 4 callers within a single dashboard cycle ---
+    cache = st.session_state.get('_rt_price_cache', {})
+    cache_ts = cache.get('ts', 0)
+    if _time.time() - cache_ts < 30 and cache.get('prices'):
+        return cache['prices']
 
     symbols = ['TSLA', 'SPY']  # VIX not on free tier
     prices: Dict[str, Optional[float]] = {}
@@ -810,7 +818,7 @@ def _get_realtime_prices() -> Dict[str, Optional[float]]:
         except Exception as e:
             print(f"[PRICE] Finnhub error: {type(e).__name__}: {e}")
 
-    # Log result
+    # Log + cache result
     if prices:
         source = 'Twelve Data' if not missing else 'TwelveData+Finnhub'
         if all(s in missing for s in prices):
@@ -819,6 +827,7 @@ def _get_realtime_prices() -> Dict[str, Optional[float]]:
     else:
         print(f"[PRICE] No real-time quotes available")
 
+    st.session_state['_rt_price_cache'] = {'prices': prices, 'ts': _time.time()}
     return prices
 
 
