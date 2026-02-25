@@ -219,6 +219,10 @@ class SignalFilterCascade:
         # Swing regime precomputed status {date_str: bool}
         self._swing_status: Dict[str, bool] = {}
 
+        # Per-evaluation log — records every filter decision for replay/audit
+        # Each entry: {bar_datetime, action, signal_type, conf_in, conf_out, rejected, reasons}
+        self.eval_log: List[dict] = []
+
         # Stats tracking
         self.stats = {
             'sq_rejected': 0,
@@ -372,6 +376,12 @@ class SignalFilterCascade:
                         self.stats['sq_rejected'] += 1
                         self.stats['total_rejected'] += 1
                         reasons.append(f"SQ_REJECT({win_prob:.2f}<{self.sq_gate_threshold:.2f})")
+                        self.eval_log.append({
+                            'bar_datetime': bar_datetime, 'action': sig.action,
+                            'signal_type': getattr(sig, 'signal_type', 'bounce'),
+                            'conf_in': sig.confidence, 'conf_out': confidence,
+                            'rejected': True, 'reasons': list(reasons),
+                        })
                         return False, confidence, reasons
                     self.stats['sq_passed'] += 1
                     reasons.append(f"SQ_PASS({win_prob:.2f})")
@@ -444,6 +454,12 @@ class SignalFilterCascade:
                         except Exception:
                             pass  # Data alignment issue — skip penalty
 
+        self.eval_log.append({
+            'bar_datetime': bar_datetime, 'action': sig.action,
+            'signal_type': getattr(sig, 'signal_type', 'bounce'),
+            'conf_in': sig.confidence, 'conf_out': confidence,
+            'rejected': False, 'reasons': list(reasons),
+        })
         return True, confidence, reasons
 
     def summary(self) -> str:
