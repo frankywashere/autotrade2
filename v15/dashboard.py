@@ -750,48 +750,85 @@ def _refresh_5min_data(
         return merged
 
 
-@st.cache_data(ttl=10)
 def _get_realtime_prices() -> Dict[str, Optional[float]]:
-    """Get real-time prices via yfinance ticker.info.
+    """Get real-time prices via Twelve Data (primary) → Finnhub (secondary).
 
-    Works in all sessions (market, premarket, afterhours).
-    Includes backoff: after 3 consecutive failures (rate-limited),
-    stops trying for 5 minutes to avoid burning API budget.
+    Only fetches during regular market hours (9:30-4 ET).
+    Premarket/afterhours: returns {} — callers fall back to 5m bar close
+    (which already includes extended-hours candles via prepost=True).
+    VIX is never fetched (not on free tier of either API).
+    Cached for 30s in session_state to avoid burning API budget (4 callers/cycle).
     """
+    import os
     import time as _time
-    backoff = st.session_state.get('_rt_price_backoff', {})
-    fails = backoff.get('consecutive_fails', 0)
-    last_fail = backoff.get('last_fail_ts', 0)
-    if fails >= 3:
-        elapsed = _time.time() - last_fail
-        if elapsed < 300:  # 5-minute cooldown
-            print(f"[PRICE] ticker.info backed off ({fails} fails, {300-elapsed:.0f}s remaining)")
-            return st.session_state.get('_rt_price_last', {})
-        else:
-            print(f"[PRICE] ticker.info backoff expired, retrying...")
+    import requests
 
+    # Only fetch during regular market hours
+    market_status = get_market_status()
+    if not market_status.get('is_open', False):
+        return {}
+
+    # --- 30s cache: reuse across the 4 callers within a single dashboard cycle ---
+    cache = st.session_state.get('_rt_price_cache', {})
+    cache_ts = cache.get('ts', 0)
+    if _time.time() - cache_ts < 30 and cache.get('prices'):
+        return cache['prices']
+
+    symbols = ['TSLA', 'SPY']  # VIX not on free tier
+    prices: Dict[str, Optional[float]] = {}
+
+    # --- Primary: Twelve Data (8 calls/min, 800/day — reliable on Streamlit Cloud) ---
+    td_key = None
     try:
-        data_feed = YFinanceLiveData(cache_ttl=55)
-        prices = data_feed.get_realtime_prices()
-        all_none = all(v is None for v in prices.values())
-        if all_none:
-            st.session_state['_rt_price_backoff'] = {
-                'consecutive_fails': fails + 1,
-                'last_fail_ts': _time.time(),
-            }
-            print(f"[PRICE] ticker.info all None — rate-limited (fail #{fails+1})")
-        else:
-            st.session_state['_rt_price_backoff'] = {'consecutive_fails': 0, 'last_fail_ts': 0}
-            print(f"[PRICE] ticker.info: { {k: f'${v:.2f}' if v else 'None' for k, v in prices.items()} }")
-        st.session_state['_rt_price_last'] = prices
-        return prices
-    except Exception as e:
-        st.session_state['_rt_price_backoff'] = {
-            'consecutive_fails': fails + 1,
-            'last_fail_ts': _time.time(),
-        }
-        print(f"[PRICE] ticker.info FAILED: {type(e).__name__}: {e} (fail #{fails+1})")
-        return st.session_state.get('_rt_price_last', {})
+        td_key = st.secrets.get('TWELVE_DATA_API_KEY')
+    except Exception:
+        pass
+    if not td_key:
+        td_key = os.environ.get('TWELVE_DATA_API_KEY')
+    if not td_key:
+        td_key = 'c37aef32727548bba7e1ff39feb73970'
+
+    for sym in symbols:
+        try:
+            resp = requests.get(
+                'https://api.twelvedata.com/price',
+                params={'symbol': sym, 'apikey': td_key},
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                p = data.get('price')
+                if p:
+                    prices[sym] = float(p)
+        except Exception as e:
+            print(f"[PRICE] Twelve Data error for {sym}: {e}")
+
+    # --- Secondary: Finnhub (for any symbols Twelve Data missed) ---
+    missing = [s for s in symbols if s not in prices]
+    if missing:
+        try:
+            from v15.data.finnhub_client import FinnhubClient
+            if '_finnhub_client' not in st.session_state:
+                st.session_state['_finnhub_client'] = FinnhubClient(cache_ttl=30)
+            client = st.session_state['_finnhub_client']
+            for sym in missing:
+                quote = client.get_quote(sym)
+                if quote and quote.current_price > 0:
+                    prices[sym] = quote.current_price
+        except Exception as e:
+            print(f"[PRICE] Finnhub error: {type(e).__name__}: {e}")
+
+    # Log + cache result
+    if prices:
+        source = 'Twelve Data' if not missing else 'TwelveData+Finnhub'
+        if all(s in missing for s in prices):
+            source = 'Finnhub'
+        print(f"[PRICE] {source}: { {k: f'${v:.2f}' for k, v in prices.items()} }")
+    else:
+        print(f"[PRICE] No real-time quotes available")
+
+    st.session_state['_rt_price_cache'] = {'prices': prices, 'ts': _time.time()}
+    return prices
 
 
 def _resample_5min_to_tf(
@@ -1616,10 +1653,10 @@ def show_trading_monitor_tab(
     rt_prices = _get_realtime_prices()
     if len(current_tsla) > 0 and 'close' in current_tsla.columns:
         current_price = float(current_tsla.iloc[-1]['close'])
-        _price_source = "yfinance (live)"
+        _price_source = "5m bar"
     elif rt_prices.get('TSLA'):
         current_price = rt_prices['TSLA']
-        _price_source = "yfinance (rt)"
+        _price_source = "rt"
     else:
         _price_source = "unavailable"
     if len(current_vix) > 0 and 'close' in current_vix.columns:
