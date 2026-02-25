@@ -549,12 +549,19 @@ class YFinanceLiveData:
                 continue
             try:
                 ticker = yf.Ticker(symbol)
-                info = ticker.fast_info
-                price = getattr(info, 'last_price', None)
+                if not _market_open:
+                    # Full info dict has preMarketPrice/postMarketPrice;
+                    # fast_info does not.
+                    info = ticker.info
+                    price = (info.get('preMarketPrice')
+                             or info.get('postMarketPrice')
+                             or info.get('regularMarketPrice'))
+                else:
+                    price = getattr(ticker.fast_info, 'last_price', None)
                 if price and price > 0:
                     prices[symbol] = float(price)
             except Exception as e:
-                logger.debug(f"yfinance fast_info failed for {symbol}: {e}")
+                logger.debug(f"yfinance price fetch failed for {symbol}: {e}")
                 prices[symbol] = None
 
         return prices
