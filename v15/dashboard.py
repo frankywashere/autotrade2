@@ -2258,20 +2258,36 @@ def _show_surfer_chart(tsla_df, analysis):
 
 def _render_break_predictor(analysis, native_tf_data, current_spy=None, current_vix=None):
     """Render the Phase 4 evolved channel break direction predictor panel."""
+    _bp_unavail = (
+        '<div style="background:#1a1a2e;border:1px solid #333;border-radius:6px;'
+        'padding:8px 12px;margin:4px 0;display:flex;align-items:center;gap:12px;">'
+        '<span style="color:#aaa;font-size:11px;font-weight:600;white-space:nowrap;">'
+        'BREAK PREDICTOR</span>'
+        '<span style="color:#555;font-size:14px;font-weight:700;">UNAVAILABLE</span>'
+        '<span style="color:#555;font-size:11px;">{reason}</span></div>'
+    )
+
     try:
         from v15.core.break_predictor import extract_break_features, predict_break
-    except ImportError:
+    except ImportError as e:
+        print(f"[BREAK_PRED] IMPORT FAILED: {e}")
+        st.markdown(_bp_unavail.format(reason=f"import failed: {e}"), unsafe_allow_html=True)
         return
 
     if analysis is None:
+        st.markdown(_bp_unavail.format(reason="no channel analysis"), unsafe_allow_html=True)
         return
 
     try:
         features = extract_break_features(analysis, native_tf_data, current_spy, current_vix)
         if features is None:
+            print("[BREAK_PRED] extract_break_features returned None")
+            st.markdown(_bp_unavail.format(reason="insufficient data for features"), unsafe_allow_html=True)
             return
         result = predict_break(features)
-    except Exception:
+    except Exception as e:
+        print(f"[BREAK_PRED] FAILED: {type(e).__name__}: {e}")
+        st.markdown(_bp_unavail.format(reason=f"{type(e).__name__}: {e}"), unsafe_allow_html=True)
         return
 
     direction   = result['direction']
