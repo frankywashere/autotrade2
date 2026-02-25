@@ -151,8 +151,9 @@ def extract_break_features(analysis, native_tf_data, current_spy=None, current_v
     # --- Daily TSLA OHLCV ---
     daily_tsla = None
     if native_tf_data:
-        daily_tsla = (native_tf_data.get('TSLA', {}).get('daily')
-                      or native_tf_data.get('TSLA', {}).get('1d'))
+        daily_tsla = native_tf_data.get('TSLA', {}).get('daily')
+        if daily_tsla is None or (hasattr(daily_tsla, 'empty') and daily_tsla.empty):
+            daily_tsla = native_tf_data.get('TSLA', {}).get('1d')
     if daily_tsla is None or len(daily_tsla) < 30:
         return None
 
@@ -206,8 +207,9 @@ def extract_break_features(analysis, native_tf_data, current_spy=None, current_v
     spy_ret5d = 0.0
     daily_spy = None
     if native_tf_data:
-        daily_spy = (native_tf_data.get('SPY', {}).get('daily')
-                     or native_tf_data.get('SPY', {}).get('1d'))
+        daily_spy = native_tf_data.get('SPY', {}).get('daily')
+        if daily_spy is None or (hasattr(daily_spy, 'empty') and daily_spy.empty):
+            daily_spy = native_tf_data.get('SPY', {}).get('1d')
     if daily_spy is None and current_spy is not None and len(current_spy) > 20:
         # Resample 5-min SPY to daily
         try:

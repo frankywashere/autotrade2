@@ -791,14 +791,14 @@ def _resample_5min_to_tf(
         # ISO week: Monday=0
         week_start = now - timedelta(days=now.weekday())
         week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
-        mask = df_5min.index >= pd.Timestamp(week_start, tz=df_5min.index.tz)
+        mask = df_5min.index >= pd.Timestamp(week_start, tz=getattr(df_5min.index, 'tz', None))
     elif tf == 'daily':
         mask = df_5min.index.date == now.date()
     elif tf in ('1h', '2h', '3h', '4h'):
         hours = int(tf.replace('h', ''))
         current_hour_block = (now.hour // hours) * hours
         period_start = now.replace(hour=current_hour_block, minute=0, second=0, microsecond=0)
-        mask = df_5min.index >= pd.Timestamp(period_start, tz=df_5min.index.tz)
+        mask = df_5min.index >= pd.Timestamp(period_start, tz=getattr(df_5min.index, 'tz', None))
     else:
         return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
 
@@ -863,10 +863,12 @@ def _update_native_tf_current_bar(
             last_native_ts = tf_df.index[-1]
             resamp_ts = resampled.index[0]
             # Timezone alignment: make resamp_ts tz-aware/naive to match
-            if tf_df.index.tz is not None and resamp_ts.tz is None:
-                resamp_ts = resamp_ts.tz_localize(tf_df.index.tz)
-                resampled.index = resampled.index.tz_localize(tf_df.index.tz)
-            elif tf_df.index.tz is None and resamp_ts.tz is not None:
+            native_tz = getattr(tf_df.index, 'tz', None)
+            resamp_tz = getattr(resamp_ts, 'tz', None) if hasattr(resamp_ts, 'tz') else None
+            if native_tz is not None and resamp_tz is None:
+                resamp_ts = resamp_ts.tz_localize(native_tz)
+                resampled.index = resampled.index.tz_localize(native_tz)
+            elif native_tz is None and resamp_tz is not None:
                 resamp_ts = resamp_ts.tz_localize(None)
                 resampled.index = resampled.index.tz_localize(None)
 
