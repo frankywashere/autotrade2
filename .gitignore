@@ -71,3 +71,32 @@ Thumbs.db
 # Database
 *.db
 *.sqlite
+
+# One-off analysis artifacts (keep repo clean)
+*.png
+analyze_*.py
+inspect_*.py
+visualize_*.py
+rank_features.py
+test_x22_*.py
+*_ANALYSIS.md
+*_SUMMARY.md
+*_QUICK_REF.md
+*_analysis.json
+FEATURE_*.md
+X22_*.md
+x23_*.md
+surfer_models/
+.streamlit/
+
+# Build artifacts
+v15_cpp/build_manual/
+*.bin.idx.meta
+*.bin.idx.npy
+
+# Experiment results (generated)
+experiments/results/
+experiments/test_yfinance_incomplete_candles.py
+v15/core/run_realistic_backtest.py
+v15/data/twelvedata_client.py
+v15/validation/compare_filters.py
