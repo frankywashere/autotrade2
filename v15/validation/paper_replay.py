@@ -133,6 +133,7 @@ def run_replay(data: dict, cfg: dict, cascade=None) -> tuple:
         max_leverage=4.0,
         bounce_cap=12.0,
         max_trade_usd=1_000_000.0,
+        min_trade_usd=33_000.0,
         initial_capital=100_000.0,
         signal_filters=cascade,
     )

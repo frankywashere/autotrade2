@@ -367,6 +367,7 @@ def run_backtest(
     max_leverage: float = 4.0,
     bounce_cap: float = 12.0,           # Max exposure cap multiplier for bounce signals (all-weather: 4-12x validated 11/11 years 2015-2025; Arch384: 8x→12x +$160K est 11yr)
     max_trade_usd: float = 0.0,         # Hard dollar cap per trade (0 = unlimited). Set to e.g. 1e6 for realistic market-capacity simulation.
+    min_trade_usd: float = 0.0,         # Min position size — skip trades where final size is below this threshold (avoids sub-$100 P&L trades).
     initial_capital: float = 0.0,       # 0 = use position_size * 10
     capture_features: bool = False,     # Save ML feature vectors per trade
     signal_quality_model=None,          # SignalQualityModel for ML position sizing
@@ -6053,6 +6054,12 @@ def run_backtest(
                                         ml_stats['vix_mid_boost'] += 1
                             except Exception:
                                 pass
+
+                    # Skip trades too small to generate meaningful P&L
+                    if min_trade_usd > 0 and trade_size < min_trade_usd:
+                        ml_stats.setdefault('min_trade_skip', 0)
+                        ml_stats['min_trade_skip'] += 1
+                        continue
 
                     positions.append(OpenPosition(
                         entry_bar=next_bar,  # Entry at next bar's open (no look-ahead)
