@@ -750,18 +750,22 @@ def _refresh_5min_data(
         return merged
 
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=55)
 def _get_realtime_prices() -> Dict[str, Optional[float]]:
     """Get real-time prices via yfinance ticker.info.
 
     Works in all sessions (market, premarket, afterhours).
-    10s TTL — ticker.info is heavier than a quote endpoint but
-    responsive enough for 60s autorefresh cycle.
+    55s TTL — refreshes once per autorefresh cycle (60s).
+    ticker.info is heavy (3 HTTP scrapes); calling more often
+    triggers Yahoo rate-limits, especially from cloud IPs.
     """
     try:
-        data_feed = YFinanceLiveData(cache_ttl=10)
-        return data_feed.get_realtime_prices()
+        data_feed = YFinanceLiveData(cache_ttl=55)
+        prices = data_feed.get_realtime_prices()
+        print(f"[PRICE] ticker.info returned: { {k: f'${v:.2f}' if v else 'None' for k, v in prices.items()} }")
+        return prices
     except Exception as e:
+        print(f"[PRICE] ticker.info FAILED: {type(e).__name__}: {e}")
         logger.warning(f"Real-time price fetch failed: {e}")
         return {}
 
@@ -2258,7 +2262,9 @@ def _render_break_predictor(analysis, native_tf_data, current_spy=None, current_
     """Render the Phase 4 evolved channel break direction predictor panel."""
     try:
         from v15.core.break_predictor import extract_break_features, predict_break
-    except ImportError:
+    except ImportError as e:
+        print(f"[BREAK_PRED] IMPORT FAILED: {e}")
+        logger.warning(f"Break predictor import failed: {e}")
         return
 
     if analysis is None:
@@ -2267,9 +2273,12 @@ def _render_break_predictor(analysis, native_tf_data, current_spy=None, current_
     try:
         features = extract_break_features(analysis, native_tf_data, current_spy, current_vix)
         if features is None:
+            print("[BREAK_PRED] extract_break_features returned None")
             return
         result = predict_break(features)
-    except Exception:
+    except Exception as e:
+        print(f"[BREAK_PRED] FAILED: {type(e).__name__}: {e}")
+        logger.warning(f"Break predictor failed: {e}")
         return
 
     direction   = result['direction']
@@ -3191,11 +3200,14 @@ def show_channel_surfer_tab(
     sig = analysis.signal
 
     # --- Section 1: Signal Banner ---
-    current_price = float(current_tsla['close'].iloc[-1]) if current_tsla is not None and len(current_tsla) > 0 else 0.0
+    # Primary price: last 5-min bar close (already fetched, zero extra API calls).
+    # Supplement: ticker.info for premarket/afterhours prices when bar is stale.
+    _bar_price = float(current_tsla['close'].iloc[-1]) if current_tsla is not None and len(current_tsla) > 0 else 0.0
+    current_price = _bar_price
+    _price_source = "5m bar"
 
-    # Override with real-time price if available (5-min bar may be stale over weekends/gaps)
+    # Detect premarket session
     _market_session = get_market_status()
-    # Premarket = weekday, before 9:30 AM ET, after 4 AM ET (extended hours window)
     _is_premarket = False
     if _market_session and not _market_session.get('is_open', True):
         _time_et = _market_session.get('current_time_et', '')
@@ -3207,19 +3219,22 @@ def show_channel_surfer_tab(
                 _is_premarket = 4 <= _h < 9 or (_h == 9 and _m < 30)
         except Exception:
             pass
+
+    # Try ticker.info for a fresher price (especially premarket/afterhours)
     try:
         _rt_prices = _get_realtime_prices()
         _rt_tsla = _rt_prices.get('TSLA')
         if _rt_tsla and _rt_tsla > 0:
             current_price = float(_rt_tsla)
             _price_source = "premarket" if _is_premarket else "live"
+            print(f"[PRICE] Channel Surfer using ticker.info: ${current_price:.2f} ({_price_source})")
         else:
-            _price_source = "bar close"
-    except Exception:
-        _price_source = "bar close"
+            print(f"[PRICE] Channel Surfer: ticker.info returned None for TSLA, using 5m bar ${_bar_price:.2f}")
+    except Exception as e:
+        print(f"[PRICE] Channel Surfer: ticker.info failed ({e}), using 5m bar ${_bar_price:.2f}")
 
-    # Also check if last 5-min bar is from today (prepost=True should include premarket bars)
-    if _price_source == "bar close" and current_tsla is not None and len(current_tsla) > 0:
+    # Annotate bar source with freshness
+    if _price_source == "5m bar" and current_tsla is not None and len(current_tsla) > 0:
         _last_bar_ts = current_tsla.index[-1]
         if hasattr(_last_bar_ts, 'date') and _last_bar_ts.date() == datetime.now().date():
             _price_source = "5m bar (premarket)" if _is_premarket else "5m bar"

@@ -531,9 +531,15 @@ class YFinanceLiveData:
                 if price and price > 0:
                     prices[symbol] = float(price)
                 else:
+                    logger.warning(
+                        f"yfinance ticker.info returned no price for {symbol}: "
+                        f"preMarket={info.get('preMarketPrice')}, "
+                        f"postMarket={info.get('postMarketPrice')}, "
+                        f"regular={info.get('regularMarketPrice')}"
+                    )
                     prices[symbol] = None
             except Exception as e:
-                logger.debug(f"yfinance price fetch failed for {symbol}: {e}")
+                logger.warning(f"yfinance ticker.info FAILED for {symbol}: {type(e).__name__}: {e}")
                 prices[symbol] = None
 
         return prices
