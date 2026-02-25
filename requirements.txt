@@ -26,6 +26,9 @@ streamlit-autorefresh
 # Scientific computing
 scipy
 
+# Signal quality model
+lightgbm
+
 # Utilities
 python-dateutil
 tqdm
