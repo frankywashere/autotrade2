@@ -2889,11 +2889,18 @@ def show_channel_surfer_tab(
     # Auto-run or manual analysis
     auto_refresh = live_config.get('auto_refresh', False)
 
+    # Staleness check: auto-re-run if last analysis is older than 5 minutes
+    _last = st.session_state.get('surfer_last_update')
+    _stale = _last is None or (datetime.now() - _last).total_seconds() > 300
+
     # Analysis button
     run_analysis = False
-    if auto_refresh:
+    if auto_refresh or _stale:
         run_analysis = True
-        st.caption("Auto-analyzing on refresh...")
+        if _stale and not auto_refresh:
+            st.caption("Auto-analyzing (analysis >5 min old)...")
+        elif auto_refresh:
+            st.caption("Auto-analyzing on refresh...")
     else:
         if st.button("Analyze Channels", type="primary", key="surfer_analyze"):
             run_analysis = True
