@@ -755,15 +755,43 @@ def _get_realtime_prices() -> Dict[str, Optional[float]]:
     """Get real-time prices via yfinance ticker.info.
 
     Works in all sessions (market, premarket, afterhours).
-    10s TTL — ticker.info is heavier than a quote endpoint but
-    responsive enough for 60s autorefresh cycle.
+    Includes backoff: after 3 consecutive failures (rate-limited),
+    stops trying for 5 minutes to avoid burning API budget.
     """
+    import time as _time
+    backoff = st.session_state.get('_rt_price_backoff', {})
+    fails = backoff.get('consecutive_fails', 0)
+    last_fail = backoff.get('last_fail_ts', 0)
+    if fails >= 3:
+        elapsed = _time.time() - last_fail
+        if elapsed < 300:  # 5-minute cooldown
+            print(f"[PRICE] ticker.info backed off ({fails} fails, {300-elapsed:.0f}s remaining)")
+            return st.session_state.get('_rt_price_last', {})
+        else:
+            print(f"[PRICE] ticker.info backoff expired, retrying...")
+
     try:
-        data_feed = YFinanceLiveData(cache_ttl=10)
-        return data_feed.get_realtime_prices()
+        data_feed = YFinanceLiveData(cache_ttl=55)
+        prices = data_feed.get_realtime_prices()
+        all_none = all(v is None for v in prices.values())
+        if all_none:
+            st.session_state['_rt_price_backoff'] = {
+                'consecutive_fails': fails + 1,
+                'last_fail_ts': _time.time(),
+            }
+            print(f"[PRICE] ticker.info all None — rate-limited (fail #{fails+1})")
+        else:
+            st.session_state['_rt_price_backoff'] = {'consecutive_fails': 0, 'last_fail_ts': 0}
+            print(f"[PRICE] ticker.info: { {k: f'${v:.2f}' if v else 'None' for k, v in prices.items()} }")
+        st.session_state['_rt_price_last'] = prices
+        return prices
     except Exception as e:
-        logger.warning(f"Real-time price fetch failed: {e}")
-        return {}
+        st.session_state['_rt_price_backoff'] = {
+            'consecutive_fails': fails + 1,
+            'last_fail_ts': _time.time(),
+        }
+        print(f"[PRICE] ticker.info FAILED: {type(e).__name__}: {e} (fail #{fails+1})")
+        return st.session_state.get('_rt_price_last', {})
 
 
 def _resample_5min_to_tf(
@@ -857,16 +885,20 @@ def _update_native_tf_current_bar(
             # If the resampled bar's timestamp matches the last bar in the
             # native data, update it; otherwise append it as a new bar.
             last_native_ts = tf_df.index[-1]
-            resamp_ts = resampled.index[0]
-            # Timezone alignment: make resamp_ts tz-aware/naive to match
+            # Align resampled index tz to match native TF data
             native_tz = getattr(tf_df.index, 'tz', None)
-            resamp_tz = getattr(resamp_ts, 'tz', None) if hasattr(resamp_ts, 'tz') else None
-            if native_tz is not None and resamp_tz is None:
-                resamp_ts = resamp_ts.tz_localize(native_tz)
+            resamp_tz = getattr(resampled.index, 'tz', None)
+            if native_tz is not None and resamp_tz is not None:
+                # Both tz-aware: convert resampled to native tz
+                if str(native_tz) != str(resamp_tz):
+                    resampled.index = resampled.index.tz_convert(native_tz)
+            elif native_tz is not None and resamp_tz is None:
+                # Native tz-aware, resamp naive: localize
                 resampled.index = resampled.index.tz_localize(native_tz)
             elif native_tz is None and resamp_tz is not None:
-                resamp_ts = resamp_ts.tz_localize(None)
-                resampled.index = resampled.index.tz_localize(None)
+                # Native naive, resamp tz-aware: strip tz
+                resampled.index = resampled.index.tz_convert(None)
+            resamp_ts = resampled.index[0]
 
             if resamp_ts >= last_native_ts:
                 # Drop the last bar and append the resampled one
