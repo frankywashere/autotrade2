@@ -532,14 +532,18 @@ class YFinanceLiveData:
         """
         prices: Dict[str, Optional[float]] = {}
 
-        # Finnhub for TSLA and SPY
-        if self._finnhub:
+        # Determine if market is currently open
+        _market_open = self.is_market_open()
+
+        # Finnhub only during market hours (free tier returns stale
+        # previous-session close during premarket/afterhours)
+        if self._finnhub and _market_open:
             for symbol in ['TSLA', 'SPY']:
                 quote = self._finnhub.get_quote(symbol)
                 if quote and quote.current_price > 0:
                     prices[symbol] = quote.current_price
 
-        # Fallback to yfinance for symbols not yet fetched
+        # yfinance for symbols not yet fetched (and always outside market hours)
         for symbol in self.symbols:
             if symbol in prices:
                 continue
