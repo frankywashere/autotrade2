@@ -26,6 +26,7 @@ scipy
 
 # Signal quality model
 lightgbm
+scikit-learn
 
 # Utilities
 python-dateutil
