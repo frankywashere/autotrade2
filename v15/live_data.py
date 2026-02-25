@@ -546,7 +546,12 @@ class YFinanceLiveData:
             try:
                 ticker = yf.Ticker(symbol)
                 info = ticker.fast_info
-                price = getattr(info, 'last_price', None)
+                # Prefer pre/post market price over previous-session close.
+                # fast_info.last_price returns the previous session's close during
+                # premarket/afterhours, which causes the display to show stale prices.
+                price = (getattr(info, 'pre_market_price', None)
+                         or getattr(info, 'post_market_price', None)
+                         or getattr(info, 'last_price', None))
                 if price and price > 0:
                     prices[symbol] = float(price)
             except Exception as e:

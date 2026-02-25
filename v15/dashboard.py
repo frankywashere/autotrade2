@@ -2938,24 +2938,44 @@ def show_channel_surfer_tab(
     # --- Section 1: Signal Banner ---
     current_price = float(current_tsla['close'].iloc[-1]) if current_tsla is not None and len(current_tsla) > 0 else 0.0
 
-    # Override with Finnhub real-time price if available (5-min bar may be stale over weekends/gaps)
+    # Override with real-time price if available (5-min bar may be stale over weekends/gaps)
+    _market_session = get_market_status()
+    # Premarket = weekday, before 9:30 AM ET, after 4 AM ET (extended hours window)
+    _is_premarket = False
+    if _market_session and not _market_session.get('is_open', True):
+        _time_et = _market_session.get('current_time_et', '')
+        try:
+            import re as _re
+            _hm = _re.search(r'(\d{2}):(\d{2}):\d{2} ET', _time_et)
+            if _hm:
+                _h, _m = int(_hm.group(1)), int(_hm.group(2))
+                _is_premarket = 4 <= _h < 9 or (_h == 9 and _m < 30)
+        except Exception:
+            pass
     try:
         _rt_prices = _get_realtime_prices()
         _rt_tsla = _rt_prices.get('TSLA')
         if _rt_tsla and _rt_tsla > 0:
             current_price = float(_rt_tsla)
-            _price_source = "Finnhub"
+            _price_source = "premarket" if _is_premarket else "live"
         else:
             _price_source = "bar close"
     except Exception:
         _price_source = "bar close"
 
+    # Also check if last 5-min bar is from today (prepost=True should include premarket bars)
+    if _price_source == "bar close" and current_tsla is not None and len(current_tsla) > 0:
+        _last_bar_ts = current_tsla.index[-1]
+        if hasattr(_last_bar_ts, 'date') and _last_bar_ts.date() == datetime.now().date():
+            _price_source = "5m bar (premarket)" if _is_premarket else "5m bar"
+
     # Current price display
     if current_price > 0:
         prev_price = float(current_tsla['close'].iloc[-2]) if current_tsla is not None and len(current_tsla) > 1 else current_price
         price_delta = current_price - prev_price
-        st.metric("TSLA", f"${current_price:.2f}", delta=f"{price_delta:+.2f} ({price_delta/prev_price*100:+.2f}%)",
-                  help=f"Source: {_price_source}")
+        _premarket_note = " [PREMARKET]" if _is_premarket else ""
+        st.metric("TSLA", f"${current_price:.2f}{_premarket_note}", delta=f"{price_delta:+.2f} ({price_delta/prev_price*100:+.2f}%)",
+                  help=f"Source: {_price_source}. Signal analysis uses completed bars (last session close).")
         st.caption(f"Price updated: {datetime.now().strftime('%H:%M:%S')} ({_price_source})")
 
     _render_signal_banner(sig, current_price=current_price)
