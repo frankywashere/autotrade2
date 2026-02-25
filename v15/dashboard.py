@@ -751,7 +751,7 @@ def _refresh_5min_data(
 
 
 def _get_realtime_prices() -> Dict[str, Optional[float]]:
-    """Get real-time prices via Finnhub (primary) → Twelve Data (secondary).
+    """Get real-time prices via Twelve Data (primary) → Finnhub (secondary).
 
     Only fetches during regular market hours (9:30-4 ET).
     Premarket/afterhours: returns {} — callers fall back to 5m bar close
@@ -759,6 +759,7 @@ def _get_realtime_prices() -> Dict[str, Optional[float]]:
     VIX is never fetched (not on free tier of either API).
     """
     import os
+    import requests
 
     # Only fetch during regular market hours
     market_status = get_market_status()
@@ -768,54 +769,52 @@ def _get_realtime_prices() -> Dict[str, Optional[float]]:
     symbols = ['TSLA', 'SPY']  # VIX not on free tier
     prices: Dict[str, Optional[float]] = {}
 
-    # --- Primary: Finnhub ---
+    # --- Primary: Twelve Data (8 calls/min, 800/day — reliable on Streamlit Cloud) ---
+    td_key = None
     try:
-        from v15.data.finnhub_client import FinnhubClient
-        if '_finnhub_client' not in st.session_state:
-            st.session_state['_finnhub_client'] = FinnhubClient(cache_ttl=30)
-        client = st.session_state['_finnhub_client']
-        for sym in symbols:
-            quote = client.get_quote(sym)
-            if quote and quote.current_price > 0:
-                prices[sym] = quote.current_price
-    except Exception as e:
-        print(f"[PRICE] Finnhub error: {type(e).__name__}: {e}")
+        td_key = st.secrets.get('TWELVE_DATA_API_KEY')
+    except Exception:
+        pass
+    if not td_key:
+        td_key = os.environ.get('TWELVE_DATA_API_KEY')
+    if not td_key:
+        td_key = 'c37aef32727548bba7e1ff39feb73970'
 
-    # --- Secondary: Twelve Data (for any symbols Finnhub missed) ---
+    for sym in symbols:
+        try:
+            resp = requests.get(
+                'https://api.twelvedata.com/price',
+                params={'symbol': sym, 'apikey': td_key},
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                p = data.get('price')
+                if p:
+                    prices[sym] = float(p)
+        except Exception as e:
+            print(f"[PRICE] Twelve Data error for {sym}: {e}")
+
+    # --- Secondary: Finnhub (for any symbols Twelve Data missed) ---
     missing = [s for s in symbols if s not in prices]
     if missing:
-        td_key = None
         try:
-            td_key = st.secrets.get('TWELVE_DATA_API_KEY')
-        except Exception:
-            pass
-        if not td_key:
-            td_key = os.environ.get('TWELVE_DATA_API_KEY')
-        if not td_key:
-            td_key = 'a]TWELVE_DATA_KEY_PLACEHOLDER'  # replace with actual key
-
-        if td_key and not td_key.endswith('PLACEHOLDER'):
-            import requests
+            from v15.data.finnhub_client import FinnhubClient
+            if '_finnhub_client' not in st.session_state:
+                st.session_state['_finnhub_client'] = FinnhubClient(cache_ttl=30)
+            client = st.session_state['_finnhub_client']
             for sym in missing:
-                try:
-                    resp = requests.get(
-                        'https://api.twelvedata.com/price',
-                        params={'symbol': sym, 'apikey': td_key},
-                        timeout=5,
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        p = data.get('price')
-                        if p:
-                            prices[sym] = float(p)
-                except Exception as e:
-                    print(f"[PRICE] Twelve Data error for {sym}: {e}")
+                quote = client.get_quote(sym)
+                if quote and quote.current_price > 0:
+                    prices[sym] = quote.current_price
+        except Exception as e:
+            print(f"[PRICE] Finnhub error: {type(e).__name__}: {e}")
 
     # Log result
     if prices:
-        source = 'Finnhub' if all(s not in missing for s in prices) else 'Finnhub+TwelveData'
+        source = 'Twelve Data' if not missing else 'TwelveData+Finnhub'
         if all(s in missing for s in prices):
-            source = 'Twelve Data'
+            source = 'Finnhub'
         print(f"[PRICE] {source}: { {k: f'${v:.2f}' for k, v in prices.items()} }")
     else:
         print(f"[PRICE] No real-time quotes available")
