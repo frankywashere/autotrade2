@@ -1999,6 +1999,87 @@ def _show_surfer_chart(tsla_df, analysis):
     st.plotly_chart(fig, width="stretch")
 
 
+def _render_break_predictor(analysis, native_tf_data, current_spy=None, current_vix=None):
+    """Render the Phase 4 evolved channel break direction predictor panel."""
+    try:
+        from v15.core.break_predictor import extract_break_features, predict_break
+    except ImportError:
+        return
+
+    if analysis is None:
+        return
+
+    try:
+        features = extract_break_features(analysis, native_tf_data, current_spy, current_vix)
+        if features is None:
+            return
+        result = predict_break(features)
+    except Exception:
+        return
+
+    direction   = result['direction']
+    confidence  = result['confidence']
+    will_break  = result['will_break']
+    position    = features['position']
+
+    # Position label
+    if position > 0.80:
+        pos_label = "near upper boundary"
+    elif position < 0.20:
+        pos_label = "near lower boundary"
+    else:
+        pos_label = f"mid-channel ({position:.0%})"
+
+    # Direction badge
+    if will_break:
+        dir_color = '#4caf50' if direction == 'UP' else '#ef5350'
+        dir_arrow = '↑' if direction == 'UP' else '↓'
+        dir_text  = f"{dir_arrow} {direction}"
+        status_text = "Break predicted"
+    else:
+        dir_color = '#888888'
+        dir_arrow = '→'
+        dir_text  = "HOLD"
+        status_text = "Channel holds"
+
+    # Alignment with current channel signal (if available from tf_states)
+    signal_action = 'HOLD'
+    if analysis.tf_states:
+        for s in analysis.tf_states.values():
+            if s.valid:
+                if s.position_pct < 0.25 and direction == 'UP':
+                    signal_action = 'ALIGNED'  # near lower, predicts UP = bounce holds
+                elif s.position_pct < 0.25 and direction == 'DOWN':
+                    signal_action = 'CAUTION'  # near lower, predicts DOWN = bounce fails
+                elif s.position_pct > 0.75 and direction == 'UP':
+                    signal_action = 'ALIGNED'  # near upper, predicts UP = breakout confirmed
+                elif s.position_pct > 0.75 and direction == 'DOWN':
+                    signal_action = 'CAUTION'  # near upper, predicts DOWN = false breakout
+                break
+
+    align_html = ''
+    if signal_action == 'ALIGNED':
+        align_html = '<span style="color:#4caf50;font-size:11px;margin-left:8px;">✓ aligned</span>'
+    elif signal_action == 'CAUTION':
+        align_html = '<span style="color:#ff9800;font-size:11px;margin-left:8px;">⚠ counter-signal</span>'
+
+    st.markdown(
+        f"""<div style="background:#1a1a2e;border:1px solid #333;border-radius:6px;
+                        padding:8px 12px;margin:4px 0;display:flex;align-items:center;gap:12px;">
+            <span style="color:#aaa;font-size:11px;font-weight:600;white-space:nowrap;">
+                BREAK PREDICTOR</span>
+            <span style="color:{dir_color};font-size:18px;font-weight:700;">{dir_text}</span>
+            <span style="color:#888;font-size:11px;">{status_text}</span>
+            <span style="color:#666;font-size:11px;">·</span>
+            <span style="color:#aaa;font-size:11px;">{pos_label}</span>
+            <span style="color:#666;font-size:11px;">·</span>
+            <span style="color:#888;font-size:11px;">conf {confidence:.0%}</span>
+            {align_html}
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+
 def _show_ml_predictions(analysis, current_tsla, native_tf_data):
     """Show ML model predictions for channel lifetime, break direction, and action."""
     try:
@@ -2924,6 +3005,9 @@ def show_channel_surfer_tab(
 
     # --- ML Predictions Section ---
     _show_ml_predictions(analysis, current_tsla, native_tf_data)
+
+    # --- Break Direction Predictor (Phase 4 evolved heuristic) ---
+    _render_break_predictor(analysis, native_tf_data, current_spy=current_spy, current_vix=current_vix)
 
     # --- Section 1b: 5min Channel Chart ---
     if current_tsla is not None and len(current_tsla) > 0 and 'close' in current_tsla.columns:
