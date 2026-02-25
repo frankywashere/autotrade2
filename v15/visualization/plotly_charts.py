@@ -101,7 +101,7 @@ def _format_ts(ts: pd.Timestamp) -> str:
     return ts.strftime('%b %d')
 
 
-def _make_date_ticks(df: pd.DataFrame, n_ticks: int = 5):
+def _make_date_ticks(df: pd.DataFrame, n_ticks: int = 8):
     """Build tick positions and labels from a DataFrame with DatetimeIndex.
 
     Returns (tickvals, ticktext) for use with fig.update_xaxes().

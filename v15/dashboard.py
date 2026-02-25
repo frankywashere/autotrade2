@@ -52,7 +52,6 @@ from v15.live_data import (
     fetch_live_data,
     get_market_status,
     YFINANCE_AVAILABLE,
-    FINNHUB_AVAILABLE,
 )
 
 # Import live trading monitor
@@ -663,33 +662,228 @@ def show_channel_visualization_tab(tsla_df: pd.DataFrame, prediction=None, nativ
 # Live Data Integration
 # =============================================================================
 
-@st.cache_data(ttl=60)
-def _fetch_live_5min() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Cached 5-min yfinance fetch (TTL=60s to avoid redundant API calls)."""
-    print("[DATA] Fetching live 5-min data from yfinance (cache miss)...")
-    data_feed = YFinanceLiveData(cache_ttl=60)
-    return data_feed.get_historical(period='60d', interval='5m')
+def _normalize_to_utc(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize a DataFrame's DatetimeIndex to UTC.
 
-
-@st.cache_data(ttl=5)
-def _get_realtime_prices() -> Dict[str, Optional[float]]:
-    """Get real-time prices via Finnhub (TSLA/SPY) + yfinance (VIX).
-
-    Short TTL (5s) — Finnhub quotes are sub-second fresh.
+    CSV data is tz-naive (America/New_York market time).
+    yfinance data is tz-aware (America/New_York).
+    Both get converted to UTC.
     """
-    if not FINNHUB_AVAILABLE:
-        return {}
-    try:
+    if len(df) == 0 or not isinstance(df.index, pd.DatetimeIndex):
+        return df
+    if df.index.tz is None:
+        df = df.copy()
+        df.index = df.index.tz_localize(
+            "America/New_York",
+            ambiguous="infer",
+            nonexistent="shift_forward"
+        ).tz_convert("UTC")
+    else:
+        tz_str = str(df.index.tz)
+        if tz_str != "UTC":
+            df = df.copy()
+            df.index = df.index.tz_convert("UTC")
+    return df
+
+
+def _normalize_tuple_to_utc(
+    data: Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Normalize a (tsla, spy, vix) tuple to UTC."""
+    return tuple(_normalize_to_utc(df) for df in data)
+
+
+def _append_bars(
+    old: Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    new: Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Concat old + new 5-min data, dedup on index (newer wins)."""
+    result = []
+    for o, n in zip(old, new):
+        merged = pd.concat([o, n])
+        merged = merged[~merged.index.duplicated(keep='last')]
+        merged = merged.sort_index()
+        result.append(merged)
+    return tuple(result)
+
+
+def _refresh_5min_data(
+    force_full: bool = False,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Session-state accumulator for 5-min data.
+
+    Cold start (or force_full): fetch full 60d of 5-min data.
+    Subsequent refreshes: fetch only period='1d' and append/update.
+
+    Returns:
+        Tuple of (tsla, spy, vix) DataFrames.
+    """
+    cached = st.session_state.get('_5min_data')
+    is_cold = cached is None or force_full
+
+    # Check staleness: full re-fetch if data is >2 hours old
+    if cached is not None and not force_full:
+        age_s = (datetime.now() - cached['ts']).total_seconds()
+        if age_s > 7200:  # 2 hours
+            print(f"[DATA] 5-min data is {age_s/60:.0f}min old — forcing full re-fetch")
+            is_cold = True
+
+    if is_cold:
+        print("[DATA] 5-min FULL fetch (cold start / forced)...")
         data_feed = YFinanceLiveData(cache_ttl=5)
+        data = _normalize_tuple_to_utc(
+            data_feed.get_historical(period='60d', interval='5m')
+        )
+        st.session_state['_5min_data'] = {'data': data, 'ts': datetime.now()}
+        print(f"[DATA] 5-min full fetch: {len(data[0]):,} TSLA bars (UTC)")
+        return data
+    else:
+        print("[DATA] 5-min INCREMENTAL fetch (period='1d')...")
+        data_feed = YFinanceLiveData(cache_ttl=5)
+        delta = _normalize_tuple_to_utc(
+            data_feed.get_historical(period='1d', interval='5m')
+        )
+        merged = _append_bars(cached['data'], delta)
+        st.session_state['_5min_data'] = {'data': merged, 'ts': datetime.now()}
+        print(f"[DATA] 5-min incremental: +{len(delta[0])} new/updated bars, "
+              f"total={len(merged[0]):,}")
+        return merged
+
+
+@st.cache_data(ttl=10)
+def _get_realtime_prices() -> Dict[str, Optional[float]]:
+    """Get real-time prices via yfinance ticker.info.
+
+    Works in all sessions (market, premarket, afterhours).
+    10s TTL — ticker.info is heavier than a quote endpoint but
+    responsive enough for 60s autorefresh cycle.
+    """
+    try:
+        data_feed = YFinanceLiveData(cache_ttl=10)
         return data_feed.get_realtime_prices()
     except Exception as e:
         logger.warning(f"Real-time price fetch failed: {e}")
         return {}
 
 
-@st.cache_data(ttl=60)
-def fetch_all_market_data():
+def _resample_5min_to_tf(
+    df_5min: pd.DataFrame,
+    tf: str,
+) -> pd.DataFrame:
+    """Resample 5-min bars to a single current-period OHLCV bar for `tf`.
+
+    Used to keep native TF data fresh between yfinance re-fetches by
+    locally aggregating the 5-min data we already have.
+    """
+    if df_5min.empty:
+        return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+
+    now = datetime.now()
+
+    # Select 5-min bars for the CURRENT period of this TF
+    if tf == 'monthly':
+        mask = (df_5min.index.year == now.year) & (df_5min.index.month == now.month)
+    elif tf == 'weekly':
+        # ISO week: Monday=0
+        week_start = now - timedelta(days=now.weekday())
+        week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        mask = df_5min.index >= pd.Timestamp(week_start, tz=df_5min.index.tz)
+    elif tf == 'daily':
+        mask = df_5min.index.date == now.date()
+    elif tf in ('1h', '2h', '3h', '4h'):
+        hours = int(tf.replace('h', ''))
+        current_hour_block = (now.hour // hours) * hours
+        period_start = now.replace(hour=current_hour_block, minute=0, second=0, microsecond=0)
+        mask = df_5min.index >= pd.Timestamp(period_start, tz=df_5min.index.tz)
+    else:
+        return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+
+    period_bars = df_5min[mask]
+    if period_bars.empty:
+        return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+
+    # Aggregate to single bar
+    agg = pd.DataFrame([{
+        'open': period_bars['open'].iloc[0],
+        'high': period_bars['high'].max(),
+        'low': period_bars['low'].min(),
+        'close': period_bars['close'].iloc[-1],
+        'volume': period_bars['volume'].sum(),
+    }], index=[period_bars.index[0]])
+    agg.index.name = df_5min.index.name
+    return agg
+
+
+def _detect_tf_boundary_crossings(last_ts: datetime) -> List[str]:
+    """Return list of TFs whose boundary has been crossed since `last_ts`."""
+    now = datetime.now()
+    crossed = []
+    if now.date() != last_ts.date():
+        crossed.extend(['daily', 'monthly'])
+    if now.isocalendar()[1] != last_ts.isocalendar()[1]:
+        crossed.append('weekly')
+    if now.hour != last_ts.hour:
+        crossed.append('1h')
+    # 2h/3h/4h derived from 1h, so if 1h boundary crossed, they might be too
+    if '1h' in crossed:
+        for multi_h in ['2h', '3h', '4h']:
+            h = int(multi_h.replace('h', ''))
+            if (now.hour // h) != (last_ts.hour // h):
+                crossed.append(multi_h)
+    return crossed
+
+
+def _update_native_tf_current_bar(
+    native_data: Dict,
+    live_5min: Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+) -> Dict:
+    """Update the last bar of each native TF with local resample from 5-min.
+
+    Modifies native_data in-place and returns it.
+    """
+    symbol_map = {'TSLA': 0, 'SPY': 1, '^VIX': 2}
+    for symbol, idx in symbol_map.items():
+        df_5m = live_5min[idx]
+        if df_5m.empty:
+            continue
+        for tf in NATIVE_TF_LIST:
+            tf_df = native_data.get(symbol, {}).get(tf)
+            if tf_df is None or tf_df.empty:
+                continue
+            resampled = _resample_5min_to_tf(df_5m, tf)
+            if resampled.empty:
+                continue
+            # Replace/append the current-period bar
+            # If the resampled bar's timestamp matches the last bar in the
+            # native data, update it; otherwise append it as a new bar.
+            last_native_ts = tf_df.index[-1]
+            resamp_ts = resampled.index[0]
+            # Timezone alignment: make resamp_ts tz-aware/naive to match
+            if tf_df.index.tz is not None and resamp_ts.tz is None:
+                resamp_ts = resamp_ts.tz_localize(tf_df.index.tz)
+                resampled.index = resampled.index.tz_localize(tf_df.index.tz)
+            elif tf_df.index.tz is None and resamp_ts.tz is not None:
+                resamp_ts = resamp_ts.tz_localize(None)
+                resampled.index = resampled.index.tz_localize(None)
+
+            if resamp_ts >= last_native_ts:
+                # Drop the last bar and append the resampled one
+                updated = pd.concat([tf_df.iloc[:-1], resampled])
+                updated = updated[~updated.index.duplicated(keep='last')]
+                native_data[symbol][tf] = updated
+    return native_data
+
+
+def fetch_all_market_data(force_full: bool = False):
     """Single source of truth: fetch ALL yfinance data (5-min + native TFs).
+
+    Uses session-state accumulators so subsequent calls are incremental:
+    - 5-min: full 60d on cold start, period='1d' on refreshes
+    - Native TFs: full fetch on cold start or boundary crossing, local
+      resample from 5-min between boundaries to keep current bar fresh
+
+    Args:
+        force_full: If True, bypass accumulators and re-fetch everything.
 
     Returns:
         Tuple of (native_data, live_5min) where:
@@ -702,39 +896,95 @@ def fetch_all_market_data():
     if not YFINANCE_AVAILABLE:
         return native_data, live_5min
 
-    # 1. Fetch native TFs (daily/weekly/monthly/1h-4h) — years of history
-    try:
-        print("[DATA] fetch_all_market_data: fetching native TFs...")
-        native_data = _load_native_tf_data(
-            symbols=['TSLA', 'SPY', '^VIX'],
-            timeframes=NATIVE_TF_LIST,
-            start_date='2015-01-01',
-            use_cache=True,
-            cache_max_age_hours=5 / 60,
-            max_retries=2,
-            retry_delay=0.75,
-            yf_request_timeout=8.0,
-            request_wall_timeout=20.0,
-            inter_request_delay=0.25,
-            verbose=True,
-        )
-        if native_data:
-            for symbol in ['TSLA', 'SPY', '^VIX']:
-                for tf in NATIVE_TF_LIST:
-                    df = native_data.get(symbol, {}).get(tf)
-                    if df is not None and not df.empty:
-                        print(f"[DATA]   {symbol:5s} {tf:8s}: {len(df):4d} bars")
-    except Exception as e:
-        print(f"[DATA] Native TF fetch failed: {e}")
-        logger.exception("Native TF data fetch failed")
+    # 1. Native TFs (daily/weekly/monthly/1h-4h) — years of history
+    #    Cold start: full yfinance fetch.
+    #    Warm: skip yfinance, update current bar from 5-min resample.
+    #    Boundary crossing: re-fetch only the crossed TFs from yfinance.
+    cached_ntf = st.session_state.get('_native_tf_data')
+    need_full_ntf = cached_ntf is None or force_full
 
-    # 2. Fetch 5-min data (60 days, yfinance limit)
+    if not need_full_ntf:
+        native_data = cached_ntf['data']
+        age_s = (datetime.now() - cached_ntf['ts']).total_seconds()
+
+        # Check for TF boundary crossings → selective re-fetch
+        crossed = _detect_tf_boundary_crossings(cached_ntf['ts'])
+        # Filter to TFs we actually fetch natively
+        crossed_native = [tf for tf in crossed if tf in NATIVE_TF_LIST]
+
+        if crossed_native:
+            print(f"[DATA] TF boundary crossed: {crossed_native} — re-fetching those TFs")
+            try:
+                fresh = _load_native_tf_data(
+                    symbols=['TSLA', 'SPY', '^VIX'],
+                    timeframes=crossed_native,
+                    start_date='2015-01-01',
+                    use_cache=True,
+                    cache_max_age_hours=5 / 60,
+                    max_retries=2,
+                    retry_delay=0.75,
+                    yf_request_timeout=8.0,
+                    request_wall_timeout=20.0,
+                    inter_request_delay=0.25,
+                    verbose=True,
+                )
+                if fresh:
+                    for symbol in ['TSLA', 'SPY', '^VIX']:
+                        for tf in crossed_native:
+                            fdf = fresh.get(symbol, {}).get(tf)
+                            if fdf is not None and not fdf.empty:
+                                native_data[symbol][tf] = fdf
+                    print(f"[DATA] Updated {len(crossed_native)} TFs from yfinance")
+            except Exception as e:
+                print(f"[DATA] Boundary re-fetch failed: {e}")
+        else:
+            print(f"[DATA] Native TF data from session state ({age_s:.0f}s old, no boundary crossed)")
+    else:
+        try:
+            print("[DATA] fetch_all_market_data: fetching native TFs (cold start)...")
+            native_data = _load_native_tf_data(
+                symbols=['TSLA', 'SPY', '^VIX'],
+                timeframes=NATIVE_TF_LIST,
+                start_date='2015-01-01',
+                use_cache=True,
+                cache_max_age_hours=5 / 60,
+                max_retries=2,
+                retry_delay=0.75,
+                yf_request_timeout=8.0,
+                request_wall_timeout=20.0,
+                inter_request_delay=0.25,
+                verbose=True,
+            )
+            if native_data:
+                for symbol in ['TSLA', 'SPY', '^VIX']:
+                    for tf in NATIVE_TF_LIST:
+                        df = native_data.get(symbol, {}).get(tf)
+                        if df is not None and not df.empty:
+                            print(f"[DATA]   {symbol:5s} {tf:8s}: {len(df):4d} bars")
+        except Exception as e:
+            print(f"[DATA] Native TF fetch failed: {e}")
+            logger.exception("Native TF data fetch failed")
+
+    # 2. Fetch 5-min data via session-state accumulator (incremental after warm start)
     try:
-        print("[DATA] fetch_all_market_data: fetching 5-min data...")
-        data_feed = YFinanceLiveData(cache_ttl=60)
-        live_5min = data_feed.get_historical(period='60d', interval='5m')
+        live_5min = _refresh_5min_data(force_full=force_full)
     except Exception as e:
         print(f"[DATA] 5-min yfinance failed: {e}")
+
+    # 3. Update native TF current bars from 5-min resample
+    if native_data and live_5min:
+        try:
+            native_data = _update_native_tf_current_bar(native_data, live_5min)
+            print("[DATA] Updated native TF current bars from 5-min resample")
+        except Exception as e:
+            print(f"[DATA] Native TF current-bar update failed: {e}")
+
+    # Persist to session state
+    if native_data:
+        st.session_state['_native_tf_data'] = {
+            'data': native_data,
+            'ts': datetime.now(),
+        }
 
     return native_data, live_5min
 
@@ -748,14 +998,16 @@ def get_live_data_with_fallback(
     """
     Get market data, merging CSV history with fresh yfinance data.
 
-    When use_live=True, uses provided live 5-min data (or fetches it)
-    and appends to CSV historical data. This gives us years of history plus
-    current market data — both are needed for all 10 timeframes.
+    When use_live=True, uses provided live 5-min data (already UTC-normalized
+    from _refresh_5min_data) and appends to CSV historical data.
+
+    Caches the merged result in st.session_state['_merged_5min'] so
+    subsequent reruns only re-merge the delta bars, not the full 35K.
 
     Args:
         use_live: Whether to attempt live data merge
         loaded_data: Tuple of (tsla, spy, vix) loaded from CSV files
-        live_5min: Optional pre-fetched 5-min data tuple from fetch_all_market_data()
+        live_5min: Optional pre-fetched 5-min data (already UTC) from fetch_all_market_data()
         lookback: Number of bars to return (from the end)
 
     Returns:
@@ -777,75 +1029,57 @@ def get_live_data_with_fallback(
             return tsla, spy, vix, False, error_msg
 
         try:
-            # Use pre-fetched 5-min data or fall back to direct fetch
+            # Use pre-fetched 5-min data or fall back to accumulator
             if live_5min is not None:
                 tsla_live, spy_live, vix_live = live_5min
                 print(f"[DATA] Using pre-fetched 5-min data")
             else:
-                print("[DATA] Fetching live data from yfinance...")
-                tsla_live, spy_live, vix_live = _fetch_live_5min()
-            print(f"[DATA] yfinance returned: TSLA={len(tsla_live):,} bars "
+                print("[DATA] Fetching live data via accumulator...")
+                tsla_live, spy_live, vix_live = _refresh_5min_data()
+            print(f"[DATA] yfinance: TSLA={len(tsla_live):,} bars "
                   f"({tsla_live.index[0]} to {tsla_live.index[-1]}, "
                   f"tz={tsla_live.index.tz})")
 
-            # Normalize timezones to UTC for consistent comparison
-            # CSV data is tz-naive (represents America/New_York market time)
-            # yfinance data is tz-aware (America/New_York)
-            def _normalize_to_utc(df: pd.DataFrame) -> pd.DataFrame:
-                if len(df) == 0 or not isinstance(df.index, pd.DatetimeIndex):
-                    return df
-                if df.index.tz is None:
-                    # tz-naive CSV data: localize to NY then convert to UTC
-                    df = df.copy()
-                    df.index = df.index.tz_localize(
-                        "America/New_York",
-                        ambiguous="infer",
-                        nonexistent="shift_forward"
-                    ).tz_convert("UTC")
-                else:
-                    # tz-aware yfinance data: convert to UTC
-                    df = df.copy()
-                    df.index = df.index.tz_convert("UTC")
-                return df
-
-            tsla = _normalize_to_utc(tsla)
-            spy = _normalize_to_utc(spy)
-            vix = _normalize_to_utc(vix)
-            tsla_live = _normalize_to_utc(tsla_live)
-            spy_live = _normalize_to_utc(spy_live)
-            vix_live = _normalize_to_utc(vix_live)
-            print(f"[DATA] Normalized all data to UTC")
+            # 5-min data is already UTC (normalized in _refresh_5min_data).
+            # CSV data only needs normalizing once on first merge.
+            cached_merge = st.session_state.get('_merged_5min')
+            if cached_merge is not None:
+                # Incremental: use previously merged CSV base, just update live tail
+                tsla_base, spy_base, vix_base = cached_merge['csv_utc']
+            else:
+                # First merge in this session — normalize CSV to UTC once
+                tsla_base = _normalize_to_utc(tsla)
+                spy_base = _normalize_to_utc(spy)
+                vix_base = _normalize_to_utc(vix)
+                print(f"[DATA] Normalized CSV data to UTC (one-time)")
 
             # Merge: CSV history + fresh yfinance data
-            # Find where yfinance data starts after CSV ends
-            csv_end = tsla.index[-1] if len(tsla) > 0 else pd.Timestamp.min.tz_localize("UTC")
+            csv_end = tsla_base.index[-1] if len(tsla_base) > 0 else pd.Timestamp.min.tz_localize("UTC")
             fresh_tsla = tsla_live[tsla_live.index > csv_end]
             fresh_spy = spy_live[spy_live.index > csv_end]
             fresh_vix = vix_live[vix_live.index > csv_end]
 
             if len(fresh_tsla) > 0:
-                tsla_merged = pd.concat([tsla, fresh_tsla])
-                spy_merged = pd.concat([spy, fresh_spy])
-                vix_merged = pd.concat([vix, fresh_vix])
-                print(f"[DATA] Merged: {len(tsla):,} CSV + {len(fresh_tsla):,} fresh "
+                tsla_merged = pd.concat([tsla_base, fresh_tsla])
+                spy_merged = pd.concat([spy_base, fresh_spy])
+                vix_merged = pd.concat([vix_base, fresh_vix])
+                print(f"[DATA] Merged: {len(tsla_base):,} CSV + {len(fresh_tsla):,} fresh "
                       f"= {len(tsla_merged):,} total bars")
             else:
-                # yfinance data is older than or overlaps with CSV — use CSV as-is
-                # but update the last few bars with live values for freshness
-                overlap_tsla = tsla_live[tsla_live.index >= tsla.index[0]]
+                # yfinance data overlaps with CSV — update last bars
+                overlap_tsla = tsla_live[tsla_live.index >= tsla_base.index[0]]
                 if len(overlap_tsla) > 0:
-                    # Replace overlapping bars with live data (more current)
-                    tsla_merged = tsla.copy()
-                    spy_merged = spy.copy()
-                    vix_merged = vix.copy()
+                    tsla_merged = tsla_base.copy()
+                    spy_merged = spy_base.copy()
+                    vix_merged = vix_base.copy()
                     tsla_merged.update(overlap_tsla)
-                    spy_merged.update(spy_live[spy_live.index >= spy.index[0]])
-                    vix_merged.update(vix_live[vix_live.index >= vix.index[0]])
-                    print(f"[DATA] Updated {len(overlap_tsla):,} overlapping bars with live data")
+                    spy_merged.update(spy_live[spy_live.index >= spy_base.index[0]])
+                    vix_merged.update(vix_live[vix_live.index >= vix_base.index[0]])
+                    print(f"[DATA] Updated {len(overlap_tsla):,} overlapping bars")
                 else:
-                    tsla_merged = tsla
-                    spy_merged = spy
-                    vix_merged = vix
+                    tsla_merged = tsla_base
+                    spy_merged = spy_base
+                    vix_merged = vix_base
                     print("[DATA] No overlap — using CSV data as-is")
 
             # Take last N bars
@@ -853,6 +1087,11 @@ def get_live_data_with_fallback(
                 tsla_merged = tsla_merged.iloc[-lookback:]
                 spy_merged = spy_merged.iloc[-lookback:]
                 vix_merged = vix_merged.iloc[-lookback:]
+
+            # Cache: store the UTC-normalized CSV base + final merged result
+            st.session_state['_merged_5min'] = {
+                'csv_utc': (tsla_base, spy_base, vix_base),
+            }
 
             print(f"[DATA] Final: {len(tsla_merged):,} bars (is_live=True)")
             return tsla_merged, spy_merged, vix_merged, True, None
@@ -1338,7 +1577,6 @@ def show_trading_monitor_tab(
 
     # Get current price and VIX
     # Prefer yfinance last 5-min bar (prepost=True, includes pre/post market).
-    # Finnhub free tier returns yesterday's close during extended hours — use as fallback only.
     current_price = 0.0
     vix_level = 20.0
     rt_prices = _get_realtime_prices()
@@ -1347,7 +1585,7 @@ def show_trading_monitor_tab(
         _price_source = "yfinance (live)"
     elif rt_prices.get('TSLA'):
         current_price = rt_prices['TSLA']
-        _price_source = "Finnhub"
+        _price_source = "yfinance (rt)"
     else:
         _price_source = "unavailable"
     if len(current_vix) > 0 and 'close' in current_vix.columns:
@@ -1928,11 +2166,27 @@ def _show_surfer_chart(tsla_df, analysis):
     except Exception:
         best_ch = None
 
+    # Build integer x-axis with ET tick labels (consistent with multi-TF charts)
+    x_values = list(range(len(df_chart)))
+
+    # Convert index to ET for tick labels
+    disp_idx = df_chart.index
+    if disp_idx.tz is not None:
+        disp_idx = disp_idx.tz_convert('America/New_York')
+
+    # Generate tick positions — every ~30 min for 5-min bars
+    n = len(df_chart)
+    tick_step = max(1, n // 10)  # ~10 ticks
+    tick_positions = list(range(0, n, tick_step))
+    if tick_positions[-1] != n - 1:
+        tick_positions.append(n - 1)
+    tick_labels = [disp_idx[p].strftime('%H:%M') for p in tick_positions]
+
     fig = go.Figure()
 
     # Candlestick
     fig.add_trace(go.Candlestick(
-        x=df_chart.index,
+        x=x_values,
         open=df_chart['open'],
         high=df_chart['high'],
         low=df_chart['low'],
@@ -1946,21 +2200,21 @@ def _show_surfer_chart(tsla_df, analysis):
     if best_ch and best_ch.valid:
         ch_len = len(best_ch.center_line)
         ch_start = max(0, len(df_chart) - ch_len)
-        ch_idx = df_chart.index[ch_start:ch_start + ch_len]
+        ch_x = x_values[ch_start:ch_start + ch_len]
 
         fig.add_trace(go.Scatter(
-            x=ch_idx, y=best_ch.upper_line[:len(ch_idx)],
+            x=ch_x, y=best_ch.upper_line[:len(ch_x)],
             mode='lines', name='Upper',
             line=dict(color='rgba(255,100,100,0.6)', width=1, dash='dash'),
         ))
         fig.add_trace(go.Scatter(
-            x=ch_idx, y=best_ch.lower_line[:len(ch_idx)],
+            x=ch_x, y=best_ch.lower_line[:len(ch_x)],
             mode='lines', name='Lower',
             line=dict(color='rgba(100,255,100,0.6)', width=1, dash='dash'),
             fill='tonexty', fillcolor='rgba(100,100,255,0.05)',
         ))
         fig.add_trace(go.Scatter(
-            x=ch_idx, y=best_ch.center_line[:len(ch_idx)],
+            x=ch_x, y=best_ch.center_line[:len(ch_x)],
             mode='lines', name='Center',
             line=dict(color='rgba(200,200,200,0.4)', width=1, dash='dot'),
         ))
@@ -1968,12 +2222,12 @@ def _show_surfer_chart(tsla_df, analysis):
     # Signal marker
     sig = analysis.signal
     if sig.action in ('BUY', 'SELL') and len(df_chart) > 0:
-        last_bar = df_chart.index[-1]
+        last_x = x_values[-1]
         last_price = float(df_chart['close'].iloc[-1])
         color = '#00ff55' if sig.action == 'BUY' else '#ff4444'
         symbol = 'triangle-up' if sig.action == 'BUY' else 'triangle-down'
         fig.add_trace(go.Scatter(
-            x=[last_bar], y=[last_price],
+            x=[last_x], y=[last_price],
             mode='markers+text',
             marker=dict(size=18, color=color, symbol=symbol),
             text=[sig.action],
@@ -1993,6 +2247,7 @@ def _show_surfer_chart(tsla_df, analysis):
         template='plotly_dark',
         height=450,
         xaxis_rangeslider_visible=False,
+        xaxis=dict(tickvals=tick_positions, ticktext=tick_labels),
         showlegend=False,
         margin=dict(l=50, r=20, t=40, b=30),
     )
@@ -2571,7 +2826,7 @@ def _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=None, vix_df=N
     ml_adjusted_usd = min(base_trade_usd * _sq_mult, max_trade_usd)
     tod_adjusted_usd = min(ml_adjusted_usd * tod_mult, max_trade_usd)
     dow_adjusted_usd = min(tod_adjusted_usd * dow_mult * vix_mult, max_trade_usd)
-    # Get current TSLA price for share count estimate (prefer Finnhub real-time over stale bar)
+    # Get current TSLA price for share count estimate (prefer real-time over stale bar)
     tsla_price = None
     if current_tsla is not None and len(current_tsla) > 0:
         tsla_price = float(current_tsla['close'].iloc[-1])
@@ -2763,7 +3018,7 @@ def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
 
     # --- Real-time exit monitoring (runs on EVERY render, not just analysis runs) ---
     if current_tsla is not None and len(current_tsla) > 0:
-        # Get best available price — prefer Finnhub real-time over stale bar
+        # Get best available price — prefer real-time over stale bar
         rt_price = current_price
         try:
             _rt = _get_realtime_prices()
@@ -3567,8 +3822,9 @@ def main():
         if cal_path.exists():
             cal_path.unlink()
         load_predictor.clear()
-        fetch_all_market_data.clear()  # Clear unified data cache
-        _fetch_live_5min.clear()  # Clear legacy 5-min cache
+        # Clear session-state data caches so next rerun does full fetch
+        for _k in ['_5min_data', '_native_tf_data', '_merged_5min']:
+            st.session_state.pop(_k, None)
         st.rerun()
 
     # Load model (auto-download from GitHub Releases if not present)
@@ -3619,6 +3875,7 @@ def main():
         )
 
     # Unified data fetch: native TFs + 5-min in one call
+    # Uses session-state accumulators: full fetch on cold start, incremental on refreshes.
     native_tf_data = None
     live_5min = None
     if YFINANCE_AVAILABLE:
