@@ -584,14 +584,10 @@ class SurferLiveScanner:
                 if expected_tp_gain > 0 and unrealized_pnl >= self.OUTLIER_MULT * expected_tp_gain:
                     exit_reason = 'outlier_winner'
 
-            # --- Stop loss ---
-            if exit_reason is None:
-                if pos.direction == 'long' and bar_low <= pos.stop_price:
-                    exit_reason = 'stop_loss'
-                    exit_price = pos.stop_price
-                elif pos.direction == 'short' and bar_high >= pos.stop_price:
-                    exit_reason = 'stop_loss'
-                    exit_price = pos.stop_price
+            # --- Stop loss DISABLED ---
+            # Hard stop removed — relying on trailing stop, EOD close, and
+            # timeout for downside protection.  stop_price still set on entry
+            # for position-sizing math and breakeven adjustment.
 
             # --- Take profit ---
             if exit_reason is None:
