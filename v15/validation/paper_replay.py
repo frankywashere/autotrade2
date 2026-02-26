@@ -114,6 +114,13 @@ def fetch_recent_data():
     }
     print(f"  1h: {len(higher_tf['1h'])} bars  |  4h: {len(higher_tf['4h'])} bars  |  daily: {len(higher_tf['daily'])} bars")
 
+    # 1h TSLA + SPY (730-day max from yfinance) — used as primary for 1h/4h replay
+    # 730d × ~1.625 bars/day → ~1,186 1h bars; resampled to 4h → ~297 bars (well above 200 warmup)
+    tsla_1h_long = _norm_cols(yf.download('TSLA', period='730d', interval='1h', progress=False))
+    spy_1h_long  = _norm_cols(yf.download('SPY',  period='730d', interval='1h', progress=False))
+    print(f"  TSLA 1h(730d): {len(tsla_1h_long)} bars  ({tsla_1h_long.index[0].date()} → {tsla_1h_long.index[-1].date()})")
+    print(f"  SPY  1h(730d): {len(spy_1h_long)} bars")
+
     # Daily TSLA (5yr) — for swing regime weekly channel detection
     tsla_daily_long = _norm_cols(yf.download('TSLA', period='5y', interval='1d', progress=False))
     tsla_weekly     = _norm_cols(yf.download('TSLA', period='5y', interval='1wk', progress=False))
@@ -128,6 +135,8 @@ def fetch_recent_data():
         'tsla_5m':         tsla_5m,
         'spy_5m':          spy_5m,
         'higher_tf':       higher_tf,
+        'tsla_1h_long':    tsla_1h_long,
+        'spy_1h_long':     spy_1h_long,
         'tsla_daily_long': tsla_daily_long,
         'tsla_weekly':     tsla_weekly,
         'spy_daily_long':  spy_daily_long,
@@ -198,15 +207,19 @@ def run_replay(data: dict, cfg: dict, cascade=None, tf: str = '5min') -> tuple:
         spy_primary  = data['spy_5m']
         higher_tf_dict = data['higher_tf']
     else:
-        # Resample 5-min to requested TF for primary bars
-        tsla_primary = _resample(data['tsla_5m'], '1h' if tf == '1h' else '4h')
-        spy_primary  = _resample(data['spy_5m'],  '1h' if tf == '1h' else '4h')
-        # Higher-TF context = daily + weekly (already resampled from 5min daily)
+        # Use 730-day 1h bars as the source — gives ~1,186 1h bars or ~297 4h bars,
+        # well above the 200-bar warmup threshold (60-day 5-min → ~97 4h bars is not enough)
+        rule = '1h' if tf == '1h' else '4h'
+        tsla_primary = _resample(data['tsla_1h_long'], rule) if tf == '4h' else data['tsla_1h_long']
+        spy_primary  = _resample(data['spy_1h_long'],  rule) if tf == '4h' else data['spy_1h_long']
+        # Higher-TF context = daily + weekly from 5yr daily data
+        tsla_weekly_from_daily = _resample(data['tsla_daily_long'], '1W')
         higher_tf_dict = {
-            'daily':  data['higher_tf']['daily'],
-            'weekly': _resample(data['tsla_5m'], '1W'),
+            'daily':  data['tsla_daily_long'],
+            'weekly': tsla_weekly_from_daily,
         }
-        print(f"    {tf} primary: {len(tsla_primary)} bars")
+        print(f"    {tf} primary: {len(tsla_primary)} bars  "
+              f"({tsla_primary.index[0].date()} → {tsla_primary.index[-1].date()})")
 
     result = run_backtest(
         days=0,
@@ -230,7 +243,12 @@ def run_replay(data: dict, cfg: dict, cascade=None, tf: str = '5min') -> tuple:
         signal_filters=cascade,
     )
 
+    if result is None or len(result) < 3:
+        print(f"    WARNING: backtest returned insufficient data (not enough bars for warmup?)")
+        return [], tsla_primary.index
+
     metrics, trades, equity_curve = result[:3]
+    print(f"    {tf} backtest: {len(trades)} total trades over full window")
     return trades, tsla_primary.index
 
 
@@ -379,9 +397,9 @@ def main():
     if args.tf == '5min':
         primary_index_df = data['tsla_5m']
     elif args.tf == '1h':
-        primary_index_df = _resample(data['tsla_5m'], '1h')
+        primary_index_df = data['tsla_1h_long']
     else:
-        primary_index_df = _resample(data['tsla_5m'], '4h')
+        primary_index_df = _resample(data['tsla_1h_long'], '4h')
 
     report_dates = get_last_n_trading_dates(primary_index_df, args.days_back)
     print(f"Report window: {report_dates[0]} → {report_dates[-1]}")
@@ -390,6 +408,7 @@ def main():
     print(f"\nRunning BASELINE (no filters, TF={args.tf})...")
     baseline_trades, tsla_index = run_replay(data, CONFIGS['baseline'], cascade=None, tf=args.tf)
     baseline_window = filter_trades_to_window(baseline_trades, tsla_index, report_dates)
+    print(f"    Window filter: {len(baseline_trades)} total trades → {len(baseline_window)} in window")
 
     # ── Run FILTERED config ────────────────────────────────────────────────
     cascade = build_cascade(cfg)
