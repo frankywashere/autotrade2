@@ -1,15 +1,17 @@
 """Unified signal filter cascade for Channel Surfer.
 
-Three independently toggleable filters that decide WHETHER to trade:
+Four independently toggleable filters that decide WHETHER to trade:
   1. Signal Quality Gate — skip low win_prob trades (uses existing LightGBM model)
   2. Break Predictor — penalize directional mismatches on breakout signals
   3. Swing Regime — boost bounce confidence when S1041 (weekly channel support + fear) fires
+  4. MTF Momentum — block when 2+ higher TFs show active opposing momentum;
+                    boost when 2+ higher TFs show opposing momentum turning/exhausting
 
 Usage:
     from v15.core.signal_filters import SignalFilterCascade
 
     cascade = SignalFilterCascade(sq_gate_threshold=0.50, break_predictor_enabled=True,
-                                  swing_regime_enabled=True)
+                                  swing_regime_enabled=True, momentum_filter_enabled=True)
     cascade.precompute_swing_regime(daily_tsla, daily_spy, daily_vix, weekly_tsla)
 
     # In backtest loop:
@@ -205,12 +207,22 @@ class SignalFilterCascade:
         swing_regime_enabled: bool = False,
         swing_boost: float = 1.2,             # Confidence multiplier when S1041 active
         break_penalty: float = 0.5,           # Confidence multiplier when break dir mismatch
+        momentum_filter_enabled: bool = False,
+        momentum_boost: float = 1.2,          # Conf multiplier when opponent TFs exhausted
+        momentum_conflict_penalty: float = 0.3,  # Conf multiplier when opponent TFs still accelerating
+        momentum_context_tfs: list = None,    # TFs to check; default ['1h','4h','daily']
+        momentum_min_tfs: int = 2,            # Min TFs needed to trigger conflict/exhaust
     ):
         self.sq_gate_threshold = sq_gate_threshold
         self.break_predictor_enabled = break_predictor_enabled
         self.swing_regime_enabled = swing_regime_enabled
         self.swing_boost = swing_boost
         self.break_penalty = break_penalty
+        self.momentum_filter_enabled = momentum_filter_enabled
+        self.momentum_boost = momentum_boost
+        self.momentum_conflict_penalty = momentum_conflict_penalty
+        self.momentum_context_tfs = momentum_context_tfs  # None → use default at eval time
+        self.momentum_min_tfs = momentum_min_tfs
 
         # SQ model (lazy-loaded)
         self._sq_model = None
@@ -231,6 +243,9 @@ class SignalFilterCascade:
             'break_passed': 0,
             'swing_boosted': 0,
             'swing_penalty': 0,
+            'momentum_blocked': 0,
+            'momentum_boosted': 0,
+            'momentum_neutral': 0,
             'total_evaluated': 0,
             'total_rejected': 0,
         }
@@ -454,6 +469,36 @@ class SignalFilterCascade:
                         except Exception:
                             pass  # Data alignment issue — skip penalty
 
+        # --- Filter 4: MTF Momentum (conflict block / exhaustion boost) ---
+        if self.momentum_filter_enabled and analysis is not None:
+            signal_dir = 1.0 if sig.action == 'BUY' else -1.0
+            context_tfs = self.momentum_context_tfs or ['1h', '4h', 'daily']
+            exhaustion_count, conflict_count = 0, 0
+
+            tf_states = getattr(analysis, 'tf_states', {}) or {}
+            for tf in context_tfs:
+                state = tf_states.get(tf)
+                if not state or not getattr(state, 'valid', False):
+                    continue
+                mom_dir = getattr(state, 'momentum_direction', 0.0)
+                is_turning = getattr(state, 'momentum_is_turning', False)
+                opposing = mom_dir * signal_dir < -0.3
+                if opposing and is_turning:
+                    exhaustion_count += 1      # Opponent decelerating → our favor
+                elif opposing and not is_turning:
+                    conflict_count += 1        # Opponent still accelerating → conflict
+
+            if conflict_count >= self.momentum_min_tfs:
+                confidence *= self.momentum_conflict_penalty
+                self.stats['momentum_blocked'] += 1
+                reasons.append(f'MTF_CONFLICT({conflict_count}TFs,conf*={self.momentum_conflict_penalty})')
+            elif exhaustion_count >= self.momentum_min_tfs:
+                confidence *= self.momentum_boost
+                self.stats['momentum_boosted'] += 1
+                reasons.append(f'MTF_EXHAUST({exhaustion_count}TFs,conf*={self.momentum_boost})')
+            else:
+                self.stats['momentum_neutral'] += 1
+
         self.eval_log.append({
             'bar_datetime': bar_datetime, 'action': sig.action,
             'signal_type': getattr(sig, 'signal_type', 'bounce'),
@@ -478,4 +523,7 @@ class SignalFilterCascade:
         if self.swing_regime_enabled:
             lines.append(f"  Swing regime: {s['swing_boosted']} boosted, "
                          f"{s['swing_penalty']} bull-penalized")
+        if self.momentum_filter_enabled:
+            lines.append(f"  MTF momentum: {s['momentum_blocked']} blocked, "
+                         f"{s['momentum_boosted']} boosted, {s['momentum_neutral']} neutral")
         return '\n'.join(lines)

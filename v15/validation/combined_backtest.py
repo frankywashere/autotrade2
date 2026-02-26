@@ -32,15 +32,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 # ---------------------------------------------------------------------------
 
 CONFIGS = {
-    'baseline':   {'sq_gate': 0.0,  'break_pred': False, 'swing': False},
-    'sq50':       {'sq_gate': 0.50, 'break_pred': False, 'swing': False},
-    'sq55':       {'sq_gate': 0.55, 'break_pred': False, 'swing': False},
-    'bp_only':    {'sq_gate': 0.0,  'break_pred': True,  'swing': False},
-    'swing_only': {'sq_gate': 0.0,  'break_pred': False, 'swing': True},
-    'sq50_bp':    {'sq_gate': 0.50, 'break_pred': True,  'swing': False},
-    'sq50_swing': {'sq_gate': 0.50, 'break_pred': False, 'swing': True},
-    'all_50':     {'sq_gate': 0.50, 'break_pred': True,  'swing': True},
-    'all_55':     {'sq_gate': 0.55, 'break_pred': True,  'swing': True},
+    'baseline':      {'sq_gate': 0.0,  'break_pred': False, 'swing': False, 'momentum': None},
+    'sq50':          {'sq_gate': 0.50, 'break_pred': False, 'swing': False, 'momentum': None},
+    'sq55':          {'sq_gate': 0.55, 'break_pred': False, 'swing': False, 'momentum': None},
+    'bp_only':       {'sq_gate': 0.0,  'break_pred': True,  'swing': False, 'momentum': None},
+    'swing_only':    {'sq_gate': 0.0,  'break_pred': False, 'swing': True,  'momentum': None},
+    'sq50_bp':       {'sq_gate': 0.50, 'break_pred': True,  'swing': False, 'momentum': None},
+    'sq50_swing':    {'sq_gate': 0.50, 'break_pred': False, 'swing': True,  'momentum': None},
+    'all_50':        {'sq_gate': 0.50, 'break_pred': True,  'swing': True,  'momentum': None},
+    'all_55':        {'sq_gate': 0.55, 'break_pred': True,  'swing': True,  'momentum': None},
+    # --- MTF Momentum configs ---
+    'mtf_conflict':  {'sq_gate': 0.0,  'break_pred': False, 'swing': False, 'momentum': 'conflict'},
+    'mtf_exhaust':   {'sq_gate': 0.0,  'break_pred': False, 'swing': False, 'momentum': 'exhaust'},
+    'mtf_full':      {'sq_gate': 0.0,  'break_pred': False, 'swing': False, 'momentum': 'full'},
+    'sq50_mtf':      {'sq_gate': 0.50, 'break_pred': False, 'swing': False, 'momentum': 'full'},
 }
 
 
@@ -48,8 +53,16 @@ def build_filter_cascade(cfg: dict):
     """Build a SignalFilterCascade from a config dict."""
     from v15.core.signal_filters import SignalFilterCascade
 
-    if cfg['sq_gate'] == 0 and not cfg['break_pred'] and not cfg['swing']:
+    momentum_mode = cfg.get('momentum')  # None | 'conflict' | 'exhaust' | 'full'
+
+    if cfg['sq_gate'] == 0 and not cfg['break_pred'] and not cfg['swing'] and not momentum_mode:
         return None  # Baseline: no filters
+
+    # MTF momentum params
+    mtf_enabled = momentum_mode is not None
+    # 'conflict' → boost disabled (factor=1.0); 'exhaust' → block disabled (penalty=1.0); 'full' → both
+    mtf_boost = 1.2 if momentum_mode in ('exhaust', 'full') else 1.0
+    mtf_penalty = 0.3 if momentum_mode in ('conflict', 'full') else 1.0
 
     return SignalFilterCascade(
         sq_gate_threshold=cfg['sq_gate'],
@@ -57,6 +70,11 @@ def build_filter_cascade(cfg: dict):
         swing_regime_enabled=cfg['swing'],
         swing_boost=1.2,
         break_penalty=0.5,
+        momentum_filter_enabled=mtf_enabled,
+        momentum_boost=mtf_boost,
+        momentum_conflict_penalty=mtf_penalty,
+        momentum_context_tfs=['1h', '4h', 'daily'],
+        momentum_min_tfs=2,
     )
 
 
@@ -237,7 +255,7 @@ def main():
 
     for cfg_name, cfg in configs_to_run.items():
         print(f"\n--- Config: {cfg_name} (SQ={cfg['sq_gate']:.0%}, BP={cfg['break_pred']}, "
-              f"Swing={cfg['swing']}) ---")
+              f"Swing={cfg['swing']}, MTF={cfg.get('momentum')}) ---")
 
         # Build filter cascade
         cascade = build_filter_cascade(cfg)
