@@ -11,10 +11,10 @@ Specifically addresses the mixed-TF divergence pattern observed on the dashboard
   4h + weekly: turning up from sell-off (bullish exhaustion)
   → Question: does short-term direction favor bulls (4h/wkly) or bears (5min top)?
 
-15 signals across 4 groups:
-  Group 1 — 5min top conditions (new — never tested for short-term)
-  Group 2 — Higher TF bullish exhaustion (turning up from sell-off)
-  Group 3 — Divergence patterns: 5min top + higher TF bullish (user's exact case)
+29 signals across 4 groups:
+  Group 1 — 5min / 1h / 4h top conditions (rally exhaustion at each TF)
+  Group 2 — Bullish exhaustion across 5min / 1h / 4h / weekly (turning up from sell-off)
+  Group 3 — Divergence: TF at top + higher TF turning bullish (user's exact case)
   Group 4 — Consensus / comparison baseline
 
 Three phases:
@@ -87,6 +87,31 @@ def _count_bullish_tfs(s):
                if s.get(tf) and s[tf]['pos_pct'] > 0.5)
 
 
+def _1h_at_top(s):
+    """1h price in upper channel zone (pos > 0.80)."""
+    return bool(s.get('1h') and s['1h']['pos_pct'] > 0.80)
+
+
+def _1h_near_top(s):
+    """1h price in upper-mid zone (pos > 0.65)."""
+    return bool(s.get('1h') and s['1h']['pos_pct'] > 0.65)
+
+
+def _1h_turning_up(s):
+    """1h momentum turning up from lower half of channel (sell-off exhaustion)."""
+    return bool(s.get('1h') and s['1h']['is_turning'] and s['1h']['pos_pct'] < 0.5)
+
+
+def _4h_at_top(s):
+    """4h price in upper channel zone (pos > 0.80)."""
+    return bool(s.get('4h') and s['4h']['pos_pct'] > 0.80)
+
+
+def _4h_near_top(s):
+    """4h price in upper-mid zone (pos > 0.65)."""
+    return bool(s.get('4h') and s['4h']['pos_pct'] > 0.65)
+
+
 def _all_neutral(s):
     """All TFs in mid-channel zone (0.25-0.75) — no strong directional signal."""
     tfs_data = [tf for tf in ['5min', '1h', '4h', 'daily', 'weekly'] if s.get(tf)]
@@ -114,8 +139,31 @@ SIGNALS_SHORT = [
     ('G1_5min_top_turning',
      lambda s: _5min_near_top(s) and bool(s.get('5min') and s['5min']['is_turning'])),
 
-    # ── Group 2: Higher TF bullish exhaustion (turning up from sell-off) ─────
-    # Hypothesis: medium-term bullish following sell-off exhaustion.
+    # ── 1h top conditions ─────────────────────────────────────────────────────
+    ('G1_1h_top',
+     lambda s: _1h_at_top(s)),
+
+    ('G1_1h_top_stressed',
+     lambda s: _1h_at_top(s) and bool(s.get('1h') and s['1h']['stressed'])),
+
+    ('G1_1h_top_turning',
+     lambda s: _1h_near_top(s) and bool(s.get('1h') and s['1h']['is_turning'])),
+
+    # ── 4h top conditions ─────────────────────────────────────────────────────
+    ('G1_4h_top',
+     lambda s: _4h_at_top(s)),
+
+    ('G1_4h_top_stressed',
+     lambda s: _4h_at_top(s) and bool(s.get('4h') and s['4h']['stressed'])),
+
+    ('G1_4h_top_turning',
+     lambda s: _4h_near_top(s) and bool(s.get('4h') and s['4h']['is_turning'])),
+
+    # ── Group 2: Bullish exhaustion (turning up from sell-off) ────────────────
+    # Hypothesis: medium-term bullish following sell-off exhaustion at each TF.
+
+    ('G2_1h_turning_up',
+     lambda s: _1h_turning_up(s)),
 
     ('G2_4h_turning_up',
      lambda s: _4h_turning_up(s)),
@@ -123,12 +171,20 @@ SIGNALS_SHORT = [
     ('G2_weekly_turning_up',
      lambda s: _weekly_turning_up(s)),
 
+    # Multi-TF confirmation: more TFs turning up = stronger bullish exhaustion
+    ('G2_1h_4h_turning',
+     lambda s: _1h_turning_up(s) and _4h_turning_up(s)),
+
     ('G2_4h_weekly_turning',
      lambda s: _4h_turning_up(s) and _weekly_turning_up(s)),
 
-    # ── Group 3: Divergence (5min top + higher TF bullish — user's pattern) ──
-    # Core question: when 5min is at top but 4h/weekly are bullish, which wins?
+    ('G2_1h_4h_weekly_turning',
+     lambda s: _1h_turning_up(s) and _4h_turning_up(s) and _weekly_turning_up(s)),
 
+    # ── Group 3: Divergence — TF at top + higher TF turning bullish ───────────
+    # Core question: when a TF is at top but higher TFs are bullish, which wins?
+
+    # 5min-based divergence (original user pattern)
     ('G3_5min_top_4h_turning',
      lambda s: _5min_at_top(s) and _4h_turning_up(s)),
 
@@ -145,8 +201,29 @@ SIGNALS_SHORT = [
                 bool(s.get('5min') and s['5min']['is_turning']) and
                 _4h_turning_up(s) and _weekly_turning_up(s))),
 
+    # 1h-based divergence: 1h at top but 4h/weekly turning bullish
+    ('G3_1h_top_4h_turning',
+     lambda s: _1h_at_top(s) and _4h_turning_up(s)),
+
+    ('G3_1h_top_weekly_turning',
+     lambda s: _1h_at_top(s) and _weekly_turning_up(s)),
+
+    ('G3_1h_top_4h_wkly',
+     lambda s: _1h_at_top(s) and _4h_turning_up(s) and _weekly_turning_up(s)),
+
+    # 4h-based divergence: 4h at top but weekly turning bullish
+    # (strongest TF conflict — 4h resistance vs weekly bull turn)
+    ('G3_4h_top_weekly_turning',
+     lambda s: _4h_at_top(s) and _weekly_turning_up(s)),
+
+    # Multiple TFs both at top = dual resistance (bearish short-term bias)
+    ('G3_5min_1h_both_top',
+     lambda s: _5min_at_top(s) and _1h_at_top(s)),
+
+    ('G3_1h_4h_both_top',
+     lambda s: _1h_at_top(s) and _4h_at_top(s)),
+
     # ── Group 4: Consensus / comparison baseline ──────────────────────────────
-    # Consensus measures multiple TFs agreeing on direction (bullish = pos > 0.5).
 
     ('G4_consensus_2_bullish',
      lambda s: _count_bullish_tfs(s) >= 2),
@@ -157,9 +234,15 @@ SIGNALS_SHORT = [
     ('G4_consensus_5_bullish',
      lambda s: _count_bullish_tfs(s) >= 5),
 
-    # Control: 5min at bottom — we know this works, confirms infrastructure
+    # Controls: bottom at each TF — confirms infrastructure works
     ('G4_5min_bottom',
      lambda s: bool(s.get('5min') and s['5min']['pos_pct'] < 0.20)),
+
+    ('G4_1h_bottom',
+     lambda s: bool(s.get('1h') and s['1h']['pos_pct'] < 0.20)),
+
+    ('G4_4h_bottom',
+     lambda s: bool(s.get('4h') and s['4h']['pos_pct'] < 0.20)),
 
     # Baseline: no strong signal (all TFs mid-channel)
     ('G4_all_neutral',
@@ -531,8 +614,16 @@ def run_phase3(daily_df, state_rows, capital):
 
     # Also track specific signals across all windows
     print(f"\n  Key signal walk-forward (fixed signals, all 6 windows):")
-    key_signals = ['G3_full_user_pattern', 'G3_5min_top_4h_wkly',
-                   'G1_5min_top', 'G2_4h_weekly_turning', 'G4_5min_bottom']
+    key_signals = [
+        # User's exact patterns
+        'G3_full_user_pattern', 'G3_5min_top_4h_wkly',
+        # 1h and 4h divergence equivalents
+        'G3_1h_top_4h_wkly', 'G3_4h_top_weekly_turning',
+        # Pure top signals per TF
+        'G1_5min_top', 'G1_1h_top', 'G1_4h_top',
+        # Controls
+        'G4_5min_bottom', 'G4_1h_bottom', 'G4_4h_bottom',
+    ]
     for name, fn in SIGNALS_SHORT:
         if name not in key_signals:
             continue
@@ -634,10 +725,14 @@ def main():
             if r['n'] >= 3:
                 print_detailed_result(r)
     else:
-        # Show top 5 by E[2d] + always show the user-specific divergence signals + control
+        # Show top 5 by E[2d] + always show key divergence and control signals
         top5_names = {r['name'] for r in ranked if r['n'] >= 5}
-        always_show = {'G3_full_user_pattern', 'G3_5min_top_4h_wkly',
-                       'G4_5min_bottom', 'G4_all_neutral', 'G1_5min_top'}
+        always_show = {
+            'G3_full_user_pattern', 'G3_5min_top_4h_wkly',
+            'G3_1h_top_4h_wkly', 'G3_4h_top_weekly_turning',
+            'G1_5min_top', 'G1_1h_top', 'G1_4h_top',
+            'G4_5min_bottom', 'G4_1h_bottom', 'G4_4h_bottom', 'G4_all_neutral',
+        }
         to_show = top5_names | always_show
         print(f"\n{'='*75}")
         print("DETAILED BREAKDOWN (top 5 by E[2d] + key divergence signals)")
@@ -660,15 +755,23 @@ def main():
     print(f"\n{'='*75}")
     print("INTERPRETATION GUIDE")
     print(f"{'='*75}")
-    print("  G4_5min_bottom   → control: buy dip. E[2d] > 0 confirms infrastructure works.")
-    print("  G1_5min_top      → 5min at channel top. E[2d] < 0 = short-term mean-reversion.")
-    print("  G2_4h_weekly_turning → higher TF turning bull. Short-term bullish edge?")
-    print("  G3_5min_top_4h_wkly  → exact user pattern (5min top + 4h/wkly bullish).")
-    print("  G3_full_user_pattern → same + 5min is_turning near top.")
+    print("  Controls (confirm infrastructure):")
+    print("    G4_5min/1h/4h_bottom  → buy-dip at each TF. E[2d] > 0 = setup works.")
     print()
-    print("  Positive E[2d] for G3 signals → 4h/weekly direction dominates short-term.")
-    print("  Negative E[2d]  → 5min resistance wins, expect pullback before rally.")
-    print("  Near-zero E[2d] → mixed/no short-term edge; check E[5d] for 1-week view.")
+    print("  Top conditions (resistance / rally exhaustion):")
+    print("    G1_5min/1h/4h_top     → price at upper channel bound. E[2d] < 0 = mean-reversion.")
+    print("    Compare E[2d] across TFs: is the 5min top signal stronger/weaker than 1h/4h top?")
+    print()
+    print("  Divergence patterns (TF at top + higher TF turning bullish):")
+    print("    G3_5min_top_4h_wkly   → exact user pattern (5min top + 4h+weekly bullish).")
+    print("    G3_1h_top_4h_wkly     → 1h version: 1h at top + 4h+weekly turning up.")
+    print("    G3_4h_top_weekly_turn → strongest conflict: 4h top vs weekly turning bull.")
+    print("    G3_full_user_pattern  → tightest: 5min near-top + is_turning + 4h+weekly bull.")
+    print()
+    print("  Reading G3 results:")
+    print("    E[2d] > 0 → higher TF bull direction dominates short-term (buy the dip).")
+    print("    E[2d] < 0 → TF-top resistance wins; expect pullback before the rally.")
+    print("    E[2d] ≈ 0 → no short-term edge; E[5d]/E[10d] may show delayed resolution.")
 
     print(f"\n{'='*75}")
     print("DONE")
