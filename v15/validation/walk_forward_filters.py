@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Walk-Forward Filter Validation — compare sq50_bp vs baseline across rolling windows.
+Walk-Forward Filter Validation — compare sq50_bp + mtf_exhaust vs baseline
+across rolling windows.
 
 Methodology:
   Rolling windows: 5yr IS → 1yr OOS
@@ -11,8 +12,8 @@ Methodology:
   IS 2019-2023 → OOS 2024
   IS 2020-2024 → OOS 2025
 
-For each window runs baseline + sq50_bp (the IS winner), reports whether
-the IS advantage transfers OOS.
+For each window runs baseline + sq50_bp + mtf_exhaust, reports whether
+the IS advantages transfer OOS.
 
 Usage:
     python3 -m v15.validation.walk_forward_filters \
@@ -40,6 +41,17 @@ def build_cascade(sq_gate=0.50, break_pred=True, swing=False):
         swing_regime_enabled=swing,
         swing_boost=1.2,
         break_penalty=0.5,
+    )
+
+
+def build_mtf_exhaust():
+    from v15.core.signal_filters import SignalFilterCascade
+    return SignalFilterCascade(
+        momentum_filter_enabled=True,
+        momentum_boost=1.2,
+        momentum_conflict_penalty=1.0,  # boost only, no blocking
+        momentum_context_tfs=['1h', '4h', 'daily'],
+        momentum_min_tfs=2,
     )
 
 
@@ -81,6 +93,13 @@ def agg(results):
     }
 
 
+def _reset_cascade(cascade):
+    """Reset cascade stats in place if not None."""
+    if cascade is not None:
+        for k in cascade.stats:
+            cascade.stats[k] = 0
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--tsla', default='data/TSLAMin.txt')
@@ -93,10 +112,10 @@ def main():
     from v15.core.historical_data import prepare_backtest_data, prepare_year_data, resample_to_tf, load_minute_data
     from v15.validation.vix_loader import load_vix_daily
 
-    print(f"\n{'='*70}")
-    print("WALK-FORWARD FILTER VALIDATION — sq50_bp vs baseline")
+    print(f"\n{'='*80}")
+    print("WALK-FORWARD FILTER VALIDATION — baseline / sq50_bp / mtf_exhaust")
     print(f"Train window: {TRAIN_YEARS}yr IS → 1yr OOS  |  {START_YEAR}-{END_YEAR}")
-    print(f"{'='*70}")
+    print(f"{'='*80}")
 
     # ── Load data ─────────────────────────────────────────────────────────
     print("\nLoading data...")
@@ -143,9 +162,9 @@ def main():
             print(f"  {yr}: {len(yd['tsla_5min']):,} bars")
 
     # ── Run windows ───────────────────────────────────────────────────────
-    print(f"\n{'='*70}")
-    print("RUNNING WINDOWS")
-    print(f"{'='*70}")
+    print(f"\n{'='*80}")
+    print("RUNNING WINDOWS (3 configs: baseline / sq50_bp / mtf_exhaust)")
+    print(f"{'='*80}")
 
     window_results = []
 
@@ -153,21 +172,21 @@ def main():
         print(f"\n── Window {w_idx+1}: IS {is_yrs[0]}-{is_yrs[-1]} → OOS {oos_yr} ──")
         t_w = time.time()
 
-        # Build fresh cascade for this window
-        cascade = build_cascade()
-        daily_tsla = full_data['higher_tf_data'].get('daily')
-        weekly_tsla = full_data['higher_tf_data'].get('weekly')
+        # Build fresh cascades for this window
+        sq_cascade     = build_cascade()
+        exhaust_cascade = build_mtf_exhaust()
 
-        # IS runs
-        base_is, filt_is = [], []
+        # IS runs — all 3 configs per year
+        base_is    = []
+        filt_is    = []
+        exhaust_is = []
+
         for yr in is_yrs:
             if yr not in year_cache:
                 continue
 
-            # Baseline
-            if cascade is not None:
-                for k in cascade.stats:
-                    cascade.stats[k] = 0
+            _reset_cascade(sq_cascade)
+            _reset_cascade(exhaust_cascade)
 
             m_base = run_year(year_cache[yr], args.capital, vix_df,
                               signal_filters=None,
@@ -176,94 +195,129 @@ def main():
             if m_base:
                 base_is.append(m_base)
 
-            # Filtered
-            if cascade is not None:
-                for k in cascade.stats:
-                    cascade.stats[k] = 0
-
+            _reset_cascade(sq_cascade)
             m_filt = run_year(year_cache[yr], args.capital, vix_df,
-                              signal_filters=cascade,
+                              signal_filters=sq_cascade,
                               bounce_cap=args.bounce_cap,
                               max_trade_usd=args.max_trade_usd)
             if m_filt:
                 filt_is.append(m_filt)
 
-        is_base = agg(base_is)
-        is_filt = agg(filt_is)
+            _reset_cascade(exhaust_cascade)
+            m_exhaust = run_year(year_cache[yr], args.capital, vix_df,
+                                 signal_filters=exhaust_cascade,
+                                 bounce_cap=args.bounce_cap,
+                                 max_trade_usd=args.max_trade_usd)
+            if m_exhaust:
+                exhaust_is.append(m_exhaust)
 
-        # OOS runs
-        if cascade is not None:
-            for k in cascade.stats:
-                cascade.stats[k] = 0
+        is_base    = agg(base_is)
+        is_filt    = agg(filt_is)
+        is_exhaust = agg(exhaust_is)
 
+        # OOS runs — fresh cascades for each config
         m_oos_base = run_year(year_cache.get(oos_yr), args.capital, vix_df,
                               signal_filters=None,
                               bounce_cap=args.bounce_cap,
                               max_trade_usd=args.max_trade_usd)
 
-        fresh_cascade = build_cascade()
+        fresh_sq = build_cascade()
         m_oos_filt = run_year(year_cache.get(oos_yr), args.capital, vix_df,
-                              signal_filters=fresh_cascade,
+                              signal_filters=fresh_sq,
                               bounce_cap=args.bounce_cap,
                               max_trade_usd=args.max_trade_usd)
 
-        oos_base = m_oos_base
-        oos_filt = m_oos_filt
+        fresh_exhaust = build_mtf_exhaust()
+        m_oos_exhaust = run_year(year_cache.get(oos_yr), args.capital, vix_df,
+                                 signal_filters=fresh_exhaust,
+                                 bounce_cap=args.bounce_cap,
+                                 max_trade_usd=args.max_trade_usd)
 
         # Print window summary
-        print(f"  IS  baseline : ${is_base['pnl']:>12,.0f}  WR={is_base['wr']:.1%}  Sharpe={is_base['sharpe']:.2f}  trades={is_base['trades']:,}")
-        print(f"  IS  sq50_bp  : ${is_filt['pnl']:>12,.0f}  WR={is_filt['wr']:.1%}  Sharpe={is_filt['sharpe']:.2f}  trades={is_filt['trades']:,}  delta=${is_filt['pnl']-is_base['pnl']:+,.0f}")
-        if oos_base and oos_filt:
-            delta_oos = oos_filt.total_pnl - oos_base.total_pnl
-            wins = 'WIN ' if delta_oos >= 0 else 'LOSS'
-            print(f"  OOS baseline : ${oos_base.total_pnl:>12,.0f}  WR={oos_base.win_rate:.1%}  trades={oos_base.total_trades:,}")
-            print(f"  OOS sq50_bp  : ${oos_filt.total_pnl:>12,.0f}  WR={oos_filt.win_rate:.1%}  trades={oos_filt.total_trades:,}  delta=${delta_oos:+,.0f}  [{wins}]")
+        print(f"  IS  baseline   : ${is_base['pnl']:>12,.0f}  WR={is_base['wr']:.1%}  "
+              f"Sharpe={is_base['sharpe']:.2f}  trades={is_base['trades']:,}")
+        print(f"  IS  sq50_bp    : ${is_filt['pnl']:>12,.0f}  WR={is_filt['wr']:.1%}  "
+              f"Sharpe={is_filt['sharpe']:.2f}  trades={is_filt['trades']:,}  "
+              f"delta=${is_filt['pnl']-is_base['pnl']:+,.0f}")
+        print(f"  IS  mtf_exhaust: ${is_exhaust['pnl']:>12,.0f}  WR={is_exhaust['wr']:.1%}  "
+              f"Sharpe={is_exhaust['sharpe']:.2f}  trades={is_exhaust['trades']:,}  "
+              f"delta=${is_exhaust['pnl']-is_base['pnl']:+,.0f}")
 
-            # IS→OOS transfer ratio
-            is_delta  = is_filt['pnl'] - is_base['pnl']
-            ratio = delta_oos / is_delta if abs(is_delta) > 1 else float('nan')
-            print(f"  IS→OOS transfer: {ratio:.2f}x  (1.0 = perfect, 0 = no transfer, <0 = reversal)")
+        if m_oos_base and m_oos_filt and m_oos_exhaust:
+            delta_sq      = m_oos_filt.total_pnl    - m_oos_base.total_pnl
+            delta_exhaust = m_oos_exhaust.total_pnl - m_oos_base.total_pnl
+            is_delta_sq   = is_filt['pnl']    - is_base['pnl']
+            is_delta_ex   = is_exhaust['pnl'] - is_base['pnl']
+            ratio_sq      = delta_sq      / is_delta_sq  if abs(is_delta_sq) > 1 else float('nan')
+            ratio_exhaust = delta_exhaust / is_delta_ex  if abs(is_delta_ex) > 1 else float('nan')
+            win_sq      = 'WIN ' if delta_sq      >= 0 else 'LOSS'
+            win_exhaust = 'WIN ' if delta_exhaust >= 0 else 'LOSS'
+
+            print(f"  OOS baseline   : ${m_oos_base.total_pnl:>12,.0f}  "
+                  f"WR={m_oos_base.win_rate:.1%}  trades={m_oos_base.total_trades:,}")
+            print(f"  OOS sq50_bp    : ${m_oos_filt.total_pnl:>12,.0f}  "
+                  f"WR={m_oos_filt.win_rate:.1%}  trades={m_oos_filt.total_trades:,}  "
+                  f"delta=${delta_sq:+,.0f}  [{win_sq}]  transfer={ratio_sq:.2f}x")
+            print(f"  OOS mtf_exhaust: ${m_oos_exhaust.total_pnl:>12,.0f}  "
+                  f"WR={m_oos_exhaust.win_rate:.1%}  trades={m_oos_exhaust.total_trades:,}  "
+                  f"delta=${delta_exhaust:+,.0f}  [{win_exhaust}]  transfer={ratio_exhaust:.2f}x")
         else:
             print(f"  OOS: insufficient data for {oos_yr}")
 
         print(f"  Window elapsed: {time.time()-t_w:.0f}s")
 
         window_results.append({
-            'is_yrs': is_yrs, 'oos_yr': oos_yr,
-            'is_base': is_base, 'is_filt': is_filt,
-            'oos_base': oos_base, 'oos_filt': oos_filt,
+            'is_yrs':    is_yrs,
+            'oos_yr':    oos_yr,
+            'is_base':   is_base,
+            'is_filt':   is_filt,
+            'is_exhaust': is_exhaust,
+            'oos_base':   m_oos_base,
+            'oos_filt':   m_oos_filt,
+            'oos_exhaust': m_oos_exhaust,
         })
 
     # ── Summary ───────────────────────────────────────────────────────────
-    print(f"\n{'='*70}")
+    print(f"\n{'='*90}")
     print("WALK-FORWARD SUMMARY")
-    print(f"{'='*70}")
-    print(f"{'Window':<22} {'IS delta':>12} {'OOS delta':>12} {'Transfer':>10} {'Result'}")
-    print('-' * 65)
+    print(f"{'='*90}")
+    hdr = (f"{'Window':<22} {'IS sq_delta':>12} {'IS ex_delta':>12} "
+           f"{'OOS sq_delta':>13} {'OOS ex_delta':>13} {'sq Win':>7} {'ex Win':>7}")
+    print(hdr)
+    print('-' * 90)
 
-    oos_wins = 0
-    total_oos_delta = 0
+    sq_wins     = 0
+    ex_wins     = 0
+    total_sq    = 0
+    total_ex    = 0
+
     for r in window_results:
-        is_delta = r['is_filt']['pnl'] - r['is_base']['pnl']
-        if r['oos_base'] and r['oos_filt']:
-            oos_delta = r['oos_filt'].total_pnl - r['oos_base'].total_pnl
-            ratio = oos_delta / is_delta if abs(is_delta) > 1 else float('nan')
-            result = 'WIN ' if oos_delta >= 0 else 'LOSS'
-            if oos_delta >= 0:
-                oos_wins += 1
-            total_oos_delta += oos_delta
-            label = f"IS {r['is_yrs'][0]}-{r['is_yrs'][-1]} OOS {r['oos_yr']}"
-            print(f"  {label:<20} {is_delta:>+12,.0f} {oos_delta:>+12,.0f} {ratio:>10.2f}x  [{result}]")
-        else:
-            label = f"IS {r['is_yrs'][0]}-{r['is_yrs'][-1]} OOS {r['oos_yr']}"
-            print(f"  {label:<20} {is_delta:>+12,.0f} {'N/A':>12} {'N/A':>10}  [SKIP]")
+        is_delta_sq = r['is_filt']['pnl']    - r['is_base']['pnl']   if r['is_filt'] and r['is_base'] else 0
+        is_delta_ex = r['is_exhaust']['pnl'] - r['is_base']['pnl']   if r['is_exhaust'] and r['is_base'] else 0
+        label = f"IS {r['is_yrs'][0]}-{r['is_yrs'][-1]} OOS {r['oos_yr']}"
 
-    valid = [r for r in window_results if r['oos_base'] and r['oos_filt']]
-    print('-' * 65)
-    print(f"  OOS wins: {oos_wins}/{len(valid)}  Total OOS delta: ${total_oos_delta:+,.0f}")
-    print(f"\n{'='*70}")
+        if r['oos_base'] and r['oos_filt'] and r['oos_exhaust']:
+            oos_sq = r['oos_filt'].total_pnl    - r['oos_base'].total_pnl
+            oos_ex = r['oos_exhaust'].total_pnl - r['oos_base'].total_pnl
+            res_sq = 'WIN ' if oos_sq >= 0 else 'LOSS'
+            res_ex = 'WIN ' if oos_ex >= 0 else 'LOSS'
+            if oos_sq >= 0: sq_wins += 1
+            if oos_ex >= 0: ex_wins += 1
+            total_sq += oos_sq
+            total_ex += oos_ex
+            print(f"  {label:<20} {is_delta_sq:>+12,.0f} {is_delta_ex:>+12,.0f} "
+                  f"{oos_sq:>+13,.0f} {oos_ex:>+13,.0f}  [{res_sq}]  [{res_ex}]")
+        else:
+            print(f"  {label:<20} {is_delta_sq:>+12,.0f} {is_delta_ex:>+12,.0f} "
+                  f"{'N/A':>13} {'N/A':>13}  [SKIP]  [SKIP]")
+
+    valid = [r for r in window_results if r['oos_base'] and r['oos_filt'] and r['oos_exhaust']]
+    print('-' * 90)
+    print(f"  sq50_bp    OOS wins: {sq_wins}/{len(valid)}  Total OOS delta: ${total_sq:+,.0f}")
+    print(f"  mtf_exhaust OOS wins: {ex_wins}/{len(valid)}  Total OOS delta: ${total_ex:+,.0f}")
+    print(f"\n{'='*90}")
     print("WALK-FORWARD COMPLETE")
-    print(f"{'='*70}")
+    print(f"{'='*90}")
 
 
 if __name__ == '__main__':
