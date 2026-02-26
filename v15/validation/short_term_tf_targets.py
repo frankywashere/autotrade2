@@ -9,18 +9,18 @@ Specifically addresses the mixed-TF divergence pattern observed on the dashboard
   5min: AT channel top (rally exhaustion, pos_pct > 0.80)
   1h:   momentum turning (rally exhaustion)
   4h + weekly: turning up from sell-off (bullish exhaustion)
-  → Question: does short-term direction favor bulls (4h/wkly) or bears (5min top)?
+  -> Question: does short-term direction favor bulls (4h/wkly) or bears (5min top)?
 
 29 signals across 4 groups:
-  Group 1 — 5min / 1h / 4h top conditions (rally exhaustion at each TF)
-  Group 2 — Bullish exhaustion across 5min / 1h / 4h / weekly (turning up from sell-off)
-  Group 3 — Divergence: TF at top + higher TF turning bullish (user's exact case)
-  Group 4 — Consensus / comparison baseline
+  Group 1 -- 5min / 1h / 4h top conditions (rally exhaustion at each TF)
+  Group 2 -- Bullish exhaustion across 5min / 1h / 4h / weekly (turning up from sell-off)
+  Group 3 -- Divergence: TF at top + higher TF turning bullish (user's exact case)
+  Group 4 -- Consensus / comparison baseline
 
 Three phases:
-  Phase 1 — Forward return analysis (IS 2015-2024, all firings independent)
-  Phase 2 — IS/OOS backtest for all signals  (hold=2d, stop=5%)
-  Phase 3 — Walk-forward: IS=5yr, OOS=1yr, 6 windows
+  Phase 1 -- Forward return analysis (IS 2015-2024, all firings independent)
+  Phase 2 -- IS/OOS backtest for all signals  (hold=2d, stop=5%)
+  Phase 3 -- Walk-forward: IS=5yr, OOS=1yr, 6 windows
 
 Usage:
     python3 -m v15.validation.short_term_tf_targets
@@ -49,7 +49,7 @@ from v15.validation.tf_state_backtest import (
 )
 
 # ── Short-term specific parameters ───────────────────────────────────────────
-SHORT_HOLD_DURATIONS = [1, 2, 5, 10, 20]   # days — short-term focus
+SHORT_HOLD_DURATIONS = [1, 2, 5, 10, 20]   # days -- short-term focus
 MAX_FORWARD_DAYS = 20                        # only track 20 days forward
 PROFIT_TARGETS = [0.03, 0.05, 0.07, 0.10, 0.15, 0.20]
 STOP_TARGETS   = [0.03, 0.05, 0.07, 0.10, 0.15, 0.20]
@@ -67,7 +67,7 @@ def _5min_at_top(s):
 
 
 def _5min_near_top(s):
-    """5min price in upper-mid zone (pos > 0.65) — broader top filter."""
+    """5min price in upper-mid zone (pos > 0.65) -- broader top filter."""
     return bool(s.get('5min') and s['5min']['pos_pct'] > 0.65)
 
 
@@ -113,7 +113,7 @@ def _4h_near_top(s):
 
 
 def _all_neutral(s):
-    """All TFs in mid-channel zone (0.25-0.75) — no strong directional signal."""
+    """All TFs in mid-channel zone (0.25-0.75) -- no strong directional signal."""
     tfs_data = [tf for tf in ['5min', '1h', '4h', 'daily', 'weekly'] if s.get(tf)]
     if not tfs_data:
         return False
@@ -123,8 +123,8 @@ def _all_neutral(s):
 # ── 15 signal definitions ────────────────────────────────────────────────────
 
 SIGNALS_SHORT = [
-    # ── Group 1: 5min top conditions (new — never tested short-term) ─────────
-    # These are "resistance" signals — price at upper channel boundary.
+    # ── Group 1: 5min top conditions (new -- never tested short-term) ─────────
+    # These are "resistance" signals -- price at upper channel boundary.
     # Hypothesis: short-term mean-reversion down (sell-off from top).
 
     ('G1_5min_top',
@@ -181,7 +181,7 @@ SIGNALS_SHORT = [
     ('G2_1h_4h_weekly_turning',
      lambda s: _1h_turning_up(s) and _4h_turning_up(s) and _weekly_turning_up(s)),
 
-    # ── Group 3: Divergence — TF at top + higher TF turning bullish ───────────
+    # ── Group 3: Divergence -- TF at top + higher TF turning bullish ───────────
     # Core question: when a TF is at top but higher TFs are bullish, which wins?
 
     # 5min-based divergence (original user pattern)
@@ -212,7 +212,7 @@ SIGNALS_SHORT = [
      lambda s: _1h_at_top(s) and _4h_turning_up(s) and _weekly_turning_up(s)),
 
     # 4h-based divergence: 4h at top but weekly turning bullish
-    # (strongest TF conflict — 4h resistance vs weekly bull turn)
+    # (strongest TF conflict -- 4h resistance vs weekly bull turn)
     ('G3_4h_top_weekly_turning',
      lambda s: _4h_at_top(s) and _weekly_turning_up(s)),
 
@@ -234,7 +234,7 @@ SIGNALS_SHORT = [
     ('G4_consensus_5_bullish',
      lambda s: _count_bullish_tfs(s) >= 5),
 
-    # Controls: bottom at each TF — confirms infrastructure works
+    # Controls: bottom at each TF -- confirms infrastructure works
     ('G4_5min_bottom',
      lambda s: bool(s.get('5min') and s['5min']['pos_pct'] < 0.20)),
 
@@ -278,7 +278,7 @@ def short_forward_analysis(
     closes = daily_df['close'].values.astype(float)
     date_to_idx = {d: i for i, d in enumerate(dates)}
 
-    # Find all signal firing dates (independent — no re-entry exclusion)
+    # Find all signal firing dates (independent -- no re-entry exclusion)
     firings = []
     for row in state_rows:
         date = row['date']
@@ -302,7 +302,7 @@ def short_forward_analysis(
     profit_rates = {t: 0  for t in PROFIT_TARGETS}
     stop_rates   = {t: 0  for t in STOP_TARGETS}
 
-    # Race pairs — short-term relevant levels
+    # Race pairs -- short-term relevant levels
     race_pairs = [(0.03, 0.03), (0.05, 0.05), (0.05, 0.03), (0.10, 0.05)]
     race_results = {p: {'profit_first': 0, 'stop_first': 0, 'neither': 0}
                     for p in race_pairs}
@@ -385,7 +385,7 @@ def short_forward_analysis(
 def print_phase1_summary(results):
     """Compact summary table for Phase 1, sorted by E[2d]."""
     print(f"\n{'='*120}")
-    print("PHASE 1 SUMMARY — SHORT-TERM FORWARD RETURNS (IS 2015-2024, all firings independent)")
+    print("PHASE 1 SUMMARY -- SHORT-TERM FORWARD RETURNS (IS 2015-2024, all firings independent)")
     print(f"{'='*120}")
     hdr = (f"{'Signal':<36} {'n':>5}  "
            f"{'hit+3%':>7} {'hit+5%':>7} {'hit+10%':>8}  "
@@ -463,7 +463,7 @@ def print_detailed_result(r):
         bar   = '#' * int(rate * 20) + '.' * (20 - int(rate * 20))
         print(f"    -{tgt:>5.0%}     {rate:>6.0%}  {avg_d:>8}  {med_d:>8}  {len(days):>5}   {bar}")
 
-    print(f"\n    RACE — which target hits first?")
+    print(f"\n    RACE -- which target hits first?")
     for (pt, st), rc in r['race_results'].items():
         pf = rc['profit_first'] / n
         sf = rc['stop_first']   / n
@@ -492,7 +492,7 @@ def run_phase2(daily_df, state_rows, capital):
     hold=2d, stop=5% (tighter for short-term).
     """
     print(f"\n{'='*100}")
-    print(f"PHASE 2 — IS/OOS BACKTEST  hold={PHASE2_HOLD}d  stop={PHASE2_STOP:.0%}  capital=${capital:,.0f}")
+    print(f"PHASE 2 -- IS/OOS BACKTEST  hold={PHASE2_HOLD}d  stop={PHASE2_STOP:.0%}  capital=${capital:,.0f}")
     print(f"{'='*100}")
     hdr = (f"{'Signal':<36}  "
            f"{'--- IS 2015-2024 ---':>34}  "
@@ -557,7 +557,7 @@ def run_phase3(daily_df, state_rows, capital):
     ]
 
     print(f"\n{'='*105}")
-    print(f"PHASE 3 — WALK-FORWARD  (IS=5yr, OOS=1yr)  hold={PHASE2_HOLD}d  stop={PHASE2_STOP:.0%}")
+    print(f"PHASE 3 -- WALK-FORWARD  (IS=5yr, OOS=1yr)  hold={PHASE2_HOLD}d  stop={PHASE2_STOP:.0%}")
     print(f"{'='*105}")
     hdr = (f"{'IS window':>12}  {'OOS':>5}  {'Best IS signal':<36}  "
            f"{'IS P&L':>10}  {'OOS n':>6}  {'OOS P&L':>10}  {'OOS/IS':>7}")
@@ -686,10 +686,10 @@ def main():
 
     # ── Phase 1: Forward return analysis (IS 2015-2024) ──────────────────────
     print(f"\n{'='*75}")
-    print("PHASE 1 — FORWARD RETURN ANALYSIS (IS 2015-2024)")
+    print("PHASE 1 -- FORWARD RETURN ANALYSIS (IS 2015-2024)")
     print(f"{'='*75}")
     print(f"Running {len(SIGNALS_SHORT)} signals, tracking {MAX_FORWARD_DAYS} days forward...")
-    print(f"(All firings independent — no re-entry exclusion)\n")
+    print(f"(All firings independent -- no re-entry exclusion)\n")
 
     t0 = time.time()
     phase1_results = []
@@ -756,22 +756,22 @@ def main():
     print("INTERPRETATION GUIDE")
     print(f"{'='*75}")
     print("  Controls (confirm infrastructure):")
-    print("    G4_5min/1h/4h_bottom  → buy-dip at each TF. E[2d] > 0 = setup works.")
+    print("    G4_5min/1h/4h_bottom  -> buy-dip at each TF. E[2d] > 0 = setup works.")
     print()
     print("  Top conditions (resistance / rally exhaustion):")
-    print("    G1_5min/1h/4h_top     → price at upper channel bound. E[2d] < 0 = mean-reversion.")
+    print("    G1_5min/1h/4h_top     -> price at upper channel bound. E[2d] < 0 = mean-reversion.")
     print("    Compare E[2d] across TFs: is the 5min top signal stronger/weaker than 1h/4h top?")
     print()
     print("  Divergence patterns (TF at top + higher TF turning bullish):")
-    print("    G3_5min_top_4h_wkly   → exact user pattern (5min top + 4h+weekly bullish).")
-    print("    G3_1h_top_4h_wkly     → 1h version: 1h at top + 4h+weekly turning up.")
-    print("    G3_4h_top_weekly_turn → strongest conflict: 4h top vs weekly turning bull.")
-    print("    G3_full_user_pattern  → tightest: 5min near-top + is_turning + 4h+weekly bull.")
+    print("    G3_5min_top_4h_wkly   -> exact user pattern (5min top + 4h+weekly bullish).")
+    print("    G3_1h_top_4h_wkly     -> 1h version: 1h at top + 4h+weekly turning up.")
+    print("    G3_4h_top_weekly_turn -> strongest conflict: 4h top vs weekly turning bull.")
+    print("    G3_full_user_pattern  -> tightest: 5min near-top + is_turning + 4h+weekly bull.")
     print()
     print("  Reading G3 results:")
-    print("    E[2d] > 0 → higher TF bull direction dominates short-term (buy the dip).")
-    print("    E[2d] < 0 → TF-top resistance wins; expect pullback before the rally.")
-    print("    E[2d] ≈ 0 → no short-term edge; E[5d]/E[10d] may show delayed resolution.")
+    print("    E[2d] > 0 -> higher TF bull direction dominates short-term (buy the dip).")
+    print("    E[2d] < 0 -> TF-top resistance wins; expect pullback before the rally.")
+    print("    E[2d] ~ 0 -> no short-term edge; E[5d]/E[10d] may show delayed resolution.")
 
     print(f"\n{'='*75}")
     print("DONE")
