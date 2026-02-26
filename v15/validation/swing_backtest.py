@@ -19198,16 +19198,22 @@ def _s1041_core(i, tsla, spy, vix, tw, sw, rt, rs, w):
     # Warmup
     if i < 252 + 20:
         return False
-    # Weekly channel: at/near lower 25% of 20/30/40/50-week channel
+    if tw is None or len(tw) < 20:
+        return False
+    # Weekly channel: find the weekly bar corresponding to daily bar i
+    daily_date = tsla.index[i]
+    wk_idx = tw.index.searchsorted(daily_date, side='right') - 1
+    if wk_idx < 20:
+        return False
+    close_w = float(tw['close'].iloc[wk_idx])
+    # at/near lower 25% of 20/30/40/50-week channel
     in_weekly_channel = False
     for win in (20, 30, 40, 50):
-        if len(tw) <= win:
-            continue
-        tw_slice = tw.iloc[len(tw) - win:]
-        ch = _channel_at(tw_slice)
-        if ch and _near_lower(float(tw['close'].iloc[-1]), ch, 0.25):
-            in_weekly_channel = True
-            break
+        if wk_idx >= win:
+            ch = _channel_at(tw.iloc[wk_idx - win:wk_idx])
+            if ch and _near_lower(close_w, ch, 0.25):
+                in_weekly_channel = True
+                break
     if not in_weekly_channel:
         return False
     # ATR compressed
