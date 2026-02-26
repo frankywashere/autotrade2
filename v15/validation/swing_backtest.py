@@ -19121,10 +19121,12 @@ def sig_s1194_rsi40_vix_cd_macd(i, tsla, spy, vix, tw, sw, rt, rs, w):
 
 
 SIGNALS_P11Q: List[Tuple] = [
-    ('S1191_rsi40_vix_cd',       sig_s1191_rsi40_vix_cd,       10, 0.20, 50),  # RSI<40 + VIX_CD, no channel
-    ('S1192_rsi35_vix_cd',       sig_s1192_rsi35_vix_cd,       10, 0.20, 50),  # RSI<35 + VIX_CD, tighter
-    ('S1193_rsi40_vix_cd_atr',   sig_s1193_rsi40_vix_cd_atr,   10, 0.20, 50),  # + ATR compressed
-    ('S1194_rsi40_vix_cd_macd',  sig_s1194_rsi40_vix_cd_macd,  10, 0.20, 50),  # + MACD turning
+    ('S1191_rsi40_vix_cd',        sig_s1191_rsi40_vix_cd,       10, 0.20, 50),  # RSI<40 + VIX_CD, no channel
+    ('S1192_rsi35_vix_cd',        sig_s1192_rsi35_vix_cd,       10, 0.20, 50),  # RSI<35 + VIX_CD, tighter
+    ('S1192_rsi35_vix_cd_h20',    sig_s1192_rsi35_vix_cd,       20, 0.20, 50),  # same, hold=20d
+    ('S1192_rsi35_vix_cd_h30',    sig_s1192_rsi35_vix_cd,       30, 0.20, 50),  # same, hold=30d
+    ('S1193_rsi40_vix_cd_atr',    sig_s1193_rsi40_vix_cd_atr,   10, 0.20, 50),  # + ATR compressed
+    ('S1194_rsi40_vix_cd_macd',   sig_s1194_rsi40_vix_cd_macd,  10, 0.20, 50),  # + MACD turning
 ]
 
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
