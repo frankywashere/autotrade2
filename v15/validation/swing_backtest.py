@@ -19150,7 +19150,205 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10Z + SIGNALS_P11A + SIGNALS_P11B + SIGNALS_P11C + SIGNALS_P11D + SIGNALS_P11E
            + SIGNALS_P11F + SIGNALS_P11G + SIGNALS_P11H + SIGNALS_P11I + SIGNALS_P11J + SIGNALS_P11K
            + SIGNALS_P11L + SIGNALS_P11M + SIGNALS_P11N + SIGNALS_P11O + SIGNALS_P11P
-           + SIGNALS_P11Q)
+           + SIGNALS_P11Q
+           + SIGNALS_P11R)
+
+
+# ── Phase 11R — RSI smooth / divergence / upward hook on S1041 ────────────────
+# Question: does the app's smoothed RSI (3-period MA of RSI-14) or classic
+# bullish RSI divergence improve S1041 entries beyond raw RSI < 40?
+#
+# Signals:
+#   S1195 — S1041 + RSI upward hook from below 40 (RSI[i] > RSI[i-2], RSI[i-2] < 40)
+#   S1196 — S1041 + RSI_smooth < 40 (3-period MA of RSI, same threshold)
+#   S1197 — S1041 + RSI bullish divergence (price lower low, RSI higher low, 10d window)
+#   S1198 — S1041 + RSI_smooth divergence (same but on smoothed RSI)
+#   S1199 — S1041 + RSI hook OR divergence (either condition)
+#   S1200 — S1041 + RSI_smooth just bottomed (smooth[i] > smooth[i-1], smooth[i-1] <= smooth[i-2])
+#
+# Hypotheses:
+#   - Hook/divergence = RSI "leading" signal fires before or at same time as price reversal
+#   - Smooth reduces noise → may filter out false oversold readings
+#   - If S1196 >> S1041: smoothed threshold is cleaner gate than raw RSI
+#   - If S1197/S1198 >> S1041: divergence captures better entries than level alone
+
+
+def _rsi_smooth(rt, i, period=3):
+    """3-period simple MA of RSI at index i."""
+    if i < period - 1:
+        return float('nan')
+    return float(rt.iloc[i - period + 1:i + 1].mean())
+
+
+def _rsi_bullish_div(closes, rt, i, lookback=10, min_rsi_edge=1.5):
+    """Bullish RSI divergence: price at/near its N-day low, RSI above its N-day low.
+    Requires: current RSI > RSI-at-price-low + min_rsi_edge (avoid noise).
+    Returns True if divergence detected."""
+    if i < lookback:
+        return False
+    price_window = closes.iloc[i - lookback:i + 1]
+    rsi_window   = rt.iloc[i - lookback:i + 1]
+    price_low_idx = price_window.idxmin()
+    rsi_at_price_low = rsi_window.loc[price_low_idx]
+    curr_price = closes.iloc[i]
+    curr_rsi   = float(rt.iloc[i])
+    price_low  = float(price_window.min())
+    # Price at or within 2% above its N-day low
+    if curr_price > price_low * 1.02:
+        return False
+    # RSI meaningfully above its value at the price low
+    return curr_rsi > float(rsi_at_price_low) + min_rsi_edge
+
+
+def _rsi_smooth_div(closes, rt, i, lookback=10, min_rsi_edge=1.5, smooth_period=3):
+    """Same as _rsi_bullish_div but uses smoothed RSI instead of raw."""
+    if i < lookback + smooth_period:
+        return False
+    price_window = closes.iloc[i - lookback:i + 1]
+    price_low_idx_pos = price_window.values.argmin()  # position within window
+    abs_low_idx = i - lookback + price_low_idx_pos
+    smooth_at_low = _rsi_smooth(rt, abs_low_idx, smooth_period)
+    curr_smooth   = _rsi_smooth(rt, i, smooth_period)
+    curr_price    = float(closes.iloc[i])
+    price_low     = float(price_window.min())
+    if curr_price > price_low * 1.02:
+        return False
+    if any(v != v for v in [smooth_at_low, curr_smooth]):  # nan check
+        return False
+    return curr_smooth > smooth_at_low + min_rsi_edge
+
+
+def _s1041_core(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1041 core conditions minus the RSI < 40 gate. Used by 11R variants."""
+    # Warmup
+    if i < 252 + 20:
+        return False
+    # Weekly channel: at/near lower 25% of 20/30/40/50-week channel
+    in_weekly_channel = False
+    for win in (20, 30, 40, 50):
+        if len(tw) <= win:
+            continue
+        tw_slice = tw.iloc[len(tw) - win:]
+        ch = _channel_at(tw_slice)
+        if ch and _near_lower(float(tw['close'].iloc[-1]), ch, 0.25):
+            in_weekly_channel = True
+            break
+    if not in_weekly_channel:
+        return False
+    # ATR compressed
+    c = _atr_components(tsla, i)
+    if c is None:
+        return False
+    _, atr_5, _, atr_20 = c
+    if not (atr_5 < 0.75 * atr_20):
+        return False
+    # VIX in fear regime (15-50)
+    vix_now = float(vix['close'].iloc[i])
+    if not (15.0 <= vix_now <= 50.0):
+        return False
+    # At least one of: 3d-selloff, MACD<0, RSI<40, SPY-TSLA div, lag5pct
+    closes = tsla['close']
+    lag5   = (float(closes.iloc[i]) - float(closes.iloc[i - 5])) / float(closes.iloc[i - 5])
+    pct3   = (float(closes.iloc[i]) - float(closes.iloc[i - 3])) / float(closes.iloc[i - 3])
+    rsi_now = float(rt.iloc[i])
+    macd_ok = sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) == 1 if i >= 26 else False
+    # SPY-TSLA divergence (simplified: SPY >+3% last 20d, TSLA flat/<0)
+    spy_20 = (float(spy['close'].iloc[i]) - float(spy['close'].iloc[i - 20])) / float(spy['close'].iloc[i - 20])
+    tsla_20 = (float(closes.iloc[i]) - float(closes.iloc[i - 20])) / float(closes.iloc[i - 20])
+    spy_div = spy_20 > 0.03 and tsla_20 < spy_20 - 0.04
+    arm_ok = (lag5 <= -0.03 or pct3 <= -0.02 or rsi_now < 40 or macd_ok or spy_div)
+    return arm_ok
+
+
+def sig_s1195_rsi_hook(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1195: S1041 core + RSI upward hook from oversold.
+    Hook = RSI[i] > RSI[i-2] AND RSI[i-2] < 40 (RSI turning up from below 40).
+    Tests: does a rising-RSI-from-oversold filter sharpen S1041 entries?"""
+    if i < 252 + 20:
+        return 0
+    rsi_now  = float(rt.iloc[i])
+    rsi_2ago = float(rt.iloc[i - 2])
+    hook = (rsi_now > rsi_2ago) and (rsi_2ago < 40.0)
+    if not hook:
+        return 0
+    return 1 if _s1041_core(i, tsla, spy, vix, tw, sw, rt, rs, w) else 0
+
+
+def sig_s1196_rsi_smooth(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1196: S1041 core + smoothed RSI < 40 (3-period MA of RSI-14).
+    Replaces raw RSI < 40 with the smoothed version. Tests whether
+    the smoothed RSI is a cleaner/tighter oversold gate than raw RSI."""
+    if i < 252 + 20:
+        return 0
+    smooth = _rsi_smooth(rt, i, 3)
+    if smooth != smooth or smooth >= 40.0:  # nan or not oversold
+        return 0
+    return 1 if _s1041_core(i, tsla, spy, vix, tw, sw, rt, rs, w) else 0
+
+
+def sig_s1197_rsi_div(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1197: S1041 core + classic bullish RSI divergence (10-day window).
+    Price at/near 10d low, raw RSI above its level at that price low (+1.5 pts).
+    Tests whether divergence is additive to or better than RSI < 40 level."""
+    if i < 252 + 20:
+        return 0
+    if not _rsi_bullish_div(tsla['close'], rt, i, lookback=10):
+        return 0
+    return 1 if _s1041_core(i, tsla, spy, vix, tw, sw, rt, rs, w) else 0
+
+
+def sig_s1198_rsi_smooth_div(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1198: S1041 core + smoothed RSI bullish divergence.
+    Same as S1197 but divergence measured on 3-period-smoothed RSI.
+    Tests whether smoothed divergence reduces noise vs raw divergence."""
+    if i < 252 + 20:
+        return 0
+    if not _rsi_smooth_div(tsla['close'], rt, i, lookback=10):
+        return 0
+    return 1 if _s1041_core(i, tsla, spy, vix, tw, sw, rt, rs, w) else 0
+
+
+def sig_s1199_rsi_hook_or_div(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1199: S1041 core + (hook OR divergence).
+    Fires if either RSI upward hook OR raw divergence is present.
+    Broader than S1195/S1197 alone — tests combined vs individual."""
+    if i < 252 + 20:
+        return 0
+    rsi_now  = float(rt.iloc[i])
+    rsi_2ago = float(rt.iloc[i - 2])
+    hook = (rsi_now > rsi_2ago) and (rsi_2ago < 40.0)
+    div  = _rsi_bullish_div(tsla['close'], rt, i, lookback=10)
+    if not (hook or div):
+        return 0
+    return 1 if _s1041_core(i, tsla, spy, vix, tw, sw, rt, rs, w) else 0
+
+
+def sig_s1200_rsi_smooth_bottomed(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1200: S1041 core + smoothed RSI just bottomed.
+    Smooth[i] > Smooth[i-1] AND Smooth[i-1] <= Smooth[i-2] (V-turn in smooth).
+    The leading edge signal: smooth RSI inflects before price does."""
+    if i < 252 + 20:
+        return 0
+    s0 = _rsi_smooth(rt, i,     3)
+    s1 = _rsi_smooth(rt, i - 1, 3)
+    s2 = _rsi_smooth(rt, i - 2, 3)
+    if any(v != v for v in [s0, s1, s2]):  # nan check
+        return 0
+    bottomed = (s0 > s1) and (s1 <= s2)
+    if not bottomed:
+        return 0
+    return 1 if _s1041_core(i, tsla, spy, vix, tw, sw, rt, rs, w) else 0
+
+
+SIGNALS_P11R: List[Tuple] = [
+    ('S1195_rsi_hook',          sig_s1195_rsi_hook,         10, 0.20, 50),  # RSI upward hook from <40
+    ('S1196_rsi_smooth',        sig_s1196_rsi_smooth,        10, 0.20, 50),  # smoothed RSI < 40
+    ('S1197_rsi_div',           sig_s1197_rsi_div,           10, 0.20, 50),  # classic RSI divergence
+    ('S1198_rsi_smooth_div',    sig_s1198_rsi_smooth_div,    10, 0.20, 50),  # smoothed RSI divergence
+    ('S1199_rsi_hook_or_div',   sig_s1199_rsi_hook_or_div,   10, 0.20, 50),  # hook OR divergence
+    ('S1200_rsi_smooth_bot',    sig_s1200_rsi_smooth_bottomed, 10, 0.20, 50), # smooth RSI V-turn
+    # Hold variants for the best performer(s) — add after seeing results
+]
 
 # ── sentinel — do not remove ──────────────────────────────────────────────────
 
