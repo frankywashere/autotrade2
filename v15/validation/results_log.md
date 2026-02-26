@@ -102,15 +102,46 @@ Walk-forward (IS=5yr, OOS=1yr, 6 windows):
 
 ## Phase 11R — RSI smooth/divergence/hook (S1195-S1200)
 **Script**: `v15/validation/swing_backtest.py`
-**Status**: RUNNING on server (launched Feb 26, 2026)
-**Signals**: S1195-S1200 (RSI smooth, RSI div, RSI hook variants on S1041 base)
+**Run**: Feb 26, 2026 — `--signal S119 --end-year 2025` (IS 2015-2024 + OOS 2025)
+**Status**: COMPLETE
 
-Run command used:
-```
-python -m v15.validation.swing_backtest --signal S119 --end-year 2025
-```
+| Signal | n | WR | P&L IS | avg/trade | Yrs |
+|--------|---|----|--------|-----------|-----|
+| S1196_rsi_smooth | 8 | **100%** | $832K | $104K | 5/5 |
+| S1199_rsi_hook_or_div | 9 | **100%** | $614K | $68K | 6/6 |
+| S1197_rsi_div | 7 | **100%** | $372K | $53K | 4/4 |
+| S1195_rsi_hook | 2 | **100%** | $242K | $121K | 2/2 |
+| S1198_rsi_smooth_div | 4 | **100%** | $205K | $51K | 3/3 |
+| S1200_rsi_smooth_bot | 4 | 75% | $365K | $91K | 2/3 |
 
-Results: PENDING
+**Key finding**: All are subsets of S1041 (smaller n, higher avg/trade).
+- S1196 (smoothed RSI<40) best: $104K avg vs S1041's $89K avg, but only 5/9 years.
+- No Phase 11R signal beats S1041's total P&L ($2,037K IS + $632K OOS).
+- **S1041 remains champion** — RSI refinements select best subset but reduce frequency.
+
+**Bugs fixed**: _s1041_core had look-ahead bias (len(tw) instead of searchsorted); Phase 11R+11S code placed after SIGNALS list (NameError).
+
+---
+
+## Phase 11S — Weekly RSI extremes (S1200-S1210)
+**Script**: `v15/validation/swing_backtest.py`
+**Run**: Feb 26, 2026 — `--signal S120,S1210 --end-year 2025`
+**Status**: COMPLETE
+
+| Signal | n | WR | P&L IS | avg/trade | Yrs | Description |
+|--------|---|----|--------|-----------|-----|-------------|
+| S1207_s1041core_wkly40 | 8 | **100%** | $768K | $96K | 6/6 | S1041_core + wkly RSI<40 |
+| S1202_wkly_rsi35 | 8 | 62% | $693K | $87K | 4/5 | wkly RSI<35 standalone |
+| S1201_wkly_rsi30 | 4 | **100%** | $335K | $84K | 4/4 | wkly RSI<30 standalone |
+| S1204_wkly30_daily40 | 4 | **100%** | $266K | $67K | 4/4 | wkly30 + daily40 |
+| S1203_wkly30_daily35 | 3 | **100%** | $160K | $53K | 3/3 | wkly30 + daily35 |
+| S1210_s1041_or_wkly30 | 27 | 93% | $1,942K | $72K | 9/9 | union (S1041 OR wkly30+d35) |
+
+**Key finding**: Weekly RSI signals work AS SUBSETS within S1041's channel structure.
+- S1207 (S1041_core + weekly RSI<40): n=8, 100% WR, $96K avg — quality within structure.
+- Standalone weekly RSI<30 (S1201): only 4 backtest trades vs 13 in forward-analysis (deduplication of overlapping positions in backtest).
+- Union S1210 (n=27, WR=93%, $1,942K) is WORSE than S1041 alone ($2,037K) — adding RSI-only trades degrades quality.
+- **S1041 channel structure is the essential quality gate** — RSI confirms it but doesn't replace it.
 
 ---
 
