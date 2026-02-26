@@ -1,11 +1,13 @@
 """Unified signal filter cascade for Channel Surfer.
 
-Four independently toggleable filters that decide WHETHER to trade:
+Five independently toggleable filters that decide WHETHER to trade:
   1. Signal Quality Gate — skip low win_prob trades (uses existing LightGBM model)
   2. Break Predictor — penalize directional mismatches on breakout signals
   3. Swing Regime — boost bounce confidence when S1041 (weekly channel support + fear) fires
   4. MTF Momentum — block when 2+ higher TFs show active opposing momentum;
                     boost when 2+ higher TFs show opposing momentum turning/exhausting
+  5. VIX Cooldown — boost BUY confidence when VIX was elevated and is now falling back
+                    (x18 finding: RSI rising during VIX fear receding = beginning of run, not end)
 
 Usage:
     from v15.core.signal_filters import SignalFilterCascade
@@ -212,6 +214,12 @@ class SignalFilterCascade:
         momentum_conflict_penalty: float = 0.3,  # Conf multiplier when opponent TFs still accelerating
         momentum_context_tfs: list = None,    # TFs to check; default ['1h','4h','daily']
         momentum_min_tfs: int = 2,            # Min TFs needed to trigger conflict/exhaust
+        # Filter 5 — VIX Cooldown (x18 finding)
+        vix_cooldown_enabled: bool = False,
+        vix_cooldown_boost: float = 1.35,     # BUY conf × 1.35 when VIX fear is fading
+        vix_cooldown_lookback: int = 10,      # Days to look back for VIX spike
+        vix_cooldown_spike_pct: float = 0.70, # VIX was above 70th pct of trailing year
+        vix_cooldown_recovery_pct: float = 0.90,  # VIX now ≥10% below that recent peak
     ):
         self.sq_gate_threshold = sq_gate_threshold
         self.break_predictor_enabled = break_predictor_enabled
@@ -223,6 +231,11 @@ class SignalFilterCascade:
         self.momentum_conflict_penalty = momentum_conflict_penalty
         self.momentum_context_tfs = momentum_context_tfs  # None → use default at eval time
         self.momentum_min_tfs = momentum_min_tfs
+        self.vix_cooldown_enabled = vix_cooldown_enabled
+        self.vix_cooldown_boost = vix_cooldown_boost
+        self.vix_cooldown_lookback = vix_cooldown_lookback
+        self.vix_cooldown_spike_pct = vix_cooldown_spike_pct
+        self.vix_cooldown_recovery_pct = vix_cooldown_recovery_pct
 
         # SQ model (lazy-loaded)
         self._sq_model = None
@@ -230,6 +243,9 @@ class SignalFilterCascade:
 
         # Swing regime precomputed status {date_str: bool}
         self._swing_status: Dict[str, bool] = {}
+
+        # VIX cooldown precomputed status {date_str: bool}
+        self._vix_cooldown_status: Dict[str, bool] = {}
 
         # Per-evaluation log — records every filter decision for replay/audit
         # Each entry: {bar_datetime, action, signal_type, conf_in, conf_out, rejected, reasons}
@@ -246,6 +262,8 @@ class SignalFilterCascade:
             'momentum_blocked': 0,
             'momentum_boosted': 0,
             'momentum_neutral': 0,
+            'vix_cd_boosted': 0,
+            'vix_cd_neutral': 0,
             'total_evaluated': 0,
             'total_rejected': 0,
         }
@@ -336,6 +354,48 @@ class SignalFilterCascade:
 
         print(f"[FILTER] Swing regime: {count} S1041 days out of {n} "
               f"({count / max(n, 1) * 100:.1f}%)")
+
+    def precompute_vix_cooldown(self, vix_daily):
+        """Precompute VIX cooldown status for each trading day.
+
+        x18 finding: when VIX was elevated (>70th pct of trailing year) within
+        the last N days AND has now fallen 10%+ from that peak, BUY signals mark
+        the beginning of a run (RSI rising = momentum resumption, not exhaustion).
+
+        Args:
+            vix_daily: Daily VIX DataFrame with 'close' column
+        """
+        if not self.vix_cooldown_enabled:
+            return
+        if vix_daily is None or len(vix_daily) < 253:
+            print("[FILTER] WARNING: Insufficient VIX data for cooldown — disabled")
+            self.vix_cooldown_enabled = False
+            return
+
+        close = vix_daily['close'].astype(float)
+        count = 0
+        for i in range(252, len(close)):
+            dt = vix_daily.index[i]
+            date_str = str(dt.date()) if hasattr(dt, 'date') else str(dt)[:10]
+
+            trailing_year = close.iloc[i - 252:i]
+            spike_threshold = float(trailing_year.quantile(self.vix_cooldown_spike_pct))
+
+            lookback_start = max(0, i - self.vix_cooldown_lookback)
+            recent_window = close.iloc[lookback_start:i + 1]
+            recent_peak = float(recent_window.max())
+
+            was_elevated = recent_peak >= spike_threshold
+            now_cooling = float(close.iloc[i]) <= recent_peak * self.vix_cooldown_recovery_pct
+
+            active = was_elevated and now_cooling
+            self._vix_cooldown_status[date_str] = active
+            if active:
+                count += 1
+
+        total = len(close) - 252
+        print(f"[FILTER] VIX cooldown: {count} active days out of {total} "
+              f"({count / max(total, 1) * 100:.1f}%)")
 
     def evaluate(
         self,
@@ -499,6 +559,17 @@ class SignalFilterCascade:
             else:
                 self.stats['momentum_neutral'] += 1
 
+        # --- Filter 5: VIX Cooldown Boost (BUY only) ---
+        # x18: VIX was elevated, now falling → RSI rising = beginning of run, not exhaustion
+        if self.vix_cooldown_enabled and sig.action == 'BUY':
+            date_str = str(bar_datetime.date()) if hasattr(bar_datetime, 'date') else str(bar_datetime)[:10]
+            if self._vix_cooldown_status.get(date_str, False):
+                confidence *= self.vix_cooldown_boost
+                self.stats['vix_cd_boosted'] += 1
+                reasons.append(f'VIX_COOLDOWN(conf*={self.vix_cooldown_boost})')
+            else:
+                self.stats['vix_cd_neutral'] += 1
+
         self.eval_log.append({
             'bar_datetime': bar_datetime, 'action': sig.action,
             'signal_type': getattr(sig, 'signal_type', 'bounce'),
@@ -526,4 +597,7 @@ class SignalFilterCascade:
         if self.momentum_filter_enabled:
             lines.append(f"  MTF momentum: {s['momentum_blocked']} blocked, "
                          f"{s['momentum_boosted']} boosted, {s['momentum_neutral']} neutral")
+        if self.vix_cooldown_enabled:
+            lines.append(f"  VIX cooldown: {s['vix_cd_boosted']} boosted (×{self.vix_cooldown_boost}), "
+                         f"{s['vix_cd_neutral']} neutral")
         return '\n'.join(lines)

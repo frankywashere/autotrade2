@@ -75,6 +75,16 @@ CONFIGS = {
     'mtf_exhaust': {
         'sq_gate': 0.0, 'break_pred': False, 'swing': False,
         'momentum': 'exhaust',  # momentum_boost=1.2, momentum_conflict_penalty=1.0
+        'vix_cd': False,
+    },
+    # VIX Cooldown configs (x18 finding: fear receding → RSI rising = run beginning)
+    'vix_cd': {
+        'sq_gate': 0.0, 'break_pred': False, 'swing': False,
+        'momentum': None, 'vix_cd': True,
+    },
+    'vix_cd_swing': {
+        'sq_gate': 0.0, 'break_pred': False, 'swing': True,
+        'momentum': None, 'vix_cd': True,
     },
 }
 
@@ -158,24 +168,21 @@ def build_cascade(cfg: dict):
     sq_gate   = cfg.get('sq_gate', 0.0)
     bp        = cfg.get('break_pred', False)
     swing     = cfg.get('swing', False)
+    vix_cd    = cfg.get('vix_cd', False)
 
     # Pure baseline — no filters at all
-    if sq_gate == 0.0 and not bp and not swing and momentum_mode is None:
+    if sq_gate == 0.0 and not bp and not swing and momentum_mode is None and not vix_cd:
         return None
 
+    mtm_enabled = momentum_mode is not None
+    mtm_boost   = 1.2
+    mtm_penalty = 1.0 if momentum_mode == 'exhaust' else (0.3 if momentum_mode in ('conflict', 'full') else 1.0)
     if momentum_mode == 'exhaust':
-        return SignalFilterCascade(
-            sq_gate_threshold=sq_gate,
-            break_predictor_enabled=bp,
-            swing_regime_enabled=swing,
-            swing_boost=1.2,
-            break_penalty=0.5,
-            momentum_filter_enabled=True,
-            momentum_boost=1.2,
-            momentum_conflict_penalty=1.0,  # boost only, no hard blocking
-            momentum_context_tfs=['1h', '4h', 'daily'],
-            momentum_min_tfs=2,
-        )
+        mtm_boost, mtm_penalty = 1.2, 1.0
+    elif momentum_mode == 'conflict':
+        mtm_boost, mtm_penalty = 1.0, 0.3
+    elif momentum_mode == 'full':
+        mtm_boost, mtm_penalty = 1.2, 0.3
 
     return SignalFilterCascade(
         sq_gate_threshold=sq_gate,
@@ -183,6 +190,13 @@ def build_cascade(cfg: dict):
         swing_regime_enabled=swing,
         swing_boost=1.2,
         break_penalty=0.5,
+        momentum_filter_enabled=mtm_enabled,
+        momentum_boost=mtm_boost,
+        momentum_conflict_penalty=mtm_penalty,
+        momentum_context_tfs=['1h', '4h', 'daily'],
+        momentum_min_tfs=2,
+        vix_cooldown_enabled=vix_cd,
+        vix_cooldown_boost=1.35,
     )
 
 
@@ -190,7 +204,7 @@ def run_replay(data: dict, cfg: dict, cascade=None, tf: str = '5min') -> tuple:
     """Run backtest on the primary TF window. Returns (trades, primary_index)."""
     from v15.core.surfer_backtest import run_backtest
 
-    # Precompute swing regime on full historical daily data (5min config only)
+    # Precompute swing regime on full historical daily data
     if cascade is not None and getattr(cascade, 'swing_regime_enabled', False):
         cascade.precompute_swing_regime(
             data['tsla_daily_long'],
@@ -198,6 +212,10 @@ def run_replay(data: dict, cfg: dict, cascade=None, tf: str = '5min') -> tuple:
             data['vix_daily'],
             data['tsla_weekly'],
         )
+
+    # Precompute VIX cooldown status (x18 finding)
+    if cascade is not None and getattr(cascade, 'vix_cooldown_enabled', False):
+        cascade.precompute_vix_cooldown(data['vix_daily'])
 
     p = TF_PARAMS[tf]
 
@@ -403,6 +421,31 @@ def main():
 
     report_dates = get_last_n_trading_dates(primary_index_df, args.days_back)
     print(f"Report window: {report_dates[0]} → {report_dates[-1]}")
+
+    # VIX cooldown diagnostic — always show VIX regime context for report window
+    vix_close = data['vix_daily']['close'].astype(float)
+    print(f"\nVIX regime for report window:")
+    for d in report_dates:
+        vix_idx = data['vix_daily'].index
+        date_mask = np.array([str(ts.date()) == d if hasattr(ts, 'date') else str(ts)[:10] == d
+                              for ts in vix_idx])
+        if date_mask.any():
+            i = int(np.where(date_mask)[0][-1])
+            current_vix = float(vix_close.iloc[i])
+            if i >= 252:
+                trailing = vix_close.iloc[i - 252:i]
+                spike_thr = float(trailing.quantile(0.70))
+                lookback_win = vix_close.iloc[max(0, i - 10):i + 1]
+                recent_peak = float(lookback_win.max())
+                was_elev = recent_peak >= spike_thr
+                cooling = current_vix <= recent_peak * 0.90
+                status = "*** COOLDOWN ACTIVE ***" if (was_elev and cooling) else "normal"
+                print(f"  {d}: VIX={current_vix:.1f}  70pct_thr={spike_thr:.1f}  "
+                      f"10d_peak={recent_peak:.1f}  [{status}]")
+            else:
+                print(f"  {d}: VIX={current_vix:.1f}  (insufficient history for cooldown check)")
+        else:
+            print(f"  {d}: no VIX data")
 
     # ── Run BASELINE ───────────────────────────────────────────────────────
     print(f"\nRunning BASELINE (no filters, TF={args.tf})...")
