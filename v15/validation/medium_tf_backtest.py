@@ -99,7 +99,11 @@ def _prepare_year(tsla_tf, spy_tf, daily_tsla, weekly_tsla, year: int,
     def _slice(df, start, end):
         if df is None:
             return None
-        mask = (df.index >= start) & (df.index <= end)
+        # Match timezone of DataFrame index so comparison never raises TypeError
+        tz = getattr(df.index, 'tz', None)
+        s = start.tz_localize(tz) if tz is not None else start
+        e = end.tz_localize(tz) if tz is not None else end
+        mask = (df.index >= s) & (df.index <= e)
         return df.loc[mask]
 
     tsla_slice = _slice(tsla_tf, cutoff_start, cutoff_year_end)
