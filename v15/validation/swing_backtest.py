@@ -19057,6 +19057,76 @@ SIGNALS_P11P: List[Tuple] = [
     ('S1190_s1041_first_day',     sig_s1190_s1041_first_day,     10, 0.20, 50),   # 1st day only
 ]
 
+
+# ── Phase 11Q — RSI level + VIX cooldown (no channel, no ATR requirement) ─────
+# Question: does "oversold + fear fading" work WITHOUT the weekly channel gate?
+# If yes: S1041's channel/ATR gates are over-constrained and S526/S522 can be fixed
+#         by swapping MACD/RSI-direction for RSI-level.
+# If no:  confirms the channel + ATR gates are load-bearing (not redundant).
+# Baseline for comparison: S526 (MACD+VIX_CD), S522 (channel+VIX_CD+RSI_rising).
+
+
+def sig_s1191_rsi40_vix_cd(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1191: RSI < 40 + VIX cooldown — no channel, no ATR requirement.
+    The RSI analog of S526: oversold level replaces MACD turning.
+    Tests whether 'stock looks washed out + fear fading' is sufficient without
+    requiring price to be at a specific channel boundary."""
+    if i < 252 + 10:
+        return 0
+    if float(rt.iloc[i]) >= 40.0:
+        return 0
+    return 1 if _vix_was_elevated_now_cooling(vix, i) else 0
+
+
+def sig_s1192_rsi35_vix_cd(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1192: RSI < 35 + VIX cooldown — tighter RSI threshold, no channel/ATR.
+    Requires deeper oversold (vs S1191's <40) but same fear-fading gate.
+    If S1192 >> S1191: depth of oversold matters more than the level itself."""
+    if i < 252 + 10:
+        return 0
+    if float(rt.iloc[i]) >= 35.0:
+        return 0
+    return 1 if _vix_was_elevated_now_cooling(vix, i) else 0
+
+
+def sig_s1193_rsi40_vix_cd_atr(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1193: RSI < 40 + VIX cooldown + ATR compressed (atr_5 < 0.75 * atr_20).
+    Adds the ATR gate from S1041 to the RSI+VIX_CD base.
+    Tests: does ATR compression add value on top of RSI oversold + VIX cooldown?
+    If S1193 >> S1191: the 'coiling spring' gate is independently valuable."""
+    if i < 252 + 10:
+        return 0
+    if float(rt.iloc[i]) >= 40.0:
+        return 0
+    if not _vix_was_elevated_now_cooling(vix, i):
+        return 0
+    c = _atr_components(tsla, i)
+    if c is None:
+        return 1   # can't compute ATR, don't block
+    _, atr_5, _, atr_20 = c
+    return 1 if atr_5 < 0.75 * atr_20 else 0
+
+
+def sig_s1194_rsi40_vix_cd_macd(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1194: RSI < 40 + VIX cooldown + MACD histogram turning positive.
+    Triple confirmation: oversold level + fear fading + momentum inflecting.
+    All three signals at daily TF simultaneously — most demanding of the set."""
+    if i < 252 + 10:
+        return 0
+    if float(rt.iloc[i]) >= 40.0:
+        return 0
+    if not _vix_was_elevated_now_cooling(vix, i):
+        return 0
+    return 1 if sig_s333_s215_macd_turning(i, tsla, spy, vix, tw, sw, rt, rs, w) else 0
+
+
+SIGNALS_P11Q: List[Tuple] = [
+    ('S1191_rsi40_vix_cd',       sig_s1191_rsi40_vix_cd,       10, 0.20, 50),  # RSI<40 + VIX_CD, no channel
+    ('S1192_rsi35_vix_cd',       sig_s1192_rsi35_vix_cd,       10, 0.20, 50),  # RSI<35 + VIX_CD, tighter
+    ('S1193_rsi40_vix_cd_atr',   sig_s1193_rsi40_vix_cd_atr,   10, 0.20, 50),  # + ATR compressed
+    ('S1194_rsi40_vix_cd_macd',  sig_s1194_rsi40_vix_cd_macd,  10, 0.20, 50),  # + MACD turning
+]
+
 SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIGNALS_P6D
            + SIGNALS_P7D + SIGNALS_P7F + SIGNALS_P7H + SIGNALS_P7J + SIGNALS_P7K + SIGNALS_P7L
            + SIGNALS_P7M + SIGNALS_P7N + SIGNALS_P7P + SIGNALS_P7Q + SIGNALS_P7R + SIGNALS_P7S
@@ -19077,7 +19147,8 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P10U + SIGNALS_P10V + SIGNALS_P10W + SIGNALS_P10X + SIGNALS_P10Y
            + SIGNALS_P10Z + SIGNALS_P11A + SIGNALS_P11B + SIGNALS_P11C + SIGNALS_P11D + SIGNALS_P11E
            + SIGNALS_P11F + SIGNALS_P11G + SIGNALS_P11H + SIGNALS_P11I + SIGNALS_P11J + SIGNALS_P11K
-           + SIGNALS_P11L + SIGNALS_P11M + SIGNALS_P11N + SIGNALS_P11O + SIGNALS_P11P)
+           + SIGNALS_P11L + SIGNALS_P11M + SIGNALS_P11N + SIGNALS_P11O + SIGNALS_P11P
+           + SIGNALS_P11Q)
 
 # ── sentinel — do not remove ──────────────────────────────────────────────────
 
