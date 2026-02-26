@@ -19481,7 +19481,7 @@ def sig_s1208_wkly30_daily35_vix(i, tsla, spy, vix, tw, sw, rt, rs, w):
     VIX gate should block complacency (VIX<15) and systemic crisis (VIX>50)."""
     if i < 252 or tw is None or len(vix) <= i:
         return 0
-    v = float(vix.iloc[i])
+    v = float(vix['close'].iloc[i])
     if not (15.0 <= v <= 50.0):
         return 0
     if float(rt.iloc[i]) >= 35.0:
