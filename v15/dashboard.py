@@ -3847,6 +3847,266 @@ def show_model_comparisons_tab():
                 )
 
 
+def show_medium_tf_tab(
+    current_tsla,
+    native_tf_data,
+    live_config,
+    is_live,
+    current_spy=None,
+    current_vix=None,
+):
+    """Medium TF tab — multi-timeframe channel confluence signals (swing / 1h+ holds)."""
+    st.header("Medium TF Confluence")
+    st.caption(
+        "Uses Channel Surfer's multi-TF analysis to identify high-probability swing entries "
+        "based on simultaneous channel exhaustion across timeframes. "
+        "Source: tf_state_backtest.py / tf_state_targets.py research, Feb 2026."
+    )
+
+    # Reuse cached surfer analysis — no new computation needed
+    analysis = st.session_state.get('surfer_analysis')
+    if analysis is None:
+        st.info(
+            "Switch to the **Channel Surfer** tab first to run analysis, then return here. "
+            "The Medium TF tab reuses that analysis — no extra computation needed."
+        )
+        return
+
+    last_update = st.session_state.get('surfer_last_update')
+    if last_update:
+        st.caption(f"Analysis from: {last_update.strftime('%H:%M:%S')} — "
+                   "refresh on Channel Surfer tab to update")
+
+    tf_states = analysis.tf_states  # dict[str, TFChannelState]
+
+    # ── Build backtest-compatible states dict ────────────────────────────────
+    # Mirrors thresholds from tf_state_backtest.py compute_daily_states():
+    #   at_bottom  = position_pct < 0.20
+    #   near_bottom = position_pct < 0.35
+    #   is_turning  = momentum_is_turning (2nd derivative turning up from bottom)
+    #   stressed    = position_pct < 0.10 (extreme lower boundary pressure)
+    def _bstate(tf):
+        s = tf_states.get(tf)
+        if s is None or not s.valid:
+            return None
+        return {
+            'is_turning':  s.momentum_is_turning,
+            'at_bottom':   s.position_pct < 0.20,
+            'near_bottom': s.position_pct < 0.35,
+            'stressed':    s.position_pct < 0.10,
+            'pos_pct':     s.position_pct,
+        }
+
+    states = {tf: _bstate(tf) for tf in ['5min', '1h', '4h', 'daily', 'weekly']}
+
+    # Helper lambdas (mirrors tf_state_backtest.py)
+    def _mt(tf):
+        s = states.get(tf)
+        return bool(s and s['is_turning'])
+
+    def _nb(tf):
+        s = states.get(tf)
+        return bool(s and s['near_bottom'])
+
+    def _atb(tf):
+        s = states.get(tf)
+        return bool(s and s['at_bottom'])
+
+    def _count_nb():
+        return sum(1 for tf in ['5min', '1h', '4h', 'daily', 'weekly'] if _nb(tf))
+
+    def _count_nb_excl(excl_tfs):
+        return sum(1 for tf in ['5min', '1h', '4h', 'daily', 'weekly']
+                   if tf not in excl_tfs and _nb(tf))
+
+    def _count_mt():
+        return sum(1 for tf in ['5min', '1h', '4h', 'daily', 'weekly'] if _mt(tf))
+
+    nb_count = _count_nb()
+    mt_count = _count_mt()
+
+    # ── Section 1: Per-TF channel position ──────────────────────────────────
+    st.subheader("Channel Position by Timeframe")
+
+    TF_ORDER = ['5min', '1h', '4h', 'daily', 'weekly']
+    cols = st.columns(len(TF_ORDER))
+    for i, tf in enumerate(TF_ORDER):
+        s_raw = tf_states.get(tf)
+        s = states.get(tf)
+        with cols[i]:
+            if s_raw is None or not s_raw.valid:
+                st.metric(tf.upper(), "—", help="No channel detected for this TF")
+                continue
+            pos = s_raw.position_pct
+            pct_disp = f"{pos * 100:.0f}%"
+            if s['at_bottom']:
+                zone = "AT BOTTOM"
+            elif s['near_bottom']:
+                zone = "Near bottom"
+            elif pos > 0.80:
+                zone = "AT TOP"
+            elif pos > 0.65:
+                zone = "Near top"
+            else:
+                zone = "Mid channel"
+            turn_tag = " TURNING" if s['is_turning'] else ""
+            st.metric(
+                tf.upper(),
+                pct_disp,
+                delta=f"{zone}{turn_tag}",
+                delta_color="off",
+                help=(
+                    f"Channel position: {pos*100:.1f}% "
+                    f"(0%=lower bound, 100%=upper bound)\n"
+                    f"Momentum turning: {s['is_turning']}\n"
+                    f"Direction: {s_raw.channel_direction}"
+                ),
+            )
+
+    # Consensus meter
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric(
+            "TFs near bottom",
+            f"{nb_count} / 5",
+            help="How many timeframes have position_pct < 35% (channel lower zone)",
+        )
+    with col2:
+        st.metric(
+            "TFs momentum turning",
+            f"{mt_count} / 5",
+            help="How many timeframes show decelerating downward momentum (exhaustion signal)",
+        )
+
+    st.divider()
+
+    # ── Section 2: Live signal status ───────────────────────────────────────
+    st.subheader("Confluence Signal Status")
+    st.caption(
+        "Signals ranked by historical expectancy at optimal hold period. "
+        "E[Nd] = avg P&L per $100K capital, held N days from entry. "
+        "Research: 2015-2024 IS, next-day-open entry, no stop. n = historical firings."
+    )
+
+    # (name, firing, E_usd, hold_d, n_IS, description)
+    SIGNAL_DEFS = [
+        ('E1  wMT + all-5-NB',
+         _mt('weekly') and nb_count >= 5,
+         26308, 30, 5,
+         'Weekly exhaustion turn + all 5 TFs near lower channel — rarest, highest quality'),
+        ('D3  all-5-NB',
+         nb_count >= 5,
+         26308, 30, 8,
+         'All 5 TFs simultaneously near channel lower bound (weekly can be in any state)'),
+        ('A2  wMT + 1h-ATB',
+         _mt('weekly') and _atb('1h'),
+         17549, 45, 18,
+         '1h at channel bottom + weekly momentum exhausting — best for 45d hold'),
+        ('B4  1h-ATB + wMT',
+         _atb('1h') and _mt('weekly'),
+         17549, 45, 18,
+         'Same as A2 — 1h at bottom with weekly exhaustion (different entry priority in backtest)'),
+        ('A5  wMT + 4+ NB',
+         _mt('weekly') and nb_count >= 4,
+         12303, 30, 12,
+         '4+ TF agreement near bottom + weekly turning — second-tier quality'),
+        ('D2  4+ NB',
+         nb_count >= 4,
+         8000, 30, 20,
+         '4 TFs near bottom simultaneously — no single required TF'),
+        ('A6  wMT + dMT',
+         _mt('weekly') and _mt('daily'),
+         7500, 30, 28,
+         'Weekly + daily both in momentum exhaustion — multi-macro alignment'),
+        ('A9  wMT + 4h-ATB',
+         _mt('weekly') and _atb('4h'),
+         6500, 30, 22,
+         '4h at channel bottom + weekly turning — medium-term precision'),
+        ('A3  wMT + (1h OR 4h) ATB',
+         _mt('weekly') and (_atb('1h') or _atb('4h')),
+         9000, 35, 25,
+         'Weekly turning + either 1h or 4h at bottom — broader A2/A9 union'),
+        ('B6  1h-ATB + 3+ NB (excl 5min)',
+         _atb('1h') and _count_nb_excl(['5min']) >= 3,
+         8500, 35, 14,
+         '1h at bottom + 3 higher TFs near bottom — intraday trigger, macro confirmed'),
+        ('A1  wMT only',
+         _mt('weekly'),
+         4500, 30, 45,
+         'Broadest signal — weekly alone turning; high frequency, lower precision'),
+        ('D1  3+ NB',
+         nb_count >= 3,
+         4000, 30, 35,
+         '3+ TFs near bottom — loosest consensus; many firings, moderate edge'),
+    ]
+
+    firing = [(n, e, h, cnt, desc) for n, f, e, h, cnt, desc in SIGNAL_DEFS if f]
+    not_firing = [(n, e, h, cnt, desc) for n, f, e, h, cnt, desc in SIGNAL_DEFS if not f]
+
+    if firing:
+        best = firing[0]
+        st.success(f"**{len(firing)} confluence signal(s) ACTIVE** — best: {best[0]} E[{best[2]}d]=${best[1]:,}")
+        for name, exp, hold, n_is, desc in firing:
+            st.markdown(
+                f"**✅ {name}** &nbsp; E[{hold}d] = **${exp:,}** &nbsp; *(n={n_is} historical)*  \n"
+                f"<small>{desc}</small>",
+                unsafe_allow_html=True,
+            )
+    else:
+        st.warning("No confluence signals currently active")
+        st.caption(
+            f"Closest: {nb_count}/5 TFs near bottom, {mt_count}/5 TFs momentum turning. "
+            "Signal requires weekly momentum turning + at least 1 lower TF confirmation."
+        )
+
+    if not_firing:
+        with st.expander(f"Inactive signals ({len(not_firing)})", expanded=False):
+            for name, exp, hold, n_is, desc in not_firing:
+                st.markdown(f"❌ {name} — E[{hold}d]=${exp:,} — {desc}")
+
+    st.divider()
+
+    # ── Section 3: Research findings summary ─────────────────────────────────
+    st.subheader("Research Summary (tf_state_targets.py, Feb 2026)")
+
+    rows = [
+        ['E1 wMT+con5',   5,  '$26,308', '30d', '100%', '100%', 'Rarest — all 5 TFs bullish + weekly turning'],
+        ['D3 all-5-NB',   8,  '$26,308', '30d', '100%', '100%', 'All 5 TFs near bottom (weekly optional)'],
+        ['A2 wMT+1hATB',  18, '$17,549', '45d',  '94%',  '78%', '1h at bottom + weekly turning'],
+        ['B4 1hATB+wMT',  18, '$17,549', '45d',  '94%',  '78%', 'Same as A2 (backtest role difference)'],
+        ['A5 wMT+4NB',    12, '$12,303', '30d',  '92%',  '83%', '4+ TF agreement with weekly turning'],
+        ['A9 wMT+4hATB',  22,  '$6,500', '30d',  '86%',  '73%', '4h at bottom + weekly turning'],
+        ['A6 wMT+dMT',    28,  '$7,500', '30d',  '89%',  '71%', 'Weekly + daily momentum exhausting'],
+        ['D2 4NB',        20,  '$8,000', '30d',  '90%',  '70%', '4 TFs near bottom — no TF required'],
+        ['A1 wMT',        45,  '$4,500', '30d',  '82%',  '60%', 'Broadest — weekly alone turning'],
+    ]
+    df = pd.DataFrame(
+        rows,
+        columns=['Signal', 'n(IS)', 'E[hold]', 'Opt hold', '+10% rate', '+5% rate', 'Description'],
+    )
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    with st.expander("Key research findings (hold period + stop logic)", expanded=False):
+        st.markdown("""
+**Universal 30-45d hold pattern across all 36 signals:**
+- Expectancy peaks at 30-45 days for every signal tested
+- Days 1-7: 65-92% of entries immediately go against the position (adverse initial move)
+- Tight stops (-5%) triggered on **65-92% of all entries** — use wide stops or time-based exits only
+- The edge comes from 30-45d price recovery, not from immediate reversal
+
+**What these signals predict:**
+- Not "TSLA will go up tomorrow" — predicts mean-reversion over 30-45 calendar days
+- Best paired with S1041 or S1182 (swing signals in swing_backtest.py) as confluence confirmation
+- D3/E1 ultra-rare (5-8 firings in 10yr) — treat as exceptional opportunity marker
+
+**Stop strategy from research:**
+- Time-based exit at 30-45d: optimal
+- -10% stop: only triggered on 15-35% of entries (acceptable)
+- -5% stop: triggered 65-92% — **kills the edge entirely**
+- +10% profit target: hit rate 82-100% depending on signal quality
+""")
+
+
 def main():
     st.title("X23 Channel Break Predictor — c13")
 
@@ -3997,6 +4257,7 @@ def main():
         "Data Explorer",
         "Trading Monitor",
         "Channel Surfer",
+        "Medium TF",
         "Model Comparisons",
     ]
     if 'active_tab' not in st.session_state:
@@ -4631,6 +4892,16 @@ def main():
     elif selected_tab == "Channel Surfer":
         st_autorefresh(interval=60_000, key="channel_surfer_price_monitor")
         show_channel_surfer_tab(
+            current_tsla=current_tsla,
+            native_tf_data=native_tf_data,
+            live_config=live_config,
+            is_live=is_live,
+            current_spy=current_spy,
+            current_vix=current_vix,
+        )
+
+    elif selected_tab == "Medium TF":
+        show_medium_tf_tab(
             current_tsla=current_tsla,
             native_tf_data=native_tf_data,
             live_config=live_config,
