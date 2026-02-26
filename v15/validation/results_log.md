@@ -40,28 +40,63 @@ Scripts add entries; never delete — append only.
 **Status**: PENDING — not yet run
 **Params**: hold=30d, stop=20%, capital=$100K
 
-Run command:
-```
-cd C:\AI\x14 && python -m v15.validation.tf_state_oos --tsla data/TSLAMin.txt >> v15/validation/tf_state_oos_results.log 2>&1
-```
+**RESULTS** (run Feb 26, 2026 — hold=30d, stop=20%, capital=$100K, IS=2015-2023):
+
+| Signal | IS n | IS WR | IS P&L | OOS24 n | OOS24 P&L | OOS25 n | OOS25 P&L |
+|--------|------|-------|--------|---------|-----------|---------|-----------|
+| C1 5min_MT | 49 | 57% | $507K | 7 | $58K | 7 | $28K |
+| D1 consensus_3+ | 63 | 56% | $471K | 8 | $77K | 8 | $19K |
+| C3 5min_MT+1hATB | 28 | 64% | $355K | 3 | $22K | 3 | $13K |
+| D5 consensus_4++MT | 31 | 65% | $340K | 4 | $19K | 3 | **-$31K** |
+| B1 1h_MT | 55 | 53% | $296K | 8 | $83K | 5 | $41K |
+| A2 wMT+1hATB | 21 | 57% | $243K | 4 | $50K | 4 | **-$19K** |
+| A9 wMT+4hATB | 17 | 59% | $150K | 4 | $53K | 3 | $3K |
+| D3 all-5-NB | 7 | 71% | $187K | 1 | -$4K | 1 | $11K |
+| E1 wMT+con5 | 4 | 75% | $89K | 1 | -$4K | 1 | $11K |
+| **TOTAL** | | | **$6.8M** | | **$677K** | | **-$32K** |
+
+Walk-forward (IS=5yr, OOS=1yr, 6 windows):
+- 6/6 windows OOS positive
+- Best IS signal: C1 (5min_MT) wins 4/6 windows
+- OOS/IS ratio: 0.09x–0.41x — much weaker than S1041 walk-forward
+- Total WF OOS: $638K on $4.4M IS = 0.15x ratio
+
+**Key findings**:
+- C1 (5min_MT alone) is the most robust OOS signal — simple, high-frequency
+- D3/E1 have only 1 OOS trade each — too few to conclude
+- 2025 OOS is flat/negative overall ($-32K across all 36 signals)
+- Channel-position signals (NB/ATB) are weaker OOS than momentum-turn signals (MT)
+- Highest IS performers (D6, B6) degrade significantly OOS
 
 ---
 
 ## rsi_bottom_targets.py — RSI percentile forward-return analysis
 **Script**: `v15/validation/rsi_bottom_targets.py`
-**Status**: PENDING — not yet run
-**Params**: RSI(14) Wilder, percentile window=252 bars, IS=2015-2024
+**Run date**: Feb 26, 2026 — IS=2015-2025 (all years), capital=$100K
 
-Tests:
-- Per-TF: 5 TFs × 8 thresholds (p10/p15/p20/p25 + abs25/30/35/40)
-- Multi-TF: 3+/4+/5 TFs simultaneously at p10/p15/p20/p25
-- Weekly combos: weekly RSI bottom + lower TF confirmation (~16 combos)
+**Top signals by +10% hit rate (n≥3, E[30d] sorted):**
 
-Run command:
-```
-cd C:\AI\x14 && python -m v15.validation.rsi_bottom_targets --tsla data/TSLAMin.txt >> v15/validation/rsi_bottom_results.log 2>&1
-cd C:\AI\x14 && python -m v15.validation.rsi_bottom_targets --tsla data/TSLAMin.txt --end-year 2025 >> v15/validation/rsi_bottom_results_2025.log 2>&1
-```
+| Signal | n | +10% hit | -5% hit | E[10d] | E[30d] | Notes |
+|--------|---|----------|---------|--------|--------|-------|
+| weekly RSI<30 | 13 | **100%** | 69% | $17.9K | **$75.3K** | Best single-TF signal |
+| wkly_RSI<30 + daily_RSI<35 | 9 | 100% | 78% | $12.4K | **$78.8K** | Narrower, even better |
+| 4+TFs RSI<30 | 4 | 100% | 75% | $13.6K | **$65.3K** | Rare but exceptional |
+| 5+TFs RSI<35 | 4 | 100% | 100% | $0.3K | **$68.3K** | Ultra-rare, 100%+10%, stops always hit too |
+| wkly_RSI<35 + daily_RSI<40 | 24 | 100% | 67% | $9.9K | **$54.1K** | More frequent version |
+| wkly_p10 + 4h_p15 | 24 | 96% | 79% | $6.1K | $17K | Percentile version |
+| daily RSI<25 | 26 | 88% | 77% | $7.8K | $28.5K | Daily absolute |
+| weekly RSI<35 | 37 | 100% | 54% | $14.2K | **$43.3K** | Broader weekly extreme |
+| daily RSI<30 | 93 | 82% | 86% | $3.9K | $14.1K | Common enough to act on |
+
+**Universal pattern confirmed again**:
+- Stops (-5%) triggered 54-100% of all RSI bottom entries
+- E[10d] is low or negative; E[30d] always 3-5× better than E[10d]
+- **Zero cases where neither +10% nor -10% hits in 60d** (race col always 100%)
+- Weekly RSI < 30 → 100% hit +10% AND +20% within 60d — no exceptions in 10yr
+
+**Best confluence signal**: `wkly_RSI<30 + daily_RSI<35` — n=9, E[30d]=$78,773, 100% hit all profit targets
+- Outperforms channel-position signals (D3/E1 at $26K) by 3×
+- Has enough frequency (9 over 10yr = ~1/yr) to be tradeable
 
 ---
 
