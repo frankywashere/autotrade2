@@ -59,6 +59,13 @@ TF_PARAMS = {
         max_trade_usd=1_000_000.0,
         tf_hours=4.0,
     ),
+    '1d': dict(
+        eval_interval=1,
+        max_hold_bars=5,
+        bounce_cap=3.0,
+        max_trade_usd=1_000_000.0,
+        tf_hours=6.5,           # approx trading hours per day
+    ),
 }
 
 # Reuse the config definitions from combined_backtest
@@ -225,17 +232,31 @@ def run_replay(data: dict, cfg: dict, cascade=None, tf: str = '5min') -> tuple:
         spy_primary  = data['spy_5m']
         higher_tf_dict = data['higher_tf']
     else:
-        # Use 730-day 1h bars as the source — gives ~1,186 1h bars or ~297 4h bars,
-        # well above the 200-bar warmup threshold (60-day 5-min → ~97 4h bars is not enough)
-        rule = '1h' if tf == '1h' else '4h'
-        tsla_primary = _resample(data['tsla_1h_long'], rule) if tf == '4h' else data['tsla_1h_long']
-        spy_primary  = _resample(data['spy_1h_long'],  rule) if tf == '4h' else data['spy_1h_long']
-        # Higher-TF context = daily + weekly from 5yr daily data
-        tsla_weekly_from_daily = _resample(data['tsla_daily_long'], '1W')
-        higher_tf_dict = {
-            'daily':  data['tsla_daily_long'],
-            'weekly': tsla_weekly_from_daily,
-        }
+        if tf == '1d':
+            # Daily primary: use tsla_daily_long (5yr) directly
+            tsla_primary = data['tsla_daily_long']
+            spy_primary  = data['spy_daily_long']
+            tsla_weekly = _resample(data['tsla_daily_long'], '1W')
+            try:
+                tsla_monthly = _resample(data['tsla_daily_long'], 'ME')
+            except Exception:
+                tsla_monthly = _resample(data['tsla_daily_long'], 'M')
+            higher_tf_dict = {
+                'weekly':  tsla_weekly,
+                'monthly': tsla_monthly,
+            }
+        else:
+            # Use 730-day 1h bars as the source — gives ~1,186 1h bars or ~297 4h bars,
+            # well above the 200-bar warmup threshold (60-day 5-min → ~97 4h bars is not enough)
+            rule = '1h' if tf == '1h' else '4h'
+            tsla_primary = _resample(data['tsla_1h_long'], rule) if tf == '4h' else data['tsla_1h_long']
+            spy_primary  = _resample(data['spy_1h_long'],  rule) if tf == '4h' else data['spy_1h_long']
+            # Higher-TF context = daily + weekly from 5yr daily data
+            tsla_weekly_from_daily = _resample(data['tsla_daily_long'], '1W')
+            higher_tf_dict = {
+                'daily':  data['tsla_daily_long'],
+                'weekly': tsla_weekly_from_daily,
+            }
         print(f"    {tf} primary: {len(tsla_primary)} bars  "
               f"({tsla_primary.index[0].date()} → {tsla_primary.index[-1].date()})")
 
@@ -330,6 +351,8 @@ def print_trade_list(trade_tuples, label: str, cascade=None, tf: str = '5min'):
         hold_hours = t.hold_bars * tf_hours
         if tf == '5min':
             hold_str = f"{t.hold_bars} bars ({t.hold_bars * 5}min)"
+        elif tf == '1d':
+            hold_str = f"{t.hold_bars} bars ({t.hold_bars} days)"
         else:
             hold_str = f"{t.hold_bars} bars ({hold_hours:.1f}h)"
 
@@ -388,7 +411,7 @@ def main():
                              'Use --days-back 3 to cover e.g. Mon+Fri+Thu (Feb 23/24/25).')
     parser.add_argument('--show-blocked', action='store_true',
                         help='Also show trades that were blocked by the filter')
-    parser.add_argument('--tf', type=str, default='5min', choices=['5min', '1h', '4h'],
+    parser.add_argument('--tf', type=str, default='5min', choices=['5min', '1h', '4h', '1d'],
                         help='Primary timeframe for backtest: 5min, 1h, or 4h (default: 5min)')
     args = parser.parse_args()
 
@@ -416,8 +439,10 @@ def main():
         primary_index_df = data['tsla_5m']
     elif args.tf == '1h':
         primary_index_df = data['tsla_1h_long']
-    else:
+    elif args.tf == '4h':
         primary_index_df = _resample(data['tsla_1h_long'], '4h')
+    else:  # '1d'
+        primary_index_df = data['tsla_daily_long']
 
     report_dates = get_last_n_trading_dates(primary_index_df, args.days_back)
     print(f"Report window: {report_dates[0]} → {report_dates[-1]}")

@@ -75,8 +75,8 @@ def main():
                         help='Path to 1-min TSLA data file')
     parser.add_argument('--spy',     type=str, default='data/SPYMin.txt',
                         help='Path to 1-min SPY data file')
-    parser.add_argument('--tf',      type=str, default='1h', choices=['1h', '4h'],
-                        help='Primary timeframe: 1h or 4h (default: 1h)')
+    parser.add_argument('--tf',      type=str, default='1h', choices=['1h', '4h', '1d'],
+                        help='Primary timeframe: 1h, 4h, or 1d (default: 1h)')
     parser.add_argument('--capital', type=float, default=100_000.0,
                         help='Initial capital per year (default: 100,000)')
     args = parser.parse_args()
@@ -93,7 +93,7 @@ def main():
     print("\nLoading data...")
     t0 = time.time()
     spy_path = args.spy if os.path.isfile(args.spy) else None
-    tsla_tf, spy_tf, daily_tsla, weekly_tsla, daily_spy = _load_and_resample(
+    tsla_tf, spy_tf, daily_tsla, weekly_tsla, daily_spy, monthly_tsla = _load_and_resample(
         args.tsla, spy_path, args.tf)
     print(f"  Loaded in {time.time()-t0:.1f}s")
 
@@ -127,7 +127,8 @@ def main():
     print(f"\nCaching {len(needed_years)} years of {args.tf} data...")
     year_cache = {}
     for yr in sorted(needed_years):
-        yd = _prepare_year(tsla_tf, spy_tf, daily_tsla, weekly_tsla, yr)
+        yd = _prepare_year(tsla_tf, spy_tf, daily_tsla, weekly_tsla, yr,
+                           monthly_tsla=monthly_tsla, primary_tf=args.tf)
         if yd is not None:
             year_cache[yr] = yd
             print(f"  {yr}: {len(yd['tsla_tf']):,} bars ({args.tf})")

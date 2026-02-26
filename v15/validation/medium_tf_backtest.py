@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-Medium-Timeframe Channel Surfer Backtest — 1h / 4h primary TF.
+Medium-Timeframe Channel Surfer Backtest — 1h / 4h / 1d primary TF.
 
 Resamples 1-min TSLA+SPY data to the requested TF and runs the Channel Surfer
-physics engine with daily/weekly higher-TF context.  Intended to capture
-multi-hour directional moves (e.g. Feb-24-style AM/PM runs) that the 5-min
-system's 5-hour max-hold misses.
+physics engine with appropriate higher-TF context.  Intended to capture
+multi-hour/multi-day directional moves that the 5-min system misses.
 
 Usage:
-    python3 -m v15.validation.medium_tf_backtest \\
+    python3 -m v15.validation.medium_tf_backtest \
         --tsla data/TSLAMin.txt --spy data/SPYMin.txt --tf 1h
 
     python3 -m v15.validation.medium_tf_backtest --tf 4h
+    python3 -m v15.validation.medium_tf_backtest --tf 1d
     python3 -m v15.validation.medium_tf_backtest --tf 1h --oos-year 2025
 """
 
@@ -46,12 +46,20 @@ TF_PARAMS = {
         max_trade_usd=1_000_000.0,
         context_tfs=['daily', 'weekly'],
     ),
+    '1d': dict(
+        eval_interval=1,
+        max_hold_bars=5,        # 5 trading days = 1 week
+        bounce_cap=3.0,         # daily moves larger %, smaller cap
+        max_trade_usd=1_000_000.0,
+        context_tfs=['weekly', 'monthly'],
+    ),
 }
 
 # Resample rule passed to resample_to_tf
 TF_RESAMPLE = {
     '1h': '1h',
     '4h': '4h',
+    '1d': '1D',
 }
 
 
@@ -60,7 +68,7 @@ TF_RESAMPLE = {
 # ---------------------------------------------------------------------------
 
 def _load_and_resample(tsla_path: str, spy_path: Optional[str], tf: str):
-    """Return (tsla_tf, spy_tf, daily_tsla, weekly_tsla, daily_spy)."""
+    """Return (tsla_tf, spy_tf, daily_tsla, weekly_tsla, daily_spy, monthly_tsla)."""
     from v15.core.historical_data import load_minute_data, resample_to_tf
 
     print(f"  Loading TSLA 1-min from {tsla_path} …")
@@ -84,13 +92,19 @@ def _load_and_resample(tsla_path: str, spy_path: Optional[str], tf: str):
     daily_tsla = resample_to_tf(tsla_1min, '1D')
     weekly_tsla = resample_to_tf(tsla_1min, '1W')
     daily_spy = resample_to_tf(spy_1min, '1D') if spy_1min is not None else None
-    print(f"  TSLA daily: {len(daily_tsla):,}  weekly: {len(weekly_tsla):,}")
+    # Monthly — try 'ME' (pandas >=2.2) then fall back to 'M'
+    try:
+        monthly_tsla = resample_to_tf(tsla_1min, 'ME')
+    except Exception:
+        monthly_tsla = resample_to_tf(tsla_1min, 'M')
+    print(f"  TSLA daily: {len(daily_tsla):,}  weekly: {len(weekly_tsla):,}  monthly: {len(monthly_tsla):,}")
 
-    return tsla_tf, spy_tf, daily_tsla, weekly_tsla, daily_spy
+    return tsla_tf, spy_tf, daily_tsla, weekly_tsla, daily_spy, monthly_tsla
 
 
 def _prepare_year(tsla_tf, spy_tf, daily_tsla, weekly_tsla, year: int,
-                  lookback_days: int = 90) -> Optional[dict]:
+                  lookback_days: int = 90, monthly_tsla=None,
+                  primary_tf: str = '1h') -> Optional[dict]:
     """Slice all DFs to `year` with a lookback buffer for channel detection."""
     cutoff_start = pd.Timestamp(f'{year - 1}-10-01')  # ~90 days before year
     cutoff_year_start = pd.Timestamp(f'{year}-01-01')
@@ -114,11 +128,18 @@ def _prepare_year(tsla_tf, spy_tf, daily_tsla, weekly_tsla, year: int,
     if tsla_slice is None or len(tsla_slice) < 20:
         return None
 
-    # Higher TF dict as expected by run_backtest
-    higher_tf_dict = {
-        'daily': daily_slice,
-        'weekly': weekly_slice,
-    }
+    # Higher TF dict — for daily primary TF use weekly+monthly; otherwise daily+weekly
+    if primary_tf == '1d':
+        higher_tf_dict = {'weekly': weekly_slice}
+        if monthly_tsla is not None:
+            monthly_slice = _slice(monthly_tsla, cutoff_start, cutoff_year_end)
+            if monthly_slice is not None and len(monthly_slice) > 0:
+                higher_tf_dict['monthly'] = monthly_slice
+    else:
+        higher_tf_dict = {
+            'daily': daily_slice,
+            'weekly': weekly_slice,
+        }
 
     return {
         'tsla_tf': tsla_slice,
@@ -229,7 +250,7 @@ def main():
         description='Medium-TF Channel Surfer backtest (1h or 4h primary)')
     parser.add_argument('--tsla', type=str, default='data/TSLAMin.txt')
     parser.add_argument('--spy',  type=str, default='data/SPYMin.txt')
-    parser.add_argument('--tf',   type=str, default='1h', choices=['1h', '4h'])
+    parser.add_argument('--tf',   type=str, default='1h', choices=['1h', '4h', '1d'])
     parser.add_argument('--years', type=str, default='2015-2024')
     parser.add_argument('--oos-year', type=int, default=2025)
     parser.add_argument('--capital', type=float, default=100_000.0)
@@ -249,7 +270,7 @@ def main():
     # Load & resample
     # ------------------------------------------------------------------
     t0 = time.time()
-    tsla_tf, spy_tf, daily_tsla, weekly_tsla, daily_spy = _load_and_resample(
+    tsla_tf, spy_tf, daily_tsla, weekly_tsla, daily_spy, monthly_tsla = _load_and_resample(
         args.tsla, args.spy if os.path.isfile(args.spy) else None, args.tf)
     print(f"  Data loaded in {time.time() - t0:.1f}s")
 
@@ -309,7 +330,8 @@ def main():
         t_cfg = time.time()
 
         for year in is_years:
-            year_data = _prepare_year(tsla_tf, spy_tf, daily_tsla, weekly_tsla, year)
+            year_data = _prepare_year(tsla_tf, spy_tf, daily_tsla, weekly_tsla, year,
+                                      monthly_tsla=monthly_tsla, primary_tf=args.tf)
             if year_data is None:
                 print(f"  {year}: no data, skipping")
                 continue
@@ -350,7 +372,8 @@ def main():
         print(f"OOS VALIDATION — {args.oos_year}")
         print(f"{'='*70}")
 
-        oos_year_data = _prepare_year(tsla_tf, spy_tf, daily_tsla, weekly_tsla, args.oos_year)
+        oos_year_data = _prepare_year(tsla_tf, spy_tf, daily_tsla, weekly_tsla, args.oos_year,
+                                      monthly_tsla=monthly_tsla, primary_tf=args.tf)
         if oos_year_data is None:
             print(f"  {args.oos_year}: no OOS data available")
         else:
