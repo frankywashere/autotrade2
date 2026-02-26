@@ -19151,7 +19151,8 @@ SIGNALS = (SIGNALS_P1 + SIGNALS_P2 + SIGNALS_P3 + SIGNALS_P4 + SIGNALS_P5D + SIG
            + SIGNALS_P11F + SIGNALS_P11G + SIGNALS_P11H + SIGNALS_P11I + SIGNALS_P11J + SIGNALS_P11K
            + SIGNALS_P11L + SIGNALS_P11M + SIGNALS_P11N + SIGNALS_P11O + SIGNALS_P11P
            + SIGNALS_P11Q
-           + SIGNALS_P11R)
+           + SIGNALS_P11R
+           + SIGNALS_P11S)
 
 
 # ── Phase 11R — RSI smooth / divergence / upward hook on S1041 ────────────────
@@ -19348,6 +19349,211 @@ SIGNALS_P11R: List[Tuple] = [
     ('S1199_rsi_hook_or_div',   sig_s1199_rsi_hook_or_div,   10, 0.20, 50),  # hook OR divergence
     ('S1200_rsi_smooth_bot',    sig_s1200_rsi_smooth_bottomed, 10, 0.20, 50), # smooth RSI V-turn
     # Hold variants for the best performer(s) — add after seeing results
+]
+
+# ── Phase 11S — Weekly RSI extremes + S1041 intersection ─────────────────────
+#
+# Motivated by rsi_bottom_targets.py (Feb 2026):
+#   weekly RSI<30 + daily RSI<35 → n=9, E[30d]=$78,773, 100% hit +10%/+20%
+#   weekly RSI<30 standalone     → n=13, 100% hit all targets, E[30d]=$75K
+#
+# Three questions:
+#   1. How does standalone weekly RSI<30 perform in a full IS/OOS backtest?
+#   2. Does adding weekly RSI gate to S1041 improve it (higher WR, better P&L)?
+#   3. Is weekly RSI<30+daily RSI<35 additive to S1041 (adds new quality trades)?
+#
+# Signals:
+#   S1201 — weekly RSI<30 only (standalone, no channel)
+#   S1202 — weekly RSI<35 only (broader, n=37 over 10yr)
+#   S1203 — weekly RSI<30 + daily RSI<35 (best combo from rsi_bottom_targets)
+#   S1204 — weekly RSI<30 + daily RSI<40 (looser daily threshold)
+#   S1205 — weekly RSI<35 + daily RSI<40
+#   S1206 — S1041_core + weekly RSI<35 (does weekly RSI sharpen S1041 entries?)
+#   S1207 — S1041_core + weekly RSI<40 (broader weekly gate on S1041)
+#   S1208 — weekly RSI<30 + daily RSI<35 + VIX 15-50 (add S1041's VIX gate)
+#   S1209 — weekly RSI<30 + daily RSI<35 + ATR_compressed (add coiling-spring)
+#   S1210 — S1041_core OR (weekly RSI<30 + daily RSI<35) [union — additive?]
+
+# Module-level cache for weekly RSI computation (avoids O(n²) recomputation)
+_wkly_rsi_cache: dict = {}
+
+
+def _weekly_rsi_at(tw, date, period: int = 14):
+    """
+    Return weekly RSI(14) as of `date` using the tw (weekly OHLCV) DataFrame.
+    Returns None if insufficient data or NaN.
+    Uses a module-level cache keyed on id(tw) to avoid re-computing per call.
+    """
+    if tw is None or len(tw) < period + 2:
+        return None
+    ck = id(tw)
+    if ck not in _wkly_rsi_cache:
+        _wkly_rsi_cache[ck] = _rsi(tw['close'], period)
+    rsi_w = _wkly_rsi_cache[ck]
+    wi = rsi_w.index.searchsorted(date + pd.Timedelta(days=1), side='left') - 1
+    if wi < period:
+        return None
+    v = float(rsi_w.iloc[wi])
+    return None if np.isnan(v) else v
+
+
+def _atr_compressed_at(tsla, i: int) -> bool:
+    """
+    True if ATR is compressed: ATR_5 < 0.75 × ATR_20.
+    Uses Wilder-smoothed (EWM) ATR on the last 25 daily bars.
+    """
+    if i < 25:
+        return False
+    hi = tsla['high'].values
+    lo = tsla['low'].values
+    cl = tsla['close'].values
+    # True range for each bar
+    tr = np.array([
+        max(hi[j] - lo[j],
+            abs(hi[j] - cl[j - 1]),
+            abs(lo[j] - cl[j - 1]))
+        for j in range(i - 24, i + 1)
+    ])
+    # Simple average (approximation of Wilder for short lookbacks)
+    atr5  = float(np.mean(tr[-5:]))
+    atr20 = float(np.mean(tr[-20:]))
+    return atr20 > 0 and atr5 < 0.75 * atr20
+
+
+def sig_s1201_wkly_rsi30(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1201: weekly RSI<30 only — pure RSI extreme, no channel condition.
+    Baseline: does the 100%-hit-rate finding from rsi_bottom_targets hold
+    in a full position-sized backtest with stops?"""
+    if i < 252 or tw is None:
+        return 0
+    wr = _weekly_rsi_at(tw, tsla.index[i])
+    return 1 if (wr is not None and wr < 30.0) else 0
+
+
+def sig_s1202_wkly_rsi35(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1202: weekly RSI<35 only — broader threshold (n=37 over 10yr).
+    Tests frequency/quality trade-off vs S1201."""
+    if i < 252 or tw is None:
+        return 0
+    wr = _weekly_rsi_at(tw, tsla.index[i])
+    return 1 if (wr is not None and wr < 35.0) else 0
+
+
+def sig_s1203_wkly30_daily35(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1203: weekly RSI<30 + daily RSI<35 — best combo from rsi_bottom_targets.
+    E[30d]=$78,773, 100% hit all profit targets over 10yr in forward-return test."""
+    if i < 252 or tw is None:
+        return 0
+    if float(rt.iloc[i]) >= 35.0:
+        return 0
+    wr = _weekly_rsi_at(tw, tsla.index[i])
+    return 1 if (wr is not None and wr < 30.0) else 0
+
+
+def sig_s1204_wkly30_daily40(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1204: weekly RSI<30 + daily RSI<40 — looser daily gate.
+    How many trades does relaxing daily RSI from <35 to <40 add?"""
+    if i < 252 or tw is None:
+        return 0
+    if float(rt.iloc[i]) >= 40.0:
+        return 0
+    wr = _weekly_rsi_at(tw, tsla.index[i])
+    return 1 if (wr is not None and wr < 30.0) else 0
+
+
+def sig_s1205_wkly35_daily40(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1205: weekly RSI<35 + daily RSI<40 — less restrictive version.
+    Covers the weekly RSI<35 range (n=37 over 10yr) with daily confirmation."""
+    if i < 252 or tw is None:
+        return 0
+    if float(rt.iloc[i]) >= 40.0:
+        return 0
+    wr = _weekly_rsi_at(tw, tsla.index[i])
+    return 1 if (wr is not None and wr < 35.0) else 0
+
+
+def sig_s1206_s1041core_wkly35(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1206: S1041_core conditions AND weekly RSI<35.
+    Tests: does requiring weekly RSI<35 at S1041 entries improve WR/P&L?
+    Reduces trade count from S1041's 23 — question is whether kept trades score higher."""
+    if tw is None:
+        return 0
+    if not _s1041_core(i, tsla, spy, vix, tw, sw, rt, rs, w):
+        return 0
+    wr = _weekly_rsi_at(tw, tsla.index[i])
+    return 1 if (wr is not None and wr < 35.0) else 0
+
+
+def sig_s1207_s1041core_wkly40(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1207: S1041_core conditions AND weekly RSI<40 — broader weekly gate.
+    How many of S1041's 23+ trades have weekly RSI<40?"""
+    if tw is None:
+        return 0
+    if not _s1041_core(i, tsla, spy, vix, tw, sw, rt, rs, w):
+        return 0
+    wr = _weekly_rsi_at(tw, tsla.index[i])
+    return 1 if (wr is not None and wr < 40.0) else 0
+
+
+def sig_s1208_wkly30_daily35_vix(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1208: weekly RSI<30 + daily RSI<35 + VIX 15-50.
+    Adds S1041's VIX regime gate to the pure RSI signal.
+    VIX gate should block complacency (VIX<15) and systemic crisis (VIX>50)."""
+    if i < 252 or tw is None or len(vix) <= i:
+        return 0
+    v = float(vix.iloc[i])
+    if not (15.0 <= v <= 50.0):
+        return 0
+    if float(rt.iloc[i]) >= 35.0:
+        return 0
+    wr = _weekly_rsi_at(tw, tsla.index[i])
+    return 1 if (wr is not None and wr < 30.0) else 0
+
+
+def sig_s1209_wkly30_daily35_atr(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1209: weekly RSI<30 + daily RSI<35 + ATR_compressed.
+    Adds the coiling-spring filter (ATR_5 < 0.75×ATR_20).
+    If compression co-occurs with RSI extreme, the bounce may be sharper."""
+    if i < 252 or tw is None:
+        return 0
+    if not _atr_compressed_at(tsla, i):
+        return 0
+    if float(rt.iloc[i]) >= 35.0:
+        return 0
+    wr = _weekly_rsi_at(tw, tsla.index[i])
+    return 1 if (wr is not None and wr < 30.0) else 0
+
+
+def sig_s1210_s1041_or_wkly30(i, tsla, spy, vix, tw, sw, rt, rs, w):
+    """S1210: S1041_core OR (weekly RSI<30 + daily RSI<35) — union test.
+    S1041_core already fires on S1041's trades; weekly RSI<30+daily RSI<35
+    fires on additional RSI-extreme trades outside S1041's channel structure.
+    Union P&L = S1041 + any incremental RSI trades not already in S1041."""
+    if tw is None:
+        return 0
+    # Check S1041 core (channel + ATR + VIX + momentum)
+    if _s1041_core(i, tsla, spy, vix, tw, sw, rt, rs, w):
+        return 1
+    # Also fire on pure weekly RSI extreme (may catch trades S1041 misses)
+    if i < 252:
+        return 0
+    if float(rt.iloc[i]) >= 35.0:
+        return 0
+    wr = _weekly_rsi_at(tw, tsla.index[i])
+    return 1 if (wr is not None and wr < 30.0) else 0
+
+
+SIGNALS_P11S: List[Tuple] = [
+    ('S1201_wkly_rsi30',        sig_s1201_wkly_rsi30,        10, 0.20, 50),  # weekly RSI<30 standalone
+    ('S1202_wkly_rsi35',        sig_s1202_wkly_rsi35,        10, 0.20, 50),  # weekly RSI<35 standalone
+    ('S1203_wkly30_daily35',    sig_s1203_wkly30_daily35,    10, 0.20, 50),  # best combo from targets
+    ('S1204_wkly30_daily40',    sig_s1204_wkly30_daily40,    10, 0.20, 50),  # looser daily threshold
+    ('S1205_wkly35_daily40',    sig_s1205_wkly35_daily40,    10, 0.20, 50),  # broader weekly+daily
+    ('S1206_s1041core_wkly35',  sig_s1206_s1041core_wkly35,  10, 0.20, 50),  # S1041 core + wkly RSI<35
+    ('S1207_s1041core_wkly40',  sig_s1207_s1041core_wkly40,  10, 0.20, 50),  # S1041 core + wkly RSI<40
+    ('S1208_wkly30_d35_vix',    sig_s1208_wkly30_daily35_vix, 10, 0.20, 50), # +VIX gate
+    ('S1209_wkly30_d35_atr',    sig_s1209_wkly30_daily35_atr, 10, 0.20, 50), # +ATR compressed
+    ('S1210_s1041_or_wkly30',   sig_s1210_s1041_or_wkly30,   10, 0.20, 50),  # union
 ]
 
 # ── sentinel — do not remove ──────────────────────────────────────────────────
