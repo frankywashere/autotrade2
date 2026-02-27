@@ -296,7 +296,7 @@ def rolling_mean(
     rolling = series.rolling(window=window, min_periods=min_periods).mean()
 
     # Replace NaN with default
-    result = rolling.to_numpy()
+    result = rolling.to_numpy().copy()
     result[~np.isfinite(result)] = default
 
     return result
@@ -335,7 +335,7 @@ def rolling_std(
     series = pd.Series(arr)
     rolling = series.rolling(window=window, min_periods=min_periods).std(ddof=ddof)
 
-    result = rolling.to_numpy()
+    result = rolling.to_numpy().copy()
     result[~np.isfinite(result)] = default
 
     return result
@@ -378,7 +378,7 @@ def rolling_correlation(
 
     rolling = series1.rolling(window=window, min_periods=min_periods).corr(series2)
 
-    result = rolling.to_numpy()
+    result = rolling.to_numpy().copy()
     result[~np.isfinite(result)] = default
 
     return result
@@ -434,7 +434,7 @@ def calc_ema(
     series = pd.Series(arr)
     ema = series.ewm(span=period, min_periods=1, adjust=False).mean()
 
-    result = ema.to_numpy()
+    result = ema.to_numpy().copy()
     result[~np.isfinite(result)] = default
 
     return result
@@ -605,8 +605,8 @@ def calc_stochastic(
     series_h = pd.Series(h)
     series_l = pd.Series(l)
 
-    highest_high = series_h.rolling(window=k_period, min_periods=1).max().to_numpy()
-    lowest_low = series_l.rolling(window=k_period, min_periods=1).min().to_numpy()
+    highest_high = series_h.rolling(window=k_period, min_periods=1).max().to_numpy().copy()
+    lowest_low = series_l.rolling(window=k_period, min_periods=1).min().to_numpy().copy()
 
     # %K = (Close - Lowest Low) / (Highest High - Lowest Low) * 100
     hl_range = highest_high - lowest_low
