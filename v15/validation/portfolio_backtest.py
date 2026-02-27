@@ -795,10 +795,13 @@ def run_phase4(all_results: Dict[str, Dict[int, 'SystemYearResult']],
             if sys_yr is None:
                 continue
             for t in sys_yr.trades:
+                # Strip tz from all timestamps for consistent comparison
+                entry = t.entry_time.tz_localize(None) if t.entry_time.tzinfo is not None else t.entry_time
+                exit_t = t.exit_time.tz_localize(None) if t.exit_time.tzinfo is not None else t.exit_time
                 all_trades.append(UnifiedTrade(
                     system=t.system,
-                    entry_time=t.entry_time,
-                    exit_time=t.exit_time,
+                    entry_time=entry,
+                    exit_time=exit_t,
                     pnl=t.pnl * scale,
                     direction=t.direction,
                 ))
@@ -817,11 +820,6 @@ def run_phase4(all_results: Dict[str, Dict[int, 'SystemYearResult']],
     for t in all_trades:
         entry = t.entry_time
         exit_t = t.exit_time
-        # Normalize to naive timestamps for comparison
-        if entry.tzinfo is not None:
-            entry = entry.tz_localize(None) if hasattr(entry, 'tz_localize') else entry.replace(tzinfo=None)
-        if exit_t.tzinfo is not None:
-            exit_t = exit_t.tz_localize(None) if hasattr(exit_t, 'tz_localize') else exit_t.replace(tzinfo=None)
         events.append((entry, +1, t))
         events.append((exit_t, -1, t))
 
