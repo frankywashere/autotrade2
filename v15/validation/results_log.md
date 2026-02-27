@@ -617,12 +617,32 @@ commit `d581b1f`.
 All 4 configs (baseline, mtf_conflict, mtf_exhaust, mtf_full) produce IDENTICAL results.
 MTF momentum filter has zero effect at daily TF -- all signals neutral.
 
+### Walk-Forward Validation (6 windows, 5yr IS -> 1yr OOS)
+**Script**: `v15/validation/medium_tf_walk_forward.py --tf 1d`
+**Run date**: Feb 26, 2026
+
+| Window | IS P&L (5yr) | IS avg/yr | OOS P&L | OOS/IS_avg | OOS WR | OOS Trades | Result |
+|--------|-------------|-----------|---------|------------|--------|------------|--------|
+| IS 2015-2019 -> OOS 2020 | $1,104,423 | $220,885 | $580,926 | 2.63x | 100% | 34 | WIN |
+| IS 2016-2020 -> OOS 2021 | $1,524,150 | $304,830 | $76,715 | 0.25x | 98.1% | 53 | WIN |
+| IS 2017-2021 -> OOS 2022 | $1,407,217 | $281,443 | $371,985 | 1.32x | 98.2% | 55 | WIN |
+| IS 2018-2022 -> OOS 2023 | $1,539,751 | $307,950 | $133,345 | 0.43x | 100% | 57 | WIN |
+| IS 2019-2023 -> OOS 2024 | $1,414,710 | $282,942 | $253,549 | 0.90x | 100% | 56 | WIN |
+| IS 2020-2024 -> OOS 2025 | $1,416,520 | $283,304 | $457,678 | 1.62x | 100% | 41 | WIN |
+
+- **OOS profitable: 6/6 WIN**
+- **Avg OOS/IS_avg ratio: 1.19x** -- OOS exceeds IS average
+- **Total OOS: $1,874,198** across 6 windows
+- Weakest window: 2021 (0.25x) -- low-vol year, but still profitable
+- Strongest window: 2020 (2.63x) -- COVID volatility rewarded
+
 ### Daily TF Assessment
 
 - **Fills the multi-day gap**: 5-bar hold = ~5 trading days, between 1h (10h) and swing (weeks)
 - **50 trades/yr**: decent frequency, ~4/month
 - **Sharpe 1.88**: comparable to 1h (2.19) and better than 4h (1.27)
-- **2020 outlier**: $581K (23% of IS total) -- COVID volatility
-- **OOS strong**: $458K in 2025 vs $252K/yr IS avg = 1.82x OOS/IS ratio
+- **Walk-forward 6/6**: OOS/IS 1.19x avg -- robust out-of-sample
 - **WR 99.0%**: consistent with other TFs
-- **Next step**: run walk-forward validation, then consider adding to portfolio backtest
+- **OOS strong**: $458K in 2025 vs $252K/yr IS avg = 1.82x OOS/IS ratio
+- **Replaces 4h**: better Sharpe (1.88 vs 1.27), lower correlation to 1h (different hold duration),
+  and fills the multi-day gap that dropping 4h created
