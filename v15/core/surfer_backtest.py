@@ -67,8 +67,8 @@ class OpenPosition:
     trailing_stop: float = 0.0  # Best price seen for trailing
     worst_price: float = 0.0    # Worst price seen (for MAE)
     best_price: float = 0.0     # Best price seen (for MFE)
-    el_flagged: bool = False    # Extreme Loser flagged — trail more aggressively
-    fast_reversion: bool = False # Fast reversion detected — bounce trail tighter
+    el_flagged: bool = False    # Extreme Loser flagged -- trail more aggressively
+    fast_reversion: bool = False # Fast reversion detected -- bounce trail tighter
     is_flagged: bool = False    # Immediate Stop flagged
     extended: bool = False       # Hold time extended on profitable timeout
     trail_width_mult: float = 1.0  # Arch 61: widen trail for predicted extended runs
@@ -177,7 +177,7 @@ def _check_position_exit(position: OpenPosition, bar: int, current_price: float,
             profit_from_entry = (position.trailing_stop - entry) / entry
             profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
             # EL: lower thresholds and tighter trails
-            # Fast reversion: even tighter — mean reversion resolves quickly
+            # Fast reversion: even tighter -- mean reversion resolves quickly
             tight = el or fast_rev
             if profit_ratio >= 0.80:
                 # Near TP: ultra-tight trail to lock in most of the move
@@ -331,7 +331,7 @@ def _extract_signal_features(analysis, tsla, bar, closes, spy_df, vix_df,
     feature_vec[offset:offset + len(CORRELATION_FEATURES)] = corr_feats
     offset += len(CORRELATION_FEATURES)
 
-    # c10 Arch2: Trade lag features (system state — recent trade outcomes)
+    # c10 Arch2: Trade lag features (system state -- recent trade outcomes)
     lag_feats = extract_trade_lag_features(
         closed_trades=closed_trades,
         consecutive_wins=consecutive_wins,
@@ -365,9 +365,9 @@ def run_backtest(
     slippage_bps: float = 3.0,          # 3 basis points per side
     commission_per_share: float = 0.005, # $0.005/share round trip
     max_leverage: float = 4.0,
-    bounce_cap: float = 12.0,           # Max exposure cap multiplier for bounce signals (all-weather: 4-12x validated 11/11 years 2015-2025; Arch384: 8x→12x +$160K est 11yr)
+    bounce_cap: float = 12.0,           # Max exposure cap multiplier for bounce signals (all-weather: 4-12x validated 11/11 years 2015-2025; Arch384: 8x->12x +$160K est 11yr)
     max_trade_usd: float = 0.0,         # Hard dollar cap per trade (0 = unlimited). Set to e.g. 1e6 for realistic market-capacity simulation.
-    min_trade_usd: float = 0.0,         # Min position size — skip trades where final size is below this threshold (avoids sub-$100 P&L trades).
+    min_trade_usd: float = 0.0,         # Min position size -- skip trades where final size is below this threshold (avoids sub-$100 P&L trades).
     initial_capital: float = 0.0,       # 0 = use position_size * 10
     capture_features: bool = False,     # Save ML feature vectors per trade
     signal_quality_model=None,          # SignalQualityModel for ML position sizing
@@ -394,7 +394,7 @@ def run_backtest(
     from v15.core.channel import detect_channels_multi_window, select_best_channel
     from v15.core.channel_surfer import analyze_channels, SIGNAL_TFS, TF_WINDOWS
 
-    # Silent failure tracker — counts errors per category, prints summary at end
+    # Silent failure tracker -- counts errors per category, prints summary at end
     _error_counts = {}
     def _track_error(category: str, err: Exception):
         _error_counts.setdefault(category, {'count': 0, 'first_err': str(err)})
@@ -415,9 +415,9 @@ def run_backtest(
                  'pos_score_weak': 0, 'low_conf_buy_bounce': 0, 'leverage_cap': 0,
                  'filter_rejected': 0, 'filter_evaluated': 0}
     if not ml_active:
-        print("⚠️  WARNING: ML MODEL NOT LOADED — trading without ML filtering!")
-        print("⚠️  All signals will pass through unfiltered by ML models.")
-        print("⚠️  This is ONLY acceptable for backtesting baseline comparisons.")
+        print("!  WARNING: ML MODEL NOT LOADED -- trading without ML filtering!")
+        print("!  All signals will pass through unfiltered by ML models.")
+        print("!  This is ONLY acceptable for backtesting baseline comparisons.")
     if ml_active:
         from v15.core.surfer_ml import (
             extract_tf_features, extract_cross_tf_features,
@@ -1042,21 +1042,21 @@ def run_backtest(
         print("Not enough data for backtest")
         return BacktestMetrics(), []
 
-    # Data quality checks — never trade on garbage data silently
+    # Data quality checks -- never trade on garbage data silently
     if spy_df is None:
-        print("⚠️  WARNING: SPY data missing — ML correlation features will be degraded!")
+        print("!  WARNING: SPY data missing -- ML correlation features will be degraded!")
     elif len(spy_df) < 100:
-        print(f"⚠️  WARNING: SPY data sparse ({len(spy_df)} bars) — correlation features unreliable!")
+        print(f"!  WARNING: SPY data sparse ({len(spy_df)} bars) -- correlation features unreliable!")
     if vix_df is None:
-        print("⚠️  WARNING: VIX data missing — volatility regime features unavailable!")
+        print("!  WARNING: VIX data missing -- volatility regime features unavailable!")
     if 'volume' not in tsla.columns or tsla['volume'].sum() == 0:
-        print("⚠️  WARNING: Volume data missing — volume filters disabled!")
+        print("!  WARNING: Volume data missing -- volume filters disabled!")
     for _req_tf in ['1h', 'daily']:
         if _req_tf not in higher_tf_data:
-            print(f"⚠️  WARNING: {_req_tf} timeframe missing — multi-TF analysis degraded!")
+            print(f"!  WARNING: {_req_tf} timeframe missing -- multi-TF analysis degraded!")
     nan_pct = tsla[['open', 'high', 'low', 'close']].isna().mean().mean() * 100
     if nan_pct > 1.0:
-        print(f"⚠️  WARNING: {nan_pct:.1f}% NaN values in TSLA OHLC — data may be corrupted!")
+        print(f"!  WARNING: {nan_pct:.1f}% NaN values in TSLA OHLC -- data may be corrupted!")
 
     closes = tsla['close'].values
     opens = tsla['open'].values
@@ -1367,7 +1367,7 @@ def run_backtest(
                 volumes_dict['5min'] = df_slice['volume'].values
 
             # Add higher TF channels (rolling window relative to current bar time)
-            # Only include COMPLETED bars — a bar timestamped at period start
+            # Only include COMPLETED bars -- a bar timestamped at period start
             # contains data through period end, so exclude it until then.
             _TF_PERIOD = {
                 '1h': pd.Timedelta(hours=1),
@@ -1432,7 +1432,7 @@ def run_backtest(
             if sig.action in ('BUY', 'SELL'):
                 ml_stats['total_signals'] += 1
             if ml_active and sig.action in ('BUY', 'SELL'):
-                # Save original confidence — sub-model penalties degrade trail
+                # Save original confidence -- sub-model penalties degrade trail
                 _original_confidence = sig.confidence
                 try:
                     feature_vec, _ = _extract_signal_features(
@@ -1453,7 +1453,7 @@ def run_backtest(
                     # Run ML prediction
                     ml_prediction = ml_model.predict(feature_vec.reshape(1, -1))
 
-                    # ML Action: 0=HOLD, 1=BUY, 2=SELL — informational only
+                    # ML Action: 0=HOLD, 1=BUY, 2=SELL -- informational only
                     # The ultra-tight trail + EL/IS/BMV handle risk better than
                     # GBT confidence penalties (which degrade trail effectiveness)
                     if 'action' in ml_prediction:
@@ -1507,10 +1507,10 @@ def run_backtest(
                                 ens_action = int(ens_pred['action'][0])
                                 physics_action_id = 1 if sig.action == 'BUY' else 2
 
-                                if ens_action == 0:  # Ensemble says HOLD → log only
+                                if ens_action == 0:  # Ensemble says HOLD -> log only
                                     ml_stats['ensemble_filtered'] += 1
                                 elif ens_action != physics_action_id:
-                                    # Ensemble disagrees — informational only
+                                    # Ensemble disagrees -- informational only
                                     ml_stats['ensemble_filtered'] += 1
 
                             # Ensemble lifetime: use for hold time if available
@@ -1573,7 +1573,7 @@ def run_backtest(
                             cv_bd = int(cv_pred['break_dir'][0])
 
                             if bd_consensus >= 0.8:
-                                # 4+/5 folds agree — high confidence
+                                # 4+/5 folds agree -- high confidence
                                 if (sig.action == 'BUY' and cv_bd == 1) or \
                                    (sig.action == 'SELL' and cv_bd == 0):
                                     sig.confidence *= 1.15  # Moderate boost
@@ -1618,7 +1618,7 @@ def run_backtest(
                             is_buy = (sig.action == 'BUY')
                             adv_pred = adverse_model.predict(feature_vec.reshape(1, -1), is_buy=is_buy)
 
-                            # If stop probability is high (>0.4) → penalize confidence
+                            # If stop probability is high (>0.4) -> penalize confidence
                             if 'stop_prob' in adv_pred:
                                 stop_p = float(adv_pred['stop_prob'][0])
                                 if stop_p > 0.4:
@@ -1671,15 +1671,15 @@ def run_backtest(
                             vol_regime = str(vol_pred['vol_regime'][0])
 
                             if vol_regime == 'danger':
-                                # High vol spike probability → strong penalty
+                                # High vol spike probability -> strong penalty
                                 sig.confidence *= 0.65
                                 ml_stats['vol_danger_skip'] += 1
                             elif vol_regime == 'warning':
-                                # Moderate vol risk → mild penalty
+                                # Moderate vol risk -> mild penalty
                                 sig.confidence *= 0.90
                                 ml_stats['vol_warning_scale'] += 1
                             else:
-                                # Calm → slight boost (low vol = favorable for channel trading)
+                                # Calm -> slight boost (low vol = favorable for channel trading)
                                 sig.confidence *= 1.05
                                 ml_stats['vol_calm_boost'] += 1
                         except Exception as _e:
@@ -1709,10 +1709,10 @@ def run_backtest(
                             ca_pred = cross_asset_model.predict(feature_vec.reshape(1, -1))
                             ca_regime = int(ca_pred['market_regime'][0])
 
-                            if ca_regime == 2:  # rotation — TSLA-specific, channels most reliable
+                            if ca_regime == 2:  # rotation -- TSLA-specific, channels most reliable
                                 sig.confidence *= 1.08
                                 ml_stats['ca_rotation_boost'] += 1
-                            elif ca_regime == 3:  # correlated selloff — avoid
+                            elif ca_regime == 3:  # correlated selloff -- avoid
                                 sig.confidence *= 0.65
                                 ml_stats['ca_selloff_skip'] += 1
 
@@ -1727,10 +1727,10 @@ def run_backtest(
                             sess_quality = float(sess_pred['session_quality'][0])
 
                             if sess_quality < 0.20:
-                                sig.confidence *= 0.80  # Poor session → reduce confidence
+                                sig.confidence *= 0.80  # Poor session -> reduce confidence
                                 ml_stats['session_penalty'] += 1
                             elif sess_quality > 0.55:
-                                sig.confidence *= 1.05  # Good session → slight boost
+                                sig.confidence *= 1.05  # Good session -> slight boost
                                 ml_stats['session_boost'] += 1
                         except Exception as _e:
                             _track_error("session", _e)
@@ -1743,10 +1743,10 @@ def run_backtest(
                             rem_life = float(mat_pred['remaining_life'][0])
 
                             if mat_prob > 0.75 and rem_life < 8:
-                                sig.confidence *= 0.75  # Channel about to break → risky
+                                sig.confidence *= 0.75  # Channel about to break -> risky
                                 ml_stats['maturity_skip'] += 1
                             elif mat_prob < 0.20 and rem_life > 50:
-                                sig.confidence *= 1.05  # Young channel → more room
+                                sig.confidence *= 1.05  # Young channel -> more room
                                 ml_stats['maturity_boost'] += 1
                         except Exception as _e:
                             _track_error("ml_predict", _e)
@@ -1758,7 +1758,7 @@ def run_backtest(
                             spike_prob = float(asym_pred['spike_prob'][0])
                             expected_skew = float(asym_pred['expected_skewness'][0])
 
-                            # High spike probability → widen stop to avoid stop-out
+                            # High spike probability -> widen stop to avoid stop-out
                             if spike_prob > 0.40:
                                 # Don't change confidence, but store for exit logic
                                 ml_stats['asym_widen_stop'] += 1
@@ -1768,7 +1768,7 @@ def run_backtest(
                             _track_error("ml_predict", _e)
 
                     # Gap Risk Predictor: AUC 0.852 but too aggressive at all thresholds
-                    # minutes_since_open dominates features → penalizes all late-day entries
+                    # minutes_since_open dominates features -> penalizes all late-day entries
                     # Disabled: trained but not integrated
                     # if gap_risk_model is not None: ...
 
@@ -1780,21 +1780,21 @@ def run_backtest(
                             fast_rev = float(rev_pred['fast_reversion_prob'][0])
 
                             if fast_rev > 0.55 and sig.signal_type == 'bounce':
-                                sig.confidence *= 1.10  # Fast reversion → bounce will work
+                                sig.confidence *= 1.10  # Fast reversion -> bounce will work
                                 ml_stats['rev_fast_boost'] += 1
                             elif fast_rev < 0.15:
-                                sig.confidence *= 0.85  # Slow reversion → less reliable
+                                sig.confidence *= 0.85  # Slow reversion -> less reliable
                                 ml_stats['rev_slow_penalty'] += 1
                         except Exception as _e:
                             _track_error("reversion", _e)
 
-                    # Liquidity State: thin market AUC 1.0 (leaky target — volume_ratio < 0.7)
+                    # Liquidity State: thin market AUC 1.0 (leaky target -- volume_ratio < 0.7)
                     # Slippage regressor (corr 0.499) too aggressive, penalizes 13/46 signals
                     # Disabled: trained but not integrated
                     # if liquidity_model is not None: ...
 
                     # Trade Duration (Arch 31): Quick AUC 0.617, Hold Corr 0.182
-                    # Neutral at all thresholds — doesn't improve PF
+                    # Neutral at all thresholds -- doesn't improve PF
                     # Disabled: trained but not integrated
                     # if duration_model is not None: ...
 
@@ -1805,14 +1805,14 @@ def run_backtest(
                             spread = float(qr_pred['return_spread'][0])
                             risk_ratio = float(qr_pred['risk_ratio'][0])
 
-                            # Favorable asymmetry (P90 >> |P10|) → boost
+                            # Favorable asymmetry (P90 >> |P10|) -> boost
                             if risk_ratio > 1.5:
                                 sig.confidence *= 1.05
                                 ml_stats['qr_favorable_asym'] += 1
                         except Exception as _e:
                             _track_error("quantile_risk", _e)
 
-                    # Tail Risk: big move coming — good for breaks, bad for bounces
+                    # Tail Risk: big move coming -- good for breaks, bad for bounces
                     tail_prob = 0.0  # Track for TP widening
                     if tail_risk_model is not None:
                         try:
@@ -1821,7 +1821,7 @@ def run_backtest(
 
                             if tail_prob > 0.15:
                                 if sig.signal_type == 'bounce':
-                                    # Big move may blow through channel → penalize bounce
+                                    # Big move may blow through channel -> penalize bounce
                                     sig.confidence *= 0.85
                                     ml_stats['tail_bounce_penalty'] += 1
                                 elif sig.signal_type == 'break':
@@ -1831,7 +1831,7 @@ def run_backtest(
                         except Exception as _e:
                             _track_error("ml_predict", _e)
 
-                    # Extreme Loser Detector: high loser probability → penalize hard
+                    # Extreme Loser Detector: high loser probability -> penalize hard
                     el_loser_prob = 0.0  # Track for stop tightening
                     if extreme_loser_model is not None:
                         try:
@@ -1858,7 +1858,7 @@ def run_backtest(
                     # if win_streak_model is not None: ...
 
                     # Adversarial Selector (Arch 37): AUC 0.605 but 0 triggers in backtest
-                    # Only 3 boosting rounds → predictions cluster, never hit thresholds
+                    # Only 3 boosting rounds -> predictions cluster, never hit thresholds
                     # Disabled: trained but not integrated
                     # if adversarial_model is not None: ...
 
@@ -1877,7 +1877,7 @@ def run_backtest(
                     # Vol Clustering (Arch 44): disabled (AUC 0.683, 11 pen/1 boost, PF unchanged)
 
                     # Feature Interaction Loser (Arch 55): AUC 0.733 but 1 boosting round
-                    # Disabled: predictions cluster 0.14-0.19, median split adds noise (PF 9.04→8.88)
+                    # Disabled: predictions cluster 0.14-0.19, median split adds noise (PF 9.04->8.88)
                     # if feat_int_model is not None: ...
 
                     # Bounce Loser (Arch 54): AUC 0.670, 18 pen on bounces, PF unchanged
@@ -1909,7 +1909,7 @@ def run_backtest(
                             _track_error("imm_stop", _e)
 
                     # Breakout Stop Predictor (Arch 59): AUC 0.794
-                    # Stop tightening only — confidence penalty hurts PF
+                    # Stop tightening only -- confidence penalty hurts PF
                     bsp_prob = 0.0
                     if breakout_stop_model is not None and sig.signal_type == 'break':
                         try:
@@ -1931,7 +1931,7 @@ def run_backtest(
                     ml_stats.setdefault('ml_predict_errors', 0)
                     ml_stats['ml_predict_errors'] += 1
                     if ml_stats['ml_predict_errors'] <= 3:
-                        print(f"⚠️  ML PREDICTION FAILED (signal #{ml_stats['total_signals']}): {_ml_err}")
+                        print(f"!  ML PREDICTION FAILED (signal #{ml_stats['total_signals']}): {_ml_err}")
             else:
                 ml_max_hold = None
                 imm_stop_skip = False
@@ -1952,7 +1952,7 @@ def run_backtest(
                     ml_stats['circuit_breaker'] += 1
                     continue
 
-                # 10AM ET skip disabled — testing without in new data window
+                # 10AM ET skip disabled -- testing without in new data window
                 pass
 
                 # Don't enter if we already have a position in the same direction
@@ -2025,24 +2025,24 @@ def run_backtest(
                     except Exception as _e:
                         _track_error("quality_scorer_predict", _e)
 
-                # Restore original confidence — ML sub-model confidence penalties
+                # Restore original confidence -- ML sub-model confidence penalties
                 # degrade trail effectiveness (0.60x drops below ultra-tight threshold)
                 if ml_active:
                     sig.confidence = _original_confidence
 
-                # Position score filter: disabled — EL+BMV handle breakout filtering
+                # Position score filter: disabled -- EL+BMV handle breakout filtering
                 if sig.signal_type == 'break' and sig.position_score < 0.80:
                     ml_stats['pos_score_weak'] += 1
                     # continue  # Disabled: EL+BMV are better breakout filters
 
-                # Low-conf bounce filter: disabled — bounces are 100% WR with ultra-tight trail
+                # Low-conf bounce filter: disabled -- bounces are 100% WR with ultra-tight trail
                 if (sig.signal_type == 'bounce' and sig.action == 'BUY'
                         and sig.confidence < 0.46):
                     ml_stats['low_conf_buy_bounce'] += 1
                     # continue  # Disabled: trail protects all bounces
 
 
-                # Enter position — use next bar's open (no look-ahead bias)
+                # Enter position -- use next bar's open (no look-ahead bias)
                 # Signal fires at bar N close; order fills at bar N+1 open
                 next_bar = bar + 1
                 if next_bar < total_bars:
@@ -2106,13 +2106,13 @@ def run_backtest(
                     adjusted_stop_pct *= 0.05
 
                 # BSP stop tightening: breakout-specific, AUC 0.794
-                # BSP stop tightening disabled — marginal impact (PF 9.67→9.70)
+                # BSP stop tightening disabled -- marginal impact (PF 9.67->9.70)
                 # if bsp_prob > 0.20 and sig.signal_type == 'break':
                 #     adjusted_stop_pct *= 0.65  # 35% tighter
                 #     ml_stats.setdefault('bsp_stop_tighten', 0)
                 #     ml_stats['bsp_stop_tighten'] += 1
 
-                # Arch 73: Skip ultra-narrow breakouts (stop<0.025%) — slippage eats profit
+                # Arch 73: Skip ultra-narrow breakouts (stop<0.025%) -- slippage eats profit
                 if realistic and sig.signal_type == 'break' and adjusted_stop_pct < 0.00030:
                     ml_stats.setdefault('narrow_break_skip', 0)
                     ml_stats['narrow_break_skip'] += 1
@@ -2133,7 +2133,7 @@ def run_backtest(
                     tp = entry_price * (1 - tp_pct)
 
                 # Risk-normalized sizing: trade_size = risk_budget / stop_pct
-                # Wider stops → smaller position, tighter stops → larger position
+                # Wider stops -> smaller position, tighter stops -> larger position
                 trade_size = risk_budget / max(adjusted_stop_pct, 0.001)
 
                 # --- ML Position Sizing ---
@@ -2173,7 +2173,7 @@ def run_backtest(
                     if len(recent_trade_wins) >= 10:
                         rolling_wr = sum(recent_trade_wins) / len(recent_trade_wins)
                         if rolling_wr >= 0.90:
-                            cap_pct = 0.70  # Hot streak → lean in (2x normal)
+                            cap_pct = 0.70  # Hot streak -> lean in (2x normal)
                             ml_stats.setdefault('dyn_cap_hot', 0)
                             ml_stats['dyn_cap_hot'] += 1
                         else:
@@ -2214,11 +2214,11 @@ def run_backtest(
                         size_cap = position_size * 250
                     trade_size = min(trade_size, size_cap)
 
-                    # Channel health penalty: disabled — 100% WR, trails catch all bad breaks
+                    # Channel health penalty: disabled -- 100% WR, trails catch all bad breaks
                     # if sig.signal_type == 'break' and sig.channel_health > 0.35:
                     #     trade_size *= 0.90
 
-                    # Double-negative breakout penalty: disabled — tight stops (0.25x) already limit damage
+                    # Double-negative breakout penalty: disabled -- tight stops (0.25x) already limit damage
                     # High-conf breakouts get tiny stops, so penalty just reduces winners
                     # if (sig.signal_type == 'break' and sig.confidence > 0.90
                     #         and sig.channel_health > 0.25):
@@ -2236,7 +2236,7 @@ def run_backtest(
                     if sig.signal_type == 'bounce' and sig.confidence > 0.55:
                         trade_size *= 1.90
 
-                    # BUY bounce low-conf penalty: disabled — 100% WR on BUY bounces
+                    # BUY bounce low-conf penalty: disabled -- 100% WR on BUY bounces
                     # if (sig.signal_type == 'bounce' and sig.action == 'BUY'
                     #         and sig.confidence < 0.50):
                     #     trade_size *= 0.50
@@ -2324,7 +2324,7 @@ def run_backtest(
                     else:
                         trade_size *= 1.15
 
-                    # Range expansion detection: contraction→expansion = trend beginning
+                    # Range expansion detection: contraction->expansion = trend beginning
                     if bar >= 10:
                         recent_range = (highs[bar-3:bar].max() - lows[bar-3:bar].min()) / closes[bar]
                         prior_range = (highs[bar-10:bar-3].max() - lows[bar-10:bar-3].min()) / closes[bar]
@@ -2340,12 +2340,12 @@ def run_backtest(
                         trade_size *= 1.20
 
                     # Continuous confidence scaling: higher conf = linearly bigger position
-                    # conf 0.40 → 1.0x, conf 0.90 → 1.5x (linear interpolation)
+                    # conf 0.40 -> 1.0x, conf 0.90 -> 1.5x (linear interpolation)
                     conf_scale = 1.0 + (sig.confidence - 0.40) * (0.5 / 0.5)
                     conf_scale = max(1.0, min(conf_scale, 1.5))
                     trade_size *= conf_scale
 
-                    # ATR-inverse sizing: low volatility → larger positions
+                    # ATR-inverse sizing: low volatility -> larger positions
                     if bar >= 14 and not np.isnan(atr[bar]):
                         atr_pct = atr[bar] / entry_price
                         # Low vol (ATR < 1.0%): boost 1.30x
@@ -2401,7 +2401,7 @@ def run_backtest(
                     bar_time = tsla.index[bar]
                     hour = bar_time.hour if hasattr(bar_time, 'hour') else 12
                     minute = bar_time.minute if hasattr(bar_time, 'minute') else 0
-                    # Arch 99: Time-of-day sizing (fix UTC→EST)
+                    # Arch 99: Time-of-day sizing (fix UTC->EST)
                     est_hour = (hour - 5) % 24
                     minutes_from_open = (est_hour - 9) * 60 + minute - 30
                     if 0 <= minutes_from_open < 15:
@@ -2426,7 +2426,7 @@ def run_backtest(
                 primary_state = analysis.tf_states.get(sig.primary_tf)
                 ou_hl = primary_state.ou_half_life if primary_state else 5.0
 
-                # Entry delay disabled — deferred entries don't work with ultra-tight 0.05x stops
+                # Entry delay disabled -- deferred entries don't work with ultra-tight 0.05x stops
                 # The stop check invalidates most deferred breakouts within 1 bar
                 defer_entry = False
                 sig_data = {
@@ -2449,7 +2449,7 @@ def run_backtest(
                     ml_stats.setdefault('deferred_total', 0)
                     ml_stats['deferred_total'] += 1
                 else:
-                    # Arch 62: Breakout Fade Detector — skip fading breakouts
+                    # Arch 62: Breakout Fade Detector -- skip fading breakouts
                     if breakout_fade_model is not None and feature_vec is not None and sig.signal_type == 'break':
                         try:
                             bf_pred = breakout_fade_model.predict(feature_vec.reshape(1, -1))
@@ -2482,7 +2482,7 @@ def run_backtest(
                         except Exception as _e:
                             _track_error("extended_run_predict", _e)
                     # Arch 65+69: Directional bounce premium
-                    # SELL bounces: 98% WR → aggressive, BUY bounces: 95% WR → moderate
+                    # SELL bounces: 98% WR -> aggressive, BUY bounces: 95% WR -> moderate
                     if realistic and sig.signal_type == 'bounce':
                         if sig.action == 'SELL':
                             trade_size *= 2.5  # SELL bounces: highest WR
@@ -2505,15 +2505,15 @@ def run_backtest(
 
                     # Arch 68: Channel health inverse sizing for breakouts
                     # Higher channel_health correlates with WORSE breakout P&L (-0.173 corr)
-                    # Healthy channels hold → breakouts tend to fade
+                    # Healthy channels hold -> breakouts tend to fade
                     if realistic and sig.signal_type == 'break':
                         ch = sig.channel_health
                         if ch > 0.50:
-                            trade_size *= 0.6  # Healthy channel → likely to hold
+                            trade_size *= 0.6  # Healthy channel -> likely to hold
                             ml_stats.setdefault('ch_break_sizedown', 0)
                             ml_stats['ch_break_sizedown'] += 1
                         elif ch < 0.30:
-                            trade_size *= 1.4  # Weak channel → breakout more likely real
+                            trade_size *= 1.4  # Weak channel -> breakout more likely real
                             ml_stats.setdefault('ch_break_sizeup', 0)
                             ml_stats['ch_break_sizeup'] += 1
                         # Arch 70: SELL breaks more reliable (80% vs 77% WR)
@@ -2547,11 +2547,11 @@ def run_backtest(
                         recent_rets = [(closes[b] - closes[b-1]) / closes[b-1] for b in range(bar-19, bar+1)]
                         rvol = np.std(recent_rets) * 100  # as percentage
                         if sig.signal_type == 'bounce' and rvol < 0.40:
-                            trade_size *= 1.2  # Low vol → cleaner bounces
+                            trade_size *= 1.2  # Low vol -> cleaner bounces
                             ml_stats.setdefault('low_vol_bounce', 0)
                             ml_stats['low_vol_bounce'] += 1
                         elif sig.signal_type == 'break' and rvol > 0.50:
-                            trade_size *= 1.2  # High vol → real breakouts
+                            trade_size *= 1.2  # High vol -> real breakouts
                             ml_stats.setdefault('high_vol_break', 0)
                             ml_stats['high_vol_break'] += 1
 
@@ -2624,7 +2624,7 @@ def run_backtest(
                             ml_stats.setdefault('counter_trend_boost', 0)
                             ml_stats['counter_trend_boost'] += 1
 
-                    # Arch 101: R-squared quality — high fit channels are more reliable
+                    # Arch 101: R-squared quality -- high fit channels are more reliable
                     if realistic and sig.signal_type == 'bounce':
                         ps101 = analysis.tf_states.get(sig.primary_tf)
                         if ps101 and ps101.r_squared > 0.85:
@@ -2645,7 +2645,7 @@ def run_backtest(
                             ml_stats.setdefault('momentum_confirmed', 0)
                             ml_stats['momentum_confirmed'] += 1
 
-                    # Arch 63+64: Follow-through → position sizing + breakout gate
+                    # Arch 63+64: Follow-through -> position sizing + breakout gate
                     # Model has 0.44 correlation with actual 5-bar moves
                     if follow_through_model is not None and feature_vec is not None and realistic:
                         try:
@@ -2656,23 +2656,23 @@ def run_backtest(
                                 ml_stats.setdefault('ft_break_skipped', 0)
                                 ml_stats['ft_break_skipped'] += 1
                                 continue
-                            # Scale position size: bigger moves → bigger positions
-                            if ft_val > 0.005:  # Large expected move → 1.5x position
+                            # Scale position size: bigger moves -> bigger positions
+                            if ft_val > 0.005:  # Large expected move -> 1.5x position
                                 trade_size *= 1.5
                                 ml_stats['ft_wide_trail'] += 1
-                            elif ft_val < 0.002:  # Small expected move → 0.5x position
+                            elif ft_val < 0.002:  # Small expected move -> 0.5x position
                                 trade_size *= 0.5
                                 ml_stats['ft_tight_trail'] += 1
                         except Exception as _e:
                             _track_error("follow_through_predict", _e)
 
-                    # Arch 71: Signal persistence boost — same dir within 2 bars
+                    # Arch 71: Signal persistence boost -- same dir within 2 bars
                     if realistic and last_signal_dir == sig.action and (bar - last_signal_bar) <= 2:
                         trade_size *= 1.1
                         ml_stats.setdefault('persist_boost', 0)
                         ml_stats['persist_boost'] += 1
 
-                    # Arch 85: Signal drought boost — rare signals after silence are highest quality
+                    # Arch 85: Signal drought boost -- rare signals after silence are highest quality
                     # Gap 4-6: 87.5% WR, Gap 26+: 90% WR (vs 80.6% for gap 2-3)
                     if realistic and last_trade_entry_bar >= 0:
                         bars_since_trade = bar - last_trade_entry_bar
@@ -2704,14 +2704,14 @@ def run_backtest(
                         ml_stats.setdefault('streak_accel', 0)
                         ml_stats['streak_accel'] += 1
 
-                    # Arch 86: Open position count scaling — reduce concentration risk
+                    # Arch 86: Open position count scaling -- reduce concentration risk
                     if realistic and len(positions) >= 3:
-                        pos_penalty = 0.85 ** (len(positions) - 2)  # 3→0.85, 4→0.72, 5→0.61
+                        pos_penalty = 0.85 ** (len(positions) - 2)  # 3->0.85, 4->0.72, 5->0.61
                         trade_size *= pos_penalty
                         ml_stats.setdefault('pos_count_reduce', 0)
                         ml_stats['pos_count_reduce'] += 1
 
-                    # Arch 87: Return variance sizing — low variance = consolidation → bigger move
+                    # Arch 87: Return variance sizing -- low variance = consolidation -> bigger move
                     if realistic and bar >= 10:
                         ret_10 = np.diff(closes[bar-10:bar+1]) / closes[bar-10:bar]
                         ret_var = np.var(ret_10)
@@ -2728,7 +2728,7 @@ def run_backtest(
                             ml_stats.setdefault('high_pe_bounce', 0)
                             ml_stats['high_pe_bounce'] += 1
 
-                    # Arch 91: Recent loser avoidance — reduce if last trade was a loss
+                    # Arch 91: Recent loser avoidance -- reduce if last trade was a loss
                     if realistic and trades and trades[-1].pnl < 0:
                         trade_size *= 0.80
                         ml_stats.setdefault('post_loss_reduce', 0)
@@ -2749,14 +2749,14 @@ def run_backtest(
                             ml_stats.setdefault('hot_streak', 0)
                             ml_stats['hot_streak'] += 1
 
-                    # Arch 94: Post-stop reduction — trade after stop-loss is riskier
+                    # Arch 94: Post-stop reduction -- trade after stop-loss is riskier
                     if realistic and trades:
                         if trades[-1].exit_reason == 'stop':
                             trade_size *= 0.70
                             ml_stats.setdefault('post_stop_reduce', 0)
                             ml_stats['post_stop_reduce'] += 1
 
-                    # Arch 95: Win magnitude regime — big recent wins = favorable regime
+                    # Arch 95: Win magnitude regime -- big recent wins = favorable regime
                     if realistic and len(trades) >= 5:
                         recent_pnls = [t.pnl_pct for t in trades[-5:] if t.pnl > 0]
                         if recent_pnls and np.mean(recent_pnls) > 0.002:
@@ -2795,7 +2795,7 @@ def run_backtest(
                         ml_stats.setdefault('low_conf_reduce', 0)
                         ml_stats['low_conf_reduce'] += 1
 
-                    # Arch 102: Break direction alignment — directional break_prob confirms signal
+                    # Arch 102: Break direction alignment -- directional break_prob confirms signal
                     if realistic and sig.signal_type == 'break':
                         ps102 = analysis.tf_states.get(sig.primary_tf)
                         if ps102:
@@ -2805,7 +2805,7 @@ def run_backtest(
                                 ml_stats.setdefault('break_dir_align', 0)
                                 ml_stats['break_dir_align'] += 1
 
-                    # Arch 103: Intraday PnL cap — protect daily gains
+                    # Arch 103: Intraday PnL cap -- protect daily gains
                     if realistic and daily_pnl > equity * 0.03:
                         trade_size *= 0.30  # 30% size after 3% daily gain
                         ml_stats.setdefault('daily_pnl_cap', 0)
@@ -3038,7 +3038,7 @@ def run_backtest(
                             ml_stats['be_cont_penalty'] += 1
 
 
-                    # Arch 124: Multi-TF comprehensive bounce score (BE+PE+theta+edge → 0.5-1.5x)
+                    # Arch 124: Multi-TF comprehensive bounce score (BE+PE+theta+edge -> 0.5-1.5x)
                     if realistic and sig.signal_type == 'bounce':
                         be_vals, pe_vals, theta_vals, edge_vals = [], [], [], []
                         for tf_name, tf_state in analysis.tf_states.items():
@@ -3179,8 +3179,8 @@ def run_backtest(
                                 ml_stats['quad_be'] += 1
 
                     # Arch 130: Equity-proportional deleveraging (log2, start at 1.5x growth)
-                    # As equity grows, automatically reduce position size: at 4x equity → 50%, at 16x → 25%
-                    # This is the single most impactful PF improvement: +20 PF, DD 3.3% → 1.2%
+                    # As equity grows, automatically reduce position size: at 4x equity -> 50%, at 16x -> 25%
+                    # This is the single most impactful PF improvement: +20 PF, DD 3.3% -> 1.2%
                     import math
                     if realistic:
                         growth = equity / initial_capital
@@ -3224,7 +3224,7 @@ def run_backtest(
                                 ml_stats['quad_ke_boost'] += 1
 
                     # Arch 131: Momentum turning point penalty (0.70x when momentum is reversing)
-                    # When momentum is turning, bounces are unreliable → reduce position
+                    # When momentum is turning, bounces are unreliable -> reduce position
                     if realistic and sig.signal_type == 'bounce':
                         ps131 = analysis.tf_states.get(sig.primary_tf)
                         if ps131 and hasattr(ps131, 'momentum_is_turning') and ps131.momentum_is_turning:
@@ -3346,7 +3346,7 @@ def run_backtest(
                             ml_stats['few_tf_reduce'] += 1
 
                     # Arch 135: Win/loss parity control (0.60x when ratio > 10x)
-                    # When avg win >> avg loss, leverage is asymmetric → reduce to rebalance
+                    # When avg win >> avg loss, leverage is asymmetric -> reduce to rebalance
                     if realistic and len(trades) >= 10:
                         wins = [t.pnl for t in trades[-20:] if t.pnl > 0]
                         losses = [abs(t.pnl) for t in trades[-20:] if t.pnl <= 0]
@@ -3476,7 +3476,7 @@ def run_backtest(
 
                     # Arch 138: Quadratic equity inverse scaling
                     # Even more aggressive than linear: trade_size *= (initial/equity)^2
-                    # At 4x equity → 1/16 size, at 10x → 1/100 size
+                    # At 4x equity -> 1/16 size, at 10x -> 1/100 size
                     if realistic:
                         eq_scale = min(1.0, (initial_capital / equity) ** 2)
                         trade_size *= eq_scale
@@ -5667,7 +5667,7 @@ def run_backtest(
 
 
                     # Arch 314f: Break stop tightening 30%
-                    # Breaks have wider stops than needed — tighten to reduce
+                    # Breaks have wider stops than needed -- tighten to reduce
                     # GL on losing breaks (#49, #80, #140) without affecting winners.
                     if realistic and sig.signal_type == 'break':
                         if sig.action == 'BUY':
@@ -5684,7 +5684,7 @@ def run_backtest(
                     if realistic and sig.signal_type == 'bounce':
                         ou_hl = max(2.0, ou_hl * 0.50)
 
-                    # Arch 324c: Late acceleration — 1.15x boost for bounces at $2M+
+                    # Arch 324c: Late acceleration -- 1.15x boost for bounces at $2M+
                     if realistic and sig.signal_type == 'bounce' and equity > 2000000:
                         trade_size *= 1.15
                         ml_stats.setdefault('late_accel_2m', 0)
@@ -5735,7 +5735,7 @@ def run_backtest(
                         trade_size *= 0.05
 
 
-                    # Arch 336: Maximum endgame acceleration — safe because no losers above $3M
+                    # Arch 336: Maximum endgame acceleration -- safe because no losers above $3M
                     if realistic and sig.signal_type == 'bounce':
                         if equity > 7000000:
                             trade_size *= 60.0
@@ -5800,7 +5800,7 @@ def run_backtest(
 
 
                     # Arch 342d: Confidence-proportional scaling at $1M+
-                    # Higher confidence = larger position. conf=0.70 → 10.5x, conf=0.90 → 13.5x
+                    # Higher confidence = larger position. conf=0.70 -> 10.5x, conf=0.90 -> 13.5x
                     if realistic and sig.signal_type == 'bounce' and equity > 1000000:
                         trade_size *= max(1.0, sig.confidence * 30.0)
                         ml_stats.setdefault('conf_scale', 0)
@@ -5862,7 +5862,7 @@ def run_backtest(
                     #   $250K/trade: Sharpe 3.39, avg $226K/yr   | $500K: Sharpe 2.95, avg $363K/yr
                     #   $1M/trade:  Sharpe 2.32, avg $649K/yr    | $2M:   Sharpe 2.13, avg $1.28M/yr
                     #   $5M/trade:  Sharpe 1.75, avg $2.86M/yr   | unlim: Sharpe 0.36 (2020/2022 OOM)
-                    # Higher cap → more raw P&L but lower Sharpe (volatile outlier years dominate)
+                    # Higher cap -> more raw P&L but lower Sharpe (volatile outlier years dominate)
                     if realistic:
                         total_open = sum(p.trade_size for p in positions)
                         _cap_base = bounce_cap if sig.signal_type == "bounce" else 4.0
@@ -5884,33 +5884,33 @@ def run_backtest(
                         # so TOD boost must come after caps to have real effect.
                         # Timestamps in index are UTC. Display code uses (utc.hour - 5) % 24 for ET.
                         # OOS 2025 top hours: UTC13=8amET $511/trade, UTC18=1pmET $595/trade (+57/83%)
-                        # vs $325 overall avg. Prime hours have larger moves → justify extra size.
-                        # Arch 377: UTC14 (9am ET) added — 4yr avg $350/trade, 100-116 trades/yr
-                        # Arch 378: UTC15 (10am ET) added — 2015 $454/trade, 2025 $292/trade, 84-104 trades/yr
-                        #           UTC19 (2pm ET) added — 2015 $280/trade, 2025 $429/trade, 93-104 trades/yr
+                        # vs $325 overall avg. Prime hours have larger moves -> justify extra size.
+                        # Arch 377: UTC14 (9am ET) added -- 4yr avg $350/trade, 100-116 trades/yr
+                        # Arch 378: UTC15 (10am ET) added -- 2015 $454/trade, 2025 $292/trade, 84-104 trades/yr
+                        #           UTC19 (2pm ET) added -- 2015 $280/trade, 2025 $429/trade, 93-104 trades/yr
                         # 9am-10am: open institutional flow; 2pm: post-lunch VWAP algo activity
-                        # Arch 379: UTC16 (11am ET) added — 8yr avg $391/trade, min $214 (all positive)
-                        #           UTC17 (12pm ET) added — 8yr avg $332/trade, min $164 (all positive)
-                        #           UTC20 (3pm ET) added — 8yr avg $310/trade, min $129 (all positive)
+                        # Arch 379: UTC16 (11am ET) added -- 8yr avg $391/trade, min $214 (all positive)
+                        #           UTC17 (12pm ET) added -- 8yr avg $332/trade, min $164 (all positive)
+                        #           UTC20 (3pm ET) added -- 8yr avg $310/trade, min $129 (all positive)
                         # Mid-morning: continuation momentum; noon: lunchtime reversal setups; 3pm: close setup
-                        # Arch 380: UTC12 (7am ET) added — 7/8yr positive, avg $263/trade (2016 flat +$5), 1.05x conservative
+                        # Arch 380: UTC12 (7am ET) added -- 7/8yr positive, avg $263/trade (2016 flat +$5), 1.05x conservative
                         # Arch 382: Reorder TOD multipliers to match avg P&L performance ranking:
-                        #   Tier 1 (×1.30): UTC13=8amET $511, UTC18=1pmET $595
-                        #   Tier 2 (×1.25): UTC19=2pmET $429 (up from 1.20x), UTC16=11amET $391 (up from 1.15x)
-                        #   Tier 3 (×1.20): UTC14=9amET $350 (down from 1.25x), UTC15=10amET $373 avg
-                        #   Tier 4 (×1.15): UTC17=12pmET $332, UTC20=3pmET $310
-                        # Arch 386: 1pmET ×1.30→×1.35 ($595 pre-boost = top TOD performer) + Thu ×1.30→×1.35
-                        # Arch 387: 8amET ×1.30→×1.35 (2nd-best hour $511, now matches 1pm tier) + 2pmET ×1.25→×1.30 ($429>11am $391)
-                        # Arch 390: 1pmET ×1.35→×1.40 ($595 still top TOD) + Thu ×1.35→×1.40 (still top DOW $490)
-                        # Arch 391: 10amET ×1.20→×1.25 ($373 > 9amET $350, promotes to 11am tier) + Mon ×1.05→×1.08 (align with Tue)
-                        # Arch 392: 8amET ×1.35→×1.40 (match 1pm tier, 2nd-best $511) + Tue ×1.08→×1.10 (Wed/Fri $417/$423 vs Tue $270)
-                        # Arch 393: 12pmET ×1.15→×1.25 (12pm $488/trade = 11am $478 tier, promotes from tier-4 to tier-2)
-                        # Arch 395: 9amET ×1.20→×1.25 + 2pmET ×1.30→×1.35 + 4pmET NEW ×1.20 (all three in same commit)
-                        # Arch 398: 2pmET ×1.35→×1.40 (match 8am/1pm top tier; 93 trades $429/trade)
-                        # Arch 394: 3pmET ×1.15→×1.20 ($340/trade, 61 trades, promote tier-4→tier-3) + Tue ×1.10→×1.15 (Tue→Wed/Fri level)
-                        # Arch 395: 4pmET (UTC21) ×1.0→×1.20 (NEW hour, 49 trades, $388/trade, after-hours strong = tier-3)
-                        # Arch 399: pre-market UTC8-11 (3am-6am ET) ×1.15 (156 trades/yr, WR=91-98%, avg $231-314/trade)
-                        # Arch 404: 11amET+12pmET ×1.25→×1.30 (promote midday to 9am/10am tier; 11am WR=99% $391, 12pm WR=96% $488)
+                        #   Tier 1 (x1.30): UTC13=8amET $511, UTC18=1pmET $595
+                        #   Tier 2 (x1.25): UTC19=2pmET $429 (up from 1.20x), UTC16=11amET $391 (up from 1.15x)
+                        #   Tier 3 (x1.20): UTC14=9amET $350 (down from 1.25x), UTC15=10amET $373 avg
+                        #   Tier 4 (x1.15): UTC17=12pmET $332, UTC20=3pmET $310
+                        # Arch 386: 1pmET x1.30->x1.35 ($595 pre-boost = top TOD performer) + Thu x1.30->x1.35
+                        # Arch 387: 8amET x1.30->x1.35 (2nd-best hour $511, now matches 1pm tier) + 2pmET x1.25->x1.30 ($429>11am $391)
+                        # Arch 390: 1pmET x1.35->x1.40 ($595 still top TOD) + Thu x1.35->x1.40 (still top DOW $490)
+                        # Arch 391: 10amET x1.20->x1.25 ($373 > 9amET $350, promotes to 11am tier) + Mon x1.05->x1.08 (align with Tue)
+                        # Arch 392: 8amET x1.35->x1.40 (match 1pm tier, 2nd-best $511) + Tue x1.08->x1.10 (Wed/Fri $417/$423 vs Tue $270)
+                        # Arch 393: 12pmET x1.15->x1.25 (12pm $488/trade = 11am $478 tier, promotes from tier-4 to tier-2)
+                        # Arch 395: 9amET x1.20->x1.25 + 2pmET x1.30->x1.35 + 4pmET NEW x1.20 (all three in same commit)
+                        # Arch 398: 2pmET x1.35->x1.40 (match 8am/1pm top tier; 93 trades $429/trade)
+                        # Arch 394: 3pmET x1.15->x1.20 ($340/trade, 61 trades, promote tier-4->tier-3) + Tue x1.10->x1.15 (Tue->Wed/Fri level)
+                        # Arch 395: 4pmET (UTC21) x1.0->x1.20 (NEW hour, 49 trades, $388/trade, after-hours strong = tier-3)
+                        # Arch 399: pre-market UTC8-11 (3am-6am ET) x1.15 (156 trades/yr, WR=91-98%, avg $231-314/trade)
+                        # Arch 404: 11amET+12pmET x1.25->x1.30 (promote midday to 9am/10am tier; 11am WR=99% $391, 12pm WR=96% $488)
                         if sig.signal_type == 'bounce':
                             _tod_h = tsla.index[bar].hour  # UTC hour
                             if _tod_h == 8:    # 3am ET: $314/trade avg, WR=97%, 29 trades/yr, 1.15x (Arch399: pre-market boost)
@@ -5929,7 +5929,7 @@ def run_backtest(
                                 trade_size *= 1.15
                                 ml_stats.setdefault('tod_6am_boost', 0)
                                 ml_stats['tod_6am_boost'] += 1
-                            elif _tod_h == 12:   # 7am ET: $263/trade avg (7yr), 2016 flat, 1.05x conservative (Arch411 +1.10x tested — zero effect, too few trades)
+                            elif _tod_h == 12:   # 7am ET: $263/trade avg (7yr), 2016 flat, 1.05x conservative (Arch411 +1.10x tested -- zero effect, too few trades)
                                 trade_size *= 1.05
                                 ml_stats.setdefault('tod_7am_boost', 0)
                                 ml_stats['tod_7am_boost'] += 1
@@ -5937,19 +5937,19 @@ def run_backtest(
                                 trade_size *= 1.50
                                 ml_stats.setdefault('tod_am_boost', 0)
                                 ml_stats['tod_am_boost'] += 1
-                            elif _tod_h == 14:  # 9am ET: WR=100%, 115 trades/yr, 1.40x (Arch410: settled; ×1.45 Arch412 tested +$4K mixed, 2024 -$2.7K, reverted)
+                            elif _tod_h == 14:  # 9am ET: WR=100%, 115 trades/yr, 1.40x (Arch410: settled; x1.45 Arch412 tested +$4K mixed, 2024 -$2.7K, reverted)
                                 trade_size *= 1.40
                                 ml_stats.setdefault('tod_9am_boost', 0)
                                 ml_stats['tod_9am_boost'] += 1
-                            elif _tod_h == 15:  # 10am ET: WR=100%, 83 trades/yr, 1.40x (Arch410: settled; ×1.45 mixed results)
+                            elif _tod_h == 15:  # 10am ET: WR=100%, 83 trades/yr, 1.40x (Arch410: settled; x1.45 mixed results)
                                 trade_size *= 1.40
                                 ml_stats.setdefault('tod_10am_boost', 0)
                                 ml_stats['tod_10am_boost'] += 1
-                            elif _tod_h == 16:  # 11am ET: $391/trade avg, WR=99%, 80 trades/yr, 1.40x (Arch410: settled; ×1.45 mixed results)
+                            elif _tod_h == 16:  # 11am ET: $391/trade avg, WR=99%, 80 trades/yr, 1.40x (Arch410: settled; x1.45 mixed results)
                                 trade_size *= 1.40
                                 ml_stats.setdefault('tod_11am_boost', 0)
                                 ml_stats['tod_11am_boost'] += 1
-                            elif _tod_h == 17:  # 12pm ET: $488/trade avg, WR=96%, 69 trades/yr, 1.40x (Arch410: settled; ×1.45 mixed results)
+                            elif _tod_h == 17:  # 12pm ET: $488/trade avg, WR=96%, 69 trades/yr, 1.40x (Arch410: settled; x1.45 mixed results)
                                 trade_size *= 1.40
                                 ml_stats.setdefault('tod_noon_boost', 0)
                                 ml_stats['tod_noon_boost'] += 1
@@ -5961,7 +5961,7 @@ def run_backtest(
                                 trade_size *= 1.50
                                 ml_stats.setdefault('tod_2pm_boost', 0)
                                 ml_stats['tod_2pm_boost'] += 1
-                            elif _tod_h == 20:  # 3pm ET: $340/trade avg, WR=92%, 61 trades/yr, 1.20x (×1.25 Arch413 tested -$1.8K 3yr; settled)
+                            elif _tod_h == 20:  # 3pm ET: $340/trade avg, WR=92%, 61 trades/yr, 1.20x (x1.25 Arch413 tested -$1.8K 3yr; settled)
                                 trade_size *= 1.20
                                 ml_stats.setdefault('tod_3pm_boost', 0)
                                 ml_stats['tod_3pm_boost'] += 1
@@ -5971,38 +5971,38 @@ def run_backtest(
                                 ml_stats['tod_4pm_boost'] += 1
 
                         # Arch 380: Thursday DOW boost for bounces (independent of TOD, compounds)
-                        # Thu avg: $451/trade (2015), $464/trade (2025) vs $278/$325 overall — +40%
+                        # Thu avg: $451/trade (2015), $464/trade (2025) vs $278/$325 overall -- +40%
                         # Effect: consistent economic data release day + end-of-week positioning
-                        # Applied AFTER TOD — a Thu 8am ET bounce gets 1.30x × 1.25x = 1.625x
+                        # Applied AFTER TOD -- a Thu 8am ET bounce gets 1.30x x 1.25x = 1.625x
                         # Arch 381: Tue/Wed moderate DOW boost (consistent above-Monday performance)
                         # Tue avg: $250-$282/trade; Wed avg: $267-$268/trade (above Mon $225-$263)
-                        # Arch 382: Thu upgraded 1.20x → 1.25x (natural $490/trade justifies top-tier DOW boost)
-                        # Arch 383: Mon 1.05x; Thu upgraded 1.25x → 1.30x
-                        #   Thu natural $490/trade = 2x Mon ($269); top-tier with 8am bounce: 1.30x×1.30x=1.69x
-                        # Arch 384: Fri 1.10x — 11yr avg $429/trade (no boost prev), recent 7yr avg $521/trade
+                        # Arch 382: Thu upgraded 1.20x -> 1.25x (natural $490/trade justifies top-tier DOW boost)
+                        # Arch 383: Mon 1.05x; Thu upgraded 1.25x -> 1.30x
+                        #   Thu natural $490/trade = 2x Mon ($269); top-tier with 8am bounce: 1.30xx1.30x=1.69x
+                        # Arch 384: Fri 1.10x -- 11yr avg $429/trade (no boost prev), recent 7yr avg $521/trade
                         #   2015-2017 weak ($177-$193) caused earlier oversight; 2019-2025 consistently strong
-                        #   Wed ×1.10 with $417 pre-boost; Fri $429 without boost = Fri justifies ×1.10+
-                        # Arch 385: Fri upgraded 1.10x→1.15x; Wed upgraded 1.10x→1.15x
+                        #   Wed x1.10 with $417 pre-boost; Fri $429 without boost = Fri justifies x1.10+
+                        # Arch 385: Fri upgraded 1.10x->1.15x; Wed upgraded 1.10x->1.15x
                         #   Fri post-boost $423/trade pre-boost (>Wed $417) + 2020-2025 avg $630 justifies upgrade
-                        #   Wed consistent $314-559 pre-boost range (×1.10→×1.15 both days for symmetry)
-                        # Arch 386: Thu upgraded 1.30x→1.35x (strongest DOW $490 pre-boost, compounds with top TOD)
-                        #   Thu 1pm ET bounce = 1.35x (TOD) × 1.35x (DOW) = 1.82x combined multiplier
-                        # Arch 388: Fri upgraded 1.15x→1.20x (Fri $423 > Wed $417, stronger 2020-2025 regime $630 avg)
-                        # Arch 389: Wed upgraded 1.15x→1.20x (symmetric with Fri, pre-boost $417 nearly equal to Fri $423)
-                        # Arch 390: Thu upgraded 1.35x→1.40x (still top DOW, consistent 11yr strength)
-                        # Arch 391: Mon upgraded 1.05x→1.08x (align with Tuesday, pre-boost $283)
-                        # Arch 392: Tue upgraded 1.08x→1.10x (Tue $270/trade in line with Wed/Fri regime, small step up)
-                        # Arch 393: 12pmET upgraded 1.15x→1.25x (12pm $488/trade matches 11am $478 tier-2)
-                        # Arch 394: Tue upgraded 1.10x→1.15x (Tue $270/trade, step toward Wed/Fri ×1.20)
-                        # Arch 396: Tue upgraded 1.15x→1.20x (full match with Wed/Fri, Tue avg $270 in same tier as $417/423)
-                        # Arch 397: Mon upgraded 1.08x→1.15x (bigger step, Mon $283/trade match Tue tier)
-                        # Arch 398: Mon 1.15x→1.20x (full DOW symmetry Mon=Tue=Wed=Fri) + 2pmET 1.35x→1.40x (match 8am/1pm top tier, 93 trades $429)
-                        # Arch 400: Thu 1.40x→1.45x (consistently top DOW $490/trade pre-boost, natural next tier)
-                        # NOTE: Thu ×1.45→×1.50 tested (Arch405) — ZERO EFFECT; all 3 years identical. DOW boost beyond 1.45x capped by max_trade_usd
-                        # Arch 406: Mon/Tue/Wed/Fri 1.20x→1.25x (uniform non-Thu upgrade; 3yr +$28K all positive; 2024 +$19K)
+                        #   Wed consistent $314-559 pre-boost range (x1.10->x1.15 both days for symmetry)
+                        # Arch 386: Thu upgraded 1.30x->1.35x (strongest DOW $490 pre-boost, compounds with top TOD)
+                        #   Thu 1pm ET bounce = 1.35x (TOD) x 1.35x (DOW) = 1.82x combined multiplier
+                        # Arch 388: Fri upgraded 1.15x->1.20x (Fri $423 > Wed $417, stronger 2020-2025 regime $630 avg)
+                        # Arch 389: Wed upgraded 1.15x->1.20x (symmetric with Fri, pre-boost $417 nearly equal to Fri $423)
+                        # Arch 390: Thu upgraded 1.35x->1.40x (still top DOW, consistent 11yr strength)
+                        # Arch 391: Mon upgraded 1.05x->1.08x (align with Tuesday, pre-boost $283)
+                        # Arch 392: Tue upgraded 1.08x->1.10x (Tue $270/trade in line with Wed/Fri regime, small step up)
+                        # Arch 393: 12pmET upgraded 1.15x->1.25x (12pm $488/trade matches 11am $478 tier-2)
+                        # Arch 394: Tue upgraded 1.10x->1.15x (Tue $270/trade, step toward Wed/Fri x1.20)
+                        # Arch 396: Tue upgraded 1.15x->1.20x (full match with Wed/Fri, Tue avg $270 in same tier as $417/423)
+                        # Arch 397: Mon upgraded 1.08x->1.15x (bigger step, Mon $283/trade match Tue tier)
+                        # Arch 398: Mon 1.15x->1.20x (full DOW symmetry Mon=Tue=Wed=Fri) + 2pmET 1.35x->1.40x (match 8am/1pm top tier, 93 trades $429)
+                        # Arch 400: Thu 1.40x->1.45x (consistently top DOW $490/trade pre-boost, natural next tier)
+                        # NOTE: Thu x1.45->x1.50 tested (Arch405) -- ZERO EFFECT; all 3 years identical. DOW boost beyond 1.45x capped by max_trade_usd
+                        # Arch 406: Mon/Tue/Wed/Fri 1.20x->1.25x (uniform non-Thu upgrade; 3yr +$28K all positive; 2024 +$19K)
                         if sig.signal_type == 'bounce':
                             _dow = tsla.index[bar].dayofweek  # 0=Mon, ..., 3=Thu, 4=Fri
-                            if _dow == 3:  # Thursday: 1.45x (Arch400: settled here; ×1.50 tested, zero effect)
+                            if _dow == 3:  # Thursday: 1.45x (Arch400: settled here; x1.50 tested, zero effect)
                                 trade_size *= 1.45
                                 ml_stats.setdefault('dow_thu_boost', 0)
                                 ml_stats['dow_thu_boost'] += 1
@@ -6025,10 +6025,10 @@ def run_backtest(
 
                         # Arch417: VIX regime boost for bounces (applied after caps, after TOD/DOW)
                         # c9 regime analysis (11yr, 3,801 trades, 100% VIX coverage):
-                        #   Low VIX (<20):  avg=$1,669/trade (0.82x) — 69% of trades, no change
-                        #   Mid VIX (20-30): avg=$2,752/trade (1.35x) — 25% of trades → ×1.10
-                        #   High VIX (>30):  avg=$3,393/trade (1.66x) — 6% of trades → ×1.25
-                        # Only boosts (never reduces) — net additive to total P&L
+                        #   Low VIX (<20):  avg=$1,669/trade (0.82x) -- 69% of trades, no change
+                        #   Mid VIX (20-30): avg=$2,752/trade (1.35x) -- 25% of trades -> x1.10
+                        #   High VIX (>30):  avg=$3,393/trade (1.66x) -- 6% of trades -> x1.25
+                        # Only boosts (never reduces) -- net additive to total P&L
                         # Uses daily VIX close prior to entry (no lookahead)
                         if sig.signal_type == 'bounce' and vix_df is not None:
                             try:
@@ -6148,19 +6148,19 @@ def run_backtest(
     if ml_active:
         title += " [ML-ENHANCED]"
     else:
-        title += " [NO ML — UNFILTERED]"
+        title += " [NO ML -- UNFILTERED]"
     print(title)
     print(f"{'='*70}")
     print(metrics.summary())
 
-    # Always show signal stats — never hide what happened
+    # Always show signal stats -- never hide what happened
     print(f"\n  Signal Stats:")
     print(f"    Total physics signals: {ml_stats['total_signals']}")
     print(f"    Trades taken:          {metrics.total_trades}")
     pass_rate = metrics.total_trades / max(ml_stats['total_signals'], 1)
     print(f"    Pass-through rate:     {pass_rate:.1%}")
     if not ml_active:
-        print(f"\n  ⚠️  ML MODELS INACTIVE — all 16 sub-models skipped!")
+        print(f"\n  !  ML MODELS INACTIVE -- all 16 sub-models skipped!")
         print(f"      Signals passed only physics + confidence filters.")
         print(f"      This is ONLY valid for baseline comparison.")
     if ml_active:
@@ -6352,10 +6352,10 @@ def run_backtest(
                 s = hour_stats[h]
                 wr = s['wins'] / s['total'] if s['total'] > 0 else 0
                 avg_pnl = s['pnl'] / s['total'] if s['total'] > 0 else 0
-                bar = '█' * max(1, int(abs(avg_pnl) / 5))
+                bar = '#' * max(1, int(abs(avg_pnl) / 5))
                 sign = '+' if avg_pnl >= 0 else ''
                 print(f"  {h:2d}:00  {s['total']:3d} trades  WR={wr:.0%}  "
-                      f"avg={sign}${avg_pnl:.1f}  {'🟢' if avg_pnl > 0 else '🔴'}{bar}")
+                      f"avg={sign}${avg_pnl:.1f}  {'[G]' if avg_pnl > 0 else '[R]'}{bar}")
 
         if day_stats:
             print(f"\nPerformance by day:")
@@ -6383,7 +6383,7 @@ def run_backtest(
                 outcomes = np.array([1 if t.pnl > 0 else 0 for t in sub_trades])
                 pnl_vals = np.array([t.pnl_pct for t in sub_trades])
 
-                print(f"\nSignal component analysis — {label} ({len(idx)} trades):")
+                print(f"\nSignal component analysis -- {label} ({len(idx)} trades):")
                 print(f"  {'Component':<18s} {'Avg(Win)':<10s} {'Avg(Loss)':<10s} {'WinCorr':<10s} {'PnlCorr':<10s}")
                 for comp in components:
                     vals = np.array([s.get(comp, 0) for s in sub_sigs])
@@ -6415,17 +6415,17 @@ def run_backtest(
         avg_trade_size = np.mean([t.trade_size for t in trades])
         max_leverage_used = max_trade_size / initial_equity if initial_equity > 0 else 0
         if max_leverage_used > 10:
-            print(f"\n⚠️  LEVERAGE AUDIT:")
+            print(f"\n!  LEVERAGE AUDIT:")
             print(f"  Max single trade:  ${max_trade_size:,.0f} ({max_leverage_used:.0f}x equity)")
             print(f"  Avg trade size:    ${avg_trade_size:,.0f} ({avg_trade_size/initial_equity:.0f}x equity)")
             print(f"  Headline P&L may be inflated by concentrated leverage.")
             if not realistic:
-                print(f"  Mode: UNREALISTIC — multiplicative boosts active")
+                print(f"  Mode: UNREALISTIC -- multiplicative boosts active")
 
-    # Print error summary — never let failures go unnoticed
+    # Print error summary -- never let failures go unnoticed
     if _error_counts:
         print(f"\n{'='*60}")
-        print(f"⚠️  ERROR SUMMARY ({sum(v['count'] for v in _error_counts.values())} total failures)")
+        print(f"!  ERROR SUMMARY ({sum(v['count'] for v in _error_counts.values())} total failures)")
         print(f"{'='*60}")
         for cat, info in sorted(_error_counts.items(), key=lambda x: -x[1]['count']):
             print(f"  {cat:<30s} {info['count']:>6}x  (first: {info['first_err'][:60]})")
@@ -6452,7 +6452,7 @@ def run_walk_forward(eval_interval: int = 3, max_hold_bars: int = 60,
         print("No trades to analyze")
         return
 
-    # Split by entry bar — first 2/3 of bars = IS, last 1/3 = OOS
+    # Split by entry bar -- first 2/3 of bars = IS, last 1/3 = OOS
     total_bars = max(t.exit_bar for t in trades)
     split_bar = int(total_bars * 2 / 3)
 
@@ -6496,14 +6496,14 @@ def run_walk_forward(eval_interval: int = 3, max_hold_bars: int = 60,
         wr_decay = (oos_wr - is_wr) / is_wr if is_wr > 0 else 0
         exp_decay = (oos_exp - is_exp) / is_exp if is_exp > 0 else 0
         print(f"\n  Stability:")
-        print(f"    WR decay: {wr_decay:+.0%} (IS→OOS)")
-        print(f"    Exp decay: {exp_decay:+.0%} (IS→OOS)")
+        print(f"    WR decay: {wr_decay:+.0%} (IS->OOS)")
+        print(f"    Exp decay: {exp_decay:+.0%} (IS->OOS)")
         if abs(wr_decay) < 0.15 and abs(exp_decay) < 0.40:
-            print(f"    ✅ Strategy appears STABLE out-of-sample")
+            print(f"    [OK] Strategy appears STABLE out-of-sample")
         elif abs(wr_decay) < 0.25:
-            print(f"    ⚠️  Moderate OOS degradation — monitor closely")
+            print(f"    !  Moderate OOS degradation -- monitor closely")
         else:
-            print(f"    ❌ Significant OOS degradation — possible overfit")
+            print(f"    [X] Significant OOS degradation -- possible overfit")
 
 
 def main():

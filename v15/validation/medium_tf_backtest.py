@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Medium-Timeframe Channel Surfer Backtest — 1h / 4h / 1d primary TF.
+Medium-Timeframe Channel Surfer Backtest -- 1h / 4h / 1d primary TF.
 
 Resamples 1-min TSLA+SPY data to the requested TF and runs the Channel Surfer
 physics engine with appropriate higher-TF context.  Intended to capture
@@ -34,14 +34,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 TF_PARAMS = {
     '1h': dict(
         eval_interval=1,
-        max_hold_bars=10,       # 10 h ≈ 1.5 trading days
+        max_hold_bars=10,       # 10 h ~ 1.5 trading days
         bounce_cap=4.0,
         max_trade_usd=1_000_000.0,
         context_tfs=['daily', 'weekly'],
     ),
     '4h': dict(
         eval_interval=1,
-        max_hold_bars=5,        # 5 × 4h = 20h ≈ 2.5 trading days
+        max_hold_bars=5,        # 5 x 4h = 20h ~ 2.5 trading days
         bounce_cap=4.0,
         max_trade_usd=1_000_000.0,
         context_tfs=['daily', 'weekly'],
@@ -71,18 +71,18 @@ def _load_and_resample(tsla_path: str, spy_path: Optional[str], tf: str):
     """Return (tsla_tf, spy_tf, daily_tsla, weekly_tsla, daily_spy, monthly_tsla)."""
     from v15.core.historical_data import load_minute_data, resample_to_tf
 
-    print(f"  Loading TSLA 1-min from {tsla_path} …")
+    print(f"  Loading TSLA 1-min from {tsla_path} ...")
     tsla_1min = load_minute_data(tsla_path)
     print(f"  TSLA 1-min: {len(tsla_1min):,} bars")
 
     spy_1min = None
     if spy_path and os.path.isfile(spy_path):
-        print(f"  Loading SPY 1-min from {spy_path} …")
+        print(f"  Loading SPY 1-min from {spy_path} ...")
         spy_1min = load_minute_data(spy_path)
         print(f"  SPY  1-min: {len(spy_1min):,} bars")
 
     rule = TF_RESAMPLE[tf]
-    print(f"  Resampling to {tf} …")
+    print(f"  Resampling to {tf} ...")
     tsla_tf = resample_to_tf(tsla_1min, rule)
     spy_tf = resample_to_tf(spy_1min, rule) if spy_1min is not None else None
     print(f"  TSLA {tf}: {len(tsla_tf):,} bars")
@@ -92,7 +92,7 @@ def _load_and_resample(tsla_path: str, spy_path: Optional[str], tf: str):
     daily_tsla = resample_to_tf(tsla_1min, '1D')
     weekly_tsla = resample_to_tf(tsla_1min, '1W')
     daily_spy = resample_to_tf(spy_1min, '1D') if spy_1min is not None else None
-    # Monthly — try 'ME' (pandas >=2.2) then fall back to 'M'
+    # Monthly -- try 'ME' (pandas >=2.2) then fall back to 'M'
     try:
         monthly_tsla = resample_to_tf(tsla_1min, 'ME')
     except Exception:
@@ -128,7 +128,7 @@ def _prepare_year(tsla_tf, spy_tf, daily_tsla, weekly_tsla, year: int,
     if tsla_slice is None or len(tsla_slice) < 20:
         return None
 
-    # Higher TF dict — for daily primary TF use weekly+monthly; otherwise daily+weekly
+    # Higher TF dict -- for daily primary TF use weekly+monthly; otherwise daily+weekly
     if primary_tf == '1d':
         higher_tf_dict = {'weekly': weekly_slice}
         if monthly_tsla is not None:
@@ -221,7 +221,7 @@ def _aggregate(results: dict) -> dict:
 def _print_table(rows: list, tf: str):
     """Print comparison table. rows = list of (label, agg_dict)."""
     print(f"\n{'='*130}")
-    print(f"MEDIUM TF BACKTEST — {tf.upper()} — COMPARISON TABLE")
+    print(f"MEDIUM TF BACKTEST -- {tf.upper()} -- COMPARISON TABLE")
     print(f"{'='*130}")
     hdr = (f"{'Config':<16} {'Trades':>7} {'WR':>7} {'PF':>6} {'Total P&L':>14} "
            f"{'Avg/Trade':>10} {'Sharpe':>7} {'Trd/Yr':>7} {'MaxDD':>8} {'AvgHold':>9}")
@@ -262,7 +262,7 @@ def main():
     is_years = list(range(start_year, end_year + 1))
 
     print(f"\n{'='*70}")
-    print(f"MEDIUM TF BACKTEST — {args.tf.upper()}")
+    print(f"MEDIUM TF BACKTEST -- {args.tf.upper()}")
     print(f"IS: {start_year}-{end_year}  OOS: {args.oos_year}")
     print(f"{'='*70}")
 
@@ -319,7 +319,7 @@ def main():
     # IS grid search
     # ------------------------------------------------------------------
     print(f"\n{'='*70}")
-    print(f"IS GRID SEARCH — {len(configs)} configs × {len(is_years)} years")
+    print(f"IS GRID SEARCH -- {len(configs)} configs x {len(is_years)} years")
     print(f"{'='*70}")
 
     all_is_results = {}
@@ -369,7 +369,7 @@ def main():
     # ------------------------------------------------------------------
     if args.oos_year > 0:
         print(f"\n{'='*70}")
-        print(f"OOS VALIDATION — {args.oos_year}")
+        print(f"OOS VALIDATION -- {args.oos_year}")
         print(f"{'='*70}")
 
         oos_year_data = _prepare_year(tsla_tf, spy_tf, daily_tsla, weekly_tsla, args.oos_year,

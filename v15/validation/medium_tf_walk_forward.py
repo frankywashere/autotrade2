@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-Medium-TF Walk-Forward Validation — 1h / 4h primary TF.
+Medium-TF Walk-Forward Validation -- 1h / 4h primary TF.
 
 Same rolling-window methodology as walk_forward_filters.py but uses the
 medium-timeframe backtest engine (1h or 4h primary TF) from medium_tf_backtest.py.
 
-Rolling windows: 5yr IS → 1yr OOS
-  IS 2015-2019 → OOS 2020
-  IS 2016-2020 → OOS 2021
-  IS 2017-2021 → OOS 2022
-  IS 2018-2022 → OOS 2023
-  IS 2019-2023 → OOS 2024
-  IS 2020-2024 → OOS 2025
+Rolling windows: 5yr IS -> 1yr OOS
+  IS 2015-2019 -> OOS 2020
+  IS 2016-2020 -> OOS 2021
+  IS 2017-2021 -> OOS 2022
+  IS 2018-2022 -> OOS 2023
+  IS 2019-2023 -> OOS 2024
+  IS 2020-2024 -> OOS 2025
 
 For each window runs baseline only (no filter, since MTF exhaust is neutral at
 the medium-TF level), aggregates 5 IS years, and reports whether OOS P&L is
@@ -82,14 +82,14 @@ def main():
     args = parser.parse_args()
 
     print(f"\n{'='*70}")
-    print(f"MEDIUM TF WALK-FORWARD VALIDATION — {args.tf.upper()}")
-    print(f"Train window: {TRAIN_YEARS}yr IS → 1yr OOS  |  {START_YEAR}-{END_YEAR}")
+    print(f"MEDIUM TF WALK-FORWARD VALIDATION -- {args.tf.upper()}")
+    print(f"Train window: {TRAIN_YEARS}yr IS -> 1yr OOS  |  {START_YEAR}-{END_YEAR}")
     print(f"TF params: eval_interval={TF_PARAMS[args.tf]['eval_interval']}, "
           f"max_hold_bars={TF_PARAMS[args.tf]['max_hold_bars']}, "
           f"bounce_cap={TF_PARAMS[args.tf]['bounce_cap']}")
     print(f"{'='*70}")
 
-    # ── Load & resample data ───────────────────────────────────────────────
+    # -- Load & resample data -----------------------------------------------
     print("\nLoading data...")
     t0 = time.time()
     spy_path = args.spy if os.path.isfile(args.spy) else None
@@ -106,7 +106,7 @@ def main():
     except Exception as e:
         print(f"  VIX load failed: {e}")
 
-    # ── Build rolling windows ──────────────────────────────────────────────
+    # -- Build rolling windows ----------------------------------------------
     all_years = list(range(START_YEAR, END_YEAR + 1))
     windows = []
     for i in range(len(all_years) - TRAIN_YEARS):
@@ -116,9 +116,9 @@ def main():
 
     print(f"\n{len(windows)} windows:")
     for is_yrs, oos_yr in windows:
-        print(f"  IS {is_yrs[0]}-{is_yrs[-1]} → OOS {oos_yr}")
+        print(f"  IS {is_yrs[0]}-{is_yrs[-1]} -> OOS {oos_yr}")
 
-    # ── Cache year data ────────────────────────────────────────────────────
+    # -- Cache year data ----------------------------------------------------
     needed_years = set()
     for is_yrs, oos_yr in windows:
         needed_years.update(is_yrs)
@@ -135,7 +135,7 @@ def main():
         else:
             print(f"  {yr}: no data, skipping")
 
-    # ── Run windows ───────────────────────────────────────────────────────
+    # -- Run windows -------------------------------------------------------
     print(f"\n{'='*70}")
     print("RUNNING WALK-FORWARD WINDOWS (baseline only)")
     print(f"{'='*70}")
@@ -143,7 +143,7 @@ def main():
     window_results = []
 
     for w_idx, (is_yrs, oos_yr) in enumerate(windows):
-        print(f"\n── Window {w_idx+1}: IS {is_yrs[0]}-{is_yrs[-1]} → OOS {oos_yr} ──")
+        print(f"\n-- Window {w_idx+1}: IS {is_yrs[0]}-{is_yrs[-1]} -> OOS {oos_yr} --")
         t_w = time.time()
 
         # IS: aggregate across all 5 in-sample years
@@ -206,9 +206,9 @@ def main():
             'oos_m':     oos_result,
         })
 
-    # ── Final summary ─────────────────────────────────────────────────────
+    # -- Final summary -----------------------------------------------------
     print(f"\n{'='*70}")
-    print(f"WALK-FORWARD SUMMARY — {args.tf.upper()}")
+    print(f"WALK-FORWARD SUMMARY -- {args.tf.upper()}")
     print(f"{'='*70}")
     hdr = f"{'Window':<24} {'IS P&L (5yr)':>14} {'IS avg/yr':>12} {'OOS P&L':>12} {'OOS/IS_avg':>12} {'OOS WR':>7} {'OOS Trd':>8} {'Result'}"
     print(hdr)
@@ -250,7 +250,7 @@ def main():
     print(f"  Avg OOS/IS_avg ratio  : {avg_ratio:.2f}x")
     print(f"  Total OOS P&L         : ${total_oos_pnl:,.0f}")
     print(f"\n{'='*70}")
-    print(f"MEDIUM TF WALK-FORWARD COMPLETE — {args.tf.upper()}")
+    print(f"MEDIUM TF WALK-FORWARD COMPLETE -- {args.tf.upper()}")
     print(f"{'='*70}")
 
 

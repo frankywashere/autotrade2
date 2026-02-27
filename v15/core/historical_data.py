@@ -28,7 +28,7 @@ def load_minute_data(filepath: str) -> pd.DataFrame:
     if not filepath.exists():
         raise FileNotFoundError(f"Data file not found: {filepath}")
 
-    # Read raw data — format: YYYYMMDD HHMMSS;open;high;low;close;volume
+    # Read raw data -- format: YYYYMMDD HHMMSS;open;high;low;close;volume
     df = pd.read_csv(
         filepath,
         sep=';',
@@ -38,7 +38,7 @@ def load_minute_data(filepath: str) -> pd.DataFrame:
                'low': float, 'close': float, 'volume': float},
     )
 
-    # Parse datetime: "20150102 114000" → datetime
+    # Parse datetime: "20150102 114000" -> datetime
     df['datetime'] = pd.to_datetime(df['datetime'], format='%Y%m%d %H%M%S')
     df = df.set_index('datetime')
     df.index = df.index.tz_localize('US/Eastern')
@@ -68,7 +68,7 @@ def resample_to_tf(df_1min: pd.DataFrame, interval: str) -> pd.DataFrame:
         'volume': 'sum',
     }
     resampled = df_1min.resample(interval).agg(agg)
-    # Drop bars where close is NaN (gaps — weekends, holidays, overnight)
+    # Drop bars where close is NaN (gaps -- weekends, holidays, overnight)
     resampled = resampled.dropna(subset=['close'])
     return resampled
 
@@ -112,7 +112,7 @@ def prepare_backtest_data(tsla_path: str, spy_path: str = None) -> dict:
     higher_tf_data['daily'] = resample_to_tf(tsla_1min, '1D')
     print(f"  daily: {len(higher_tf_data['daily']):,} bars")
 
-    # SPY (optional — physics mode doesn't need it)
+    # SPY (optional -- physics mode doesn't need it)
     spy_5min = None
     if spy_path:
         print(f"Loading SPY minute data from {spy_path}...")

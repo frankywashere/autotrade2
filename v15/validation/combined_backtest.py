@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Combined Backtest — Grid search over signal filter combinations.
+Combined Backtest -- Grid search over signal filter combinations.
 
 Tests 9 configurations of the unified filter cascade (SQ gate, break predictor,
 swing regime) on 2015-2024 IS data, then validates the winner on 2025 OOS.
@@ -60,7 +60,7 @@ def build_filter_cascade(cfg: dict):
 
     # MTF momentum params
     mtf_enabled = momentum_mode is not None
-    # 'conflict' → boost disabled (factor=1.0); 'exhaust' → block disabled (penalty=1.0); 'full' → both
+    # 'conflict' -> boost disabled (factor=1.0); 'exhaust' -> block disabled (penalty=1.0); 'full' -> both
     mtf_boost = 1.2 if momentum_mode in ('exhaust', 'full') else 1.0
     mtf_penalty = 0.3 if momentum_mode in ('conflict', 'full') else 1.0
 
@@ -150,7 +150,7 @@ def aggregate_results(results: dict) -> dict:
 def print_comparison(all_agg: dict):
     """Print a comparison table of all configurations."""
     print(f"\n{'='*120}")
-    print("GRID SEARCH RESULTS — COMPARISON TABLE")
+    print("GRID SEARCH RESULTS -- COMPARISON TABLE")
     print(f"{'='*120}")
 
     header = f"{'Config':<14} {'Trades':>7} {'WR':>7} {'PF':>6} {'Total P&L':>14} {'Avg P&L':>10} {'Sharpe':>7} {'Trd/Yr':>7} {'MaxDD':>8}"
@@ -172,7 +172,7 @@ def print_comparison(all_agg: dict):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Combined backtest — grid search over filter configs')
+    parser = argparse.ArgumentParser(description='Combined backtest -- grid search over filter configs')
     parser.add_argument('--tsla', type=str, default='data/TSLAMin.txt')
     parser.add_argument('--spy', type=str, default='data/SPYMin.txt')
     parser.add_argument('--years', type=str, default='2015-2024',
@@ -246,7 +246,7 @@ def main():
     # RUN GRID SEARCH (IS)
     # ======================================================================
     print(f"\n{'='*70}")
-    print(f"RUNNING GRID SEARCH — {len(configs_to_run)} configs × {len(is_years)} years")
+    print(f"RUNNING GRID SEARCH -- {len(configs_to_run)} configs x {len(is_years)} years")
     print(f"  bounce_cap={args.bounce_cap}x, max_trade_usd=${args.max_trade_usd:,.0f}, "
           f"capital=${args.capital:,.0f}")
     print(f"{'='*70}")
@@ -335,7 +335,7 @@ def main():
     # ======================================================================
     if args.oos_year > 0:
         print(f"\n{'='*70}")
-        print(f"OOS VALIDATION — {args.oos_year}")
+        print(f"OOS VALIDATION -- {args.oos_year}")
         print(f"{'='*70}")
 
         # Run baseline + winner on OOS

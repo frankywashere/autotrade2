@@ -1,12 +1,12 @@
 """Unified signal filter cascade for Channel Surfer.
 
 Five independently toggleable filters that decide WHETHER to trade:
-  1. Signal Quality Gate — skip low win_prob trades (uses existing LightGBM model)
-  2. Break Predictor — penalize directional mismatches on breakout signals
-  3. Swing Regime — boost bounce confidence when S1041 (weekly channel support + fear) fires
-  4. MTF Momentum — block when 2+ higher TFs show active opposing momentum;
+  1. Signal Quality Gate -- skip low win_prob trades (uses existing LightGBM model)
+  2. Break Predictor -- penalize directional mismatches on breakout signals
+  3. Swing Regime -- boost bounce confidence when S1041 (weekly channel support + fear) fires
+  4. MTF Momentum -- block when 2+ higher TFs show active opposing momentum;
                     boost when 2+ higher TFs show opposing momentum turning/exhausting
-  5. VIX Cooldown — boost BUY confidence when VIX was elevated and is now falling back
+  5. VIX Cooldown -- boost BUY confidence when VIX was elevated and is now falling back
                     (x18 finding: RSI rising during VIX fear receding = beginning of run, not end)
 
 Usage:
@@ -123,7 +123,7 @@ def _check_s929_base(i: int, tsla, vix, weekly_tsla, vix_lo: float = 18) -> bool
     atr_5, atr_20 = c
     if atr_5 >= 0.75 * atr_20:
         return False
-    # Weekly channel lower 25% — OR over 20/30/40/50 windows
+    # Weekly channel lower 25% -- OR over 20/30/40/50 windows
     if weekly_tsla is None or len(weekly_tsla) < 50:
         return False
     daily_date = tsla.index[i]
@@ -185,7 +185,7 @@ def _check_s1034(i: int, tsla, spy, vix, weekly_tsla) -> bool:
 
 
 def _check_s1041(i: int, tsla, spy, vix, weekly_tsla) -> bool:
-    """S1041 = S993 OR S1034 — the definitive swing champion."""
+    """S1041 = S993 OR S1034 -- the definitive swing champion."""
     return (_check_s993(i, tsla, spy, vix, weekly_tsla) or
             _check_s1034(i, tsla, spy, vix, weekly_tsla))
 
@@ -214,12 +214,12 @@ class SignalFilterCascade:
         momentum_conflict_penalty: float = 0.3,  # Conf multiplier when opponent TFs still accelerating
         momentum_context_tfs: list = None,    # TFs to check; default ['1h','4h','daily']
         momentum_min_tfs: int = 2,            # Min TFs needed to trigger conflict/exhaust
-        # Filter 5 — VIX Cooldown (x18 finding)
+        # Filter 5 -- VIX Cooldown (x18 finding)
         vix_cooldown_enabled: bool = False,
-        vix_cooldown_boost: float = 1.35,     # BUY conf × 1.35 when VIX fear is fading
+        vix_cooldown_boost: float = 1.35,     # BUY conf x 1.35 when VIX fear is fading
         vix_cooldown_lookback: int = 10,      # Days to look back for VIX spike
         vix_cooldown_spike_pct: float = 0.70, # VIX was above 70th pct of trailing year
-        vix_cooldown_recovery_pct: float = 0.90,  # VIX now ≥10% below that recent peak
+        vix_cooldown_recovery_pct: float = 0.90,  # VIX now >=10% below that recent peak
     ):
         self.sq_gate_threshold = sq_gate_threshold
         self.break_predictor_enabled = break_predictor_enabled
@@ -229,7 +229,7 @@ class SignalFilterCascade:
         self.momentum_filter_enabled = momentum_filter_enabled
         self.momentum_boost = momentum_boost
         self.momentum_conflict_penalty = momentum_conflict_penalty
-        self.momentum_context_tfs = momentum_context_tfs  # None → use default at eval time
+        self.momentum_context_tfs = momentum_context_tfs  # None -> use default at eval time
         self.momentum_min_tfs = momentum_min_tfs
         self.vix_cooldown_enabled = vix_cooldown_enabled
         self.vix_cooldown_boost = vix_cooldown_boost
@@ -247,7 +247,7 @@ class SignalFilterCascade:
         # VIX cooldown precomputed status {date_str: bool}
         self._vix_cooldown_status: Dict[str, bool] = {}
 
-        # Per-evaluation log — records every filter decision for replay/audit
+        # Per-evaluation log -- records every filter decision for replay/audit
         # Each entry: {bar_datetime, action, signal_type, conf_in, conf_out, rejected, reasons}
         self.eval_log: List[dict] = []
 
@@ -286,7 +286,7 @@ class SignalFilterCascade:
                     return
                 except Exception as e:
                     print(f"[FILTER] Failed to load {path.name}: {e}")
-        print("[FILTER] WARNING: No signal quality model found — SQ gate disabled")
+        print("[FILTER] WARNING: No signal quality model found -- SQ gate disabled")
 
     def precompute_swing_regime(self, daily_tsla, daily_spy, daily_vix, weekly_tsla):
         """Precompute S1041 status for each trading day.
@@ -304,7 +304,7 @@ class SignalFilterCascade:
             return
 
         if daily_tsla is None or daily_spy is None or daily_vix is None or weekly_tsla is None:
-            print("[FILTER] WARNING: Missing data for swing regime — disabled")
+            print("[FILTER] WARNING: Missing data for swing regime -- disabled")
             self.swing_regime_enabled = False
             return
 
@@ -321,7 +321,7 @@ class SignalFilterCascade:
         common = tsla_dates.intersection(spy_dates).intersection(vix_dates)
 
         if len(common) < 100:
-            print(f"[FILTER] WARNING: Only {len(common)} common dates — swing regime disabled")
+            print(f"[FILTER] WARNING: Only {len(common)} common dates -- swing regime disabled")
             self.swing_regime_enabled = False
             return
 
@@ -368,7 +368,7 @@ class SignalFilterCascade:
         if not self.vix_cooldown_enabled:
             return
         if vix_daily is None or len(vix_daily) < 253:
-            print("[FILTER] WARNING: Insufficient VIX data for cooldown — disabled")
+            print("[FILTER] WARNING: Insufficient VIX data for cooldown -- disabled")
             self.vix_cooldown_enabled = False
             return
 
@@ -527,7 +527,7 @@ class SignalFilterCascade:
                                     self.stats['swing_penalty'] += 1
                                     reasons.append("SWING_BULL_PENALTY(above_50dMA,conf*=0.95)")
                         except Exception:
-                            pass  # Data alignment issue — skip penalty
+                            pass  # Data alignment issue -- skip penalty
 
         # --- Filter 4: MTF Momentum (conflict block / exhaustion boost) ---
         if self.momentum_filter_enabled and analysis is not None:
@@ -544,9 +544,9 @@ class SignalFilterCascade:
                 is_turning = getattr(state, 'momentum_is_turning', False)
                 opposing = mom_dir * signal_dir < -0.3
                 if opposing and is_turning:
-                    exhaustion_count += 1      # Opponent decelerating → our favor
+                    exhaustion_count += 1      # Opponent decelerating -> our favor
                 elif opposing and not is_turning:
-                    conflict_count += 1        # Opponent still accelerating → conflict
+                    conflict_count += 1        # Opponent still accelerating -> conflict
 
             if conflict_count >= self.momentum_min_tfs:
                 confidence *= self.momentum_conflict_penalty
@@ -560,7 +560,7 @@ class SignalFilterCascade:
                 self.stats['momentum_neutral'] += 1
 
         # --- Filter 5: VIX Cooldown Boost (BUY only) ---
-        # x18: VIX was elevated, now falling → RSI rising = beginning of run, not exhaustion
+        # x18: VIX was elevated, now falling -> RSI rising = beginning of run, not exhaustion
         if self.vix_cooldown_enabled and sig.action == 'BUY':
             date_str = str(bar_datetime.date()) if hasattr(bar_datetime, 'date') else str(bar_datetime)[:10]
             if self._vix_cooldown_status.get(date_str, False):
@@ -598,6 +598,6 @@ class SignalFilterCascade:
             lines.append(f"  MTF momentum: {s['momentum_blocked']} blocked, "
                          f"{s['momentum_boosted']} boosted, {s['momentum_neutral']} neutral")
         if self.vix_cooldown_enabled:
-            lines.append(f"  VIX cooldown: {s['vix_cd_boosted']} boosted (×{self.vix_cooldown_boost}), "
+            lines.append(f"  VIX cooldown: {s['vix_cd_boosted']} boosted (x{self.vix_cooldown_boost}), "
                          f"{s['vix_cd_neutral']} neutral")
         return '\n'.join(lines)
