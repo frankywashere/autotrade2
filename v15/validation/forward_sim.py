@@ -197,6 +197,7 @@ def run_surfer(data, system, capital, sim_start, sim_end):
         eval_interval=params['eval_interval'],
         max_hold_bars=params['max_hold_bars'],
         position_size=capital / 10,
+        initial_capital=capital,
         min_confidence=0.45,
         use_multi_tf=True,
         tsla_df=tsla_df,
