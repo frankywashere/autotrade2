@@ -203,7 +203,7 @@ def run_5min_year(all_data: dict, year: int, capital: float, vix_df) -> Optional
 
 
 def _prepare_medium_tf_year(all_data: dict, tf: str, year: int) -> Optional[dict]:
-    """Prepare year data for 1h or 4h backtest."""
+    """Prepare year data for 1h, 4h, or 1d backtest."""
     tsla_key = f'tsla_{tf}'
     spy_key = f'spy_{tf}'
     tsla_tf = all_data[tsla_key]
@@ -225,16 +225,25 @@ def _prepare_medium_tf_year(all_data: dict, tf: str, year: int) -> Optional[dict
         return None
 
     spy_slice = _slice(spy_tf, cutoff_start, cutoff_year_end) if spy_tf is not None else None
-    daily_slice = _slice(all_data['tsla_daily'], cutoff_start, cutoff_year_end)
+
+    # Build higher_tf_dict with all available context TFs
+    higher_tf_dict = {}
+    if tf != '1h' and 'tsla_1h' in all_data:
+        hourly_slice = _slice(all_data['tsla_1h'], cutoff_start, cutoff_year_end)
+        if hourly_slice is not None and len(hourly_slice) > 0:
+            higher_tf_dict['1h'] = hourly_slice
+    if tf != '1d':
+        daily_slice = _slice(all_data['tsla_daily'], cutoff_start, cutoff_year_end)
+        if daily_slice is not None and len(daily_slice) > 0:
+            higher_tf_dict['daily'] = daily_slice
     weekly_slice = _slice(all_data['tsla_weekly'], cutoff_start, cutoff_year_end)
+    if weekly_slice is not None and len(weekly_slice) > 0:
+        higher_tf_dict['weekly'] = weekly_slice
 
     return {
         'tsla_tf': tsla_slice,
         'spy_tf': spy_slice,
-        'higher_tf_dict': {
-            'daily': daily_slice,
-            'weekly': weekly_slice,
-        },
+        'higher_tf_dict': higher_tf_dict,
         'year_start': pd.Timestamp(f'{year}-01-01'),
         'year_end': cutoff_year_end,
     }
