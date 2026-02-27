@@ -3186,8 +3186,17 @@ def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
             f"Trade History: {total_trades} trades | WR {wr:.0%} | Total P&L ${total_pnl:+,.0f}",
             expanded=False
         ):
+            def _fmt_dt(iso: str) -> str:
+                """Format ISO timestamp to readable date/time."""
+                try:
+                    dt = datetime.fromisoformat(iso)
+                    return dt.strftime('%m/%d/%Y %I:%M %p')
+                except (ValueError, TypeError):
+                    return iso or ''
+
             hist_rows = [{
-                'ID': t.pos_id,
+                'Entry Time': _fmt_dt(t.entry_time),
+                'Exit Time': _fmt_dt(t.exit_time),
                 'Dir': t.direction.upper(),
                 'Entry $': f"${t.entry_price:.2f}",
                 'Exit $': f"${t.exit_price:.2f}",
@@ -3195,7 +3204,7 @@ def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
                 'P&L': f"${t.pnl:+.0f}",
                 'Hold (min)': f"{t.hold_minutes:.0f}",
                 'Reason': t.exit_reason,
-            } for t in reversed(scanner.closed_trades[-50:])]
+            } for t in reversed(scanner.closed_trades)]
             st.dataframe(pd.DataFrame(hist_rows), hide_index=True, width="stretch")
 
     # Reset button
