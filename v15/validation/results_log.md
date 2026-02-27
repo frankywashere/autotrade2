@@ -556,8 +556,6 @@ Top 10 by Sharpe -- ALL have 0% to 4h:
    - 1h max hold = 10h (~1.5 trading days)
    - Swing = 2-3 trades/yr (not continuous coverage)
    - **Daily TF (1d) never tested** -- config exists (5-day hold, weekly+monthly context) but no results
-   - TODO: run `medium_tf_backtest.py --tf 1d` with correct context (weekly+monthly) and record results
-
 ### Context Fix Note (Feb 26, 2026)
 
 The surfer backtest engine (`surfer_backtest.py:1054`) warns when '1h' or 'daily' keys are
@@ -568,15 +566,63 @@ Correct higher TF context per primary:
 - **5min primary**: 1h + 4h + daily + weekly (default in `combined_backtest.py`, correct)
 - **1h primary**: daily + weekly (original code was correct)
 - **4h primary**: daily + weekly (original code was correct; 1h is LOWER TF, not context)
-- **1d primary**: weekly + monthly (original code had weekly but was MISSING monthly)
+- **1d primary**: weekly + monthly (monthly loaded but silently dropped by engine: <30 bars)
 
 An earlier "fix" (commits `8148f73` + `4fd18ce`) incorrectly added lower-TF data (1h for 4h/1d,
 daily for 1d) and duplicates (1h for 1h primary). This inflated the daily TF results by
-corrupting the multi-TF alignment/stacked boost signals (+69% artificial P&L). Reverted.
+corrupting the multi-TF alignment/stacked boost signals (+69% artificial P&L). Reverted in
+commit `d581b1f`.
 
 **Impact on existing results**:
 - **1h results**: UNAFFECTED -- original context (daily+weekly) was correct
 - **4h results**: UNAFFECTED -- original context (daily+weekly) was correct
 - **Portfolio backtest cache (1h/4h)**: VALID -- ran before the bad fix
-- **Daily TF results ($4.2M)**: INVALID -- ran with corrupted context, need re-run
-- **1d first run ($2.5M with weekly-only)**: was MISSING monthly context, also needs re-run
+- **1d results**: Original weekly-only was already correct. Monthly can't help (engine
+  requires 30 bars min at `surfer_backtest.py:1393`, lookback buffer gives only ~15 monthly bars)
+
+---
+
+## Daily (1d) Channel Surfer Backtest
+**Script**: `v15/validation/medium_tf_backtest.py --tf 1d`
+**Run date**: Feb 26, 2026 (correct context: weekly; monthly loaded but <30 bars = dropped)
+**Params**: eval_interval=1, max_hold=5 bars (5 trading days), bounce_cap=3
+**Context TFs**: weekly (monthly requires 30 bars, lookback gives ~15 -- silently skipped)
+**Capital**: $100K per trade, $1M max
+
+### IS Results (2015-2024)
+
+| Year | Trades | WR | P&L | Avg/Trade |
+|------|--------|----|-----|-----------|
+| 2015 | 38 | 97.4% | $161,199 | $4,242 |
+| 2016 | 40 | 100% | $193,649 | $4,841 |
+| 2017 | 66 | 97.0% | $239,451 | $3,628 |
+| 2018 | 50 | 100% | $258,386 | $5,168 |
+| 2019 | 47 | 100% | $251,738 | $5,356 |
+| 2020 | 34 | 100% | $580,926 | $17,086 |
+| 2021 | 53 | 98.1% | $76,715 | $1,447 |
+| 2022 | 55 | 98.2% | $371,985 | $6,763 |
+| 2023 | 57 | 100% | $133,345 | $2,339 |
+| 2024 | 56 | 100% | $253,549 | $4,528 |
+| **Total** | **496** | **99.0%** | **$2,520,943** | **$5,083** |
+
+- **Per-year avg**: $252K, **Sharpe**: 1.88, **50 trades/yr**
+
+### OOS 2025
+
+| Year | Trades | WR | P&L | Avg/Trade |
+|------|--------|----|-----|-----------|
+| 2025 | 41 | 100% | $457,678 | $11,163 |
+
+### MTF Filter Impact
+All 4 configs (baseline, mtf_conflict, mtf_exhaust, mtf_full) produce IDENTICAL results.
+MTF momentum filter has zero effect at daily TF -- all signals neutral.
+
+### Daily TF Assessment
+
+- **Fills the multi-day gap**: 5-bar hold = ~5 trading days, between 1h (10h) and swing (weeks)
+- **50 trades/yr**: decent frequency, ~4/month
+- **Sharpe 1.88**: comparable to 1h (2.19) and better than 4h (1.27)
+- **2020 outlier**: $581K (23% of IS total) -- COVID volatility
+- **OOS strong**: $458K in 2025 vs $252K/yr IS avg = 1.82x OOS/IS ratio
+- **WR 99.0%**: consistent with other TFs
+- **Next step**: run walk-forward validation, then consider adding to portfolio backtest
