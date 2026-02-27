@@ -14,6 +14,25 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import pytz
+
+_ET = pytz.timezone('US/Eastern')
+
+
+def _now_et() -> datetime:
+    """Current time in US/Eastern (consistent with market hours and charts)."""
+    return datetime.now(_ET)
+
+
+def _is_market_open() -> bool:
+    """True if current ET time is within regular trading hours (9:30-16:00, weekdays)."""
+    now = _now_et()
+    if now.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    t = now.time()
+    from datetime import time as _time
+    return _time(9, 30) <= t < _time(16, 0)
+
 STATE_PATH = Path.home() / ".x14" / "surfer_scanner_state.json"
 MAX_SIGNAL_HISTORY = 200
 GIST_FILE_NAME = 'surfer_scanner_state.json'
@@ -208,7 +227,7 @@ class SurferLiveScanner:
         try:
             full = self._gist_load_full()
             full[MODEL_TAG] = data
-            full['_last_updated'] = datetime.now().isoformat()
+            full['_last_updated'] = _now_et().isoformat()
             url = f'https://api.github.com/gists/{self.gist_id}'
             payload = json.dumps({
                 'files': {GIST_FILE_NAME: {'content': json.dumps(full, indent=2)}}
@@ -271,7 +290,7 @@ class SurferLiveScanner:
         self._gist_save(data)
 
     def _reset_daily_if_needed(self):
-        today = datetime.now().strftime('%Y-%m-%d')
+        today = _now_et().strftime('%Y-%m-%d')
         if today != self._daily_date:
             self.daily_pnl = 0.0
             self.daily_trade_count = 0
@@ -289,9 +308,13 @@ class SurferLiveScanner:
             current_price: Latest TSLA price
         """
         self._reset_daily_if_needed()
-        now = datetime.now().isoformat()
+        now = _now_et().isoformat()
 
         sig = analysis.signal
+
+        # Block entries outside regular trading hours (9:30 AM - 4:00 PM ET)
+        if not _is_market_open():
+            return None
 
         # Record in history
         self.signal_history.append({
@@ -504,21 +527,14 @@ class SurferLiveScanner:
         """
         alerts: List[ScannerAlert] = []
         to_close: List[str] = []
-        now = datetime.now()
+        now = _now_et()
 
-        # Compute ET time once for EOD check
-        _is_eod = False
-        try:
-            import pytz
-            _et = pytz.timezone('US/Eastern')
-            _now_et = datetime.now(_et)
-            _is_eod = (
-                _now_et.hour > self.EOD_CLOSE_HOUR_ET or
-                (_now_et.hour == self.EOD_CLOSE_HOUR_ET and
-                 _now_et.minute >= self.EOD_CLOSE_MINUTE_ET)
-            )
-        except Exception:
-            pass
+        # EOD check using ET time
+        _is_eod = (
+            now.hour > self.EOD_CLOSE_HOUR_ET or
+            (now.hour == self.EOD_CLOSE_HOUR_ET and
+             now.minute >= self.EOD_CLOSE_MINUTE_ET)
+        )
 
         for pos_id, pos in self.positions.items():
             exit_reason = None
@@ -528,6 +544,9 @@ class SurferLiveScanner:
             hold_minutes = 0.0
             try:
                 entry_dt = datetime.fromisoformat(pos.entry_time)
+                # Normalize: if entry was stored tz-naive, assume ET
+                if entry_dt.tzinfo is None:
+                    entry_dt = _ET.localize(entry_dt)
                 hold_minutes = (now - entry_dt).total_seconds() / 60
             except (ValueError, TypeError):
                 pass
@@ -634,7 +653,7 @@ class SurferLiveScanner:
         self, pos_id: str, pos: HypotheticalPosition,
         exit_price: float, exit_reason: str,
     ) -> ScannerAlert:
-        now = datetime.now()
+        now = _now_et()
 
         # P&L with slippage + commission
         if pos.direction == 'long':
@@ -654,6 +673,8 @@ class SurferLiveScanner:
 
         try:
             entry_dt = datetime.fromisoformat(pos.entry_time)
+            if entry_dt.tzinfo is None:
+                entry_dt = _ET.localize(entry_dt)
             hold_minutes = (now - entry_dt).total_seconds() / 60
         except (ValueError, TypeError):
             hold_minutes = 0
