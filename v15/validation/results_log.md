@@ -490,3 +490,70 @@ Walk-forward (IS=5yr, OOS=1yr, 6 windows):
 - The constraint-based scoring may be too strict for evolutionary search
 - Recommendation: try unconstrained scoring (pure P&L or Sharpe) in next OE run
 - S1041 remains champion by default
+
+---
+
+## Portfolio Backtest -- Multi-System Allocation (Feb 26, 2026)
+
+**Script**: `v15/validation/portfolio_backtest.py`
+**Run date**: Feb 26, 2026 (server, all 4 phases)
+**Capital**: $100K per system baseline, $1M total for allocation search
+**Years**: 2015-2025 (11yr), walk-forward 6 windows IS 5yr -> OOS 1yr
+
+### Phase 1 -- Per-System Independent Baseline ($100K each)
+
+| System | Total P&L (11yr) | Trades | WR | Sharpe | Trd/yr | Max Hold |
+|--------|-----------------|--------|-----|--------|--------|----------|
+| 5min | $17,330,408 | 12,158 | 94.5% | 2.19 | 1,105 | 5h (intraday) |
+| 1h | $31,980,935 | 9,814 | 95.4% | 2.32 | 892 | 10h (~1.5d) |
+| 4h | $26,177,386 | 2,965 | 98.1% | 1.35 | 270 | 20h (~2.5d) |
+| swing | $112,703 | 29 | 69.0% | 0.89 | 3 | 10d |
+
+Runtime: 869s total (parallel). Swing 4.5s, 4h 107s, 1h 351s, 5min 868s.
+
+### Annual P&L Correlation Matrix
+
+|       | 5min  | 1h    | 4h    | swing |
+|-------|-------|-------|-------|-------|
+| 5min  | 1.000 | 0.917 | 0.831 | 0.203 |
+| 1h    | 0.917 | 1.000 | 0.865 | 0.176 |
+| 4h    | 0.831 | 0.865 | 1.000 | -0.008 |
+| swing | 0.203 | 0.176 | -0.008 | 1.000 |
+
+Key: intraday systems highly correlated (0.83-0.92). Swing near-zero with everything.
+
+### Phase 2 -- Allocation Grid Search (286 combos, $1M total, 10% step)
+
+Top 10 by Sharpe -- ALL have 0% to 4h:
+
+| Rank | 5min | 1h | 4h | Swing | Total P&L | Sharpe | MaxDD | Worst Yr |
+|------|------|-----|-----|-------|-----------|--------|-------|----------|
+| 1 | 0% | 10% | 0% | 90% | $33.0M | 2.35 | -2.7% | $908K |
+| 2 | 10% | 10% | 0% | 80% | $50.2M | 2.34 | -1.9% | $1.4M |
+| 3 | 10% | 20% | 0% | 70% | $82.1M | 2.34 | -1.2% | $2.3M |
+| 4 | 0% | 20% | 0% | 80% | $64.9M | 2.34 | -1.6% | $1.8M |
+| 5 | 10% | 30% | 0% | 60% | $114M | 2.33 | -0.8% | $3.2M |
+
+### Phase 3 -- Walk-Forward Validation (6/6 WIN for all top 3)
+
+**Allocation #1** (0/10/0/90): 6/6 WIN, total OOS $24.1M, avg $4.0M/yr
+**Allocation #2** (10/10/0/80): 6/6 WIN, total OOS $36.3M, avg $6.1M/yr
+**Allocation #3** (10/20/0/70): 6/6 WIN, total OOS $59.7M, avg $9.9M/yr
+
+### Phase 4 -- Overlap Analysis (top-1 allocation: 0/10/0/90)
+
+- Zero concurrent positions (1h and swing on completely different timescales)
+- Max concurrent: 0, overlap time: 0% of market hours
+- No capital conflict between systems
+
+### Key Findings
+
+1. **1h is the best single system** -- highest P&L ($32M), highest Sharpe (2.32), 95.4% WR
+2. **4h is redundant** -- 86.5% correlated with 1h, lower Sharpe (1.35 vs 2.32), adds correlated risk
+3. **Swing inflates Sharpe** -- 90% allocation is a math artifact (idle capital = low variance)
+4. **Practical deployment**: 60-70% 1h / 20-30% 5min / swing overlay when triggered
+5. **Gap identified**: dropping 4h leaves no system covering 1.5-day to 10-day holds
+   - 1h max hold = 10h (~1.5 trading days)
+   - Swing = 2-3 trades/yr (not continuous coverage)
+   - **Daily TF (1d) never tested** -- config exists (5-day hold, weekly+monthly context) but no results
+   - TODO: run `medium_tf_backtest.py --tf 1d` to fill the multi-day gap
