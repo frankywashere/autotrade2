@@ -556,6 +556,83 @@ Top 10 by Sharpe -- ALL have 0% to 4h:
    - 1h max hold = 10h (~1.5 trading days)
    - Swing = 2-3 trades/yr (not continuous coverage)
    - **Daily TF (1d) never tested** -- config exists (5-day hold, weekly+monthly context) but no results
+---
+
+## Portfolio Backtest v2 -- 5-System Allocation (Feb 26, 2026)
+
+**Script**: `v15/validation/portfolio_backtest.py` (updated with 1d as 5th system)
+**Run date**: Feb 26, 2026 (server, all 4 phases)
+**Capital**: $100K per system baseline, $1M total for allocation search
+**Systems**: 5min, 1h, 4h, 1d, swing
+**Grid**: 1001 combos (5 systems, 10% step)
+
+### Phase 1 -- Per-System Independent Baseline ($100K each)
+
+| System | Total P&L (11yr) | Trades | WR | Sharpe | Trd/yr |
+|--------|-----------------|--------|-----|--------|--------|
+| 5min | $17,330,408 | 12,158 | 94.5% | 2.19 | 1,105 |
+| 1h | $31,980,935 | 9,814 | 95.4% | 2.32 | 892 |
+| 4h | $26,177,386 | 2,965 | 98.1% | 1.35 | 270 |
+| 1d | $2,978,622 | 537 | 99.1% | 1.92 | 49 |
+| swing | $112,703 | 29 | 69.0% | 0.89 | 3 |
+
+### 5x5 Annual P&L Correlation Matrix
+
+|       | 5min  | 1h    | 4h    | 1d    | swing |
+|-------|-------|-------|-------|-------|-------|
+| 5min  | 1.000 | 0.917 | 0.831 | 0.604 | 0.203 |
+| 1h    | 0.917 | 1.000 | 0.865 | 0.513 | 0.176 |
+| 4h    | 0.831 | 0.865 | 1.000 | 0.614 | -0.008 |
+| 1d    | 0.604 | 0.513 | 0.614 | 1.000 | 0.408 |
+| swing | 0.203 | 0.176 | -0.008 | 0.408 | 1.000 |
+
+Key: 1d has LOWER correlation with 1h (0.51) than 4h does (0.87). Best diversifier among intraday systems.
+
+### Phase 2 -- Allocation Grid Search (1001 combos, $1M total)
+
+Top 10 by Sharpe -- ALL have 0% to 5min, 0% to 4h:
+
+| Rank | 5min | 1h | 4h | 1d | Swing | Total P&L | Sharpe | MaxDD | Worst Yr |
+|------|------|-----|-----|-----|-------|-----------|--------|-------|----------|
+| 1 | 0% | 10% | 0% | 50% | 40% | $47.3M | 2.48 | -0.9% | $2.1M |
+| 2 | 0% | 10% | 0% | 40% | 50% | $44.5M | 2.48 | -1.2% | $1.9M |
+| 3 | 0% | 10% | 0% | 60% | 30% | $50.2M | 2.47 | -0.7% | $2.3M |
+| 4 | 0% | 20% | 0% | 80% | 0% | $87.8M | 2.47 | -0.1% | $3.7M |
+| 5 | 0% | 10% | 0% | 30% | 60% | $41.6M | 2.47 | -1.5% | $1.6M |
+| 6 | 0% | 20% | 0% | 70% | 10% | $84.9M | 2.47 | -0.2% | $3.5M |
+| 7 | 0% | 10% | 0% | 70% | 20% | $53.1M | 2.46 | -0.4% | $2.6M |
+| 8 | 0% | 20% | 0% | 60% | 20% | $82.1M | 2.46 | -0.3% | $3.3M |
+| 9 | 0% | 10% | 0% | 80% | 10% | $55.9M | 2.45 | -0.2% | $2.8M |
+| 10 | 0% | 20% | 0% | 50% | 30% | $79.2M | 2.45 | -0.5% | $3.0M |
+
+Equal-weight (rank #545): $157.2M, Sharpe=1.95
+
+### Phase 3 -- Walk-Forward (6/6 WIN for all top 5)
+
+| Allocation | Windows Won | Total OOS | Avg OOS/yr |
+|-----------|-------------|-----------|------------|
+| #1 (0/10/0/50/40) | 6/6 | $33.1M | $5.5M |
+| #2 (0/10/0/40/50) | 6/6 | $31.3M | $5.2M |
+| #3 (0/10/0/60/30) | 6/6 | $34.9M | $5.8M |
+| #4 (0/20/0/80/0) | **6/6** | **$61.8M** | **$10.3M** |
+| #5 (0/10/0/30/60) | 6/6 | $29.5M | $4.9M |
+
+### Phase 4 -- Overlap Analysis (allocation #1: 0/10/0/50/40)
+
+- Zero concurrent positions across 1h, 1d, and swing
+- No capital conflict between systems
+
+### Key Findings (v2 -- 5 systems)
+
+1. **Daily (1d) dominates the grid search** -- every top-10 combo allocates 30-80% to 1d
+2. **4h is still redundant** -- 0% in all top combos (corr 0.87 with 1h vs 1d's 0.51)
+3. **5min is also redundant** -- 0% in all top combos (corr 0.92 with 1h)
+4. **1d is the best diversifier** -- lowest correlation with 1h (0.51) among all intraday systems
+5. **Allocation #4 (0/20/0/80/0)** has the highest total OOS ($61.8M) with no swing needed
+6. **Swing inflation persists** -- 40-60% swing allocation still a Sharpe artifact (idle capital)
+7. **Practical allocation**: 20% 1h + 80% 1d (rank #4) -- no swing, no 5min, no 4h
+   - Or more conservatively: 10-20% 1h + 50-70% 1d + swing overlay when triggered
+
 ### Context Fix Note (Feb 26, 2026)
 
 The surfer backtest engine (`surfer_backtest.py:1054`) warns when '1h' or 'daily' keys are
