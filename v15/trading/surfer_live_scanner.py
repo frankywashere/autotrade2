@@ -256,6 +256,99 @@ class SurferLiveScanner:
         ]
         self.signal_history = data.get('signal_history', [])
 
+    @staticmethod
+    def _migrate_utc_to_et(data: dict) -> dict:
+        """One-time migration: convert naive UTC timestamps to ET, purge after-hours trades.
+
+        Before this fix, Streamlit Cloud logged datetime.now() which was UTC.
+        This converts those naive timestamps to proper ET and removes any
+        trades whose entry fell outside regular market hours (9:30-16:00 ET).
+        """
+        if data.get('_migrated_tz_v1'):
+            return data  # Already migrated
+
+        from datetime import time as _time
+        _utc = pytz.utc
+        _mkt_open = _time(9, 30)
+        _mkt_close = _time(16, 0)
+
+        def _convert_ts(iso_str: str) -> str:
+            """Convert a naive-UTC ISO string to ET-aware ISO string."""
+            try:
+                dt = datetime.fromisoformat(iso_str)
+                if dt.tzinfo is not None:
+                    return iso_str  # Already tz-aware, skip
+                # Naive → assume UTC (Streamlit Cloud) → convert to ET
+                dt_utc = _utc.localize(dt)
+                dt_et = dt_utc.astimezone(_ET)
+                return dt_et.isoformat()
+            except (ValueError, TypeError):
+                return iso_str
+
+        def _entry_during_market(iso_str: str) -> bool:
+            """Return True if the timestamp falls within market hours."""
+            try:
+                dt = datetime.fromisoformat(iso_str)
+                if dt.tzinfo is None:
+                    dt = _utc.localize(dt).astimezone(_ET)
+                else:
+                    dt = dt.astimezone(_ET)
+                if dt.weekday() >= 5:
+                    return False
+                return _mkt_open <= dt.time() < _mkt_close
+            except (ValueError, TypeError):
+                return True  # Keep if unparseable
+
+        n_trades_before = len(data.get('closed_trades', []))
+        n_pos_before = len(data.get('positions', {}))
+
+        # Migrate closed trades: convert timestamps, drop after-hours entries
+        migrated_trades = []
+        removed_pnl = 0.0
+        for t in data.get('closed_trades', []):
+            et_entry = _convert_ts(t.get('entry_time', ''))
+            if not _entry_during_market(t.get('entry_time', '')):
+                removed_pnl += t.get('pnl', 0.0)
+                continue  # Drop this trade
+            t['entry_time'] = et_entry
+            t['exit_time'] = _convert_ts(t.get('exit_time', ''))
+            migrated_trades.append(t)
+        data['closed_trades'] = migrated_trades
+
+        # Migrate open positions: convert timestamps, drop after-hours entries
+        migrated_pos = {}
+        for k, p in data.get('positions', {}).items():
+            et_entry = _convert_ts(p.get('entry_time', ''))
+            if not _entry_during_market(p.get('entry_time', '')):
+                continue  # Drop this position
+            p['entry_time'] = et_entry
+            migrated_pos[k] = p
+        data['positions'] = migrated_pos
+
+        # Migrate signal history timestamps
+        migrated_signals = []
+        for s in data.get('signal_history', []):
+            et_time = _convert_ts(s.get('time', ''))
+            if not _entry_during_market(s.get('time', '')):
+                continue
+            s['time'] = et_time
+            migrated_signals.append(s)
+        data['signal_history'] = migrated_signals
+
+        # Adjust equity for removed trades' PnL
+        if removed_pnl != 0:
+            data['equity'] = data.get('equity', 100000.0) - removed_pnl
+
+        n_trades_after = len(data['closed_trades'])
+        n_pos_after = len(data['positions'])
+        print(f"[SCANNER] TZ migration: trades {n_trades_before}→{n_trades_after} "
+              f"(removed {n_trades_before - n_trades_after} after-hours), "
+              f"positions {n_pos_before}→{n_pos_after}, "
+              f"equity adjusted by ${-removed_pnl:+,.0f}")
+
+        data['_migrated_tz_v1'] = True
+        return data
+
     def _load_state(self):
         # Try Gist first (authoritative on Streamlit Cloud), fall back to local
         data = self._gist_load()
@@ -266,7 +359,11 @@ class SurferLiveScanner:
                 print(f"[SCANNER] Failed to load local state: {e}")
         if data:
             try:
+                data = self._migrate_utc_to_et(data)
                 self._apply_state(data)
+                # Save migrated state back (persists the fix)
+                if data.get('_migrated_tz_v1'):
+                    self._save_state()
             except Exception as e:
                 print(f"[SCANNER] Failed to apply state: {e}")
 
