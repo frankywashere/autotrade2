@@ -568,9 +568,37 @@ def run_phase2(all_results: Dict[str, Dict[int, 'SystemYearResult']],
     allocations = _generate_allocations(step)
     print(f"  Testing {len(allocations)} allocation combos...")
 
-    # Precompute: for each system/year, get the daily equity curve (cumsum of daily P&L)
-    # Scale factor: all_results used $100K capital; we scale to allocation weight * total_capital
-    # Since P&L is linear with capital, multiplier = (weight * total_capital) / 100_000
+    # Precompute per-system combined daily P&L (concatenated across years, at $100K base)
+    # Then for each allocation, just multiply by weight and sum -- avoids redundant .add() calls
+    sys_daily = {}   # system -> single pd.Series across all years
+    sys_yr_pnl = {}  # system -> {year: float}
+    for system in SYSTEMS:
+        parts = []
+        yr_pnl = {}
+        for year in years:
+            sys_yr = all_results.get(system, {}).get(year)
+            if sys_yr is None:
+                yr_pnl[year] = 0.0
+                continue
+            yr_pnl[year] = sys_yr.total_pnl
+            parts.append(sys_yr.daily_pnl)
+        sys_yr_pnl[system] = yr_pnl
+        if parts:
+            sys_daily[system] = pd.concat(parts).sort_index()
+        else:
+            sys_daily[system] = pd.Series(dtype=float)
+
+    # Build a common date index across all systems
+    all_dates = set()
+    for s in sys_daily.values():
+        all_dates.update(s.index)
+    all_dates = sorted(all_dates)
+    common_idx = pd.DatetimeIndex(all_dates)
+
+    # Reindex each system to common dates
+    sys_daily_arr = {}  # system -> np.array aligned to common_idx
+    for system in SYSTEMS:
+        sys_daily_arr[system] = sys_daily[system].reindex(common_idx, fill_value=0.0).values
 
     results = []
     for weights in allocations:
@@ -581,11 +609,8 @@ def run_phase2(all_results: Dict[str, Dict[int, 'SystemYearResult']],
             for i, system in enumerate(SYSTEMS):
                 if weights[i] == 0:
                     continue
-                sys_yr = all_results.get(system, {}).get(year)
-                if sys_yr is None:
-                    continue
                 scale = (weights[i] * total_capital) / 100_000.0
-                year_pnl += sys_yr.total_pnl * scale
+                year_pnl += sys_yr_pnl[system].get(year, 0.0) * scale
             yr_pnls.append(year_pnl)
 
         if len(yr_pnls) < 2:
@@ -596,26 +621,22 @@ def run_phase2(all_results: Dict[str, Dict[int, 'SystemYearResult']],
         std_pnl = np.std(yr_pnls)
         sharpe = float(mean_pnl / std_pnl) if std_pnl > 0 else 0.0
 
-        # Max drawdown from combined daily equity curve
-        daily_combined = pd.Series(0.0, dtype=float)
+        # Max drawdown from combined daily equity curve (numpy, fast)
+        daily_arr = np.zeros(len(common_idx))
         for i, system in enumerate(SYSTEMS):
             if weights[i] == 0:
                 continue
             scale = (weights[i] * total_capital) / 100_000.0
-            for year in years:
-                sys_yr = all_results.get(system, {}).get(year)
-                if sys_yr is None:
-                    continue
-                scaled = sys_yr.daily_pnl * scale
-                daily_combined = daily_combined.add(scaled, fill_value=0.0)
+            daily_arr += sys_daily_arr[system] * scale
 
-        equity = daily_combined.cumsum()
+        equity = np.cumsum(daily_arr)
         if len(equity) > 0:
-            running_max = equity.cummax()
+            running_max = np.maximum.accumulate(equity)
             drawdown = equity - running_max
             max_dd_abs = drawdown.min()
-            peak_at_dd = running_max[drawdown.idxmin()] if len(drawdown) > 0 else total_capital
-            max_dd_pct = max_dd_abs / max(peak_at_dd + total_capital, 1.0) if peak_at_dd + total_capital > 0 else 0.0
+            dd_idx = np.argmin(drawdown)
+            peak_at_dd = running_max[dd_idx]
+            max_dd_pct = max_dd_abs / max(peak_at_dd + total_capital, 1.0)
         else:
             max_dd_pct = 0.0
 
