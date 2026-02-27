@@ -90,6 +90,10 @@ def load_all_data(tsla_path: str, spy_path: str):
     tsla_4h   = resample_to_tf(tsla_1min, '4h')
     tsla_daily  = resample_to_tf(tsla_1min, '1D')
     tsla_weekly = resample_to_tf(tsla_1min, '1W')
+    try:
+        tsla_monthly = resample_to_tf(tsla_1min, 'ME')
+    except Exception:
+        tsla_monthly = resample_to_tf(tsla_1min, 'M')
 
     spy_5min = resample_to_tf(spy_1min, '5min') if spy_1min is not None else None
     spy_1h   = resample_to_tf(spy_1min, '1h')   if spy_1min is not None else None
@@ -97,7 +101,7 @@ def load_all_data(tsla_path: str, spy_path: str):
     spy_daily  = resample_to_tf(spy_1min, '1D')  if spy_1min is not None else None
 
     print(f"  5min: {len(tsla_5min):,}  1h: {len(tsla_1h):,}  4h: {len(tsla_4h):,}  "
-          f"daily: {len(tsla_daily):,}  weekly: {len(tsla_weekly):,}")
+          f"daily: {len(tsla_daily):,}  weekly: {len(tsla_weekly):,}  monthly: {len(tsla_monthly):,}")
 
     return {
         'tsla_1min': tsla_1min,
@@ -106,6 +110,7 @@ def load_all_data(tsla_path: str, spy_path: str):
         'tsla_4h': tsla_4h,
         'tsla_daily': tsla_daily,
         'tsla_weekly': tsla_weekly,
+        'tsla_monthly': tsla_monthly,
         'spy_1min': spy_1min,
         'spy_5min': spy_5min,
         'spy_1h': spy_1h,
@@ -226,22 +231,28 @@ def _prepare_medium_tf_year(all_data: dict, tf: str, year: int) -> Optional[dict
 
     spy_slice = _slice(spy_tf, cutoff_start, cutoff_year_end) if spy_tf is not None else None
 
-    # Build higher_tf_dict with all available context TFs.
-    # Engine expects '1h' and 'daily' keys -- include even if one matches primary
-    # (redundant but harmless channel detection, avoids degraded-analysis warning).
+    # Higher TF context -- only include TFs ABOVE the primary.
+    # The engine labels the primary as '5min' internally and uses higher_tf_data
+    # for multi-TF alignment/stacked boosts.  Including lower TFs or duplicates
+    # of the primary would corrupt those signals.
     higher_tf_dict = {}
-    if 'tsla_1h' in all_data:
-        hourly_slice = _slice(all_data['tsla_1h'], cutoff_start, cutoff_year_end)
-        if hourly_slice is not None and len(hourly_slice) > 0:
-            higher_tf_dict['1h'] = hourly_slice
-    if tf == '1h' and '1h' not in higher_tf_dict:
-        higher_tf_dict['1h'] = tsla_slice
-    daily_slice = _slice(all_data['tsla_daily'], cutoff_start, cutoff_year_end)
-    if daily_slice is not None and len(daily_slice) > 0:
-        higher_tf_dict['daily'] = daily_slice
-    weekly_slice = _slice(all_data['tsla_weekly'], cutoff_start, cutoff_year_end)
-    if weekly_slice is not None and len(weekly_slice) > 0:
-        higher_tf_dict['weekly'] = weekly_slice
+    if tf != '1d':
+        # 1h and 4h get daily + weekly as higher context
+        daily_slice = _slice(all_data['tsla_daily'], cutoff_start, cutoff_year_end)
+        if daily_slice is not None and len(daily_slice) > 0:
+            higher_tf_dict['daily'] = daily_slice
+        weekly_slice = _slice(all_data['tsla_weekly'], cutoff_start, cutoff_year_end)
+        if weekly_slice is not None and len(weekly_slice) > 0:
+            higher_tf_dict['weekly'] = weekly_slice
+    else:
+        # Daily primary gets weekly + monthly as higher context
+        weekly_slice = _slice(all_data['tsla_weekly'], cutoff_start, cutoff_year_end)
+        if weekly_slice is not None and len(weekly_slice) > 0:
+            higher_tf_dict['weekly'] = weekly_slice
+        if 'tsla_monthly' in all_data:
+            monthly_slice = _slice(all_data['tsla_monthly'], cutoff_start, cutoff_year_end)
+            if monthly_slice is not None and len(monthly_slice) > 0:
+                higher_tf_dict['monthly'] = monthly_slice
 
     return {
         'tsla_tf': tsla_slice,

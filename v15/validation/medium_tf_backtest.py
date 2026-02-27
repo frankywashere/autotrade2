@@ -68,7 +68,7 @@ TF_RESAMPLE = {
 # ---------------------------------------------------------------------------
 
 def _load_and_resample(tsla_path: str, spy_path: Optional[str], tf: str):
-    """Return (tsla_tf, spy_tf, daily_tsla, weekly_tsla, daily_spy, monthly_tsla, hourly_tsla)."""
+    """Return (tsla_tf, spy_tf, daily_tsla, weekly_tsla, daily_spy, monthly_tsla)."""
     from v15.core.historical_data import load_minute_data, resample_to_tf
 
     print(f"  Loading TSLA 1-min from {tsla_path} ...")
@@ -89,8 +89,6 @@ def _load_and_resample(tsla_path: str, spy_path: Optional[str], tf: str):
     if spy_tf is not None:
         print(f"  SPY  {tf}: {len(spy_tf):,} bars")
 
-    # Always resample 1h for multi-TF context (engine expects '1h' key)
-    hourly_tsla = resample_to_tf(tsla_1min, '1h') if tf != '1h' else None
     daily_tsla = resample_to_tf(tsla_1min, '1D')
     weekly_tsla = resample_to_tf(tsla_1min, '1W')
     daily_spy = resample_to_tf(spy_1min, '1D') if spy_1min is not None else None
@@ -99,15 +97,14 @@ def _load_and_resample(tsla_path: str, spy_path: Optional[str], tf: str):
         monthly_tsla = resample_to_tf(tsla_1min, 'ME')
     except Exception:
         monthly_tsla = resample_to_tf(tsla_1min, 'M')
-    hourly_str = f"  1h: {len(hourly_tsla):,}" if hourly_tsla is not None else ""
-    print(f"  TSLA{hourly_str}  daily: {len(daily_tsla):,}  weekly: {len(weekly_tsla):,}  monthly: {len(monthly_tsla):,}")
+    print(f"  TSLA daily: {len(daily_tsla):,}  weekly: {len(weekly_tsla):,}  monthly: {len(monthly_tsla):,}")
 
-    return tsla_tf, spy_tf, daily_tsla, weekly_tsla, daily_spy, monthly_tsla, hourly_tsla
+    return tsla_tf, spy_tf, daily_tsla, weekly_tsla, daily_spy, monthly_tsla
 
 
 def _prepare_year(tsla_tf, spy_tf, daily_tsla, weekly_tsla, year: int,
                   lookback_days: int = 90, monthly_tsla=None,
-                  primary_tf: str = '1h', hourly_tsla=None) -> Optional[dict]:
+                  primary_tf: str = '1h') -> Optional[dict]:
     """Slice all DFs to `year` with a lookback buffer for channel detection."""
     cutoff_start = pd.Timestamp(f'{year - 1}-10-01')  # ~90 days before year
     cutoff_year_start = pd.Timestamp(f'{year}-01-01')
@@ -127,37 +124,35 @@ def _prepare_year(tsla_tf, spy_tf, daily_tsla, weekly_tsla, year: int,
     spy_slice = _slice(spy_tf, cutoff_start, cutoff_year_end) if spy_tf is not None else None
     daily_slice = _slice(daily_tsla, cutoff_start, cutoff_year_end)
     weekly_slice = _slice(weekly_tsla, cutoff_start, cutoff_year_end)
-    hourly_slice = _slice(hourly_tsla, cutoff_start, cutoff_year_end) if hourly_tsla is not None else None
 
     if tsla_slice is None or len(tsla_slice) < 20:
         return None
 
-    # Build higher_tf_dict with all available context TFs.
-    # The surfer engine expects '1h' and 'daily' keys for full multi-TF analysis.
-    # Include all TFs -- even if one matches the primary (engine just gets
-    # redundant but harmless channel detection on the same data).
+    # Higher TF context -- only include TFs ABOVE the primary.
+    # The engine labels the primary channel as '5min' internally and uses
+    # higher_tf_data for multi-TF alignment/stacked boosts.  Including
+    # lower TFs or duplicates of the primary would corrupt those signals.
+    #
+    # Primary TF  -> higher context TFs
+    # 1h          -> daily, weekly
+    # 4h          -> daily, weekly
+    # 1d          -> weekly, monthly
     higher_tf_dict = {}
 
-    # 1h context
-    if hourly_slice is not None and len(hourly_slice) > 0:
-        higher_tf_dict['1h'] = hourly_slice
-    elif primary_tf == '1h':
-        # Primary IS 1h -- pass it as higher_tf so engine doesn't warn
-        higher_tf_dict['1h'] = tsla_slice
-
-    # Daily context
-    if daily_slice is not None and len(daily_slice) > 0:
-        higher_tf_dict['daily'] = daily_slice
-
-    # Weekly always included
-    if weekly_slice is not None and len(weekly_slice) > 0:
-        higher_tf_dict['weekly'] = weekly_slice
-
-    # Monthly for daily primary
-    if monthly_tsla is not None:
-        monthly_slice = _slice(monthly_tsla, cutoff_start, cutoff_year_end)
-        if monthly_slice is not None and len(monthly_slice) > 0:
-            higher_tf_dict['monthly'] = monthly_slice
+    if primary_tf != '1d':
+        # 1h and 4h get daily + weekly as higher context
+        if daily_slice is not None and len(daily_slice) > 0:
+            higher_tf_dict['daily'] = daily_slice
+        if weekly_slice is not None and len(weekly_slice) > 0:
+            higher_tf_dict['weekly'] = weekly_slice
+    else:
+        # Daily primary gets weekly + monthly as higher context
+        if weekly_slice is not None and len(weekly_slice) > 0:
+            higher_tf_dict['weekly'] = weekly_slice
+        if monthly_tsla is not None:
+            monthly_slice = _slice(monthly_tsla, cutoff_start, cutoff_year_end)
+            if monthly_slice is not None and len(monthly_slice) > 0:
+                higher_tf_dict['monthly'] = monthly_slice
 
     return {
         'tsla_tf': tsla_slice,
@@ -288,7 +283,7 @@ def main():
     # Load & resample
     # ------------------------------------------------------------------
     t0 = time.time()
-    tsla_tf, spy_tf, daily_tsla, weekly_tsla, daily_spy, monthly_tsla, hourly_tsla = _load_and_resample(
+    tsla_tf, spy_tf, daily_tsla, weekly_tsla, daily_spy, monthly_tsla = _load_and_resample(
         args.tsla, args.spy if os.path.isfile(args.spy) else None, args.tf)
     print(f"  Data loaded in {time.time() - t0:.1f}s")
 
@@ -349,8 +344,7 @@ def main():
 
         for year in is_years:
             year_data = _prepare_year(tsla_tf, spy_tf, daily_tsla, weekly_tsla, year,
-                                      monthly_tsla=monthly_tsla, primary_tf=args.tf,
-                                      hourly_tsla=hourly_tsla)
+                                      monthly_tsla=monthly_tsla, primary_tf=args.tf)
             if year_data is None:
                 print(f"  {year}: no data, skipping")
                 continue
@@ -392,8 +386,7 @@ def main():
         print(f"{'='*70}")
 
         oos_year_data = _prepare_year(tsla_tf, spy_tf, daily_tsla, weekly_tsla, args.oos_year,
-                                      monthly_tsla=monthly_tsla, primary_tf=args.tf,
-                                      hourly_tsla=hourly_tsla)
+                                      monthly_tsla=monthly_tsla, primary_tf=args.tf)
         if oos_year_data is None:
             print(f"  {args.oos_year}: no OOS data available")
         else:

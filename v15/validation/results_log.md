@@ -556,4 +556,27 @@ Top 10 by Sharpe -- ALL have 0% to 4h:
    - 1h max hold = 10h (~1.5 trading days)
    - Swing = 2-3 trades/yr (not continuous coverage)
    - **Daily TF (1d) never tested** -- config exists (5-day hold, weekly+monthly context) but no results
-   - TODO: run `medium_tf_backtest.py --tf 1d` to fill the multi-day gap
+   - TODO: run `medium_tf_backtest.py --tf 1d` with correct context (weekly+monthly) and record results
+
+### Context Fix Note (Feb 26, 2026)
+
+The surfer backtest engine (`surfer_backtest.py:1054`) warns when '1h' or 'daily' keys are
+missing from `higher_tf_data`. This warning is ONLY relevant for 5-min primary -- for other
+primary TFs, these are false alarms (1h is lower TF for 4h/1d, daily IS the primary for 1d).
+
+Correct higher TF context per primary:
+- **5min primary**: 1h + 4h + daily + weekly (default in `combined_backtest.py`, correct)
+- **1h primary**: daily + weekly (original code was correct)
+- **4h primary**: daily + weekly (original code was correct; 1h is LOWER TF, not context)
+- **1d primary**: weekly + monthly (original code had weekly but was MISSING monthly)
+
+An earlier "fix" (commits `8148f73` + `4fd18ce`) incorrectly added lower-TF data (1h for 4h/1d,
+daily for 1d) and duplicates (1h for 1h primary). This inflated the daily TF results by
+corrupting the multi-TF alignment/stacked boost signals (+69% artificial P&L). Reverted.
+
+**Impact on existing results**:
+- **1h results**: UNAFFECTED -- original context (daily+weekly) was correct
+- **4h results**: UNAFFECTED -- original context (daily+weekly) was correct
+- **Portfolio backtest cache (1h/4h)**: VALID -- ran before the bad fix
+- **Daily TF results ($4.2M)**: INVALID -- ran with corrupted context, need re-run
+- **1d first run ($2.5M with weekly-only)**: was MISSING monthly context, also needs re-run
