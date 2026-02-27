@@ -1,0 +1,21 @@
+llm:
+  api_base: "http://localhost:5562/v1"
+  api_key: "dummy"
+  primary_model: "claude-code"
+  primary_model_weight: 1.0
+  temperature: 0.7
+  max_tokens: 8000
+  timeout: 600
+
+max_iterations: 300
+
+database:
+  population_size: 30
+  num_islands: 2
+
+evaluator:
+  timeout: 120
+  parallel_evaluations: 1
+  cascade_evaluation: false
+
+diff_based_evolution: false

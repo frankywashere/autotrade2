@@ -87,6 +87,21 @@ class SurferSignal:
 
 
 @dataclass
+class OverrideConfig:
+    """Configuration for higher-TF signal override."""
+    mode: str = 'none'                   # 'none', 'suppress', 'flip', 'boost_only'
+    position_threshold: float = 0.25     # How extreme higher TFs must be (0.20-0.30)
+    required_agreement: int = 1          # How many higher TFs must agree (1 or 2)
+    override_tfs: Optional[List[str]] = None  # Which TFs to check (e.g. ['daily', 'weekly'])
+    min_override_confidence: float = 0.50     # Floor confidence for flipped signals
+    require_stabilizing: bool = False    # Only override when higher TF momentum is turning
+
+    def __post_init__(self):
+        if self.override_tfs is None:
+            self.override_tfs = ['daily', 'weekly']
+
+
+@dataclass
 class ChannelAnalysis:
     """Complete multi-TF channel analysis."""
     tf_states: Dict[str, TFChannelState]
@@ -94,6 +109,7 @@ class ChannelAnalysis:
     confluence_matrix: Dict[str, float]  # TF -> alignment score
     timestamp: str                        # When analysis was computed
     regime: Optional[MarketRegime] = None # Current market regime
+    override_info: Optional[Dict] = None  # Details of any higher-TF override applied
 
 
 # ---------------------------------------------------------------------------
@@ -1325,6 +1341,111 @@ def generate_signal(
 
 
 # ---------------------------------------------------------------------------
+# Higher-TF Override Post-Processor
+# ---------------------------------------------------------------------------
+
+def apply_higher_tf_override(
+    signal: SurferSignal,
+    tf_states: Dict[str, TFChannelState],
+    config: OverrideConfig,
+) -> Tuple[SurferSignal, Dict]:
+    """
+    Post-process a raw signal using higher-TF context.
+
+    If raw_action is SELL but higher TFs are oversold → suppress or flip to BUY.
+    If raw_action is BUY but higher TFs are overbought → suppress or flip to SELL.
+
+    Returns:
+        (modified_signal, override_info_dict)
+    """
+    info: Dict = {
+        'override_applied': False,
+        'original_action': signal.action,
+        'original_confidence': signal.confidence,
+        'agreeing_tfs': [],
+        'mode': config.mode,
+    }
+
+    if config.mode == 'none' or signal.action == 'HOLD':
+        return signal, info
+
+    # Determine which higher TFs to check
+    higher_tfs = config.override_tfs or ['daily', 'weekly']
+
+    # Check higher TF agreement
+    agreeing_tfs = []
+    for htf in higher_tfs:
+        state = tf_states.get(htf)
+        if state is None or not state.valid:
+            continue
+
+        if signal.action == 'SELL':
+            # Higher TF is oversold → counter-trend short
+            if state.position_pct < config.position_threshold:
+                # Check stabilizing requirement
+                if config.require_stabilizing:
+                    if state.momentum_direction > 0 or state.momentum_is_turning:
+                        agreeing_tfs.append(htf)
+                else:
+                    agreeing_tfs.append(htf)
+
+        elif signal.action == 'BUY':
+            # Higher TF is overbought → counter-trend long
+            if state.position_pct > (1.0 - config.position_threshold):
+                if config.require_stabilizing:
+                    if state.momentum_direction < 0 or state.momentum_is_turning:
+                        agreeing_tfs.append(htf)
+                else:
+                    agreeing_tfs.append(htf)
+
+    info['agreeing_tfs'] = agreeing_tfs
+
+    if len(agreeing_tfs) < config.required_agreement:
+        return signal, info
+
+    # Override triggered
+    info['override_applied'] = True
+
+    if config.mode == 'suppress':
+        # Convert to HOLD
+        from dataclasses import replace
+        new_signal = replace(
+            signal,
+            action='HOLD',
+            reason=f"SUPPRESSED by higher TF ({', '.join(agreeing_tfs)}) | {signal.reason}",
+        )
+        return new_signal, info
+
+    elif config.mode == 'flip':
+        # Flip direction
+        from dataclasses import replace
+        new_action = 'BUY' if signal.action == 'SELL' else 'SELL'
+        new_confidence = max(signal.confidence * 0.8, config.min_override_confidence)
+        new_signal = replace(
+            signal,
+            action=new_action,
+            confidence=round(new_confidence, 3),
+            reason=f"FLIPPED by higher TF ({', '.join(agreeing_tfs)}) | was {signal.action} | {signal.reason}",
+        )
+        return new_signal, info
+
+    elif config.mode == 'boost_only':
+        # Only boost confidence if higher TFs agree with direction
+        # (opposite of suppress — here higher TFs confirm the signal)
+        from dataclasses import replace
+        boost = 0.10 * len(agreeing_tfs)
+        new_confidence = min(1.0, signal.confidence + boost)
+        new_signal = replace(
+            signal,
+            confidence=round(new_confidence, 3),
+            reason=f"BOOSTED by higher TF ({', '.join(agreeing_tfs)}) | {signal.reason}",
+        )
+        return new_signal, info
+
+    return signal, info
+
+
+# ---------------------------------------------------------------------------
 # Main Analysis Entry Point
 # ---------------------------------------------------------------------------
 
@@ -1333,6 +1454,7 @@ def analyze_channels(
     prices_by_tf: Dict[str, np.ndarray],
     current_prices: Dict[str, float],
     volumes_by_tf: Optional[Dict[str, np.ndarray]] = None,
+    override_config: Optional[OverrideConfig] = None,
 ) -> ChannelAnalysis:
     """
     Run complete multi-TF channel analysis.
@@ -1486,12 +1608,18 @@ def analyze_channels(
     # Generate signal (regime-aware)
     signal = generate_signal(tf_states, confluence, regime)
 
+    # Apply higher-TF override (if configured)
+    override_info = None
+    if override_config is not None and override_config.mode != 'none':
+        signal, override_info = apply_higher_tf_override(signal, tf_states, override_config)
+
     return ChannelAnalysis(
         tf_states=tf_states,
         signal=signal,
         confluence_matrix=confluence,
         timestamp=datetime.now().isoformat(),
         regime=regime,
+        override_info=override_info,
     )
 
 
@@ -1519,6 +1647,7 @@ def prepare_multi_tf_analysis(
     live_5min_tsla: Optional['pd.DataFrame'] = None,
     symbol: str = 'TSLA',
     target_tfs: Optional[List[str]] = None,
+    override_config: Optional[OverrideConfig] = None,
 ) -> ChannelAnalysis:
     """
     Full pipeline: raw data → channel detection → surfer analysis.
@@ -1606,4 +1735,5 @@ def prepare_multi_tf_analysis(
     return analyze_channels(
         channels_by_tf, prices_by_tf, current_prices,
         volumes_by_tf=volumes_by_tf if volumes_by_tf else None,
+        override_config=override_config,
     )

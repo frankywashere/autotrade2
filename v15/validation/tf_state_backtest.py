@@ -59,6 +59,7 @@ TF_WINDOWS = {
     '4h':    30,   # 30 × 4h bars ≈ 6 weeks
     'daily': 60,   # 60 trading days ≈ 3 months
     'weekly': 50,  # 50 weeks ≈ 1 year
+    'monthly': 24, # 24 months ≈ 2 years
 }
 
 # ── TF state helpers ─────────────────────────────────────────────────────────
@@ -268,12 +269,12 @@ SIGNALS = [
      lambda s: _count_near_bottom(s) >= 5),
 
     ('D4 3+ TFs MT simultaneously',
-     lambda s: sum(1 for tf in ['5min','1h','4h','daily','weekly']
+     lambda s: sum(1 for tf in ['5min','1h','4h','daily','weekly','monthly']
                    if _mt(s, tf)) >= 3),
 
     ('D5 consensus_4+ + any_MT',
      lambda s: _count_near_bottom(s) >= 4 and
-               any(_mt(s, tf) for tf in ['5min','1h','4h','daily','weekly'])),
+               any(_mt(s, tf) for tf in ['5min','1h','4h','daily','weekly','monthly'])),
 
     ('D6 (weekly OR daily)_MT + consensus_3+',
      lambda s: (_mt(s, 'weekly') or _mt(s, 'daily')) and
@@ -302,7 +303,7 @@ def _mt(states, tf):
 
 
 def _count_near_bottom(states):
-    return sum(1 for tf in ['5min', '1h', '4h', 'daily', 'weekly']
+    return sum(1 for tf in ['5min', '1h', '4h', 'daily', 'weekly', 'monthly']
                if states.get(tf) and states[tf]['near_bottom'])
 
 
@@ -328,18 +329,19 @@ def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
 
 def load_all_tfs(tsla_min_path: str | None, start: str, end: str):
     """
-    Load TSLA data resampled to all 5 TFs.
+    Load TSLA data resampled to all 6 TFs (5min, 1h, 4h, daily, weekly, monthly).
     If 1-min file not available, falls back to yfinance for 1h/4h/5min.
-    Always fetches daily & weekly natively (full history).
+    Always fetches daily, weekly & monthly natively (full history).
     """
     print("Loading data...")
 
-    # ── Daily + weekly from native_tf (full history) ─────────────────────────
+    # ── Daily + weekly + monthly from native_tf (full history) ───────────────
     from v15.data.native_tf import fetch_native_tf
     daily = _norm_cols(fetch_native_tf('TSLA', 'daily', start, end))
     daily.index = pd.to_datetime(daily.index).tz_localize(None)
     weekly = _resample_ohlcv(daily, 'W-FRI')
-    print(f"  daily: {len(daily):,} bars  weekly: {len(weekly):,} bars")
+    monthly = _resample_ohlcv(daily, 'ME')
+    print(f"  daily: {len(daily):,} bars  weekly: {len(weekly):,}  monthly: {len(monthly):,}")
 
     # ── Intraday TFs ─────────────────────────────────────────────────────────
     if tsla_min_path and os.path.isfile(tsla_min_path):
@@ -378,6 +380,7 @@ def load_all_tfs(tsla_min_path: str | None, start: str, end: str):
         '4h':    tf4h,
         'daily': daily,
         'weekly': weekly,
+        'monthly': monthly,
     }
 
 
@@ -487,7 +490,7 @@ def run_backtest(daily_df: pd.DataFrame, state_rows: list,
             continue
 
         # Check signal
-        states = {tf: row.get(tf) for tf in ['5min', '1h', '4h', 'daily', 'weekly']}
+        states = {tf: row.get(tf) for tf in ['5min', '1h', '4h', 'daily', 'weekly', 'monthly']}
         try:
             fires = signal_fn(states)
         except Exception:
@@ -666,7 +669,7 @@ def main():
         print(f"\n{'='*70}")
         print(f"CURRENT CONDITIONS ({last['date'].strftime('%Y-%m-%d')})")
         print(f"{'='*70}")
-        for tf in ['5min', '1h', '4h', 'daily', 'weekly']:
+        for tf in ['5min', '1h', '4h', 'daily', 'weekly', 'monthly']:
             s = last.get(tf)
             if s is None:
                 print(f"  {tf:<8}  no data")
