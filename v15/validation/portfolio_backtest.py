@@ -2,10 +2,11 @@
 """
 Multi-System Portfolio Backtest
 
-Combines 4 proven TSLA trading systems and finds optimal capital allocation:
+Combines 5 proven TSLA trading systems and finds optimal capital allocation:
   - 5-min Channel Surfer  (~1,050 trades/yr, Sharpe=2.09)
   - 1h Channel Surfer     (~900 trades/yr, Sharpe=2.19)
   - 4h Channel Surfer     (~275 trades/yr, Sharpe=1.27)
+  - 1d Channel Surfer     (~50 trades/yr, Sharpe=1.88)
   - Swing S1041            (~2-3 trades/yr, WR=100%)
 
 Phases:
@@ -37,7 +38,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 CACHE_DIR = Path.home() / '.x14' / 'portfolio_cache'
-SYSTEMS = ['5min', '1h', '4h', 'swing']
+SYSTEMS = ['5min', '1h', '4h', '1d', 'swing']
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -109,6 +110,7 @@ def load_all_data(tsla_path: str, spy_path: str):
         'tsla_1h': tsla_1h,
         'tsla_4h': tsla_4h,
         'tsla_daily': tsla_daily,
+        'tsla_1d': tsla_daily,          # alias for medium_tf lookup
         'tsla_weekly': tsla_weekly,
         'tsla_monthly': tsla_monthly,
         'spy_1min': spy_1min,
@@ -116,6 +118,7 @@ def load_all_data(tsla_path: str, spy_path: str):
         'spy_1h': spy_1h,
         'spy_4h': spy_4h,
         'spy_daily': spy_daily,
+        'spy_1d': spy_daily,            # alias for medium_tf lookup
     }
 
 
@@ -392,7 +395,7 @@ def _run_system_all_years(system: str, all_data: dict, years: List[int],
         try:
             if system == '5min':
                 result = run_5min_year(all_data, year, capital, vix_df)
-            elif system in ('1h', '4h'):
+            elif system in ('1h', '4h', '1d'):
                 result = run_medium_tf_year(all_data, system, year, capital, vix_df)
             elif system == 'swing':
                 result = run_swing_year(all_data, year, capital, vix_df)
@@ -558,15 +561,23 @@ def _print_correlation_matrix(all_results: Dict[str, Dict[int, 'SystemYearResult
 # Phase 2 -- Allocation Grid Search
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _generate_allocations(step: float = 0.10) -> List[Tuple[float, ...]]:
-    """Generate all 4-way allocations summing to 1.0 in `step` increments."""
+def _generate_allocations(n_systems: int = 5, step: float = 0.10) -> List[Tuple[float, ...]]:
+    """Generate all n-way allocations summing to 1.0 in `step` increments."""
     steps = int(round(1.0 / step))
     combos = []
-    for a in range(steps + 1):
-        for b in range(steps + 1 - a):
-            for c in range(steps + 1 - a - b):
-                d = steps - a - b - c
-                combos.append((a * step, b * step, c * step, d * step))
+    if n_systems == 5:
+        for a in range(steps + 1):
+            for b in range(steps + 1 - a):
+                for c in range(steps + 1 - a - b):
+                    for d in range(steps + 1 - a - b - c):
+                        e = steps - a - b - c - d
+                        combos.append((a * step, b * step, c * step, d * step, e * step))
+    elif n_systems == 4:
+        for a in range(steps + 1):
+            for b in range(steps + 1 - a):
+                for c in range(steps + 1 - a - b):
+                    d = steps - a - b - c
+                    combos.append((a * step, b * step, c * step, d * step))
     return combos
 
 
@@ -588,7 +599,7 @@ def run_phase2(all_results: Dict[str, Dict[int, 'SystemYearResult']],
     print(f"PHASE 2 -- ALLOCATION GRID SEARCH (total=${total_capital:,.0f}, step={step:.0%})")
     print(f"{'='*80}")
 
-    allocations = _generate_allocations(step)
+    allocations = _generate_allocations(n_systems=len(SYSTEMS), step=step)
     print(f"  Testing {len(allocations)} allocation combos...")
 
     # Precompute per-system combined daily P&L (concatenated across years, at $100K base)
@@ -676,17 +687,18 @@ def run_phase2(all_results: Dict[str, Dict[int, 'SystemYearResult']],
 
     # Print top N
     print(f"\n  TOP {top_n} ALLOCATIONS BY SHARPE")
-    print(f"  {'='*100}")
-    header = (f"  {'Rank':<5} {'5min':>5} {'1h':>5} {'4h':>5} {'Swing':>5}"
+    print(f"  {'='*110}")
+    sys_headers = ''.join(f' {s:>5}' for s in SYSTEMS)
+    header = (f"  {'Rank':<5}{sys_headers}"
               f"  {'Total P&L':>12} {'Sharpe':>7} {'MaxDD':>7} {'Avg/Yr':>12} {'Worst Yr':>12}")
     print(header)
-    print(f"  {'-'*100}")
+    print(f"  {'-'*110}")
 
     for rank, r in enumerate(results[:top_n], 1):
         avg_yr = np.mean(r.yr_pnls) if r.yr_pnls else 0
         worst_yr = min(r.yr_pnls) if r.yr_pnls else 0
-        print(f"  {rank:<5} {r.weights[0]:>4.0%} {r.weights[1]:>4.0%} "
-              f"{r.weights[2]:>4.0%} {r.weights[3]:>4.0%}"
+        w_str = ''.join(f' {w:>4.0%}' for w in r.weights)
+        print(f"  {rank:<5}{w_str}"
               f"  ${r.total_pnl:>10,.0f} {r.annual_sharpe:>7.2f} "
               f"{r.max_drawdown_pct:>7.1%} ${avg_yr:>10,.0f} ${worst_yr:>10,.0f}")
 
@@ -738,7 +750,8 @@ def run_phase3(all_results: Dict[str, Dict[int, 'SystemYearResult']],
     for rank, alloc in enumerate(phase2_results[:top_n], 1):
         weights = alloc.weights
         w_str = '/'.join(f'{w:.0%}' for w in weights)
-        print(f"\n  Allocation #{rank}: [{w_str}] (5min/1h/4h/swing)")
+        sys_str = '/'.join(SYSTEMS)
+        print(f"\n  Allocation #{rank}: [{w_str}] ({sys_str})")
         print(f"  {'-'*70}")
         print(f"  {'Window':<18} {'IS P&L':>12} {'IS Sharpe':>10} {'OOS P&L':>12} {'OOS/IS_avg':>10} {'Win?':>5}")
         print(f"  {'-'*70}")
@@ -969,7 +982,7 @@ def main():
 
     print(f"\n{'#'*80}")
     print(f"# MULTI-SYSTEM PORTFOLIO BACKTEST")
-    print(f"# Systems: 5min / 1h / 4h / Swing S1041")
+    print(f"# Systems: {' / '.join(SYSTEMS)}")
     print(f"# Years: {years[0]}-{years[-1]} | Capital: ${args.total_capital:,.0f}")
     print(f"# Phase: {phases}")
     print(f"{'#'*80}")
