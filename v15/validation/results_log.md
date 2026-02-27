@@ -176,10 +176,32 @@ Walk-forward (IS=5yr, OOS=1yr, 6 windows):
 
 ---
 
-## combined_backtest.py — 5-min filter grid
+## combined_backtest.py -- 5-min filter grid (ALL 13 configs)
 **Script**: `v15/validation/combined_backtest.py`
+**Run date**: Feb 26, 2026 -- all 13 configs run in parallel on server
 **Status**: COMPLETE
-**Result**: baseline (no filters) wins OOS; see walk_forward_filters.py
+
+| Config | IS P&L (10yr) | Delta vs baseline | OOS 2025 P&L | OOS trades |
+|--------|--------------|-------------------|--------------|------------|
+| **baseline** | **$15,772,582** | -- | **$1,557,826** | 1,058 |
+| mtf_exhaust | $15,894,706 | +$122,124 (+0.8%) | $1,562,133 | 1,055 |
+| bp_only | $15,867,248 | +$94,666 (+0.6%) | $1,555,535 | 1,062 |
+| sq50_bp | $15,867,248 | +$94,666 (+0.6%) | $1,555,535 | 1,062 |
+| sq50 | $15,772,582 | +$0 | $1,557,826 | 1,058 |
+| sq55 | $15,772,582 | +$0 | $1,557,826 | 1,058 |
+| swing_only | $15,772,582 | +$0 | $1,557,826 | 1,058 |
+| mtf_conflict | $15,772,582 | +$0 | $1,557,826 | 1,058 |
+| mtf_full | $15,772,582 | +$0 | $1,557,826 | 1,058 |
+| sq50_mtf | $15,772,582 | +$0 | $1,557,826 | 1,058 |
+| sq50_swing | $15,772,582 | +$0 | $1,557,826 | 1,058 |
+| all_50 | $15,772,582 | +$0 | $1,557,826 | 1,058 |
+| all_55 | $15,772,582 | +$0 | $1,557,826 | 1,058 |
+
+**Verdict**: Baseline wins. 10/13 configs are identical to baseline (zero effect).
+- mtf_exhaust: marginal IS gain (+0.8%), marginal OOS gain (+$4,307) -- consistent with walk-forward (5/6 wins)
+- bp_only: small IS gain (+0.6%), LOSES OOS (-$2,291)
+- SQ gate, swing regime, mtf_conflict, mtf_full, all combos: literally zero difference from baseline
+- **5-min channel surfer is self-contained. No filter improves it meaningfully.**
 
 ---
 
