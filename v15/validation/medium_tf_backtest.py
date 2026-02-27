@@ -134,15 +134,19 @@ def _prepare_year(tsla_tf, spy_tf, daily_tsla, weekly_tsla, year: int,
 
     # Build higher_tf_dict with all available context TFs.
     # The surfer engine expects '1h' and 'daily' keys for full multi-TF analysis.
-    # Include everything above the primary TF, plus 1h/daily if available.
+    # Include all TFs -- even if one matches the primary (engine just gets
+    # redundant but harmless channel detection on the same data).
     higher_tf_dict = {}
 
-    # 1h context (skip if 1h IS the primary TF)
-    if primary_tf != '1h' and hourly_slice is not None and len(hourly_slice) > 0:
+    # 1h context
+    if hourly_slice is not None and len(hourly_slice) > 0:
         higher_tf_dict['1h'] = hourly_slice
+    elif primary_tf == '1h':
+        # Primary IS 1h -- pass it as higher_tf so engine doesn't warn
+        higher_tf_dict['1h'] = tsla_slice
 
-    # Daily context (skip if daily IS the primary TF)
-    if primary_tf != '1d' and daily_slice is not None and len(daily_slice) > 0:
+    # Daily context
+    if daily_slice is not None and len(daily_slice) > 0:
         higher_tf_dict['daily'] = daily_slice
 
     # Weekly always included

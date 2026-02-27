@@ -226,16 +226,19 @@ def _prepare_medium_tf_year(all_data: dict, tf: str, year: int) -> Optional[dict
 
     spy_slice = _slice(spy_tf, cutoff_start, cutoff_year_end) if spy_tf is not None else None
 
-    # Build higher_tf_dict with all available context TFs
+    # Build higher_tf_dict with all available context TFs.
+    # Engine expects '1h' and 'daily' keys -- include even if one matches primary
+    # (redundant but harmless channel detection, avoids degraded-analysis warning).
     higher_tf_dict = {}
-    if tf != '1h' and 'tsla_1h' in all_data:
+    if 'tsla_1h' in all_data:
         hourly_slice = _slice(all_data['tsla_1h'], cutoff_start, cutoff_year_end)
         if hourly_slice is not None and len(hourly_slice) > 0:
             higher_tf_dict['1h'] = hourly_slice
-    if tf != '1d':
-        daily_slice = _slice(all_data['tsla_daily'], cutoff_start, cutoff_year_end)
-        if daily_slice is not None and len(daily_slice) > 0:
-            higher_tf_dict['daily'] = daily_slice
+    if tf == '1h' and '1h' not in higher_tf_dict:
+        higher_tf_dict['1h'] = tsla_slice
+    daily_slice = _slice(all_data['tsla_daily'], cutoff_start, cutoff_year_end)
+    if daily_slice is not None and len(daily_slice) > 0:
+        higher_tf_dict['daily'] = daily_slice
     weekly_slice = _slice(all_data['tsla_weekly'], cutoff_start, cutoff_year_end)
     if weekly_slice is not None and len(weekly_slice) > 0:
         higher_tf_dict['weekly'] = weekly_slice
