@@ -12,6 +12,25 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
+import pytz
+
+_ET = pytz.timezone('US/Eastern')
+
+
+def _now_et() -> datetime:
+    """Current time in US/Eastern (consistent with market hours and charts)."""
+    return datetime.now(_ET)
+
+
+def _is_market_open() -> bool:
+    """True if current ET time is within regular trading hours (9:30-16:00, weekdays)."""
+    now = _now_et()
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    from datetime import time as _time
+    return _time(9, 30) <= t < _time(16, 0)
+
 from .signals import (
     TradeSignal, SignalType, MarketRegime,
     RegimeAdaptiveSignalEngine, HazardClock,
@@ -220,8 +239,12 @@ class TradingMonitor:
         # Sort by score descending
         results.sort(key=lambda x: x.score, reverse=True)
 
+        # Block entries outside regular trading hours
+        if not _is_market_open():
+            return []
+
         # Record to history
-        now_str = datetime.now().isoformat()
+        now_str = _now_et().isoformat()
         for fs in results:
             self.signal_history.append({
                 'time': now_str,
@@ -271,7 +294,7 @@ class TradingMonitor:
             stop_price = actual_entry_price * (1 + pos.stop_loss_pct)
             tp_price = actual_entry_price * (1 - pos.take_profit_pct)
 
-        pos_id = f"pos_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
+        pos_id = f"pos_{_now_et().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
 
         live_pos = LivePosition(
             pos_id=pos_id,
@@ -279,7 +302,7 @@ class TradingMonitor:
             direction=direction,
             entry_price=actual_entry_price,
             shares=shares,
-            entry_time=datetime.now().isoformat(),
+            entry_time=_now_et().isoformat(),
             stop_loss_price=stop_price,
             take_profit_price=tp_price,
             stop_loss_pct=pos.stop_loss_pct,
@@ -329,7 +352,9 @@ class TradingMonitor:
 
             # Compute bars_held from wall clock time
             entry_time = datetime.fromisoformat(pos.entry_time)
-            elapsed_minutes = (datetime.now() - entry_time).total_seconds() / 60.0
+            if entry_time.tzinfo is None:
+                entry_time = _ET.localize(entry_time)
+            elapsed_minutes = (_now_et() - entry_time).total_seconds() / 60.0
             bars_held = elapsed_minutes / 5.0  # 5-min bars
 
             horizon = TF_TO_HORIZON.get(pos.primary_tf, 'medium')
@@ -408,7 +433,9 @@ class TradingMonitor:
             return None
 
         entry_time = datetime.fromisoformat(pos.entry_time)
-        hold_minutes = (datetime.now() - entry_time).total_seconds() / 60.0
+        if entry_time.tzinfo is None:
+            entry_time = _ET.localize(entry_time)
+        hold_minutes = (_now_et() - entry_time).total_seconds() / 60.0
 
         if pos.direction == 'long':
             pnl = (actual_exit_price - pos.entry_price) * pos.shares
@@ -428,7 +455,7 @@ class TradingMonitor:
             pnl=pnl,
             pnl_pct=pnl_pct,
             entry_time=pos.entry_time,
-            exit_time=datetime.now().isoformat(),
+            exit_time=_now_et().isoformat(),
             exit_reason=exit_reason,
             hold_minutes=hold_minutes,
         )
