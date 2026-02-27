@@ -1,0 +1,40 @@
+# Core ML
+torch>=2.0.0
+numpy
+pandas
+
+# Model architecture
+ncps
+
+# Training CLI/UI
+rich
+InquirerPy
+
+# Market calendar
+pandas_market_calendars
+yfinance
+
+# Dashboard (optional)
+streamlit>=1.45.0
+plotly
+matplotlib
+pytz
+streamlit-autorefresh
+
+# Scientific computing
+scipy
+
+# Signal quality model
+lightgbm
+scikit-learn
+
+# Utilities
+python-dateutil
+tqdm
+
+# C++ extension build dependency
+pybind11>=2.11
+
+# Build and install the C++ feature extractor extension (v15scanner_cpp).
+# Requires: packages.txt apt deps (libeigen3-dev, build-essential)
+.

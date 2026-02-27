@@ -1,0 +1,1439 @@
+"""
+Full Feature Extractor
+
+Combines ALL features:
+- TSLA channel features (all TFs)
+- TSLA RSI at bounces
+- SPY channel features (all TFs)
+- Cross-asset containment (TSLA position in SPY's channels)
+- VIX regime features
+- Channel history (past patterns)
+- Multi-TF containment (where TSLA is in longer TF channels)
+"""
+
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Any
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from core.channel import (
+    detect_channel, detect_channels_multi_window, Channel, Direction,
+    STANDARD_WINDOWS
+)
+from core.timeframe import resample_ohlc, TIMEFRAMES, get_longer_timeframes
+from features.rsi import calculate_rsi, calculate_rsi_series, detect_rsi_divergence
+from features.containment import check_all_containments, ContainmentInfo
+from features.cross_asset import (
+    extract_spy_features, extract_vix_features, extract_all_cross_asset_features,
+    extract_vix_channel_features,
+    SPYFeatures, VIXFeatures, VIXChannelFeatures, CrossAssetContainment
+)
+from features.history import (
+    scan_channel_history, extract_history_features,
+    detect_bounces_with_rsi, ChannelHistoryFeatures, BounceRecord
+)
+from features.exit_tracking import track_exits_in_channel, ExitTrackingFeatures
+from features.break_trigger import calculate_break_trigger_features, BreakTriggerFeatures
+from features.events import (
+    EventFeatures, EventsHandler, extract_event_features,
+    event_features_to_dict, EVENT_FEATURE_NAMES
+)
+from features.feature_ordering import (
+    FEATURE_ORDER, validate_feature_dict, get_expected_dimensions,
+    WINDOW_SCORE_FEATURES
+)
+
+
+# Number of metrics extracted per window
+NUM_WINDOW_METRICS = 5  # bounce_count, r_squared, quality_score, alternation_ratio, width_pct
+
+
+def calculate_data_confidence(num_bars: int) -> float:
+    """
+    Calculate data confidence score based on available native bars.
+
+    The confidence score indicates how reliable features are based on
+    the amount of data available for the timeframe.
+
+    Args:
+        num_bars: Number of native bars available for the timeframe
+
+    Returns:
+        float: Confidence score between 0.0 and 1.0
+            - 80+ bars: 1.0 (fully reliable)
+            - 50-79 bars: 0.8 (good)
+            - 30-49 bars: 0.6 (moderate)
+            - 20-29 bars: 0.4 (low)
+            - 10-19 bars: 0.2 (very low)
+            - <10 bars: 0.0 (insufficient)
+    """
+    if num_bars >= 80:
+        return 1.0
+    elif num_bars >= 50:
+        return 0.8
+    elif num_bars >= 30:
+        return 0.6
+    elif num_bars >= 20:
+        return 0.4
+    elif num_bars >= 10:
+        return 0.2
+    else:
+        return 0.0
+
+
+def channel_to_scores(channel: Channel) -> np.ndarray:
+    """
+    Extract key scores from a channel as numpy array.
+
+    Returns array of 5 metrics:
+    - bounce_count: Number of alternating touches
+    - r_squared: Quality of linear fit (0-1)
+    - quality_score: Composite quality score
+    - alternation_ratio: Bounce cleanliness (0-1)
+    - width_pct: Channel width as percentage of price
+
+    Args:
+        channel: Channel object from detect_channel()
+
+    Returns:
+        np.ndarray of shape (5,) with float32 dtype
+    """
+    scores = np.array([
+        channel.bounce_count,
+        channel.r_squared,
+        channel.quality_score,
+        channel.alternation_ratio,
+        channel.width_pct
+    ], dtype=np.float32)
+
+    # Defensive NaN check - log if detected (indicates upstream data issue)
+    if not np.isfinite(scores).all():
+        import warnings
+        warnings.warn(f"NaN/Inf in channel scores - channel may have insufficient data for regression")
+
+    return scores
+
+
+def extract_multi_window_scores(channels: Dict[int, Channel]) -> np.ndarray:
+    """
+    Extract per-window channel scores from multi-window channel detection.
+
+    Args:
+        channels: Dict mapping window size to Channel, from detect_channels_multi_window()
+                 Expected windows: STANDARD_WINDOWS = [10, 20, 30, 40, 50, 60, 70, 80]
+
+    Returns:
+        np.ndarray of shape (num_windows, num_metrics) = (8, 5) = 40 features
+        Metrics per window: bounce_count, r_squared, quality_score, alternation_ratio, width_pct
+        Windows are in ascending order: 10, 20, 30, 40, 50, 60, 70, 80
+    """
+    num_windows = len(STANDARD_WINDOWS)
+    scores = np.zeros((num_windows, NUM_WINDOW_METRICS), dtype=np.float32)
+
+    for i, window in enumerate(STANDARD_WINDOWS):
+        if window in channels:
+            scores[i] = channel_to_scores(channels[window])
+        # else: keep zeros for missing windows
+
+    return scores
+
+
+@dataclass
+class TSLAChannelFeatures:
+    """TSLA channel features for a single timeframe."""
+    timeframe: str
+    channel_valid: bool
+    direction: int                # 0=bear, 1=sideways, 2=bull
+    position: float               # 0-1 (lower to upper)
+    upper_dist: float             # % distance to upper
+    lower_dist: float             # % distance to lower
+    width_pct: float
+    slope_pct: float
+    r_squared: float
+    bounce_count: int
+    cycles: int
+    bars_since_bounce: int
+    last_touch: int               # 0=lower, 1=upper, -1=none
+
+    # RSI
+    rsi: float
+    rsi_divergence: int           # 1=bullish, -1=bearish, 0=none
+
+    # RSI at recent bounces
+    rsi_at_last_upper: float      # RSI when last touched upper
+    rsi_at_last_lower: float      # RSI when last touched lower
+
+    # Quality metrics
+    channel_quality: float        # Composite quality score (0-1)
+    rsi_confidence: float         # RSI reliability score (0-1)
+
+    # Data confidence based on available native bars (0-1)
+    data_confidence: float = 1.0  # Default to fully reliable
+
+    # Containment against longer TFs
+    containments: Dict[str, ContainmentInfo] = field(default_factory=dict)
+
+    # Exit/Return tracking
+    exit_tracking: Optional[ExitTrackingFeatures] = None
+
+    # Break trigger features (distance to longer TF boundaries)
+    break_trigger: Optional[BreakTriggerFeatures] = None
+
+
+@dataclass
+class SharedFeatures:
+    """
+    Window-independent features computed once and reused across all windows.
+
+    These features don't depend on the channel detection window parameter,
+    so computing them once saves ~75-85% of feature extraction time.
+    """
+    timestamp: pd.Timestamp
+
+    # Resampled DataFrames for all 11 timeframes (computed once, reused for all windows)
+    tsla_resampled: Dict[str, pd.DataFrame]
+    spy_resampled: Dict[str, pd.DataFrame]
+
+    # VIX regime features (6 basic features)
+    vix: VIXFeatures
+
+    # Channel history features (window=20 standard) - 25 features each
+    tsla_history: ChannelHistoryFeatures
+    spy_history: ChannelHistoryFeatures
+
+    # Cross-asset alignment (computed with standard window=20)
+    tsla_spy_direction_match: bool
+    both_near_upper: bool
+    both_near_lower: bool
+
+    # Fields with defaults must come after non-default fields (dataclass requirement)
+
+    # VIX-channel interaction features (15 features)
+    vix_channel: Optional[VIXChannelFeatures] = None
+
+    # RSI series for each TF (reusable for divergence/bounce detection)
+    rsi_series_per_tf: Dict[str, np.ndarray] = field(default_factory=dict)
+
+    # Event calendar features (46 features)
+    events: Optional[EventFeatures] = None
+
+    # Multi-window channel scores using STANDARD_WINDOWS (8 x 5 = 40 features)
+    # This is identical for ALL window iterations (uses hardcoded windows)
+    tsla_window_scores: Optional[np.ndarray] = None
+
+    # Per-timeframe data confidence scores (0-1 based on native bar count)
+    # Window-independent since it only depends on resampled data length
+    data_confidence_per_tf: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class PerWindowFeatures:
+    """Features that depend on the channel detection window size."""
+    timestamp: pd.Timestamp
+    window: int
+
+    # Per-timeframe features (11 TFs each)
+    tsla: Dict[str, TSLAChannelFeatures]  # 35 features per TF
+    spy: Dict[str, SPYFeatures]  # 11 features per TF
+    cross_containment: Dict[str, CrossAssetContainment]  # 10 features per TF
+
+
+@dataclass
+class FullFeatures:
+    """
+    Complete feature set for a single bar.
+
+    This is everything the model needs to make predictions.
+    """
+    timestamp: pd.Timestamp
+
+    # TSLA features for all timeframes
+    tsla: Dict[str, TSLAChannelFeatures]
+
+    # SPY features for all timeframes
+    spy: Dict[str, SPYFeatures]
+
+    # Cross-asset containment (TSLA in SPY's channels)
+    cross_containment: Dict[str, CrossAssetContainment]
+
+    # VIX regime (6 basic features)
+    vix: VIXFeatures
+
+    # Channel history (TSLA)
+    tsla_history: ChannelHistoryFeatures
+
+    # Channel history (SPY)
+    spy_history: ChannelHistoryFeatures
+
+    # Alignment summary
+    tsla_spy_direction_match: bool  # Same direction on primary TF?
+    both_near_upper: bool           # Both near upper bounds?
+    both_near_lower: bool           # Both near lower bounds?
+
+    # Fields with defaults must come after non-default fields (dataclass requirement)
+
+    # VIX-channel interaction features (15 features)
+    vix_channel: Optional[VIXChannelFeatures] = None
+
+    # Event features (46 features)
+    events: Optional[EventFeatures] = None
+
+    # Multi-window channel scores for TSLA (8 windows x 5 metrics = 40 features)
+    # Windows: [10, 20, 30, 40, 50, 60, 70, 80]
+    # Metrics per window: bounce_count, r_squared, quality_score, alternation_ratio, width_pct
+    tsla_window_scores: Optional[np.ndarray] = None
+
+    # Per-timeframe data confidence scores (0-1 based on native bar count)
+    data_confidence_per_tf: Dict[str, float] = field(default_factory=dict)
+
+
+def extract_tsla_channel_features(
+    tsla_df: pd.DataFrame,
+    timeframe: str,
+    channel: Channel,
+    rsi_series: np.ndarray,
+    window: int = 20,
+    longer_tf_channels: Optional[Dict[str, Channel]] = None,
+    lookforward_bars: int = 200,
+    data_confidence: float = 1.0,
+) -> TSLAChannelFeatures:
+    """Extract TSLA channel features for one timeframe.
+
+    IMPORTANT: channel and rsi_series are REQUIRED parameters.
+    These must be pre-computed by the caller to avoid redundant computation.
+    This function will NOT silently fall back to computing them.
+
+    Args:
+        tsla_df: TSLA OHLCV data for this timeframe
+        timeframe: Timeframe string (e.g., '5min', '15min')
+        channel: Pre-computed channel from detect_channel() - REQUIRED
+        rsi_series: Pre-computed RSI series from calculate_rsi_series() - REQUIRED
+        window: Channel detection window size (for exit tracking context)
+        longer_tf_channels: Pre-computed channels from longer timeframes
+        lookforward_bars: Bars to look forward for exit tracking
+        data_confidence: Pre-computed data confidence score (0-1) based on native bar count
+
+    Raises:
+        ValueError: If channel or rsi_series is None
+    """
+    if channel is None:
+        raise ValueError("channel is required - must be pre-computed by caller")
+    if rsi_series is None:
+        raise ValueError("rsi_series is required - must be pre-computed by caller")
+
+    rsi = float(rsi_series[-1])  # Extract current RSI from series
+    divergence = detect_rsi_divergence(tsla_df['close'].values, rsi_series, lookback=10)
+
+    # RSI at bounce points
+    bounces = detect_bounces_with_rsi(tsla_df, channel, rsi_series)
+    rsi_at_last_upper = 50.0
+    rsi_at_last_lower = 50.0
+
+    for b in reversed(bounces):
+        if b.touch_type == 1 and rsi_at_last_upper == 50.0:
+            rsi_at_last_upper = b.rsi_at_bounce
+        elif b.touch_type == 0 and rsi_at_last_lower == 50.0:
+            rsi_at_last_lower = b.rsi_at_bounce
+        if rsi_at_last_upper != 50.0 and rsi_at_last_lower != 50.0:
+            break
+
+    # Last touch
+    last_touch = -1
+    if channel.last_touch is not None:
+        last_touch = int(channel.last_touch)
+
+    # Containment against longer TFs
+    # OPTIMIZATION: Pass pre-computed longer_tf_channels to avoid redundant channel detection
+    # This was the main bottleneck - check_all_containments was re-detecting channels
+    # for all longer TFs on every call (11 TFs × 8 windows = 88 redundant detection sets)
+    containments = check_all_containments(
+        tsla_df, timeframe, window,
+        channel_cache=longer_tf_channels if longer_tf_channels else None
+    )
+
+    # Exit/Return tracking
+    exit_features = None
+    if len(tsla_df) >= window + lookforward_bars:
+        exit_features = track_exits_in_channel(tsla_df.iloc[-(window + lookforward_bars):], channel, lookforward_bars)
+
+    # Break trigger features
+    break_trigger = None
+    if longer_tf_channels:
+        current_price = tsla_df['close'].iloc[-1]
+        break_trigger = calculate_break_trigger_features(
+            current_price,
+            timeframe,
+            longer_tf_channels,
+            rsi
+        )
+
+    # Calculate channel quality score (0-1)
+    # Combines: r_squared, bounce_count, cycles, and validity
+    channel_quality = 0.0
+    if channel.valid:
+        # R-squared component (0-1, already normalized)
+        r2_component = channel.r_squared
+
+        # Bounce count component (normalize to 0-1, saturates at 5 bounces)
+        bounce_component = min(channel.bounce_count / 5.0, 1.0)
+
+        # Cycles component (normalize to 0-1, saturates at 2 cycles)
+        cycles_component = min(channel.complete_cycles / 2.0, 1.0)
+
+        # Weighted average: r_squared=40%, bounces=35%, cycles=25%
+        channel_quality = (0.40 * r2_component +
+                          0.35 * bounce_component +
+                          0.25 * cycles_component)
+
+    # Calculate RSI confidence score (0-1)
+    # Based on RSI divergence from extreme zones and historical bounce consistency
+    rsi_confidence = 0.5  # Default neutral confidence
+
+    # RSI zone reliability: Higher confidence when RSI is in clear zones
+    if rsi < 30:
+        # Oversold zone - very reliable
+        rsi_confidence = 0.9
+    elif rsi < 40:
+        # Approaching oversold - reliable
+        rsi_confidence = 0.75
+    elif rsi > 70:
+        # Overbought zone - very reliable
+        rsi_confidence = 0.9
+    elif rsi > 60:
+        # Approaching overbought - reliable
+        rsi_confidence = 0.75
+    elif 45 <= rsi <= 55:
+        # Neutral zone - less reliable
+        rsi_confidence = 0.3
+    else:
+        # Moderate zones
+        rsi_confidence = 0.5
+
+    # Boost confidence if RSI divergence is detected
+    if divergence != 0:
+        rsi_confidence = min(rsi_confidence * 1.2, 1.0)
+
+    # Adjust confidence based on consistency of RSI at bounce points
+    if rsi_at_last_upper != 50.0 or rsi_at_last_lower != 50.0:
+        # We have actual bounce data
+        if rsi_at_last_upper > 60 or rsi_at_last_lower < 40:
+            # Good RSI behavior at bounces
+            rsi_confidence = min(rsi_confidence * 1.1, 1.0)
+
+    return TSLAChannelFeatures(
+        timeframe=timeframe,
+        channel_valid=channel.valid,
+        direction=int(channel.direction),
+        position=channel.position_at(),
+        upper_dist=channel.distance_to_upper(),
+        lower_dist=channel.distance_to_lower(),
+        width_pct=channel.width_pct,
+        slope_pct=channel.slope_pct,
+        r_squared=channel.r_squared,
+        bounce_count=channel.bounce_count,
+        cycles=channel.complete_cycles,
+        bars_since_bounce=channel.bars_since_last_touch,
+        last_touch=last_touch,
+        rsi=rsi,
+        rsi_divergence=divergence,
+        rsi_at_last_upper=rsi_at_last_upper,
+        rsi_at_last_lower=rsi_at_last_lower,
+        channel_quality=channel_quality,
+        rsi_confidence=rsi_confidence,
+        data_confidence=data_confidence,
+        containments=containments,
+        exit_tracking=exit_features,
+        break_trigger=break_trigger,
+    )
+
+
+def extract_full_features(
+    tsla_df: pd.DataFrame,
+    spy_df: pd.DataFrame,
+    vix_df: pd.DataFrame,
+    window: int = 20,
+    include_history: bool = True,
+    lookforward_bars: int = 200,
+    events_handler: Optional[EventsHandler] = None,
+    native_tfs: Optional[Dict[str, Dict[str, pd.DataFrame]]] = None
+) -> FullFeatures:
+    """
+    Extract ALL features for model input.
+
+    Args:
+        tsla_df: TSLA 5min OHLCV data
+        spy_df: SPY 5min OHLCV data
+        vix_df: VIX daily data
+        window: Window for channel detection
+        include_history: Whether to scan historical channels (slower)
+        lookforward_bars: Bars to look forward for exit tracking
+        events_handler: Optional EventsHandler for event features (46 features)
+        native_tfs: Optional dict of native timeframe DataFrames to use instead of resampling.
+                   Format: {'tsla': {'5min': DataFrame, '15min': DataFrame, ..., '3month': DataFrame},
+                            'spy': {'5min': DataFrame, ..., '3month': DataFrame}}
+                   Falls back to resampling if a specific TF is not in native_tfs.
+
+    Returns:
+        FullFeatures object with everything
+    """
+    timestamp = tsla_df.index[-1]
+
+    # Cache for resampled data to avoid redundant resampling
+    resample_cache = {}
+
+    def get_resampled(df, tf, cache_key_prefix):
+        """Get resampled data, preferring native TF data when available."""
+        cache_key = f"{cache_key_prefix}_{tf}"
+        if cache_key not in resample_cache:
+            # Check if native TF data is available
+            if native_tfs is not None and cache_key_prefix in native_tfs and tf in native_tfs[cache_key_prefix]:
+                resample_cache[cache_key] = native_tfs[cache_key_prefix][tf]
+            elif tf == '5min':
+                resample_cache[cache_key] = df
+            else:
+                resample_cache[cache_key] = resample_ohlc(df, tf)
+        return resample_cache[cache_key]
+
+    # First pass: detect channels, compute RSI, and calculate data confidence at all timeframes for TSLA
+    tsla_channels_dict = {}
+    rsi_series_per_tf = {}
+    data_confidence_per_tf = {}
+    for tf in TIMEFRAMES:
+        df_tf = get_resampled(tsla_df, tf, 'tsla')
+
+        # Calculate data confidence based on native bar count
+        data_confidence_per_tf[tf] = calculate_data_confidence(len(df_tf))
+
+        try:
+            tsla_channels_dict[tf] = detect_channel(df_tf, window=window)
+        except (ValueError, IndexError):
+            pass
+
+        try:
+            rsi_series_per_tf[tf] = calculate_rsi_series(df_tf['close'].values, period=14)
+        except (ValueError, IndexError):
+            pass
+
+    # Second pass: extract features with longer TF context
+    # Channel and RSI series are REQUIRED - skip TFs that don't have them
+    tsla_features = {}
+    for tf in TIMEFRAMES:
+        df_tf = get_resampled(tsla_df, tf, 'tsla')
+        channel = tsla_channels_dict.get(tf)
+        rsi_series = rsi_series_per_tf.get(tf)
+
+        # Skip if we don't have required data
+        if channel is None or rsi_series is None:
+            continue
+
+        try:
+            # Get longer TF channels for this timeframe
+            longer_tfs = get_longer_timeframes(tf)
+            longer_channels = {ltf: tsla_channels_dict.get(ltf) for ltf in longer_tfs if ltf in tsla_channels_dict}
+
+            tsla_features[tf] = extract_tsla_channel_features(
+                df_tf, tf, channel, rsi_series,
+                window=window,
+                longer_tf_channels=longer_channels,
+                lookforward_bars=lookforward_bars,
+                data_confidence=data_confidence_per_tf.get(tf, 1.0),
+            )
+        except (ValueError, IndexError):
+            pass
+
+    # SPY features for all timeframes
+    spy_features = {}
+    for tf in TIMEFRAMES:
+        df_tf = get_resampled(spy_df, tf, 'spy')
+
+        try:
+            spy_features[tf] = extract_spy_features(df_tf, window, tf)
+        except (ValueError, IndexError):
+            # Skip if insufficient data
+            pass
+
+    # Cross-asset containment
+    cross_asset = extract_all_cross_asset_features(tsla_df, spy_df, vix_df, window)
+    cross_containment = cross_asset['cross_containment']
+    vix = cross_asset['vix']
+
+    # Channel history
+    tsla_history = ChannelHistoryFeatures(
+        last_n_directions=[1] * 5,
+        last_n_durations=[50] * 5,
+        last_n_break_dirs=[1] * 5,
+        avg_duration=50.0,
+        direction_streak=0,
+        bear_count_last_5=0,
+        bull_count_last_5=0,
+        sideways_count_last_5=0,
+        avg_rsi_at_upper_bounce=50.0,
+        avg_rsi_at_lower_bounce=50.0,
+        rsi_at_last_break=50.0,
+        break_up_after_bear_pct=0.5,
+        break_down_after_bull_pct=0.5,
+    )
+
+    spy_history = ChannelHistoryFeatures(
+        last_n_directions=[1] * 5,
+        last_n_durations=[50] * 5,
+        last_n_break_dirs=[1] * 5,
+        avg_duration=50.0,
+        direction_streak=0,
+        bear_count_last_5=0,
+        bull_count_last_5=0,
+        sideways_count_last_5=0,
+        avg_rsi_at_upper_bounce=50.0,
+        avg_rsi_at_lower_bounce=50.0,
+        rsi_at_last_break=50.0,
+        break_up_after_bear_pct=0.5,
+        break_down_after_bull_pct=0.5,
+    )
+
+    # Track bounces for VIX-channel features
+    all_tsla_bounces: List[BounceRecord] = []
+    channel_start_timestamp = None
+
+    if include_history:
+        tsla_records = scan_channel_history(tsla_df, window=window, max_channels=10, vix_df=vix_df)
+        tsla_history = extract_history_features(tsla_records)
+        # Collect bounces from most recent channel for VIX-channel features
+        if tsla_records:
+            all_tsla_bounces = tsla_records[0].bounces
+            if tsla_records[0].start_idx >= 0 and tsla_records[0].start_idx < len(tsla_df):
+                channel_start_timestamp = tsla_df.index[tsla_records[0].start_idx]
+
+        spy_records = scan_channel_history(spy_df, window=window, max_channels=10, vix_df=vix_df)
+        spy_history = extract_history_features(spy_records)
+
+    # Extract VIX-channel interaction features
+    vix_channel = None
+    try:
+        vix_channel = extract_vix_channel_features(
+            vix_df=vix_df,
+            bounces=all_tsla_bounces,
+            channel_start_timestamp=channel_start_timestamp,
+            current_timestamp=timestamp
+        )
+    except (ValueError, IndexError, AttributeError) as e:
+        import warnings
+        warnings.warn(f"Failed to extract VIX-channel features: {e}")
+
+    # Alignment features
+    primary_tf = '5min'
+    tsla_dir = tsla_features.get(primary_tf, TSLAChannelFeatures(
+        timeframe=primary_tf, channel_valid=False, direction=1,
+        position=0.5, upper_dist=0, lower_dist=0, width_pct=0,
+        slope_pct=0, r_squared=0, bounce_count=0, cycles=0,
+        bars_since_bounce=0, last_touch=-1, rsi=50, rsi_divergence=0,
+        rsi_at_last_upper=50, rsi_at_last_lower=50,
+        channel_quality=0.0, rsi_confidence=0.5
+    )).direction
+
+    spy_dir = spy_features.get(primary_tf, SPYFeatures(
+        timeframe=primary_tf, channel_valid=False, direction=1,
+        position=0.5, upper_dist=0, lower_dist=0, width_pct=0,
+        slope_pct=0, r_squared=0, bounce_count=0, cycles=0, rsi=50
+    )).direction
+
+    tsla_pos = tsla_features.get(primary_tf).position if primary_tf in tsla_features else 0.5
+    spy_pos = spy_features.get(primary_tf).position if primary_tf in spy_features else 0.5
+
+    # Event features (46 features)
+    event_features = None
+    if events_handler is not None:
+        try:
+            event_features = extract_event_features(timestamp, events_handler, tsla_df)
+        except Exception as e:
+            # Log but don't fail - events are optional
+            import warnings
+            warnings.warn(f"Failed to extract event features: {e}")
+
+    # Multi-window channel scores for TSLA (8 windows x 5 metrics = 40 features)
+    # Uses STANDARD_WINDOWS = [10, 20, 30, 40, 50, 60, 70, 80]
+    tsla_window_scores = None
+    try:
+        multi_window_channels = detect_channels_multi_window(tsla_df, windows=STANDARD_WINDOWS)
+        tsla_window_scores = extract_multi_window_scores(multi_window_channels)
+    except (ValueError, IndexError):
+        # Fall back to zeros if insufficient data
+        tsla_window_scores = np.zeros(
+            (len(STANDARD_WINDOWS), NUM_WINDOW_METRICS), dtype=np.float32
+        )
+
+    return FullFeatures(
+        timestamp=timestamp,
+        tsla=tsla_features,
+        spy=spy_features,
+        cross_containment=cross_containment,
+        vix=vix,
+        vix_channel=vix_channel,
+        tsla_history=tsla_history,
+        spy_history=spy_history,
+        tsla_spy_direction_match=(tsla_dir == spy_dir),
+        both_near_upper=(tsla_pos > 0.8 and spy_pos > 0.8),
+        both_near_lower=(tsla_pos < 0.2 and spy_pos < 0.2),
+        events=event_features,
+        tsla_window_scores=tsla_window_scores,
+        data_confidence_per_tf=data_confidence_per_tf,
+    )
+
+
+def extract_shared_features(
+    tsla_df: pd.DataFrame,
+    spy_df: pd.DataFrame,
+    vix_df: pd.DataFrame,
+    lookforward_bars: int = 200,
+    events_handler: Optional[EventsHandler] = None
+) -> SharedFeatures:
+    """
+    Extract features that don't depend on the channel detection window.
+
+    These features can be computed once and reused for all 8 window sizes,
+    saving ~75-85% of feature extraction time.
+
+    Args:
+        tsla_df: TSLA 5min OHLCV data
+        spy_df: SPY 5min OHLCV data
+        vix_df: VIX daily data
+        lookforward_bars: Bars to look forward for exit tracking (unused here, for API consistency)
+        events_handler: Optional EventsHandler for event features
+
+    Returns:
+        SharedFeatures object with all window-independent features
+    """
+    timestamp = tsla_df.index[-1]
+
+    # Step 1: Resample TSLA and SPY to all 11 TIMEFRAMES
+    # Also compute data confidence based on native bar count (window-independent)
+    tsla_resampled = {}
+    spy_resampled = {}
+    data_confidence_per_tf = {}
+
+    for tf in TIMEFRAMES:
+        if tf == '5min':
+            tsla_resampled[tf] = tsla_df
+            spy_resampled[tf] = spy_df
+        else:
+            try:
+                tsla_resampled[tf] = resample_ohlc(tsla_df, tf)
+                spy_resampled[tf] = resample_ohlc(spy_df, tf)
+            except (ValueError, IndexError):
+                pass
+
+        # Calculate data confidence based on native bar count for TSLA
+        if tf in tsla_resampled:
+            data_confidence_per_tf[tf] = calculate_data_confidence(len(tsla_resampled[tf]))
+        else:
+            data_confidence_per_tf[tf] = 0.0
+
+    # Step 2: Extract SPY features for all TFs using default window=20
+    spy_features = {}
+    for tf in TIMEFRAMES:
+        df_tf = spy_resampled.get(tf)
+        if df_tf is None:
+            continue
+        try:
+            spy_features[tf] = extract_spy_features(df_tf, 20, tf)
+        except (ValueError, IndexError):
+            pass
+
+    # Step 3: Extract cross-asset features (VIX and cross-containment)
+    cross_asset = extract_all_cross_asset_features(tsla_df, spy_df, vix_df, 20)
+    vix = cross_asset['vix']
+    cross_containment = cross_asset['cross_containment']
+
+    # Step 4: Calculate RSI series for each TF (reusable for window-dependent features)
+    rsi_series_per_tf = {}
+    for tf in TIMEFRAMES:
+        df_tf = tsla_resampled.get(tf)
+        if df_tf is None:
+            continue
+        try:
+            rsi_series_per_tf[tf] = calculate_rsi_series(df_tf['close'].values, period=14)
+        except (ValueError, IndexError):
+            pass
+
+    # Step 5: Extract event features if handler provided
+    event_features = None
+    if events_handler is not None:
+        try:
+            event_features = extract_event_features(timestamp, events_handler, tsla_df)
+        except Exception as e:
+            import warnings
+            warnings.warn(f"Failed to extract event features: {e}")
+
+    # Step 6: Channel history (scan TSLA and SPY for historical patterns)
+    # Use window=20 as standard for history scanning
+    tsla_history = ChannelHistoryFeatures(
+        last_n_directions=[1] * 5,
+        last_n_durations=[50] * 5,
+        last_n_break_dirs=[1] * 5,
+        avg_duration=50.0,
+        direction_streak=0,
+        bear_count_last_5=0,
+        bull_count_last_5=0,
+        sideways_count_last_5=0,
+        avg_rsi_at_upper_bounce=50.0,
+        avg_rsi_at_lower_bounce=50.0,
+        rsi_at_last_break=50.0,
+        break_up_after_bear_pct=0.5,
+        break_down_after_bull_pct=0.5,
+    )
+
+    spy_history = ChannelHistoryFeatures(
+        last_n_directions=[1] * 5,
+        last_n_durations=[50] * 5,
+        last_n_break_dirs=[1] * 5,
+        avg_duration=50.0,
+        direction_streak=0,
+        bear_count_last_5=0,
+        bull_count_last_5=0,
+        sideways_count_last_5=0,
+        avg_rsi_at_upper_bounce=50.0,
+        avg_rsi_at_lower_bounce=50.0,
+        rsi_at_last_break=50.0,
+        break_up_after_bear_pct=0.5,
+        break_down_after_bull_pct=0.5,
+    )
+
+    # Track all bounces for VIX-channel features
+    all_tsla_bounces: List[BounceRecord] = []
+    channel_start_timestamp = None
+
+    try:
+        tsla_records = scan_channel_history(tsla_df, window=20, max_channels=10, vix_df=vix_df)
+        tsla_history = extract_history_features(tsla_records)
+        # Collect bounces from most recent channel for VIX-channel features
+        if tsla_records:
+            all_tsla_bounces = tsla_records[0].bounces
+            # Get channel start timestamp from the most recent channel
+            if tsla_records[0].start_idx >= 0 and tsla_records[0].start_idx < len(tsla_df):
+                channel_start_timestamp = tsla_df.index[tsla_records[0].start_idx]
+    except (ValueError, IndexError):
+        pass
+
+    try:
+        spy_records = scan_channel_history(spy_df, window=20, max_channels=10, vix_df=vix_df)
+        spy_history = extract_history_features(spy_records)
+    except (ValueError, IndexError):
+        pass
+
+    # Step 6b: Extract VIX-channel interaction features
+    vix_channel = None
+    try:
+        vix_channel = extract_vix_channel_features(
+            vix_df=vix_df,
+            bounces=all_tsla_bounces,
+            channel_start_timestamp=channel_start_timestamp,
+            current_timestamp=timestamp
+        )
+    except (ValueError, IndexError, AttributeError) as e:
+        import warnings
+        warnings.warn(f"Failed to extract VIX-channel features: {e}")
+
+    # Step 7: Alignment features (using primary TF with standard window=20)
+    primary_tf = '5min'
+
+    # Detect channels at primary TF with window=20
+    try:
+        primary_channel_tsla = detect_channel(tsla_df, window=20)
+        tsla_dir = int(primary_channel_tsla.direction)
+        tsla_pos = primary_channel_tsla.position_at()
+    except (ValueError, IndexError):
+        tsla_dir = 1  # Default: sideways
+        tsla_pos = 0.5
+
+    try:
+        primary_channel_spy = detect_channel(spy_df, window=20)
+        spy_dir = int(primary_channel_spy.direction)
+        spy_pos = primary_channel_spy.position_at()
+    except (ValueError, IndexError):
+        spy_dir = 1  # Default: sideways
+        spy_pos = 0.5
+
+    # Step 8: Compute tsla_window_scores using detect_channels_multi_window
+    # This is identical for all window iterations
+    tsla_window_scores = None
+    try:
+        multi_window_channels = detect_channels_multi_window(tsla_df, windows=STANDARD_WINDOWS)
+        tsla_window_scores = extract_multi_window_scores(multi_window_channels)
+    except (ValueError, IndexError):
+        # Fall back to zeros if insufficient data
+        tsla_window_scores = np.zeros(
+            (len(STANDARD_WINDOWS), NUM_WINDOW_METRICS), dtype=np.float32
+        )
+
+    return SharedFeatures(
+        timestamp=timestamp,
+        tsla_resampled=tsla_resampled,
+        spy_resampled=spy_resampled,
+        vix=vix,
+        vix_channel=vix_channel,
+        tsla_history=tsla_history,
+        spy_history=spy_history,
+        tsla_spy_direction_match=(tsla_dir == spy_dir),
+        both_near_upper=(tsla_pos > 0.8 and spy_pos > 0.8),
+        both_near_lower=(tsla_pos < 0.2 and spy_pos < 0.2),
+        rsi_series_per_tf=rsi_series_per_tf,
+        events=event_features,
+        tsla_window_scores=tsla_window_scores,
+        data_confidence_per_tf=data_confidence_per_tf,
+    )
+
+
+def extract_window_features(
+    shared: SharedFeatures,
+    window: int,
+    tsla_df: pd.DataFrame,
+    spy_df: pd.DataFrame,
+    include_history: bool = True,
+    lookforward_bars: int = 200
+) -> FullFeatures:
+    """
+    Extract window-dependent features using pre-computed shared features.
+
+    This function computes only the features that depend on the channel detection
+    window size, reusing the shared features for everything else.
+
+    Args:
+        shared: Pre-computed shared features from extract_shared_features()
+        window: Channel detection window size (e.g., 10, 20, 30...)
+        tsla_df: TSLA 5min OHLCV data (for history scanning)
+        spy_df: SPY 5min OHLCV data (for history scanning)
+        include_history: Whether to scan channel history
+        lookforward_bars: Bars for exit tracking
+
+    Returns:
+        FullFeatures with all features populated
+    """
+    # Step 1: Detect TSLA channels at all TFs with the specified window
+    # Use pre-computed resampled data from shared features
+    tsla_channels_dict = {}
+    for tf in TIMEFRAMES:
+        df_tf = shared.tsla_resampled.get(tf)
+        if df_tf is None:
+            continue
+        try:
+            tsla_channels_dict[tf] = detect_channel(df_tf, window=window)
+        except (ValueError, IndexError):
+            pass
+
+    # Step 2: Extract TSLA channel features for each TF
+    # Channel and RSI series are REQUIRED - skip TFs that don't have them
+    tsla_features = {}
+    for tf in TIMEFRAMES:
+        df_tf = shared.tsla_resampled.get(tf)
+        if df_tf is None:
+            continue
+
+        channel = tsla_channels_dict.get(tf)
+        rsi_series = shared.rsi_series_per_tf.get(tf)
+
+        # Skip if we don't have required data
+        if channel is None or rsi_series is None:
+            continue
+
+        try:
+            # Get longer TF channels for this timeframe
+            longer_tfs = get_longer_timeframes(tf)
+            longer_channels = {ltf: tsla_channels_dict.get(ltf) for ltf in longer_tfs if ltf in tsla_channels_dict}
+
+            tsla_features[tf] = extract_tsla_channel_features(
+                df_tf, tf, channel, rsi_series,
+                window=window,
+                longer_tf_channels=longer_channels,
+                lookforward_bars=lookforward_bars,
+                data_confidence=shared.data_confidence_per_tf.get(tf, 1.0),
+            )
+        except (ValueError, IndexError):
+            pass
+
+    # Step 3: Extract SPY features at all timeframes with the specified window
+    spy_features = {}
+    for tf in TIMEFRAMES:
+        df_tf = shared.spy_resampled.get(tf)
+        if df_tf is None:
+            continue
+
+        try:
+            spy_features[tf] = extract_spy_features(df_tf, window, tf)
+        except (ValueError, IndexError):
+            pass
+
+    # Step 4: Extract cross-asset containment for this window
+    # Pass vix_df=None to skip redundant VIX computation (we use shared.vix instead)
+    cross_asset = extract_all_cross_asset_features(tsla_df, spy_df, None, window)
+    cross_containment = cross_asset['cross_containment']
+
+    # Step 5: Channel history (if enabled and different from shared window=20)
+    tsla_history = shared.tsla_history
+    spy_history = shared.spy_history
+
+    if include_history and window != 20:
+        # Re-scan history with this specific window
+        try:
+            tsla_records = scan_channel_history(tsla_df, window=window, max_channels=10)
+            tsla_history = extract_history_features(tsla_records)
+        except (ValueError, IndexError):
+            pass
+
+        try:
+            spy_records = scan_channel_history(spy_df, window=window, max_channels=10)
+            spy_history = extract_history_features(spy_records)
+        except (ValueError, IndexError):
+            pass
+
+    # Step 6: Compute alignment features for this window
+    primary_tf = '5min'
+    tsla_dir = tsla_features.get(primary_tf, TSLAChannelFeatures(
+        timeframe=primary_tf, channel_valid=False, direction=1,
+        position=0.5, upper_dist=0, lower_dist=0, width_pct=0,
+        slope_pct=0, r_squared=0, bounce_count=0, cycles=0,
+        bars_since_bounce=0, last_touch=-1, rsi=50, rsi_divergence=0,
+        rsi_at_last_upper=50, rsi_at_last_lower=50,
+        channel_quality=0.0, rsi_confidence=0.5
+    )).direction
+
+    spy_dir = spy_features.get(primary_tf, SPYFeatures(
+        timeframe=primary_tf, channel_valid=False, direction=1,
+        position=0.5, upper_dist=0, lower_dist=0, width_pct=0,
+        slope_pct=0, r_squared=0, bounce_count=0, cycles=0, rsi=50
+    )).direction
+
+    tsla_pos = tsla_features.get(primary_tf).position if primary_tf in tsla_features else 0.5
+    spy_pos = spy_features.get(primary_tf).position if primary_tf in spy_features else 0.5
+
+    # Step 7: Assemble FullFeatures
+    return FullFeatures(
+        timestamp=shared.timestamp,
+        tsla=tsla_features,
+        spy=spy_features,
+        cross_containment=cross_containment,
+        vix=shared.vix,
+        vix_channel=shared.vix_channel,
+        tsla_history=tsla_history,
+        spy_history=spy_history,
+        tsla_spy_direction_match=(tsla_dir == spy_dir),
+        both_near_upper=(tsla_pos > 0.8 and spy_pos > 0.8),
+        both_near_lower=(tsla_pos < 0.2 and spy_pos < 0.2),
+        events=shared.events,
+        tsla_window_scores=shared.tsla_window_scores,
+        data_confidence_per_tf=shared.data_confidence_per_tf,
+    )
+
+
+def extract_all_window_features(
+    tsla_df: pd.DataFrame,
+    spy_df: pd.DataFrame,
+    vix_df: pd.DataFrame,
+    windows: List[int] = None,
+    include_history: bool = True,
+    lookforward_bars: int = 200,
+    events_handler: Optional[EventsHandler] = None
+) -> Dict[int, FullFeatures]:
+    """
+    Extract features for all window sizes efficiently.
+
+    This is the optimized entry point that:
+    1. Computes shared features ONCE (resampling, VIX, events, window_scores)
+    2. Loops over windows computing only window-dependent features
+
+    Saves ~50-60% extraction time vs calling extract_full_features() 8 times.
+    The savings come from:
+    - Resampling computed once (11 TFs) instead of 8 times
+    - VIX features computed once
+    - Event features computed once
+    - Window scores computed once
+
+    Args:
+        tsla_df: TSLA 5min OHLCV data
+        spy_df: SPY 5min OHLCV data
+        vix_df: VIX daily data
+        windows: List of window sizes (default: STANDARD_WINDOWS)
+        include_history: Whether to scan channel history
+        lookforward_bars: Bars for exit tracking
+        events_handler: Optional events handler
+
+    Returns:
+        Dict mapping window size to FullFeatures
+    """
+    if windows is None:
+        windows = STANDARD_WINDOWS
+
+    # Step 1: Extract shared features ONCE (resampling, VIX, events, window_scores)
+    shared = extract_shared_features(
+        tsla_df, spy_df, vix_df,
+        lookforward_bars=lookforward_bars,
+        events_handler=events_handler
+    )
+
+    # Step 2: Extract window-dependent features for each window
+    # Using shared resampled data avoids redundant resampling
+    features_per_window = {}
+    for window in windows:
+        try:
+            features_per_window[window] = extract_window_features(
+                shared=shared,
+                window=window,
+                tsla_df=tsla_df,
+                spy_df=spy_df,
+                include_history=include_history,
+                lookforward_bars=lookforward_bars
+            )
+        except Exception:
+            # Skip windows that fail
+            continue
+
+    return features_per_window
+
+
+def features_to_tensor_dict(features: FullFeatures) -> Dict[str, np.ndarray]:
+    """
+    Convert FullFeatures to flat numpy arrays for model input.
+
+    Returns dict with arrays for each feature group.
+    """
+    arrays = {}
+
+    # TSLA channel features per TF - ALWAYS include all 11 timeframes
+    for tf in TIMEFRAMES:
+        if tf in features.tsla:
+            f = features.tsla[tf]
+            base_features = [
+                float(f.channel_valid),
+                f.direction,
+                f.position,
+                f.upper_dist,
+                f.lower_dist,
+                f.width_pct,
+                f.slope_pct,
+                f.r_squared,
+                f.bounce_count,
+                f.cycles,
+                f.bars_since_bounce,
+                f.last_touch,
+                f.rsi,
+                f.rsi_divergence,
+                f.rsi_at_last_upper,
+                f.rsi_at_last_lower,
+                f.channel_quality,
+                f.rsi_confidence,
+                # Note: data_confidence is metadata only, NOT included in tensor
+            ]
+
+            # Add exit tracking features (15 total: 10 original + 5 new return tracking)
+            if f.exit_tracking:
+                et = f.exit_tracking
+                base_features.extend([
+                    et.exit_count,
+                    et.avg_bars_outside,
+                    et.max_bars_outside,
+                    et.exit_frequency,
+                    float(et.exits_accelerating),
+                    et.exits_up_count,
+                    et.exits_down_count,
+                    et.avg_return_speed,
+                    float(et.return_speed_slowing),
+                    et.bounces_after_last_return,
+                    # New return tracking features (5)
+                    et.return_rate,
+                    et.channel_resilience_score,
+                    et.avg_duration_after_return,
+                    et.max_duration_after_return,
+                    et.returns_leading_to_new_channel,
+                ])
+            else:
+                # Default values if no exit tracking (15 features)
+                base_features.extend([0.0] * 15)
+
+            # Add break trigger features
+            if f.break_trigger:
+                bt = f.break_trigger
+                base_features.extend([
+                    bt.nearest_boundary_dist,
+                    bt.rsi_alignment_with_boundary,
+                ])
+            else:
+                base_features.extend([0.0, 0.0])
+
+            arrays[f'tsla_{tf}'] = np.array(base_features, dtype=np.float32)
+        else:
+            # Provide default invalid features for this TF (35 total features)
+            # All zeros with channel_valid=0.0, direction=1 (sideways), position=0.5, rsi=50.0
+            # Note: data_confidence is metadata only, NOT included in tensor
+            arrays[f'tsla_{tf}'] = np.array([
+                0.0,   # channel_valid
+                1.0,   # direction (sideways)
+                0.5,   # position
+                0.0,   # upper_dist
+                0.0,   # lower_dist
+                0.0,   # width_pct
+                0.0,   # slope_pct
+                0.0,   # r_squared
+                0.0,   # bounce_count
+                0.0,   # cycles
+                0.0,   # bars_since_bounce
+                -1.0,  # last_touch (none)
+                50.0,  # rsi
+                0.0,   # rsi_divergence
+                50.0,  # rsi_at_last_upper
+                50.0,  # rsi_at_last_lower
+                0.0,   # channel_quality
+                0.5,   # rsi_confidence
+                # Exit tracking defaults (15: 10 original + 5 new return tracking)
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0, 0.0,
+                # Break trigger defaults (2)
+                0.0, 0.0,
+            ], dtype=np.float32)
+
+    # SPY channel features per TF - ALWAYS include all 11 timeframes
+    for tf in TIMEFRAMES:
+        if tf in features.spy:
+            f = features.spy[tf]
+            arrays[f'spy_{tf}'] = np.array([
+                float(f.channel_valid),
+                f.direction,
+                f.position,
+                f.upper_dist,
+                f.lower_dist,
+                f.width_pct,
+                f.slope_pct,
+                f.r_squared,
+                f.bounce_count,
+                f.cycles,
+                f.rsi,
+            ], dtype=np.float32)
+        else:
+            # Provide default invalid features for this TF (11 total features)
+            arrays[f'spy_{tf}'] = np.array([
+                0.0,   # channel_valid
+                1.0,   # direction (sideways)
+                0.5,   # position
+                0.0,   # upper_dist
+                0.0,   # lower_dist
+                0.0,   # width_pct
+                0.0,   # slope_pct
+                0.0,   # r_squared
+                0.0,   # bounce_count
+                0.0,   # cycles
+                50.0,  # rsi
+            ], dtype=np.float32)
+
+    # Cross containment - ALWAYS include all 11 timeframes
+    for tf in TIMEFRAMES:
+        if tf in features.cross_containment:
+            c = features.cross_containment[tf]
+            arrays[f'cross_{tf}'] = np.array([
+                float(c.spy_channel_valid),
+                c.spy_direction,
+                c.spy_position,
+                float(c.tsla_in_spy_upper),
+                float(c.tsla_in_spy_lower),
+                c.tsla_dist_to_spy_upper,
+                c.tsla_dist_to_spy_lower,
+                c.alignment,
+                c.rsi_correlation,
+                c.rsi_correlation_trend,
+            ], dtype=np.float32)
+        else:
+            # Provide default invalid features for this TF (10 total features)
+            arrays[f'cross_{tf}'] = np.array([
+                0.0,   # spy_channel_valid
+                1.0,   # spy_direction (sideways)
+                0.5,   # spy_position
+                0.0,   # tsla_in_spy_upper
+                0.0,   # tsla_in_spy_lower
+                0.0,   # tsla_dist_to_spy_upper
+                0.0,   # tsla_dist_to_spy_lower
+                0.0,   # alignment
+                0.0,   # rsi_correlation
+                0.0,   # rsi_correlation_trend
+            ], dtype=np.float32)
+
+    # VIX (6 basic + 15 channel interaction = 21 features)
+    vix_basic = [
+        features.vix.level,
+        features.vix.level_normalized,
+        features.vix.trend_5d,
+        features.vix.trend_20d,
+        features.vix.percentile_252d,
+        features.vix.regime,
+    ]
+
+    # VIX-channel interaction features (15)
+    if features.vix_channel is not None:
+        vc = features.vix_channel
+        vix_channel_features = [
+            # VIX at Channel Events (5)
+            vc.vix_at_channel_start,
+            vc.vix_at_last_bounce,
+            vc.vix_change_during_channel,
+            vc.vix_regime_at_start,
+            vc.vix_regime_at_current,
+            # VIX-Bounce Relationships (4)
+            vc.avg_vix_at_upper_bounces,
+            vc.avg_vix_at_lower_bounces,
+            vc.vix_upper_minus_lower,
+            vc.pct_bounces_high_vix,
+            # VIX Dynamics (3)
+            vc.vix_trend_during_channel,
+            vc.vix_volatility_during_channel,
+            vc.vix_regime_changes_count,
+            # Bounce Resilience by VIX (3)
+            vc.bounce_hold_rate_low_vix,
+            vc.bounce_hold_rate_high_vix,
+            vc.vix_bounce_quality_diff,
+        ]
+    else:
+        # Default values (15 features)
+        vix_channel_features = [
+            20.0,  # vix_at_channel_start
+            20.0,  # vix_at_last_bounce
+            0.0,   # vix_change_during_channel
+            1,     # vix_regime_at_start (normal)
+            1,     # vix_regime_at_current (normal)
+            20.0,  # avg_vix_at_upper_bounces
+            20.0,  # avg_vix_at_lower_bounces
+            0.0,   # vix_upper_minus_lower
+            0.0,   # pct_bounces_high_vix
+            0,     # vix_trend_during_channel
+            0.0,   # vix_volatility_during_channel
+            0,     # vix_regime_changes_count
+            0.5,   # bounce_hold_rate_low_vix
+            0.5,   # bounce_hold_rate_high_vix
+            0.0,   # vix_bounce_quality_diff
+        ]
+
+    arrays['vix'] = np.array(vix_basic + vix_channel_features, dtype=np.float32)
+
+    # TSLA history
+    h = features.tsla_history
+    arrays['tsla_history'] = np.array([
+        *h.last_n_directions,
+        *h.last_n_durations,
+        *h.last_n_break_dirs,
+        h.avg_duration,
+        h.direction_streak,
+        h.bear_count_last_5,
+        h.bull_count_last_5,
+        h.sideways_count_last_5,
+        h.avg_rsi_at_upper_bounce,
+        h.avg_rsi_at_lower_bounce,
+        h.rsi_at_last_break,
+        h.break_up_after_bear_pct,
+        h.break_down_after_bull_pct,
+    ], dtype=np.float32)
+
+    # SPY history
+    h = features.spy_history
+    arrays['spy_history'] = np.array([
+        *h.last_n_directions,
+        *h.last_n_durations,
+        *h.last_n_break_dirs,
+        h.avg_duration,
+        h.direction_streak,
+        h.bear_count_last_5,
+        h.bull_count_last_5,
+        h.sideways_count_last_5,
+        h.avg_rsi_at_upper_bounce,
+        h.avg_rsi_at_lower_bounce,
+        h.rsi_at_last_break,
+        h.break_up_after_bear_pct,
+        h.break_down_after_bull_pct,
+    ], dtype=np.float32)
+
+    # Alignment
+    arrays['alignment'] = np.array([
+        float(features.tsla_spy_direction_match),
+        float(features.both_near_upper),
+        float(features.both_near_lower),
+    ], dtype=np.float32)
+
+    # Events (46 features)
+    if features.events is not None:
+        ev = features.events
+        arrays['events'] = np.array([
+            # Generic timing (2)
+            ev.days_until_event,
+            ev.days_since_event,
+            # Event-specific timing - forward (6)
+            ev.days_until_tsla_earnings,
+            ev.days_until_tsla_delivery,
+            ev.days_until_fomc,
+            ev.days_until_cpi,
+            ev.days_until_nfp,
+            ev.days_until_quad_witching,
+            # Event-specific timing - backward (6)
+            ev.days_since_tsla_earnings,
+            ev.days_since_tsla_delivery,
+            ev.days_since_fomc,
+            ev.days_since_cpi,
+            ev.days_since_nfp,
+            ev.days_since_quad_witching,
+            # Intraday timing (6)
+            ev.hours_until_tsla_earnings,
+            ev.hours_until_tsla_delivery,
+            ev.hours_until_fomc,
+            ev.hours_until_cpi,
+            ev.hours_until_nfp,
+            ev.hours_until_quad_witching,
+            # Binary flags (2)
+            ev.is_high_impact_event,
+            ev.is_earnings_week,
+            # Multi-hot flags (6)
+            ev.event_is_tsla_earnings_3d,
+            ev.event_is_tsla_delivery_3d,
+            ev.event_is_fomc_3d,
+            ev.event_is_cpi_3d,
+            ev.event_is_nfp_3d,
+            ev.event_is_quad_witching_3d,
+            # Earnings context - backward (4)
+            ev.last_earnings_surprise_pct,
+            ev.last_earnings_surprise_abs,
+            ev.last_earnings_actual_eps_norm,
+            ev.last_earnings_beat_miss,
+            # Earnings context - forward (2)
+            ev.upcoming_earnings_estimate_norm,
+            ev.estimate_trajectory,
+            # Pre-event drift (6)
+            ev.pre_tsla_earnings_drift,
+            ev.pre_tsla_delivery_drift,
+            ev.pre_fomc_drift,
+            ev.pre_cpi_drift,
+            ev.pre_nfp_drift,
+            ev.pre_quad_witching_drift,
+            # Post-event drift (6)
+            ev.post_tsla_earnings_drift,
+            ev.post_tsla_delivery_drift,
+            ev.post_fomc_drift,
+            ev.post_cpi_drift,
+            ev.post_nfp_drift,
+            ev.post_quad_witching_drift,
+        ], dtype=np.float32)
+    else:
+        # Default zeros if no events
+        arrays['events'] = np.zeros(46, dtype=np.float32)
+
+    # Multi-window channel scores (8 windows x 5 metrics = 40 features)
+    # Shape: [num_windows, num_metrics] flattened to [40]
+    if features.tsla_window_scores is not None:
+        # Flatten from (8, 5) to (40,)
+        arrays['window_scores'] = features.tsla_window_scores.flatten()
+    else:
+        # Default zeros if not available
+        arrays['window_scores'] = np.zeros(WINDOW_SCORE_FEATURES, dtype=np.float32)
+
+    # Validate feature dimensions match expected values
+    # This catches bugs early before they propagate to training
+    errors = validate_feature_dict(arrays, raise_on_error=False)
+    if errors:
+        import warnings
+        warnings.warn(f"Feature validation warnings: {errors}")
+
+    return arrays

@@ -1,0 +1,1330 @@
+"""
+Training Loop for Channel Prediction Model
+
+Provides a flexible training framework with:
+- Multi-task learning (duration, break direction, new channel direction)
+- Mixed precision training
+- Gradient clipping
+- Learning rate scheduling
+- Checkpointing and early stopping
+- TensorBoard logging
+- Validation metrics tracking
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch.amp import autocast, GradScaler
+from pathlib import Path
+from typing import Dict, Optional, Tuple, List, Any
+from dataclasses import dataclass, field
+import json
+import time
+from tqdm import tqdm
+import numpy as np
+from datetime import datetime
+
+# Import loss classes
+from v7.training.losses import CombinedLoss, EndToEndLoss, MetricsCalculator
+
+# Import TIMEFRAMES for single source of truth
+from v7.core.timeframe import TIMEFRAMES
+
+# Import canonical feature ordering - CRITICAL for correct feature concatenation!
+from v7.features.feature_ordering import FEATURE_ORDER, TOTAL_FEATURES
+
+# Import hazard conversion for survival loss metrics
+from v7.models.hierarchical_cfc import hazard_to_duration_stats
+
+
+class GradNormBalancer:
+    """
+    GradNorm: Gradient Normalization for Adaptive Loss Balancing
+    Paper: https://arxiv.org/abs/1711.02257
+
+    Dynamically adjusts task weights based on gradient magnitudes
+    to balance training across multiple tasks.
+    """
+    def __init__(self, num_tasks: int, alpha: float = 1.5, device: str = 'cpu'):
+        self.num_tasks = num_tasks
+        self.alpha = alpha  # Restoring force strength
+        self.device = device
+
+        # Task weights (learnable)
+        self.task_weights = torch.ones(num_tasks, device=device, requires_grad=True)
+
+        # Initial loss values for relative scaling
+        self.initial_losses = None
+
+    def compute_grad_norms(self, losses: List[torch.Tensor], shared_params: List[torch.Tensor]) -> torch.Tensor:
+        """Compute gradient norms for each task w.r.t. shared parameters."""
+        grad_norms = []
+        for loss in losses:
+            # Compute gradients
+            grads = torch.autograd.grad(loss, shared_params, retain_graph=True, allow_unused=True)
+            # Compute L2 norm of gradients - ensure result is a tensor even if all grads are None
+            grad_squared_sums = [g.pow(2).sum() for g in grads if g is not None]
+            if grad_squared_sums:
+                grad_norm = torch.sqrt(sum(grad_squared_sums) + 1e-8)
+            else:
+                # No gradients - return small norm to avoid division issues
+                grad_norm = torch.tensor(1e-8, device=self.device)
+            grad_norms.append(grad_norm)
+        return torch.stack(grad_norms)
+
+    def update_weights(self, losses: List[torch.Tensor], shared_params: List[torch.Tensor]) -> torch.Tensor:
+        """Update task weights based on GradNorm algorithm."""
+        # Initialize initial losses on first call
+        if self.initial_losses is None:
+            self.initial_losses = torch.tensor([l.item() for l in losses], device=self.device)
+
+        # Compute gradient norms
+        grad_norms = self.compute_grad_norms(losses, shared_params)
+
+        # Compute relative inverse training rates
+        loss_ratios = torch.tensor([l.item() / (il + 1e-8) for l, il in zip(losses, self.initial_losses)],
+                                   device=self.device)
+        mean_loss_ratio = loss_ratios.mean()
+        inverse_train_rates = loss_ratios / (mean_loss_ratio + 1e-8)
+
+        # Compute target gradient norms
+        mean_grad_norm = grad_norms.mean()
+        target_grad_norms = mean_grad_norm * (inverse_train_rates ** self.alpha)
+
+        # Update weights to match target gradient norms
+        with torch.no_grad():
+            grad_norm_ratios = target_grad_norms / (grad_norms + 1e-8)
+            self.task_weights.data = self.task_weights.data * grad_norm_ratios
+            # Normalize weights to sum to num_tasks
+            self.task_weights.data = self.task_weights.data * self.num_tasks / self.task_weights.sum()
+
+        return self.task_weights.detach()
+
+
+class PCGradBalancer:
+    """
+    PCGrad: Projecting Conflicting Gradients
+    Paper: https://arxiv.org/abs/2001.06782
+
+    Projects gradients to remove conflicting components between tasks.
+    """
+    def __init__(self, num_tasks: int):
+        self.num_tasks = num_tasks
+
+    def project_gradients(self, grads: List[torch.Tensor]) -> List[torch.Tensor]:
+        """
+        Project gradients to remove conflicts.
+        For each gradient, subtract components that conflict with other gradients.
+        """
+        projected_grads = [g.clone() for g in grads]
+
+        for i in range(self.num_tasks):
+            for j in range(self.num_tasks):
+                if i == j:
+                    continue
+
+                # Check if gradients conflict (negative dot product)
+                dot = (projected_grads[i] * grads[j]).sum()
+                if dot < 0:
+                    # Project out the conflicting component
+                    # g_i = g_i - (g_i . g_j / ||g_j||^2) * g_j
+                    grad_j_norm_sq = (grads[j] ** 2).sum() + 1e-8
+                    projected_grads[i] = projected_grads[i] - (dot / grad_j_norm_sq) * grads[j]
+
+        return projected_grads
+
+    def apply(self, model: nn.Module, task_losses: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Compute PCGrad-adjusted combined gradient.
+
+        Args:
+            model: The model to compute gradients for
+            task_losses: List of individual task losses
+
+        Returns:
+            Combined loss for backward pass (gradients already modified)
+        """
+        # Get all parameters
+        params = [p for p in model.parameters() if p.requires_grad]
+
+        # Compute gradients for each task
+        task_grads = []
+        for loss in task_losses:
+            grads = torch.autograd.grad(loss, params, retain_graph=True, allow_unused=True)
+            # Flatten all gradients into single vector
+            flat_grad = torch.cat([g.flatten() if g is not None else torch.zeros_like(p).flatten()
+                                   for g, p in zip(grads, params)])
+            task_grads.append(flat_grad)
+
+        # Project gradients
+        projected_grads = self.project_gradients(task_grads)
+
+        # Average projected gradients
+        avg_grad = torch.stack(projected_grads).mean(dim=0)
+
+        # Apply averaged gradient to parameters
+        idx = 0
+        for p in params:
+            numel = p.numel()
+            p.grad = avg_grad[idx:idx + numel].view_as(p)
+            idx += numel
+
+        # Return sum of losses (gradients already set)
+        return sum(task_losses)
+
+
+@dataclass
+class TrainingConfig:
+    """Configuration for training."""
+
+    # Model architecture (to be defined by user)
+    model_class: Any = None
+    model_kwargs: Dict = field(default_factory=dict)
+
+    # Training hyperparameters
+    num_epochs: int = 100
+    learning_rate: float = 0.001
+    weight_decay: float = 0.0001
+    batch_size: int = 32
+    gradient_clip: float = 1.0
+
+    # Gradient balancing
+    gradient_balancing: str = 'none'  # 'none', 'gradnorm', 'pcgrad'
+    gradnorm_alpha: float = 1.5  # GradNorm alpha parameter
+
+    # Loss configuration
+    num_timeframes: int = 11  # Number of timeframes being predicted
+    use_learnable_weights: bool = True  # Use uncertainty-based learnable task weights
+    fixed_weights: Optional[Dict[str, float]] = None  # Fixed weights when use_learnable_weights=False
+
+    # Calibration mode: how to train calibration
+    # - 'ece_direction': ECE on direction probs (calibrates direction probabilities directly)
+    # - 'brier_per_tf': Brier on per-TF confidence head (default, separate confidence head)
+    # - 'brier_aggregate': Brier on aggregate confidence head (single cross-TF confidence)
+    calibration_mode: str = 'brier_per_tf'
+
+    # Loss function options
+    duration_loss_type: str = 'gaussian_nll'  # 'gaussian_nll', 'huber', 'survival'
+    huber_delta: float = 1.0
+    direction_loss_type: str = 'bce'  # 'bce', 'focal'
+    focal_gamma: float = 2.0
+
+    # Window selection loss (for learned_selection strategy)
+    # When enabled, trains the model's window_selector head to pick optimal windows
+    use_window_selection_loss: bool = False
+    window_selection_weight: float = 0.1  # Weight for window selection loss in total loss
+
+    # End-to-end loss (for learned_selection with EndToEndWindowModel)
+    # Uses EndToEndLoss instead of CombinedLoss - designed for Phase 2b with gradient flow
+    use_end_to_end_loss: bool = False
+
+    # Duration loss tuning (v9.1 fixes)
+    # These settings prevent the model from "gaming" the loss by predicting high uncertainty
+    uncertainty_penalty: float = 0.1  # Penalizes "I don't know" predictions (0 = disabled)
+    min_duration_precision: float = 0.25  # Floor for duration task weight (prevents abandonment)
+    max_duration: float = 100.0  # Maximum duration for SurvivalLoss binning (in TF bars)
+
+    # SE-blocks (Squeeze-and-Excitation) for feature reweighting
+    # SE-blocks learn which features in the hidden representation are important per sample
+    # This is lighter than full attention (~4K params/branch vs ~4M for attention)
+    use_se_blocks: bool = False  # Enable SE-block feature reweighting in TF branches
+    se_reduction_ratio: int = 8  # Bottleneck ratio (hidden_dim/ratio = bottleneck size)
+
+    # TCN block (Temporal Convolutional Network)
+    use_tcn: bool = False
+    tcn_channels: int = 64
+    tcn_kernel_size: int = 3
+    tcn_layers: int = 2
+
+    # Multi-resolution heads
+    use_multi_resolution: bool = False
+    resolution_levels: int = 3
+
+    # Optimization
+    optimizer: str = 'adam'  # 'adam', 'adamw', 'sgd'
+    scheduler: str = 'cosine_restarts'  # 'cosine', 'cosine_restarts', 'step', 'plateau', 'none'
+    # FIX: Default to warm restarts instead of pure cosine (which decays to zero)
+    scheduler_kwargs: Dict = field(default_factory=lambda: {'T_0': 50, 'T_mult': 1})
+
+    # Mixed precision training
+    use_amp: bool = True
+
+    # Early stopping
+    early_stopping_patience: int = 10
+    early_stopping_metric: str = 'total'  # 'total', 'duration', 'direction_acc', 'next_channel_acc', etc.
+    early_stopping_mode: str = 'min'  # 'min' for losses, 'max' for accuracies
+
+    # Two-stage training
+    two_stage_training: bool = False
+    stage1_epochs: int = 5
+    stage1_task: str = 'direction'  # 'direction' or 'duration'
+
+    # Checkpointing
+    save_dir: Path = Path('./checkpoints')
+    save_every_n_epochs: int = 5
+    save_best_only: bool = True
+
+    # Logging
+    log_dir: Path = Path('./logs')
+    log_every_n_steps: int = 10
+    use_tensorboard: bool = False
+
+    # Device
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # Reproducibility
+    seed: int = 42
+
+
+def assert_finite(name: str, tensor: torch.Tensor, raise_error: bool = True):
+    """Check tensor for NaN/Inf values."""
+    if not torch.isfinite(tensor).all():
+        msg = f"{name} contains NaN or Inf values"
+        if raise_error:
+            raise ValueError(msg)
+        else:
+            import warnings
+            warnings.warn(msg)
+            return False
+    return True
+
+
+class Trainer:
+    """
+    Training manager for channel prediction model.
+
+    Handles:
+    - Training loop with validation
+    - Checkpointing and loading
+    - Metrics tracking and logging
+    - Early stopping
+    - Learning rate scheduling
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        config: TrainingConfig,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        test_loader: Optional[DataLoader] = None
+    ):
+        self.model = model
+        self.config = config
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.test_loader = test_loader
+
+        # Setup device
+        self.device = torch.device(config.device)
+        self.model.to(self.device)
+
+        # Setup loss - select based on training mode
+        if config.use_end_to_end_loss:
+            # Phase 2b: EndToEndLoss for learned_selection with EndToEndWindowModel
+            # Designed for gradient flow through window selection
+            self.criterion = EndToEndLoss(
+                num_timeframes=config.num_timeframes,
+                duration_weight=config.fixed_weights.get('duration', 1.0) if config.fixed_weights else 1.0,
+                direction_weight=config.fixed_weights.get('direction', 1.0) if config.fixed_weights else 1.0,
+                next_channel_weight=config.fixed_weights.get('next_channel', 1.0) if config.fixed_weights else 1.0,
+                calibration_weight=0.5,
+                entropy_weight=0.1,  # Encourages decisive window selection
+                consistency_weight=0.05,  # Helps warm-start with heuristic best_window
+                # Loss type configuration
+                duration_loss_type=config.duration_loss_type,
+                huber_delta=config.huber_delta,
+                direction_loss_type=config.direction_loss_type,
+                focal_gamma=config.focal_gamma,
+                max_duration=config.max_duration,
+            )
+        else:
+            # Phase 2a: CombinedLoss with learnable or fixed weights
+            self.criterion = CombinedLoss(
+                num_timeframes=config.num_timeframes,
+                use_learnable_weights=config.use_learnable_weights,
+                fixed_weights=config.fixed_weights,
+                calibration_mode=config.calibration_mode,
+                use_window_selection_loss=config.use_window_selection_loss,
+                window_selection_weight=config.window_selection_weight,
+                # v9.1 duration loss tuning
+                uncertainty_penalty=config.uncertainty_penalty,
+                min_duration_precision=config.min_duration_precision,
+                # Loss type configuration
+                duration_loss_type=config.duration_loss_type,
+                huber_delta=config.huber_delta,
+                direction_loss_type=config.direction_loss_type,
+                focal_gamma=config.focal_gamma,
+                max_duration=config.max_duration,
+            )
+        # Move criterion to device (critical for learnable weights)
+        self.criterion.to(self.device)
+
+        # MetricsCalculator for detailed per-TF metrics (parallel to inline metrics)
+        self.metrics_calculator = MetricsCalculator(
+            timeframe_names=list(TIMEFRAMES)
+        )
+
+        # Setup optimizer
+        self.optimizer = self._create_optimizer()
+
+        # Setup scheduler
+        self.scheduler = self._create_scheduler()
+
+        # Setup gradient balancing
+        self.gradient_balancing = config.gradient_balancing
+        if self.gradient_balancing == 'gradnorm':
+            self.grad_balancer = GradNormBalancer(
+                num_tasks=5,  # duration, direction, next_channel, calibration, trigger_tf
+                alpha=config.gradnorm_alpha,
+                device=str(config.device)
+            )
+        elif self.gradient_balancing == 'pcgrad':
+            self.grad_balancer = PCGradBalancer(num_tasks=5)
+        else:
+            self.grad_balancer = None
+
+        # Mixed precision scaler
+        if config.use_amp:
+            # Use device type directly (supports cuda, mps, cpu)
+            self.scaler = GradScaler(self.device.type)
+        else:
+            self.scaler = None
+
+        # Tracking
+        self.current_epoch = 0
+        self.global_step = 0
+        self.best_val_metric = float('inf') if config.early_stopping_mode == 'min' else float('-inf')
+        self.epochs_without_improvement = 0
+        self.train_metrics_history = []
+        self.val_metrics_history = []
+
+        # Two-stage training setup
+        self.two_stage_training = config.two_stage_training
+        self.stage1_epochs = config.stage1_epochs if config.two_stage_training else 0
+        self.stage1_task = config.stage1_task
+        self.current_stage = 1 if config.two_stage_training else 0  # 0 = no two-stage, 1 = stage1, 2 = stage2
+
+        # Setup directories
+        self.config.save_dir.mkdir(parents=True, exist_ok=True)
+        self.config.log_dir.mkdir(parents=True, exist_ok=True)
+
+        # TensorBoard (optional)
+        self.writer = None
+        if config.use_tensorboard:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+                self.writer = SummaryWriter(log_dir=str(config.log_dir))
+            except ImportError:
+                print("TensorBoard not available. Install with: pip install tensorboard")
+
+    def _create_optimizer(self) -> optim.Optimizer:
+        """Create optimizer based on config.
+
+        Includes loss parameters if using learnable weights (CombinedLoss).
+        """
+        # Combine model and loss parameters if loss has learnable weights
+        params = list(self.model.parameters()) + list(self.criterion.parameters())
+
+        if self.config.optimizer.lower() == 'adam':
+            return optim.Adam(
+                params,
+                lr=self.config.learning_rate,
+                weight_decay=self.config.weight_decay
+            )
+        elif self.config.optimizer.lower() == 'adamw':
+            return optim.AdamW(
+                params,
+                lr=self.config.learning_rate,
+                weight_decay=self.config.weight_decay
+            )
+        elif self.config.optimizer.lower() == 'sgd':
+            return optim.SGD(
+                params,
+                lr=self.config.learning_rate,
+                momentum=0.9,
+                weight_decay=self.config.weight_decay
+            )
+        else:
+            raise ValueError(f"Unknown optimizer: {self.config.optimizer}")
+
+    def _create_scheduler(self) -> Optional[Any]:
+        """Create learning rate scheduler based on config.
+
+        FIX: Added 'cosine_restarts' option which prevents LR from decaying to zero.
+        The old 'cosine' scheduler would decay LR to ~0 by the end of training,
+        causing the model to stop learning after ~200-300 epochs.
+
+        ANALOGY: Regular cosine is like a car running out of gas - it slows down
+        and eventually stops. Cosine with warm restarts is like refueling every
+        N miles - the car keeps going at full speed periodically.
+        """
+        if self.config.scheduler.lower() == 'none':
+            return None
+        elif self.config.scheduler.lower() == 'cosine_restarts':
+            # FIX: Use warm restarts instead of decay-to-zero
+            # T_0 = epochs until first restart (default 50)
+            # T_mult = multiplier for subsequent periods (1 = same period each time)
+            # eta_min = minimum LR (10% of initial by default)
+            kwargs = {
+                'T_0': self.config.scheduler_kwargs.get('T_0', 50),
+                'T_mult': self.config.scheduler_kwargs.get('T_mult', 1),
+                'eta_min': self.config.scheduler_kwargs.get('eta_min', self.config.learning_rate * 0.1)
+            }
+            print(f"Using CosineAnnealingWarmRestarts: restart every {kwargs['T_0']} epochs")
+            return optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                self.optimizer,
+                **kwargs
+            )
+        elif self.config.scheduler.lower() == 'cosine':
+            # WARNING: This decays LR to zero - not recommended for long training
+            print("WARNING: 'cosine' scheduler decays LR to zero. Consider 'cosine_restarts' instead.")
+            return optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=self.config.num_epochs,
+                **self.config.scheduler_kwargs
+            )
+        elif self.config.scheduler.lower() == 'step':
+            return optim.lr_scheduler.StepLR(
+                self.optimizer,
+                **self.config.scheduler_kwargs
+            )
+        elif self.config.scheduler.lower() == 'plateau':
+            return optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode=self.config.early_stopping_mode,
+                **self.config.scheduler_kwargs
+            )
+        else:
+            raise ValueError(f"Unknown scheduler: {self.config.scheduler}")
+
+    def _setup_stage1(self):
+        """Configure model for stage 1 pretraining (single task focus)."""
+        print(f"\n[Two-Stage Training] Setting up Stage 1: Focus on {self.stage1_task}")
+
+        # Store original loss weights
+        self._original_fixed_weights = self.config.fixed_weights.copy() if self.config.fixed_weights else None
+
+        # Modify loss weights to focus on primary task
+        if self.stage1_task == 'direction':
+            self.criterion.set_task_weights({
+                'duration': 0.1,      # Minimal
+                'direction': 5.0,     # Primary focus
+                'next_channel': 0.1,
+                'trigger_tf': 0.1,
+                'calibration': 0.1,
+            })
+        elif self.stage1_task == 'duration':
+            self.criterion.set_task_weights({
+                'duration': 5.0,      # Primary focus
+                'direction': 0.1,
+                'next_channel': 0.1,
+                'trigger_tf': 0.1,
+                'calibration': 0.1,
+            })
+
+        # Optionally freeze non-primary heads to focus learning
+        for name, param in self.model.named_parameters():
+            if self.stage1_task == 'direction':
+                if 'duration_head' in name.lower():
+                    param.requires_grad = False
+            elif self.stage1_task == 'duration':
+                if 'direction_head' in name.lower():
+                    param.requires_grad = False
+
+    def _setup_stage2(self):
+        """Configure model for stage 2 joint training."""
+        print(f"\n[Two-Stage Training] Transitioning to Stage 2: Joint training")
+
+        # Unfreeze all parameters
+        for param in self.model.parameters():
+            param.requires_grad = True
+
+        # Restore original loss weights or use balanced weights
+        if self._original_fixed_weights:
+            self.criterion.set_task_weights(self._original_fixed_weights)
+        else:
+            # Use balanced weights for joint training
+            self.criterion.set_task_weights({
+                'duration': 2.5,
+                'direction': 1.0,
+                'next_channel': 0.8,
+                'trigger_tf': 1.5,
+                'calibration': 0.5,
+            })
+
+        # Reduce learning rate for fine-tuning
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = param_group['lr'] * 0.5
+        print(f"[Two-Stage Training] Reduced learning rate to {self.optimizer.param_groups[0]['lr']:.6f}")
+
+    def train_epoch(self) -> Dict[str, float]:
+        """Train for one epoch."""
+        # Reset hidden states for fresh start (critical for CfC models)
+        if hasattr(self.model, 'reset_hidden_states'):
+            self.model.reset_hidden_states()
+        self.model.train()
+
+        epoch_losses = {
+            'total': [],
+            'duration': [],
+            'direction': [],
+            'next_channel': [],
+            'calibration': [],
+            'trigger_tf': [],  # v9.0.0
+            'window_selection': [],  # For learned_selection strategy (CombinedLoss)
+            'entropy': [],  # For EndToEndLoss
+            'consistency': [],  # For EndToEndLoss
+            'window_max_prob': [],  # For EndToEndLoss debugging
+            'window_mode': [],  # For EndToEndLoss debugging
+        }
+
+        pbar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch + 1}/{self.config.num_epochs}")
+
+        for batch_idx, (features, labels) in enumerate(pbar):
+            # Move to device
+            features = {k: v.to(self.device) for k, v in features.items()}
+
+            # Handle feature input based on mode:
+            # - End-to-end mode (learned_selection): features contains 'per_window_features' [batch, 8, 776]
+            # - Standard mode: features contains individual keys matching FEATURE_ORDER
+            is_end_to_end = 'per_window_features' in features
+
+            if is_end_to_end:
+                # End-to-end mode: use per_window_features directly
+                x = features['per_window_features']  # [batch, 8, 776]
+                window_valid = features.get('window_valid')  # [batch, 8]
+                window_scores = labels.get('window_scores')
+                if window_scores is not None:
+                    window_scores = window_scores.to(self.device)
+            else:
+                # Standard mode: concatenate using CANONICAL ordering
+                # CRITICAL: Must use FEATURE_ORDER, NOT sorted()! This ensures:
+                # - Timeframe-grouped layout: [TF0_features][TF1_features]...[shared_features]
+                # - Model's TF branches receive coherent feature blocks
+                feature_tensors = [features[k] for k in FEATURE_ORDER if k in features]
+                if not feature_tensors:
+                    raise ValueError(f"No FEATURE_ORDER keys found in features. Got keys: {list(features.keys())}")
+                x = torch.cat(feature_tensors, dim=1)
+                window_valid = None
+                window_scores = None
+
+            # Remap labels to match CombinedLoss expectations
+            targets = {
+                'duration': labels['duration'].to(self.device),
+                'direction': labels['direction'].to(self.device),
+                'next_channel': labels['next_channel'].to(self.device),
+            }
+
+            # v9.0.0: Add trigger_tf target if present
+            if 'trigger_tf' in labels:
+                targets['trigger_tf'] = labels['trigger_tf'].to(self.device)
+
+            # Window selection targets (for learned_selection strategy)
+            if self.config.use_window_selection_loss:
+                if 'best_window' in labels:
+                    targets['best_window'] = labels['best_window'].to(self.device)
+                if 'window_scores' in labels:
+                    targets['window_scores'] = labels['window_scores'].to(self.device)
+
+            # Extract validity masks (v9.0.0 format required)
+            # Masks are 1.0 for valid labels, 0.0 for invalid/missing labels
+            masks = {
+                'duration_valid': labels['duration_valid'].to(self.device),
+                'direction_valid': labels['direction_valid'].to(self.device),
+                'next_channel_valid': labels['next_channel_valid'].to(self.device),
+            }
+            if 'trigger_tf_valid' in labels:
+                masks['trigger_tf_valid'] = labels['trigger_tf_valid'].to(self.device)
+
+            # Forward pass with mixed precision
+            self.optimizer.zero_grad()
+
+            if self.config.use_amp:
+                # Use device type directly (supports cuda, mps, cpu)
+                with autocast(self.device.type):
+                    if is_end_to_end:
+                        predictions = self.model(x, window_scores=window_scores, window_valid=window_valid)
+                    else:
+                        predictions = self.model(x)
+
+                    # Check predictions for NaN/Inf
+                    if not assert_finite("duration_mean", predictions['duration_mean'], raise_error=False):
+                        continue
+
+                    loss, loss_dict = self.criterion(predictions, targets, masks)
+
+                # Check loss for NaN/Inf
+                if not torch.isfinite(loss):
+                    import warnings
+                    warnings.warn(f"Loss is NaN/Inf at step {self.global_step}, skipping update")
+                    continue
+
+                # Backward pass with gradient balancing
+                if self.gradient_balancing == 'gradnorm' and self.grad_balancer is not None:
+                    # Get individual task losses from raw_losses (tensors with gradients)
+                    raw_losses = loss_dict.get('raw_losses', {})
+                    task_losses = [
+                        raw_losses.get('duration', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('direction', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('next_channel', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('calibration', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('trigger_tf', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                    ]
+
+                    # Get shared parameters (encoder - not head parameters)
+                    shared_params = [p for n, p in self.model.named_parameters()
+                                     if 'head' not in n.lower() and p.requires_grad]
+
+                    # Update weights
+                    weights = self.grad_balancer.update_weights(task_losses, shared_params)
+
+                    # Recompute weighted loss
+                    loss = sum(w * l for w, l in zip(weights, task_losses))
+
+                    self.scaler.scale(loss).backward()
+
+                elif self.gradient_balancing == 'pcgrad' and self.grad_balancer is not None:
+                    # Get individual task losses from raw_losses (tensors with gradients)
+                    raw_losses = loss_dict.get('raw_losses', {})
+                    task_losses = [
+                        raw_losses.get('duration', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('direction', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('next_channel', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('calibration', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('trigger_tf', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                    ]
+
+                    # Apply PCGrad - this sets gradients directly
+                    loss = self.grad_balancer.apply(self.model, task_losses)
+                    # Skip regular backward since PCGrad already set gradients
+
+                else:
+                    # Standard backward pass
+                    self.scaler.scale(loss).backward()
+
+                # Gradient clipping (include both model and criterion parameters)
+                if self.config.gradient_clip > 0:
+                    self.scaler.unscale_(self.optimizer)
+                    all_params = list(self.model.parameters()) + list(self.criterion.parameters())
+                    torch.nn.utils.clip_grad_norm_(all_params, self.config.gradient_clip)
+
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                if is_end_to_end:
+                    predictions = self.model(x, window_scores=window_scores, window_valid=window_valid)
+                else:
+                    predictions = self.model(x)
+
+                # Check predictions for NaN/Inf
+                if not assert_finite("duration_mean", predictions['duration_mean'], raise_error=False):
+                    continue
+
+                loss, loss_dict = self.criterion(predictions, targets, masks)
+
+                # Check loss for NaN/Inf
+                if not torch.isfinite(loss):
+                    import warnings
+                    warnings.warn(f"Loss is NaN/Inf at step {self.global_step}, skipping update")
+                    continue
+
+                # Backward pass with gradient balancing
+                if self.gradient_balancing == 'gradnorm' and self.grad_balancer is not None:
+                    # Get individual task losses from raw_losses (tensors with gradients)
+                    raw_losses = loss_dict.get('raw_losses', {})
+                    task_losses = [
+                        raw_losses.get('duration', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('direction', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('next_channel', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('calibration', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('trigger_tf', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                    ]
+
+                    # Get shared parameters (encoder - not head parameters)
+                    shared_params = [p for n, p in self.model.named_parameters()
+                                     if 'head' not in n.lower() and p.requires_grad]
+
+                    # Update weights
+                    weights = self.grad_balancer.update_weights(task_losses, shared_params)
+
+                    # Recompute weighted loss
+                    loss = sum(w * l for w, l in zip(weights, task_losses))
+
+                    loss.backward()
+
+                elif self.gradient_balancing == 'pcgrad' and self.grad_balancer is not None:
+                    # Get individual task losses from raw_losses (tensors with gradients)
+                    raw_losses = loss_dict.get('raw_losses', {})
+                    task_losses = [
+                        raw_losses.get('duration', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('direction', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('next_channel', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('calibration', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                        raw_losses.get('trigger_tf', torch.tensor(0.0, device=self.device, requires_grad=True)),
+                    ]
+
+                    # Apply PCGrad - this sets gradients directly
+                    loss = self.grad_balancer.apply(self.model, task_losses)
+                    # Skip regular backward since PCGrad already set gradients
+
+                else:
+                    # Standard backward pass
+                    loss.backward()
+
+                # Gradient clipping (include both model and criterion parameters)
+                if self.config.gradient_clip > 0:
+                    all_params = list(self.model.parameters()) + list(self.criterion.parameters())
+                    torch.nn.utils.clip_grad_norm_(all_params, self.config.gradient_clip)
+
+                self.optimizer.step()
+
+            # Track losses (skip nested dicts like 'weights')
+            for k, v in loss_dict.items():
+                if isinstance(v, dict):
+                    continue  # Skip nested dicts
+                if k in epoch_losses:
+                    epoch_losses[k].append(v)
+                else:
+                    # Warn about unknown keys - helps catch mismatches between loss and trainer
+                    print(f"⚠️ Warning: Unknown loss key '{k}' ignored (value={v})")
+
+            # Update progress bar
+            pbar.set_postfix({'loss': loss_dict['total']})
+
+            # Log to tensorboard (skip nested dicts)
+            if self.writer and self.global_step % self.config.log_every_n_steps == 0:
+                for k, v in loss_dict.items():
+                    if not isinstance(v, dict):
+                        self.writer.add_scalar(f'train/{k}_loss', v, self.global_step)
+                self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
+
+            self.global_step += 1
+
+        # Average losses for epoch
+        epoch_metrics = {k: np.mean(v) if v else 0.0 for k, v in epoch_losses.items()}
+
+        return epoch_metrics
+
+    def validate(self) -> Dict[str, float]:
+        """Validate on validation set."""
+        self.model.eval()
+
+        epoch_losses = {
+            'total': [],
+            'duration': [],
+            'direction': [],
+            'next_channel': [],
+            'calibration': [],
+            'trigger_tf': [],  # v9.0.0
+            'window_selection': [],  # For learned_selection strategy (CombinedLoss)
+            'entropy': [],  # For EndToEndLoss
+            'consistency': [],  # For EndToEndLoss
+            'window_max_prob': [],  # For EndToEndLoss debugging
+            'window_mode': [],  # For EndToEndLoss debugging
+        }
+
+        # Track accuracy metrics (weighted by mask if present)
+        direction_correct = 0.0
+        next_channel_correct = 0.0
+        trigger_tf_correct = 0.0  # v9.0.0
+        total_valid_samples = 0.0  # Float for mask weighting (direction)
+        total_next_channel_samples = 0.0  # Separate counter for next_channel
+        total_trigger_tf_samples = 0.0  # v9.0.0
+
+        # Duration metrics accumulators (MAE and RMSE)
+        duration_mae_sum = 0.0
+        duration_mse_sum = 0.0
+        duration_valid_count = 0.0
+
+        # Accumulators for MetricsCalculator (detailed per-TF metrics)
+        all_predictions = {'duration_mean': [], 'duration_log_std': [], 'direction_logits': [], 'next_channel_logits': []}
+        all_targets = {'duration': [], 'direction': [], 'next_channel': []}
+        all_masks = {'duration_valid': [], 'direction_valid': [], 'next_channel_valid': []}
+
+        with torch.no_grad():
+            for features, labels in tqdm(self.val_loader, desc="Validation"):
+                # Move to device
+                features = {k: v.to(self.device) for k, v in features.items()}
+
+                # Handle feature input based on mode:
+                # - End-to-end mode (learned_selection): features contains 'per_window_features' [batch, 8, 776]
+                # - Standard mode: features contains individual keys matching FEATURE_ORDER
+                is_end_to_end = 'per_window_features' in features
+
+                if is_end_to_end:
+                    # End-to-end mode: use per_window_features directly
+                    x = features['per_window_features']  # [batch, 8, 776]
+                    window_valid = features.get('window_valid')  # [batch, 8]
+                    window_scores = labels.get('window_scores')
+                    if window_scores is not None:
+                        window_scores = window_scores.to(self.device)
+                else:
+                    # Standard mode: concatenate using CANONICAL ordering
+                    # CRITICAL: Must use FEATURE_ORDER, NOT sorted()!
+                    feature_tensors = [features[k] for k in FEATURE_ORDER if k in features]
+                    if not feature_tensors:
+                        raise ValueError(f"No FEATURE_ORDER keys found in features. Got keys: {list(features.keys())}")
+                    x = torch.cat(feature_tensors, dim=1)
+                    window_valid = None
+                    window_scores = None
+
+                # Remap labels to match CombinedLoss expectations
+                targets = {
+                    'duration': labels['duration'].to(self.device),
+                    'direction': labels['direction'].to(self.device),
+                    'next_channel': labels['next_channel'].to(self.device),
+                }
+
+                # v9.0.0: Add trigger_tf target if present
+                if 'trigger_tf' in labels:
+                    targets['trigger_tf'] = labels['trigger_tf'].to(self.device)
+
+                # Window selection targets (for learned_selection strategy)
+                if self.config.use_window_selection_loss:
+                    if 'best_window' in labels:
+                        targets['best_window'] = labels['best_window'].to(self.device)
+                    if 'window_scores' in labels:
+                        targets['window_scores'] = labels['window_scores'].to(self.device)
+
+                # Extract validity masks (v9.0.0 format required)
+                masks = {
+                    'duration_valid': labels['duration_valid'].to(self.device),
+                    'direction_valid': labels['direction_valid'].to(self.device),
+                    'next_channel_valid': labels['next_channel_valid'].to(self.device),
+                }
+                direction_mask = masks['direction_valid']
+                next_channel_mask = masks['next_channel_valid']
+                trigger_tf_mask = None
+                if 'trigger_tf_valid' in labels:
+                    masks['trigger_tf_valid'] = labels['trigger_tf_valid'].to(self.device)
+                    trigger_tf_mask = masks['trigger_tf_valid']
+
+                # Forward pass
+                if self.config.use_amp:
+                    # Use device type directly (supports cuda, mps, cpu)
+                    with autocast(self.device.type):
+                        if is_end_to_end:
+                            predictions = self.model(x, window_scores=window_scores, window_valid=window_valid)
+                        else:
+                            predictions = self.model(x)
+                        loss, loss_dict = self.criterion(predictions, targets, masks)
+                else:
+                    if is_end_to_end:
+                        predictions = self.model(x, window_scores=window_scores, window_valid=window_valid)
+                    else:
+                        predictions = self.model(x)
+                    loss, loss_dict = self.criterion(predictions, targets, masks)
+
+                # Track losses (skip nested dicts like 'weights')
+                for k, v in loss_dict.items():
+                    if isinstance(v, dict):
+                        continue  # Skip nested dicts
+                    if k in epoch_losses:
+                        epoch_losses[k].append(v)
+                    else:
+                        # Warn about unknown keys - helps catch mismatches between loss and trainer
+                        print(f"⚠️ Warning: Unknown loss key '{k}' ignored in validation (value={v})")
+
+                # Accumulate for MetricsCalculator (detailed per-TF metrics)
+                # For survival loss, convert hazard to duration_mean/std (matches predict() behavior)
+                if (hasattr(self.model, 'num_hazard_bins') and self.model.num_hazard_bins > 0 and
+                    'duration_hazard' in predictions and predictions['duration_hazard'] is not None):
+                    # Convert hazard to duration stats for MetricsCalculator
+                    duration_mean_converted, duration_std_converted = hazard_to_duration_stats(
+                        predictions['duration_hazard'],
+                        num_bins=self.model.num_hazard_bins,
+                        max_duration=self.model.max_duration
+                    )
+                    all_predictions['duration_mean'].append(duration_mean_converted.cpu())
+                    # Store log_std for consistency (MetricsCalculator expects log_std)
+                    duration_log_std_converted = torch.log(duration_std_converted + 1e-6)
+                    all_predictions['duration_log_std'].append(duration_log_std_converted.cpu())
+                else:
+                    all_predictions['duration_mean'].append(predictions['duration_mean'].cpu())
+                    all_predictions['duration_log_std'].append(predictions['duration_log_std'].cpu())
+                all_predictions['direction_logits'].append(predictions['direction_logits'].cpu())
+                all_predictions['next_channel_logits'].append(predictions['next_channel_logits'].cpu())
+                all_targets['duration'].append(targets['duration'].cpu())
+                all_targets['direction'].append(targets['direction'].cpu())
+                all_targets['next_channel'].append(targets['next_channel'].cpu())
+                all_masks['duration_valid'].append(masks['duration_valid'].cpu())
+                all_masks['direction_valid'].append(masks['direction_valid'].cpu())
+                all_masks['next_channel_valid'].append(masks['next_channel_valid'].cpu())
+
+                # Calculate accuracies (direction is binary, next_channel is 3-class)
+                # Weight by mask - only count valid samples
+                direction_probs = torch.sigmoid(predictions['direction_logits'])
+                direction_pred = (direction_probs > 0.5).long()
+                direction_matches = (direction_pred == targets['direction']).float()
+
+                next_channel_pred = predictions['next_channel_logits'].argmax(dim=-1)
+                next_channel_matches = (next_channel_pred == targets['next_channel']).float()
+
+                direction_correct += (direction_matches * direction_mask).sum().item()
+                next_channel_correct += (next_channel_matches * next_channel_mask).sum().item()
+                total_valid_samples += direction_mask.sum().item()
+                total_next_channel_samples += next_channel_mask.sum().item()
+
+                # Duration metrics (MAE and RMSE)
+                # Use hazard-derived expected duration if available (for survival loss)
+                if (hasattr(self.model, 'num_hazard_bins') and self.model.num_hazard_bins > 0 and
+                    'duration_hazard' in predictions and predictions['duration_hazard'] is not None):
+                    # Use same conversion as MetricsCalculator and predict() for consistency
+                    duration_pred, _ = hazard_to_duration_stats(
+                        predictions['duration_hazard'],
+                        num_bins=self.model.num_hazard_bins,
+                        max_duration=self.model.max_duration
+                    )
+                    if duration_pred.dim() == 1:  # If aggregate [batch], expand to [batch, num_tfs]
+                        duration_pred = duration_pred.unsqueeze(1).expand(-1, targets['duration'].shape[1])
+                else:
+                    duration_pred = predictions['duration_mean']
+
+                duration_target = targets['duration']
+                duration_mask = masks.get('duration_valid', torch.ones_like(duration_target))
+                duration_errors = torch.abs(duration_pred - duration_target)
+                duration_squared_errors = (duration_pred - duration_target) ** 2
+
+                duration_mae_sum += (duration_errors * duration_mask).sum().item()
+                duration_mse_sum += (duration_squared_errors * duration_mask).sum().item()
+                duration_valid_count += duration_mask.sum().item()
+
+                # v9.0.0: Calculate trigger_tf accuracy (aggregate-only, 21-class)
+                if ('aggregate' in predictions and
+                    'trigger_tf_logits' in predictions.get('aggregate', {}) and
+                    'trigger_tf' in targets):
+                    trigger_tf_pred = predictions['aggregate']['trigger_tf_logits'].argmax(dim=-1)  # [batch]
+                    trigger_tf_target = targets['trigger_tf']
+                    # Use first TF's target if per-TF shaped
+                    if trigger_tf_target.dim() > 1 and trigger_tf_target.size(1) > 1:
+                        trigger_tf_target = trigger_tf_target[:, 0]
+                    elif trigger_tf_target.dim() > 1:
+                        trigger_tf_target = trigger_tf_target.squeeze(-1)
+
+                    trigger_tf_matches = (trigger_tf_pred == trigger_tf_target).float()
+
+                    if trigger_tf_mask is not None:
+                        # Use first TF's validity for aggregate
+                        if trigger_tf_mask.dim() > 1 and trigger_tf_mask.size(1) > 1:
+                            trigger_tf_mask_agg = trigger_tf_mask[:, 0]
+                        else:
+                            trigger_tf_mask_agg = trigger_tf_mask.squeeze(-1) if trigger_tf_mask.dim() > 1 else trigger_tf_mask
+                        trigger_tf_correct += (trigger_tf_matches * trigger_tf_mask_agg).sum().item()
+                        total_trigger_tf_samples += trigger_tf_mask_agg.sum().item()
+                    else:
+                        trigger_tf_correct += trigger_tf_matches.sum().item()
+                        total_trigger_tf_samples += trigger_tf_matches.numel()
+
+        # Average losses and accuracies
+        epoch_metrics = {k: np.mean(v) if v else 0.0 for k, v in epoch_losses.items()}
+        epoch_metrics['direction_acc'] = direction_correct / total_valid_samples if total_valid_samples > 0 else 0.0
+        epoch_metrics['next_channel_acc'] = next_channel_correct / total_next_channel_samples if total_next_channel_samples > 0 else 0.0
+        epoch_metrics['trigger_tf_acc'] = trigger_tf_correct / total_trigger_tf_samples if total_trigger_tf_samples > 0 else 0.0  # v9.0.0
+
+        # Duration MAE and RMSE metrics
+        epoch_metrics['duration_mae'] = duration_mae_sum / duration_valid_count if duration_valid_count > 0 else 0.0
+        epoch_metrics['duration_rmse'] = np.sqrt(duration_mse_sum / duration_valid_count) if duration_valid_count > 0 else 0.0
+
+        # Compute detailed per-TF metrics using MetricsCalculator (parallel to inline metrics)
+        # This provides per-TF MAEs without replacing existing checkpoint metrics
+        if len(all_predictions['duration_mean']) > 0:  # Check if any batches were processed
+            concatenated_predictions = {k: torch.cat(v, dim=0) for k, v in all_predictions.items()}
+            concatenated_targets = {k: torch.cat(v, dim=0) for k, v in all_targets.items()}
+            concatenated_masks = {k: torch.cat(v, dim=0) for k, v in all_masks.items()}
+
+            detailed_metrics = self.metrics_calculator.compute_metrics(
+                concatenated_predictions,
+                concatenated_targets,
+                concatenated_masks
+            )
+
+            # Add per-TF MAEs to epoch_metrics for logging
+            for key, value in detailed_metrics.items():
+                if 'duration_mae_' in key:  # Only add per-TF duration MAEs
+                    epoch_metrics[key] = value
+
+        return epoch_metrics
+
+    def save_checkpoint(self, filename: str, is_best: bool = False):
+        """Save model checkpoint."""
+        # Ensure model_kwargs includes architecture parameters from TrainingConfig
+        # This is critical for dashboards to reconstruct models properly
+        model_kwargs = dict(self.config.model_kwargs) if self.config.model_kwargs else {}
+
+        # SE-blocks parameters
+        if 'use_se_blocks' not in model_kwargs:
+            model_kwargs['use_se_blocks'] = self.config.use_se_blocks
+        if 'se_reduction_ratio' not in model_kwargs:
+            model_kwargs['se_reduction_ratio'] = self.config.se_reduction_ratio
+
+        # TCN block parameters
+        if 'use_tcn' not in model_kwargs:
+            model_kwargs['use_tcn'] = self.config.use_tcn
+        if 'tcn_channels' not in model_kwargs:
+            model_kwargs['tcn_channels'] = self.config.tcn_channels
+        if 'tcn_kernel_size' not in model_kwargs:
+            model_kwargs['tcn_kernel_size'] = self.config.tcn_kernel_size
+        if 'tcn_layers' not in model_kwargs:
+            model_kwargs['tcn_layers'] = self.config.tcn_layers
+
+        # Multi-resolution heads parameters
+        if 'use_multi_resolution' not in model_kwargs:
+            model_kwargs['use_multi_resolution'] = self.config.use_multi_resolution
+        if 'resolution_levels' not in model_kwargs:
+            model_kwargs['resolution_levels'] = self.config.resolution_levels
+
+        # Loss configuration
+        if 'duration_loss_type' not in model_kwargs:
+            model_kwargs['duration_loss_type'] = self.config.duration_loss_type
+        if 'direction_loss_type' not in model_kwargs:
+            model_kwargs['direction_loss_type'] = self.config.direction_loss_type
+        if 'num_hazard_bins' not in model_kwargs:
+            model_kwargs['num_hazard_bins'] = 50 if self.config.duration_loss_type == 'survival' else 0
+        if 'huber_delta' not in model_kwargs:
+            model_kwargs['huber_delta'] = self.config.huber_delta if hasattr(self.config, 'huber_delta') else 1.0
+        if 'focal_gamma' not in model_kwargs:
+            model_kwargs['focal_gamma'] = self.config.focal_gamma if hasattr(self.config, 'focal_gamma') else 2.0
+
+        # Training strategy
+        if 'gradient_balancing' not in model_kwargs:
+            model_kwargs['gradient_balancing'] = self.config.gradient_balancing if hasattr(self.config, 'gradient_balancing') else 'none'
+        if 'gradnorm_alpha' not in model_kwargs:
+            model_kwargs['gradnorm_alpha'] = self.config.gradnorm_alpha if hasattr(self.config, 'gradnorm_alpha') else 1.5
+        if 'two_stage_training' not in model_kwargs:
+            model_kwargs['two_stage_training'] = self.config.two_stage_training if hasattr(self.config, 'two_stage_training') else False
+        if 'stage1_epochs' not in model_kwargs:
+            model_kwargs['stage1_epochs'] = self.config.stage1_epochs if hasattr(self.config, 'stage1_epochs') else 5
+        if 'stage1_task' not in model_kwargs:
+            model_kwargs['stage1_task'] = self.config.stage1_task if hasattr(self.config, 'stage1_task') else 'direction'
+
+        # Calibration configuration
+        if 'calibration_mode' not in model_kwargs:
+            model_kwargs['calibration_mode'] = self.config.calibration_mode if hasattr(self.config, 'calibration_mode') else 'brier_per_tf'
+
+        # Create a copy of config with updated model_kwargs
+        # We modify the dataclass directly since it will be serialized
+        self.config.model_kwargs = model_kwargs
+
+        checkpoint = {
+            'epoch': self.current_epoch,
+            'global_step': self.global_step,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'loss_state_dict': self.criterion.state_dict(),  # Save learnable loss weights
+            'best_val_metric': self.best_val_metric,
+            'config': self.config,
+            'train_metrics_history': self.train_metrics_history,
+            'val_metrics_history': self.val_metrics_history,
+        }
+
+        if self.scheduler:
+            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+
+        if self.scaler:
+            checkpoint['scaler_state_dict'] = self.scaler.state_dict()
+
+        save_path = self.config.save_dir / filename
+        torch.save(checkpoint, save_path)
+
+        if is_best:
+            best_path = self.config.save_dir / 'best_model.pt'
+            torch.save(checkpoint, best_path)
+            print(f"Saved best model to {best_path}")
+
+    def load_checkpoint(self, checkpoint_path: Path):
+        """Load model checkpoint with graceful handling of architecture mismatches."""
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+
+        # Load model state with strict=False to handle architecture mismatches
+        incompatible_keys = self.model.load_state_dict(
+            checkpoint['model_state_dict'],
+            strict=False
+        )
+
+        # Log warnings about missing/extra keys
+        if incompatible_keys.missing_keys:
+            print(f"WARNING: {len(incompatible_keys.missing_keys)} missing keys in checkpoint")
+            for key in incompatible_keys.missing_keys[:3]:
+                print(f"  - {key}")
+            if len(incompatible_keys.missing_keys) > 3:
+                print(f"  ... and {len(incompatible_keys.missing_keys) - 3} more")
+
+        if incompatible_keys.unexpected_keys:
+            print(f"WARNING: {len(incompatible_keys.unexpected_keys)} unexpected keys in checkpoint")
+            for key in incompatible_keys.unexpected_keys[:3]:
+                print(f"  - {key}")
+            if len(incompatible_keys.unexpected_keys) > 3:
+                print(f"  ... and {len(incompatible_keys.unexpected_keys) - 3} more")
+
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.current_epoch = checkpoint['epoch']
+        self.global_step = checkpoint['global_step']
+        self.best_val_metric = checkpoint['best_val_metric']
+        self.train_metrics_history = checkpoint.get('train_metrics_history', [])
+        self.val_metrics_history = checkpoint.get('val_metrics_history', [])
+
+        # Load learnable loss weights if present
+        if 'loss_state_dict' in checkpoint:
+            incompatible_loss_keys = self.criterion.load_state_dict(
+                checkpoint['loss_state_dict'],
+                strict=False
+            )
+            if incompatible_loss_keys.missing_keys or incompatible_loss_keys.unexpected_keys:
+                print(f"WARNING: Loss state has {len(incompatible_loss_keys.missing_keys)} missing, "
+                      f"{len(incompatible_loss_keys.unexpected_keys)} unexpected keys")
+
+        if self.scheduler and 'scheduler_state_dict' in checkpoint:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        if self.scaler and 'scaler_state_dict' in checkpoint:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+        print(f"Loaded checkpoint from epoch {self.current_epoch}")
+
+    def reset_training_state(self):
+        """Reset training state for next walk-forward window."""
+        self.current_epoch = 0
+        self.global_step = 0
+        self.epochs_without_improvement = 0
+        self.best_val_metric = float('inf') if self.config.early_stopping_mode == 'min' else float('-inf')
+        self.train_metrics_history = []
+        self.val_metrics_history = []
+
+    def update_dataloaders(self, train_loader, val_loader, test_loader=None):
+        """Update dataloaders for next walk-forward window."""
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        if test_loader:
+            self.test_loader = test_loader
+
+    def get_fold_metrics(self) -> Dict:
+        """Get current fold metrics for walk-forward tracking."""
+        return {
+            'best_val_metric': self.best_val_metric,
+            'train_history': self.train_metrics_history,
+            'val_history': self.val_metrics_history,
+            'epochs_trained': self.current_epoch,
+        }
+
+    def train(self) -> Dict[str, Any]:
+        """Main training loop with optional two-stage training."""
+        print(f"Starting training on {self.device}")
+        print(f"Expected feature dimensions: {TOTAL_FEATURES}")
+        print(f"Training samples: {len(self.train_loader.dataset)}")
+        print(f"Validation samples: {len(self.val_loader.dataset)}")
+
+        # Setup stage 1 if two-stage training enabled
+        if self.two_stage_training and self.current_stage == 1:
+            self._setup_stage1()
+
+        for epoch in range(self.current_epoch, self.config.num_epochs):
+            self.current_epoch = epoch
+            epoch_start_time = time.time()
+
+            # Check for stage transition
+            if self.two_stage_training:
+                if self.current_stage == 1 and epoch >= self.stage1_epochs:
+                    self.current_stage = 2
+                    self._setup_stage2()
+                    print(f"\n{'='*50}")
+                    print(f"Stage 2 starting at epoch {epoch}")
+                    print(f"{'='*50}\n")
+
+            # Train
+            train_metrics = self.train_epoch()
+
+            # Validate
+            val_metrics = self.validate()
+
+            # Update scheduler
+            if self.scheduler:
+                if isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                    self.scheduler.step(val_metrics[self.config.early_stopping_metric])
+                else:
+                    self.scheduler.step()
+
+            # Track history
+            self.train_metrics_history.append(train_metrics)
+            self.val_metrics_history.append(val_metrics)
+
+            # Log to tensorboard
+            if self.writer:
+                for k, v in val_metrics.items():
+                    self.writer.add_scalar(f'val/{k}', v, epoch)
+
+            # Print epoch summary
+            epoch_time = time.time() - epoch_start_time
+            # Log current stage
+            stage_str = f" [Stage {self.current_stage}]" if self.two_stage_training else ""
+            print(f"\nEpoch {epoch + 1}/{self.config.num_epochs}{stage_str} ({epoch_time:.1f}s):")
+            print(f"  Train Loss: {train_metrics['total']:.4f}")
+            print(f"  Val Loss: {val_metrics['total']:.4f}")
+            # v9.0.0: Include trigger_tf accuracy if present
+            trigger_tf_str = f", TrigTF={val_metrics.get('trigger_tf_acc', 0):.3f}" if 'trigger_tf_acc' in val_metrics else ""
+            duration_mae_str = f", DurMAE={val_metrics.get('duration_mae', 0):.3f}" if 'duration_mae' in val_metrics else ""
+            print(f"  Val Accuracies: Dir={val_metrics['direction_acc']:.3f}, "
+                  f"NextCh={val_metrics['next_channel_acc']:.3f}{trigger_tf_str}{duration_mae_str}")
+
+            # Check if this is the best model
+            current_metric = val_metrics[self.config.early_stopping_metric]
+            is_best = False
+
+            if self.config.early_stopping_mode == 'min':
+                if current_metric < self.best_val_metric:
+                    self.best_val_metric = current_metric
+                    is_best = True
+                    self.epochs_without_improvement = 0
+                else:
+                    self.epochs_without_improvement += 1
+            else:
+                if current_metric > self.best_val_metric:
+                    self.best_val_metric = current_metric
+                    is_best = True
+                    self.epochs_without_improvement = 0
+                else:
+                    self.epochs_without_improvement += 1
+
+            # Save checkpoint
+            if (epoch + 1) % self.config.save_every_n_epochs == 0 or is_best:
+                if self.config.save_best_only and not is_best:
+                    pass
+                else:
+                    self.save_checkpoint(f'checkpoint_epoch_{epoch + 1}.pt', is_best=is_best)
+
+            # Early stopping (skip if patience is 0 = disabled)
+            if self.config.early_stopping_patience > 0 and self.epochs_without_improvement >= self.config.early_stopping_patience:
+                print(f"\nEarly stopping triggered after {epoch + 1} epochs")
+                break
+
+        # Close tensorboard writer
+        if self.writer:
+            self.writer.close()
+
+        # Return training history with two-stage info
+        results = {
+            'train': self.train_metrics_history,
+            'val': self.val_metrics_history,
+            'two_stage_training': self.two_stage_training,
+            'stage1_epochs': self.stage1_epochs if self.two_stage_training else 0,
+            'stage1_task': self.stage1_task if self.two_stage_training else None,
+        }
+        return results
+
+
+if __name__ == '__main__':
+    """
+    Example usage placeholder.
+
+    To use this trainer, you need to:
+    1. Define your model architecture (nn.Module)
+    2. Create dataloaders using dataset.py
+    3. Configure TrainingConfig
+    4. Create Trainer and call train()
+
+    See example_training.py for a complete example.
+    """
+    print("Trainer module loaded.")
+    print("This module requires a model definition to run training.")
+    print("See TrainingConfig and Trainer classes for usage.")

@@ -1,0 +1,98 @@
+{
+  "gbt": {
+    "lifetime_mae": 52.136713829975,
+    "break_dir_accuracy": 0.4738675958188153,
+    "action_accuracy": 0.42857142857142855,
+    "future_return_5_mae": 0.0037034501148389036,
+    "future_return_5_dir_acc": 0.5679442508710801,
+    "future_return_20_mae": 0.007933185543616935,
+    "future_return_20_dir_acc": 0.4808362369337979,
+    "future_return_60_mae": 0.014832903327160231,
+    "future_return_60_dir_acc": 0.4843205574912892,
+    "test_lifetime_mae": 49.77482400227169,
+    "test_break_dir_acc": 0.4583333333333333,
+    "test_action_acc": 0.4791666666666667
+  },
+  "survival": {
+    "concordance_index": 0.6212660926149273,
+    "best_val_loss": 5.129554748535156,
+    "median_survival_mae": 18.783920288085938,
+    "test_concordance": 0.5682974770456932,
+    "test_median_mae": 25.922727584838867
+  },
+  "transformer": {
+    "lifetime_mae": 70.15306353569031,
+    "break_dir_accuracy": 0.5609756112098694,
+    "action_accuracy": 0.407665491104126,
+    "return_5_dir_acc": 0.5052264928817749,
+    "return_20_dir_acc": 0.5156794190406799,
+    "return_60_dir_acc": 0.37979093194007874,
+    "best_val_loss": 2.181424617767334,
+    "test_lifetime_mae": 66.56143951416016,
+    "test_break_dir_acc": 0.3715277777777778,
+    "test_action_acc": 0.3680555555555556,
+    "test_return_20_dir_acc": 0.4930555555555556
+  },
+  "trade_quality": {
+    "win_accuracy": 0.6132404181184669,
+    "win_auc": 0.5973256924546323,
+    "pnl_mae": 0.7899795215936659,
+    "pnl_dir_acc": 0.42334494773519166,
+    "quality_mae": 0.7899795215936659,
+    "quality_dir_acc": 0.42334494773519166,
+    "test_win_accuracy": 0.6069565217391304,
+    "test_win_auc": 0.5753523809523811,
+    "test_pnl_dir_acc": 0.5147826086956522
+  },
+  "ensemble": {
+    "action_accuracy": 0.45993031358885017,
+    "break_dir_accuracy": 0.4738675958188153,
+    "lifetime_mae": 46.411205694627505,
+    "test_action_acc": 0.5416666666666666,
+    "test_break_dir_acc": 0.4236111111111111,
+    "test_lifetime_mae": 43.76168885613512
+  },
+  "regime": {
+    "regime_accuracy": 0.8327526132404182,
+    "action_accuracy": 0.4181184668989547,
+    "trending_up_action_acc": 0.36666666666666664,
+    "trending_down_action_acc": 0.4411764705882353,
+    "volatile_action_acc": 0.5087719298245614,
+    "quiet_action_acc": 0.3302752293577982,
+    "break_dir_accuracy": 0.47735191637630664,
+    "trending_up_break_dir_acc": 0.6,
+    "trending_down_break_dir_acc": 0.5588235294117647,
+    "volatile_break_dir_acc": 0.39473684210526316,
+    "quiet_break_dir_acc": 0.5045871559633027,
+    "test_action_acc": 0.4652777777777778,
+    "test_break_dir_acc": 0.4652777777777778
+  },
+  "temporal_attention": {
+    "action_accuracy": 0.4392857142857143,
+    "break_dir_accuracy": 0.4392857142857143,
+    "lifetime_mae": 72.84134674072266,
+    "best_val_loss": 2.8653363466262816,
+    "test_action_acc": 0.47686832740213525,
+    "test_break_dir_acc": 0.3594306049822064,
+    "test_lifetime_mae": 58.488746643066406
+  },
+  "trend_gbt": {
+    "action_accuracy": 0.375,
+    "break_dir_accuracy": 0.6642857142857143,
+    "lifetime_mae": 52.091083106898814,
+    "test_action_acc": 0.5444839857651246,
+    "test_break_dir_acc": 0.4804270462633452,
+    "test_lifetime_mae": 46.64352448575654
+  },
+  "physics_residual": {
+    "physics_action_acc": 0.233,
+    "physics_bd_acc": 0.387,
+    "action_correct_acc": 0.756,
+    "bd_correct_acc": 0.613,
+    "confidence_scale_mae": 0.067,
+    "lifetime_error_mae": 54.25,
+    "raw_lifetime_mae": 66.42,
+    "corrected_lifetime_mae": 54.25,
+    "lifetime_improvement_pct": 18.32
+  }
+}

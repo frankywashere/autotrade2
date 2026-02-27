@@ -1,0 +1,243 @@
+================================================================================
+V15 C++ SCANNER - QUICK START GUIDE
+================================================================================
+
+Version: 1.0.0
+Date: 2026-01-25
+
+--------------------------------------------------------------------------------
+BUILD (3 commands)
+--------------------------------------------------------------------------------
+
+1. Navigate to project directory:
+   cd /Users/frank/Desktop/CodingProjects/x14/v15_cpp
+
+2. Build with installation script (recommended):
+   ./install.sh --install
+
+   OR manually:
+   mkdir -p build && cd build
+   cmake -DCMAKE_BUILD_TYPE=Release ..
+   make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+
+3. Verify build:
+   ./build/v15_scanner --version
+
+--------------------------------------------------------------------------------
+RUN (2 examples)
+--------------------------------------------------------------------------------
+
+Basic scan (10,000 samples):
+   ./build/v15_scanner \
+     --data-dir ../data \
+     --output samples.bin \
+     --step 10 \
+     --max-samples 10000
+
+High-performance scan (8 workers, unlimited samples):
+   ./build/v15_scanner \
+     --data-dir ../data \
+     --output samples.bin \
+     --step 10 \
+     --workers 8 \
+     --verbose
+
+--------------------------------------------------------------------------------
+VALIDATE (1 command)
+--------------------------------------------------------------------------------
+
+Verify scanner produces correct output:
+   cd build && ctest --output-on-failure
+
+--------------------------------------------------------------------------------
+PYTHON USAGE
+--------------------------------------------------------------------------------
+
+Import and use:
+   import sys
+   sys.path.insert(0, '/Users/frank/Desktop/CodingProjects/x14/v15_cpp/build')
+   import v15scanner_py
+
+   # Configure
+   config = v15scanner_py.ScannerConfig()
+   config.step = 10
+   config.workers = 8
+
+   # Run
+   scanner = v15scanner_py.Scanner(config)
+   samples = scanner.scan(tsla_df, spy_df, vix_df)
+
+   # Stats
+   stats = scanner.get_stats()
+   print(f"Generated {stats.samples_created} samples in {stats.total_duration_ms/1000:.2f}s")
+
+--------------------------------------------------------------------------------
+COMMON ISSUES & FIXES
+--------------------------------------------------------------------------------
+
+Issue: CMake not found
+Fix:  brew install cmake  (macOS)
+      sudo apt-get install cmake  (Linux)
+
+Issue: C++ compiler too old (need C++17)
+Fix:  brew install gcc  (macOS)
+      sudo apt-get install g++-11  (Linux)
+
+Issue: Eigen3 not found
+Fix:  CMake will auto-fetch Eigen3
+      OR: brew install eigen  (macOS)
+          sudo apt-get install libeigen3-dev  (Linux)
+
+Issue: Poor performance
+Fix:  Rebuild in Release mode:
+      cd build && rm -rf * && cmake -DCMAKE_BUILD_TYPE=Release .. && make -j$(nproc)
+
+Issue: Out of memory
+Fix:  Reduce batch size:
+      v15_scanner --batch-size 4 --max-samples 1000 --data-dir ../data --output samples.bin
+
+Issue: Python module not found
+Fix:  Add build directory to PYTHONPATH:
+      export PYTHONPATH=/Users/frank/Desktop/CodingProjects/x14/v15_cpp/build:$PYTHONPATH
+
+Issue: Scanner segfaults
+Fix:  1. Verify data files exist and are valid CSV
+      2. Check available memory (need 8GB+ RAM)
+      3. Run with debug build to get backtrace:
+         cd build && cmake -DCMAKE_BUILD_TYPE=Debug .. && make && ./v15_scanner ...
+
+--------------------------------------------------------------------------------
+COMMAND-LINE OPTIONS
+--------------------------------------------------------------------------------
+
+Required:
+  --data-dir PATH          Directory with TSLA.csv, SPY.csv, VIX.csv
+  --output PATH            Output file (.bin or .pkl)
+
+Common:
+  --step N                 Channel detection step (default: 10)
+  --max-samples N          Max samples to generate (default: unlimited)
+  --workers N              Worker threads (default: auto-detect)
+  --batch-size N           Channels per batch (default: 8)
+  --verbose                Show detailed logging
+  --progress               Show progress bars (default: true)
+
+Advanced:
+  --warmup-bars N          Warmup period (default: 32760)
+  --strict                 Strict mode - fail on errors
+  --help                   Full help
+  --version                Show version
+
+--------------------------------------------------------------------------------
+PERFORMANCE EXPECTATIONS
+--------------------------------------------------------------------------------
+
+Expected performance (vs Python baseline):
+  - Channel detection: 10-100x faster
+  - Label generation:  10-50x faster
+  - Feature extraction: 5-10x faster
+  - Overall pipeline:   10-20x faster
+
+Throughput:
+  - Python baseline: ~30 samples/sec
+  - C++ scanner:     300-500 samples/sec (10-15x faster)
+
+Memory:
+  - Python baseline: ~15 GB peak
+  - C++ scanner:     ~5-7 GB peak (2-3x better)
+
+Typical execution time (440K bars, 10 timeframes):
+  - Python: ~800-1000 seconds
+  - C++:    ~30-50 seconds
+
+--------------------------------------------------------------------------------
+FILE LOCATIONS
+--------------------------------------------------------------------------------
+
+After installation:
+
+Executable:     ~/.local/bin/v15_scanner
+              OR /usr/local/bin/v15_scanner (system install)
+
+Headers:        ~/.local/include/v15scanner/*.hpp
+              OR /usr/local/include/v15scanner/*.hpp
+
+Python module:  ~/.local/python/v15scanner_py.so
+              OR in Python site-packages
+
+Documentation:  /Users/frank/Desktop/CodingProjects/x14/v15_cpp/DEPLOYMENT.md
+              /Users/frank/Desktop/CodingProjects/x14/v15_cpp/README.md
+
+--------------------------------------------------------------------------------
+TYPICAL WORKFLOW
+--------------------------------------------------------------------------------
+
+1. Build scanner:
+   ./install.sh --install
+
+2. Prepare data:
+   # Ensure CSV files in correct format:
+   # timestamp,open,high,low,close,volume
+   ls -lh ../data/*.csv
+
+3. Run scan:
+   v15_scanner --data-dir ../data --output samples.bin --workers 8 --max-samples 10000
+
+4. Verify output:
+   ls -lh samples.bin
+   # Should be ~600KB per 1000 samples
+
+5. Use in Python:
+   python3 -c "
+   import sys
+   sys.path.insert(0, '$HOME/.local/python')
+   import pickle
+   # Load and use samples
+   "
+
+--------------------------------------------------------------------------------
+GETTING HELP
+--------------------------------------------------------------------------------
+
+Documentation:
+  cat DEPLOYMENT.md         # Full deployment guide
+  cat README.md             # Project overview
+  cat PERFORMANCE_BENCHMARK.md  # Performance details
+
+  ./v15_scanner --help      # Command-line help
+
+Examples:
+  ls examples/              # Example code
+  cat examples/quick_start.cpp
+
+Support:
+  GitHub: github.com/yourrepo/v15_cpp
+  Docs:   /Users/frank/Desktop/CodingProjects/x14/v15_cpp/docs/
+
+--------------------------------------------------------------------------------
+QUICK REFERENCE - MOST COMMON COMMANDS
+--------------------------------------------------------------------------------
+
+# Build and install
+./install.sh --install
+
+# Run with defaults
+v15_scanner --data-dir ../data --output samples.bin
+
+# High performance
+v15_scanner --data-dir ../data --output samples.bin --workers 8 --step 10
+
+# Limited samples (testing)
+v15_scanner --data-dir ../data --output test.bin --max-samples 100 --verbose
+
+# Clean rebuild
+./install.sh --clean --install
+
+# Test Python module
+python3 -c "import sys; sys.path.insert(0, 'build'); import v15scanner_py; print(v15scanner_py.__version__)"
+
+================================================================================
+For complete documentation, see DEPLOYMENT.md
+For performance details, see PERFORMANCE_BENCHMARK.md
+For troubleshooting, see DEPLOYMENT.md section 7
+================================================================================

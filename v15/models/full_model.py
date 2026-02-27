@@ -1,0 +1,540 @@
+"""
+Full V15 Channel Prediction Model.
+
+Takes all 8,632+ features, applies explicit weights, encodes per-TF,
+applies cross-TF attention, and produces predictions.
+"""
+import torch
+import logging
+
+logger = logging.getLogger(__name__)
+
+import torch.nn as nn
+from typing import Dict, Optional, Tuple
+
+from .feature_weights import ExplicitFeatureWeights, FeatureGating
+from .tf_encoder import MultiTFEncoder
+from .cross_tf_attention import CrossTFAttention, HorizonGroupedAttention, TFAggregator
+from .prediction_heads import PredictionHeads, PerTFPredictionHeads, PerTFPredictionHeadsV2
+from .sequence_branch import PerTFWindowLSTM
+from ..config import (
+    TOTAL_FEATURES, N_TIMEFRAMES, FEATURES_PER_TF,
+    FEATURE_COUNTS, MODEL_CONFIG, WINDOW_INDEPENDENT_PER_TF, N_WINDOWS
+)
+from ..exceptions import ModelError
+
+
+class V15Model(nn.Module):
+    """
+    Complete V15 Channel Prediction Model.
+
+    Architecture:
+        Input (8,665 features)
+            ↓
+        Feature Validation (check for NaN/Inf)
+            ↓
+        Explicit Feature Weights (8,665 learnable weights)
+            ↓
+        Feature Gating (optional, learns to suppress features)
+            ↓
+        Split into TF features (11 x 782) + Shared features (63)
+            ↓
+        Per-TF Encoders (11 encoders → 11 x 128 embeddings)
+            ↓
+        Cross-TF Attention (learns TF relationships)
+            ↓
+        TF Aggregator (11 x 128 → 256)
+            ↓
+        Prediction Heads (duration, direction, new_channel)
+            ↓
+        [Optional] Window Selector (learned window selection)
+
+    When use_window_selector=True, the model also predicts which of the 8
+    lookback windows is optimal. This enables end-to-end training where
+    the duration loss backpropagates through the window selection.
+    """
+
+    def __init__(
+        self,
+        input_dim: int = TOTAL_FEATURES,
+        n_timeframes: int = N_TIMEFRAMES,
+        features_per_tf: int = FEATURES_PER_TF,
+        hidden_dim: int = 256,
+        embed_dim: int = 128,
+        n_attention_heads: int = 8,
+        dropout: float = 0.1,
+        use_explicit_weights: bool = True,
+        use_gating: bool = False,
+        share_tf_weights: bool = False,
+        use_window_selector: bool = False,
+        num_windows: int = 8,
+        # Break scan label head flags
+        enable_tsla_heads: bool = False,
+        enable_spy_heads: bool = False,
+        enable_cross_correlation_heads: bool = False,
+        # Durability and RSI head flags
+        enable_durability_heads: bool = False,
+        enable_rsi_heads: bool = False,
+        # Per-TF head version: 1 = original lightweight, 2 = with TF embedding + bigger
+        per_tf_head_version: int = 1,
+        # Use horizon-grouped attention instead of global cross-TF attention
+        use_horizon_attention: bool = False,
+        # LSTM branch over 8-window channel sequences per TF
+        use_sequence_branch: bool = False,
+    ):
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.n_timeframes = n_timeframes
+        self.features_per_tf = features_per_tf
+        self.use_window_selector = use_window_selector
+        self.num_windows = num_windows
+        self.enable_tsla_heads = enable_tsla_heads
+        self.enable_spy_heads = enable_spy_heads
+        self.enable_cross_correlation_heads = enable_cross_correlation_heads
+        self.enable_durability_heads = enable_durability_heads
+        self.enable_rsi_heads = enable_rsi_heads
+        # Will be set to False if input_dim doesn't match TOTAL_FEATURES
+        self.use_sequence_branch = use_sequence_branch
+
+        # Shared features = events + bar metadata
+        self.shared_features_dim = (
+            FEATURE_COUNTS['events_total'] +
+            FEATURE_COUNTS['bar_metadata_per_tf'] * n_timeframes
+        )
+
+        # Validate or compute features_per_tf from input_dim
+        # This allows flexibility when C++ scanner produces different feature counts
+        expected_dim = features_per_tf * n_timeframes + self.shared_features_dim
+        if input_dim != expected_dim:
+            # Compute features_per_tf from actual input_dim
+            computed_per_tf = (input_dim - self.shared_features_dim) // n_timeframes
+            if computed_per_tf * n_timeframes + self.shared_features_dim == input_dim:
+                logger.info(
+                    f"Adjusting features_per_tf: {features_per_tf} -> {computed_per_tf} "
+                    f"(input_dim={input_dim})"
+                )
+                self.features_per_tf = computed_per_tf
+            else:
+                # Can't evenly divide, use input_dim directly as flat features
+                logger.warning(
+                    f"Input dim {input_dim} doesn't match expected structure. "
+                    f"Using flat feature processing."
+                )
+                self.features_per_tf = (input_dim - self.shared_features_dim) // n_timeframes
+
+        # 1. Explicit Feature Weights
+        if use_explicit_weights:
+            self.feature_weights = ExplicitFeatureWeights(input_dim)
+        else:
+            self.feature_weights = None
+
+        # 2. Optional Feature Gating
+        if use_gating:
+            self.feature_gating = FeatureGating(input_dim)
+        else:
+            self.feature_gating = None
+
+        # 3. Per-TF Encoders
+        self.tf_encoder = MultiTFEncoder(
+            n_timeframes=n_timeframes,
+            features_per_tf=self.features_per_tf,
+            shared_features=self.shared_features_dim,
+            hidden_dim=hidden_dim,
+            output_dim=embed_dim,
+            share_weights=share_tf_weights,
+            dropout=dropout
+        )
+
+        # 4. Cross-TF Attention
+        if use_horizon_attention:
+            self.cross_tf_attention = HorizonGroupedAttention(
+                embed_dim=embed_dim,
+                n_heads=n_attention_heads,
+                dropout=dropout,
+            )
+        else:
+            self.cross_tf_attention = CrossTFAttention(
+                embed_dim=embed_dim,
+                n_heads=n_attention_heads,
+                dropout=dropout
+            )
+
+        # 5. TF Aggregator
+        self.tf_aggregator = TFAggregator(
+            embed_dim=embed_dim,
+            n_timeframes=n_timeframes,
+            strategy='attention',
+            output_dim=hidden_dim
+        )
+
+        # 6. Prediction Heads (with optional window selector and break scan heads)
+        self.prediction_heads = PredictionHeads(
+            input_dim=hidden_dim,
+            hidden_dim=hidden_dim // 2,
+            use_window_selector=use_window_selector,
+            num_windows=num_windows,
+            enable_tsla_heads=enable_tsla_heads,
+            enable_spy_heads=enable_spy_heads,
+            enable_cross_correlation_heads=enable_cross_correlation_heads,
+            enable_durability_heads=enable_durability_heads,
+            enable_rsi_heads=enable_rsi_heads,
+        )
+
+        # 7. Per-TF Prediction Heads for per-timeframe breakdown
+        if per_tf_head_version == 2:
+            self.per_tf_heads = PerTFPredictionHeadsV2(
+                embed_dim=embed_dim,
+                hidden_dim=hidden_dim // 2,
+                n_timeframes=n_timeframes,
+            )
+        else:
+            self.per_tf_heads = PerTFPredictionHeads(
+                embed_dim=embed_dim,
+                hidden_dim=hidden_dim // 4,
+            )
+
+        # 8. Optional LSTM branch over per-TF window channel sequences
+        # CRITICAL: Only enable if using full 15350-feature format (offset calculations require it)
+        if use_sequence_branch and input_dim == TOTAL_FEATURES:
+            channel_per_window = (
+                FEATURE_COUNTS['channel_per_window'] +
+                FEATURE_COUNTS['spy_channel_per_window']
+            )  # 128
+            lstm_hidden = embed_dim // 2  # 64
+            self.window_lstm = PerTFWindowLSTM(
+                input_dim=channel_per_window,
+                hidden_dim=lstm_hidden,
+                num_layers=1,
+                dropout=dropout,
+            )
+            # Fusion: concat TF embedding [embed_dim] + LSTM output [2*lstm_hidden]
+            lstm_out_dim = lstm_hidden * 2  # 128 (bidirectional)
+            self.sequence_fusion = nn.Linear(embed_dim + lstm_out_dim, embed_dim)
+            # Gating: sigmoid gate to blend LSTM info with MLP output
+            self.sequence_gate = nn.Sequential(
+                nn.Linear(embed_dim + lstm_out_dim, embed_dim),
+                nn.Sigmoid(),
+            )
+            # Store layout info for window extraction
+            self._window_offset = WINDOW_INDEPENDENT_PER_TF
+            self._n_windows = N_WINDOWS
+            self._channel_per_window = channel_per_window
+            logger.info(f"LSTM sequence branch enabled (requires 15350 features)")
+        elif use_sequence_branch and input_dim != TOTAL_FEATURES:
+            logger.warning(
+                f"LSTM sequence branch disabled: requires {TOTAL_FEATURES} features, got {input_dim}. "
+                f"Old data format detected. LSTM will be skipped."
+            )
+            self.use_sequence_branch = False  # Disable to prevent NaN
+        else:
+            self.use_sequence_branch = use_sequence_branch
+
+    def validate_input(self, x: torch.Tensor) -> None:
+        """Check for NaN/Inf in input - LOUD failure."""
+        if torch.isnan(x).any():
+            nan_count = torch.isnan(x).sum().item()
+            raise ModelError(f"Input contains {nan_count} NaN values")
+        if torch.isinf(x).any():
+            inf_count = torch.isinf(x).sum().item()
+            raise ModelError(f"Input contains {inf_count} Inf values")
+
+    def split_features(
+        self,
+        x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Split input into per-TF features and shared features.
+
+        Args:
+            x: [batch, input_dim]
+
+        Returns:
+            tf_features: [batch, n_timeframes, features_per_tf]
+            shared_features: [batch, shared_features_dim]
+        """
+        batch_size = x.size(0)
+
+        # TF features are first (n_tf * features_per_tf)
+        tf_dim = self.n_timeframes * self.features_per_tf
+        tf_flat = x[:, :tf_dim]
+        tf_features = tf_flat.view(batch_size, self.n_timeframes, self.features_per_tf)
+
+        # Shared features are last
+        shared_features = x[:, tf_dim:]
+
+        return tf_features, shared_features
+
+    def extract_window_sequences(
+        self, tf_features: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Extract per-TF window channel features as a sequence.
+
+        Within each TF block of features_per_tf, the channel features for the
+        8 windows start at offset WINDOW_INDEPENDENT_PER_TF (338) and span
+        N_WINDOWS * channel_per_window (8 * 128 = 1024).
+
+        Args:
+            tf_features: [batch, n_tfs, features_per_tf]
+
+        Returns:
+            [batch, n_tfs, 8, 128] - 8 windows × 128 channel features per window
+        """
+        batch, n_tf, feat = tf_features.shape
+        offset = self._window_offset
+        n_win = self._n_windows
+        cpw = self._channel_per_window
+        # Extract the contiguous window block: [batch, n_tfs, 1024]
+        window_flat = tf_features[:, :, offset:offset + n_win * cpw]
+        # Reshape to [batch, n_tfs, 8, 128]
+        return window_flat.view(batch, n_tf, n_win, cpw)
+
+    def _fuse_sequence_branch(
+        self,
+        tf_embeddings: torch.Tensor,
+        window_sequences: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Fuse LSTM output with TF embeddings using gated fusion.
+
+        Args:
+            tf_embeddings: [batch, n_tfs, embed_dim] from TFEncoder + CrossTFAttention
+            window_sequences: [batch, n_tfs, 8, 128] raw window channel features
+
+        Returns:
+            [batch, n_tfs, embed_dim] fused embeddings
+        """
+        lstm_out = self.window_lstm(window_sequences)  # [batch, n_tfs, lstm_out_dim]
+
+        # Convert LSTM output to match embedding dtype (LSTM runs in FP32, embeddings might be bfloat16)
+        if lstm_out.dtype != tf_embeddings.dtype:
+            lstm_out = lstm_out.to(tf_embeddings.dtype)
+
+        combined = torch.cat([tf_embeddings, lstm_out], dim=-1)  # [B, n_tfs, embed_dim + lstm_out_dim]
+        gate = self.sequence_gate(combined)  # [B, n_tfs, embed_dim]
+        fused = self.sequence_fusion(combined)  # [B, n_tfs, embed_dim]
+        # Gate blends: gate * fused + (1 - gate) * tf_embeddings
+        return gate * fused + (1 - gate) * tf_embeddings
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_attention: bool = False,
+        return_per_tf: bool = False,
+        validate: bool = True,
+        window_selector_temperature: float = 1.0,
+        window_selector_hard: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass.
+
+        Args:
+            x: [batch, input_dim] raw features
+            return_attention: If True, include attention weights in output
+            return_per_tf: If True, include per-TF predictions under 'per_tf' key
+            validate: If True, check for NaN/Inf (LOUD failure)
+            window_selector_temperature: Temperature for window selection softmax (default: 1.0)
+            window_selector_hard: If True, use argmax for window selection (inference mode)
+
+        Returns:
+            Dict with predictions and optional attention weights.
+            If use_window_selector, also includes 'window_selection' dict.
+        """
+        # 1. Validate input
+        if validate:
+            self.validate_input(x)
+
+        # 2. Apply explicit feature weights
+        if self.feature_weights is not None:
+            x = self.feature_weights(x)
+
+        # 3. Apply feature gating
+        if self.feature_gating is not None:
+            x = self.feature_gating(x)
+
+        # 4. Split into TF and shared features
+        tf_features, shared_features = self.split_features(x)
+
+        # 5. Encode per-TF
+        tf_embeddings = self.tf_encoder(tf_features, shared_features)
+
+        # 6. Cross-TF attention
+        tf_embeddings, attn_weights = self.cross_tf_attention(
+            tf_embeddings, return_attention=return_attention
+        )
+
+        # 6b. LSTM sequence branch fusion (if enabled)
+        if self.use_sequence_branch:
+            window_seqs = self.extract_window_sequences(tf_features)
+            tf_embeddings = self._fuse_sequence_branch(tf_embeddings, window_seqs)
+
+        # 7. Per-TF predictions (before aggregation)
+        if return_per_tf:
+            per_tf_predictions = self.per_tf_heads(tf_embeddings)
+
+        # 8. Aggregate
+        aggregated, agg_weights = self.tf_aggregator(tf_embeddings)
+
+        # 9. Predictions
+        predictions = self.prediction_heads(
+            aggregated,
+            window_selector_temperature=window_selector_temperature,
+            window_selector_hard=window_selector_hard,
+        )
+
+        if return_attention:
+            predictions['tf_attention_weights'] = attn_weights
+            predictions['aggregation_weights'] = agg_weights
+
+        if return_per_tf:
+            predictions['per_tf'] = per_tf_predictions
+
+        return predictions
+
+    def forward_with_per_tf(
+        self,
+        x: torch.Tensor,
+        validate: bool = True,
+        window_selector_temperature: float = 1.0,
+        window_selector_hard: bool = False,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """
+        Forward pass that also returns per-TF predictions.
+
+        This method is useful for per-timeframe prediction breakdown.
+        Returns both the normal (aggregated) predictions and per-TF predictions
+        from lightweight heads run on embeddings after cross-TF attention.
+
+        Args:
+            x: [batch, input_dim] raw features
+            validate: If True, check for NaN/Inf (LOUD failure)
+            window_selector_temperature: Temperature for window selection softmax
+            window_selector_hard: If True, use argmax for window selection
+
+        Returns:
+            Tuple of:
+                - predictions: Dict with all aggregated prediction outputs (same as forward())
+                - per_tf_predictions: Dict with per-TF predictions:
+                    - 'duration_mean': [batch, n_timeframes]
+                    - 'duration_log_std': [batch, n_timeframes]
+                    - 'direction_logits': [batch, n_timeframes]
+        """
+        # 1. Validate input
+        if validate:
+            self.validate_input(x)
+
+        # 2. Apply explicit feature weights
+        if self.feature_weights is not None:
+            x = self.feature_weights(x)
+
+        # 3. Apply feature gating
+        if self.feature_gating is not None:
+            x = self.feature_gating(x)
+
+        # 4. Split into TF and shared features
+        tf_features, shared_features = self.split_features(x)
+
+        # 5. Encode per-TF
+        tf_embeddings = self.tf_encoder(tf_features, shared_features)
+
+        # 6. Cross-TF attention
+        tf_embeddings_attended, _ = self.cross_tf_attention(
+            tf_embeddings, return_attention=False
+        )
+
+        # 6b. LSTM sequence branch fusion (if enabled)
+        if self.use_sequence_branch:
+            window_seqs = self.extract_window_sequences(tf_features)
+            tf_embeddings_attended = self._fuse_sequence_branch(
+                tf_embeddings_attended, window_seqs
+            )
+
+        # 7. Per-TF predictions (before aggregation)
+        per_tf_predictions = self.per_tf_heads(tf_embeddings_attended)
+
+        # 8. Aggregate
+        aggregated, _ = self.tf_aggregator(tf_embeddings_attended)
+
+        # 9. Aggregated predictions
+        predictions = self.prediction_heads(
+            aggregated,
+            window_selector_temperature=window_selector_temperature,
+            window_selector_hard=window_selector_hard,
+        )
+
+        return predictions, per_tf_predictions
+
+    def get_feature_importance(self) -> Optional[torch.Tensor]:
+        """Get learned feature importance from explicit weights."""
+        if self.feature_weights is not None:
+            return self.feature_weights.get_feature_importance()
+        return None
+
+    def has_window_selector(self) -> bool:
+        """Check if this model has a learned window selector."""
+        return self.prediction_heads.has_window_selector()
+
+    def has_tsla_heads(self) -> bool:
+        """Check if this model has TSLA break scan heads."""
+        return self.prediction_heads.has_tsla_heads()
+
+    def has_spy_heads(self) -> bool:
+        """Check if this model has SPY break scan heads."""
+        return self.prediction_heads.has_spy_heads()
+
+    def has_cross_correlation_heads(self) -> bool:
+        """Check if this model has cross-correlation heads."""
+        return self.prediction_heads.has_cross_correlation_heads()
+
+    def has_durability_heads(self) -> bool:
+        """Check if this model has durability and bars-to-permanent heads."""
+        return self.prediction_heads.has_durability_heads()
+
+    def has_rsi_heads(self) -> bool:
+        """Check if this model has RSI prediction heads."""
+        return self.prediction_heads.has_rsi_heads()
+
+
+def create_model(config: Optional[Dict] = None) -> V15Model:
+    """
+    Create V15 model with config.
+
+    Args:
+        config: Optional config dict, defaults to MODEL_CONFIG
+            Supported keys:
+            - input_dim: Total number of input features
+            - hidden_dim: Hidden layer dimension
+            - n_attention_heads: Number of attention heads
+            - dropout: Dropout probability
+            - use_explicit_weights: Whether to use explicit feature weights
+            - use_window_selector: Whether to include learned window selection
+            - num_windows: Number of windows for selector (default: 8)
+            - enable_tsla_heads: Whether to include TSLA break scan heads (default: False)
+            - enable_spy_heads: Whether to include SPY break scan heads (default: False)
+            - enable_cross_correlation_heads: Whether to include cross-correlation heads (default: False)
+            - enable_durability_heads: Whether to include durability heads (default: False)
+            - enable_rsi_heads: Whether to include RSI prediction heads (default: False)
+
+    Returns:
+        Initialized V15Model
+    """
+    cfg = {**MODEL_CONFIG, **(config or {})}
+
+    return V15Model(
+        input_dim=cfg['input_dim'],
+        hidden_dim=cfg['hidden_dim'],
+        n_attention_heads=cfg['n_attention_heads'],
+        dropout=cfg['dropout'],
+        use_explicit_weights=cfg['use_explicit_weights'],
+        use_window_selector=cfg.get('use_window_selector', False),
+        num_windows=cfg.get('num_windows', 8),
+        enable_tsla_heads=cfg.get('enable_tsla_heads', False),
+        enable_spy_heads=cfg.get('enable_spy_heads', False),
+        enable_cross_correlation_heads=cfg.get('enable_cross_correlation_heads', False),
+        enable_durability_heads=cfg.get('enable_durability_heads', False),
+        enable_rsi_heads=cfg.get('enable_rsi_heads', False),
+        per_tf_head_version=cfg.get('per_tf_head_version', 1),
+        use_horizon_attention=cfg.get('use_horizon_attention', False),
+        use_sequence_branch=cfg.get('use_sequence_branch', False),
+    )

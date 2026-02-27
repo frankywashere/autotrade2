@@ -1,0 +1,219 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2867
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fnil\fcharset0 Menlo-Regular;\f1\fnil\fcharset0 Menlo-Bold;}
+{\colortbl;\red255\green255\blue255;\red0\green0\blue0;\red97\green34\blue255;}
+{\*\expandedcolortbl;;\csgray\c0;\cssrgb\c46228\c27437\c100000;}
+\margl1440\margr1440\vieww26720\viewh16640\viewkind0
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+
+\f0\fs48 \cf2 \CocoaLigature0  
+\f1\b What is a "window"?
+\f0\b0                                                                                \
+                                                                                                    \
+  A window is just 
+\f1\b how many bars back you look
+\f0\b0  when drawing a channel on a chart.                   \
+                                                                                                    \
+  TSLA 1-hour chart:                                                                                \
+                                                                                                    \
+  Price  \uc0\u9581 \u9472 \u9472 \u9582                                                                                        \
+    \uc0\u9474    \u9581 \u9583   \u9584 \u9582   \u9581 \u9472 \u9472 \u9582        \u9581 \u9472 \u9472 \u9582                                                                      \
+    \uc0\u9474   \u9581 \u9583     \u9584 \u9582 \u9581 \u9583   \u9584 \u9582   \u9581 \u9472 \u9472 \u9582 \u9583   \u9584 \u9582                                                                     \
+    \uc0\u9474  \u9581 \u9583       \u9584 \u9583     \u9584 \u9582 \u9581 \u9583   \u9584 \u9583     \u9584 \u9582                                                                   \
+    \uc0\u9474 \u9581 \u9583               \u9584 \u9583            \u9584 \u9582                                                                 \
+    \uc0\u9492 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u8594  Time                                                       \
+                                                                                                    \
+    |\uc0\u8592  window=20 \u8594 |    Sees a small channel                                                         \
+    |\uc0\u8592 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472  window=50 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u8594 |  Sees a bigger channel                                              \
+    |\uc0\u8592 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472  window=80 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u8594 |  Sees the biggest channel                                 \
+                                                                                                    \
+  The system tries 
+\f1\b 8 different windows
+\f0\b0  (10, 20, 30, 40, 50, 60, 70, 80) on the same data. Each      \
+  window finds a different channel. Then it picks the "best" one \'97 the cleanest channel with the    \
+  most bounces.                                                                                     \
+                                                                                                    \
+  
+\f1\b \cf3 best_window\cf2  = which of these 8 lookback sizes gave the best channel.
+\f0\b0  Not a timeframe. Not which TF\
+   to use. Just "look back 50 bars gave the cleanest channel."                                      \
+                                                                                                    \
+  ---                                                                                               \
+  
+\f1\b What is a timeframe (TF)?
+\f0\b0                                                                          \
+                                                                                                    \
+  A timeframe is 
+\f1\b how you group the raw 5-minute bars
+\f0\b0  into bigger bars:                              \
+                                                                                                    \
+  Raw 5-min bars:     |.|.|.|.|.|.|.|.|.|.|.|.|                                                     \
+                                                                                                    \
+  Group by 3  \uc0\u8594  15min: |==|==|==|==|                                                                \
+  Group by 6  \uc0\u8594  30min: |====|====|                                                                  \
+  Group by 12 \uc0\u8594    1hr: |========|                                                                   \
+  Group by 78 \uc0\u8594  daily: |========================|                                                   \
+                                                                                                    \
+  The system uses 10 timeframes:                                                                    \
+    5min, 15min, 30min, 1h, 2h, 3h, 4h, daily, weekly, monthly                                      \
+                                                                                                    \
+  ---                                                                                               \
+  
+\f1\b What happens at each timeframe?
+\f0\b0                                                                    \
+                                                                                                    \
+  For EACH of the 10 timeframes, the system:                                                        \
+  1. Resamples the 5-min data into that TF's bars                                                   \
+  2. Tries all 8 windows (10-80) to detect channels                                                 \
+  3. Extracts features (price patterns, channel quality, history, etc.)                             \
+                                                                                                    \
+             8 windows tried per TF                                                                 \
+             \uc0\u9484 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9488                                                                 \
+  5min    \uc0\u8594   \u9474  w10 w20 w30 ... w80 \u9474  \u8594  ~1,484 features                                              \
+  15min   \uc0\u8594   \u9474  w10 w20 w30 ... w80 \u9474  \u8594  ~1,484 features                                              \
+  30min   \uc0\u8594   \u9474  w10 w20 w30 ... w80 \u9474  \u8594  ~1,484 features                                              \
+  1h      \uc0\u8594   \u9474  w10 w20 w30 ... w80 \u9474  \u8594  ~1,484 features                                              \
+  2h      \uc0\u8594   \u9474  w10 w20 w30 ... w80 \u9474  \u8594  ~1,484 features                                              \
+  3h      \uc0\u8594   \u9474  w10 w20 w30 ... w80 \u9474  \u8594  ~1,484 features                                              \
+  4h      \uc0\u8594   \u9474  w10 w20 w30 ... w80 \u9474  \u8594  ~1,484 features                                              \
+  daily   \uc0\u8594   \u9474  w10 w20 w30 ... w80 \u9474  \u8594  ~1,484 features                                              \
+  weekly  \uc0\u8594   \u9474  w10 w20 w30 ... w80 \u9474  \u8594  ~1,484 features                                              \
+  monthly \uc0\u8594   \u9474  w10 w20 w30 ... w80 \u9474  \u8594  ~1,484 features                                              \
+             \uc0\u9492 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9496                                                                 \
+                                      = 14,840 total features                                       \
+                                                                                                    \
+  ---                                                                                               \
+  
+\f1\b How does the model process all this?
+\f0\b0                                                               \
+                                                                                                    \
+  Here's the full flow, step by step:                                                               \
+                                                                                                    \
+  STEP 1: Split features by timeframe                                                               \
+  \uc0\u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552                                                        \
+                                                                                                    \
+  14,840 features come in as one flat list.                                                         \
+  Split them into 10 groups (one per TF):                                                           \
+                                                                                                    \
+    [5min features] [15min features] ... [monthly features]                                         \
+         1,484          1,484                 1,484                                                 \
+                                                                                                    \
+                                                                                                    \
+  STEP 2: Encode each TF separately                                                                 \
+  \uc0\u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552                                                        \
+                                                                                                    \
+  Each TF's features go through their own encoder                                                   \
+  (a small neural network) to create an "embedding"                                                 \
+  (a compressed summary of what that TF sees):                                                      \
+                                                                                                    \
+    5min features  \uc0\u9472 \u9472 \u8594  [Encoder] \u9472 \u9472 \u8594  5min embedding  (128 numbers)                                  \
+    15min features \uc0\u9472 \u9472 \u8594  [Encoder] \u9472 \u9472 \u8594  15min embedding (128 numbers)                                  \
+    30min features \uc0\u9472 \u9472 \u8594  [Encoder] \u9472 \u9472 \u8594  30min embedding (128 numbers)                                  \
+    ...                                                                                             \
+    monthly feat.  \uc0\u9472 \u9472 \u8594  [Encoder] \u9472 \u9472 \u8594  monthly embed.  (128 numbers)                                  \
+                                                                                                    \
+                                                                                                    \
+  STEP 3: Cross-TF Attention                                                                        \
+  \uc0\u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552                                                        \
+                                                                                                    \
+  The 10 embeddings "talk to each other" so each TF                                                 \
+  can see what the other TFs are seeing:                                                            \
+                                                                                                    \
+    5min  \uc0\u8592 \u9472 \u9472 \u8594   15min \u8592 \u9472 \u9472 \u8594  30min \u8592 \u9472 \u9472 \u8594  ... \u8592 \u9472 \u9472 \u8594  monthly                                              \
+      \uc0\u8597            \u8597           \u8597                     \u8597                                                  \
+    (each embedding gets updated with info from all others)                                         \
+                                                                                                    \
+  Think of it like: "Hey daily, 5min sees a breakout \'97                                              \
+  does that match what you're seeing?"                                                              \
+                                                                                                    \
+  After this step, each TF's embedding is enriched                                                  \
+  with context from all other TFs.                                                                  \
+                                                                                                    \
+                                                                                                    \
+  STEP 4: TWO separate paths branch off here                                                        \
+  \uc0\u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552 \u9552                                                        \
+                                                                                                    \
+           \uc0\u9484 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9488                                                           \
+           \uc0\u9474  10 enriched TF embeddings   \u9474                                                           \
+           \uc0\u9474  [5min] [15min] ... [monthly]\u9474                                                           \
+           \uc0\u9492 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9516 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9496                                                           \
+                      \uc0\u9474                                                                              \
+            \uc0\u9484 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9524 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9488                                                                    \
+            \uc0\u9474                    \u9474                                                                    \
+       PATH A              PATH B                                                                   \
+     (Per-TF Heads)     (Aggregated Head)                                                           \
+                                                                                                    \
+  ---                                                                                               \
+  
+\f1\b PATH A: Per-TF Heads (one small head per TF)
+\f0\b0                                                       \
+                                                                                                    \
+  Each TF embedding gets its OWN small prediction head:                                             \
+                                                                                                    \
+    5min embed.  \uc0\u9472 \u9472 \u8594  [Small Head] \u9472 \u9472 \u8594  5min duration,  5min confidence                               \
+    15min embed. \uc0\u9472 \u9472 \u8594  [Small Head] \u9472 \u9472 \u8594  15min duration, 15min confidence                              \
+    30min embed. \uc0\u9472 \u9472 \u8594  [Small Head] \u9472 \u9472 \u8594  30min duration, 30min confidence                              \
+    1h embed.    \uc0\u9472 \u9472 \u8594  [Small Head] \u9472 \u9472 \u8594  1h duration,    1h confidence                                 \
+    ...                                                                                             \
+    monthly      \uc0\u9472 \u9472 \u8594  [Small Head] \u9472 \u9472 \u8594  monthly dur.,   monthly confidence                            \
+                                                                                                    \
+  Trained against: EACH TF's OWN labels                                                             \
+    - 5min head learns from 5min ground truth                                                       \
+    - daily head learns from daily ground truth                                                     \
+    - etc.                                                                                          \
+                                                                                                    \
+  This is what --per-tf-loss-weight 0.5 enables.                                                    \
+  These are the per-TF rows you see in the dashboard table.                                         \
+                                                                                                    \
+  
+\f1\b Yes, you were right \'97 there IS a head for each TF.
+\f0\b0  That's Path A.                                 \
+                                                                                                    \
+  ---                                                                                               \
+  
+\f1\b PATH B: Aggregated Head (one big head for the blend)
+\f0\b0                                               \
+                                                                                                    \
+  All 10 TF embeddings get blended into ONE vector:                                                 \
+                                                                                                    \
+    5min embed.  \uc0\u9472 \u9472 \u9586                                                                                 \
+    15min embed. \uc0\u9472 \u9472 \u8594  [Aggregator: learned weighted average] \u9472 \u9472 \u8594  ONE vector                          \
+    30min embed. \uc0\u9472 \u9472 \u9585      (attention picks how much each TF                                          \
+    ...          \uc0\u9472 \u9472 \u9585       matters, but it's a BLEND, not a pick)                                    \
+    monthly      \uc0\u9472 \u9472 \u9585                                                                                 \
+                                \uc0\u9474                                                                    \
+                                \uc0\u9660                                                                    \
+                      [Big Prediction Head]                                                         \
+                                \uc0\u9474                                                                    \
+                      \uc0\u9484 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9524 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9488                                                          \
+                      \uc0\u9474  ONE duration      \u9474                                                          \
+                      \uc0\u9474  ONE direction     \u9474                                                          \
+                      \uc0\u9474  ONE new_channel   \u9474                                                          \
+                      \uc0\u9474  ONE confidence    \u9474                                                          \
+                      \uc0\u9474  ONE best_window   \u9474                                                          \
+                      \uc0\u9492 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9472 \u9496                                                          \
+                                                                                                    \
+  Trained against: ONLY daily labels (target_tf='daily')                                            \
+                                                                                                    \
+  The aggregator is like mixing paint \'97 it blends all 10 colors (TFs) into one color. It's not      \
+  picking the "best" TF. It's averaging them with learned weights.                                  \
+                                                                                                    \
+  ---                                                                                               \
+  
+\f1\b The gap you spotted
+\f0\b0                                                                                \
+                                                                                                    \
+  PATH A (per-TF heads):                                                                            \
+    5min head   \uc0\u8594  trained on 5min labels    \u10003  makes sense                                           \
+    daily head  \uc0\u8594  trained on daily labels   \u10003  makes sense                                           \
+    monthly head\uc0\u8594  trained on monthly labels  \u10003  makes sense                                          \
+                                                                                                    \
+  PATH B (aggregated head):                                                                         \
+    Blend of ALL TFs \uc0\u8594  trained on ONLY daily labels  \u8592  this is the design choice                    \
+                                                                                                    \
+  The aggregated head always answers: "what will the DAILY channel do?"                             \
+  It uses all 10 TFs as context to answer that one question.                                        \
+                                                                                                    \
+  The two paths are 
+\f1\b independent
+\f0\b0 . Path A's per-TF predictions are shown in the dashboard table. Path \
+  B's aggregated prediction is shown in the main prediction card. Path A doesn't feed into Path B. }

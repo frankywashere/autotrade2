@@ -1,0 +1,367 @@
+================================================================================
+                    extract_all_features() FLOW DIAGRAM
+================================================================================
+
+CALLER VIEW: Where each overload is used
+────────────────────────────────────────────────────────────────────────────
+
+┌───────────────────────────────────────────────────────────────────────────┐
+│                                                                           │
+│   PASS 1/2 SCANNER (scanner.cpp:1569)                                    │
+│   ═════════════════════════════════════                                  │
+│                                                                           │
+│   ┌─────────────────────────────────────────┐                           │
+│   │ 1. Detect channels                      │                           │
+│   │    → SlimLabeledChannelMap              │                           │
+│   └──────────────┬──────────────────────────┘                           │
+│                  │                                                       │
+│                  ▼                                                       │
+│   ┌─────────────────────────────────────────┐                           │
+│   │ 2. Build channel history                │                           │
+│   │    → map<tf, vector<ChannelHistory>>    │                           │
+│   │    (last 5 channels per TF)             │                           │
+│   └──────────────┬──────────────────────────┘                           │
+│                  │                                                       │
+│                  ▼                                                       │
+│   ┌─────────────────────────────────────────┐                           │
+│   │ 3. Extract features                     │                           │
+│   │                                          │                           │
+│   │    extract_all_features(                │                           │
+│   │        tsla_view,           ◄─ DataView │                           │
+│   │        spy_view,                        │                           │
+│   │        vix_view,                        │                           │
+│   │        timestamp,                       │                           │
+│   │        tsla_slim_map,                   │                           │
+│   │        spy_slim_map,                    │                           │
+│   │        tsla_history_by_tf,  ◄─ REAL!    │                           │
+│   │        spy_history_by_tf,   ◄─ REAL!    │                           │
+│   │        source_bar_count,                │                           │
+│   │        true                             │                           │
+│   │    )                                    │                           │
+│   │                                          │                           │
+│   │    ↓                                    │                           │
+│   │    OVERLOAD #3 (FULL)                   │                           │
+│   │    14,840 features ✓                    │                           │
+│   └─────────────────────────────────────────┘                           │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+
+
+┌───────────────────────────────────────────────────────────────────────────┐
+│                                                                           │
+│   PASS 3 SCANNER (scanner_pass3.cpp:104)                                 │
+│   ════════════════════════════════════════                               │
+│                                                                           │
+│   ┌─────────────────────────────────────────┐                           │
+│   │ 1. Use pre-computed slim maps           │                           │
+│   │    (from Pass 1/2)                      │                           │
+│   └──────────────┬──────────────────────────┘                           │
+│                  │                                                       │
+│                  ▼                                                       │
+│   ┌─────────────────────────────────────────┐                           │
+│   │ 2. Slice data for each channel          │                           │
+│   │    → std::vector<OHLCV>                 │                           │
+│   └──────────────┬──────────────────────────┘                           │
+│                  │                                                       │
+│                  ▼                                                       │
+│   ┌─────────────────────────────────────────┐                           │
+│   │ 3. Extract features                     │                           │
+│   │                                          │                           │
+│   │    extract_all_features(                │                           │
+│   │        tsla_slice,          ◄─ vector   │                           │
+│   │        spy_slice,                       │                           │
+│   │        vix_slice,                       │                           │
+│   │        timestamp,                       │                           │
+│   │        tsla_slim_map,                   │                           │
+│   │        spy_slim_map,                    │                           │
+│   │        source_bar_count,                │                           │
+│   │        true                             │                           │
+│   │    )                                    │                           │
+│   │                                          │                           │
+│   │    ↓                                    │                           │
+│   │    OVERLOAD #1 (Vector)                 │                           │
+│   │    14,170 features (no history)         │                           │
+│   └─────────────────────────────────────────┘                           │
+│                                                                           │
+└───────────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+                        INTERNAL FLOW DIAGRAM
+================================================================================
+
+┌────────────────────────────────────────────────────────────────────────┐
+│                         OVERLOAD #1                                    │
+│              (Vector + SlimMaps, no history)                           │
+│                                                                        │
+│   extract_all_features(vector, vector, vector, ...)                   │
+│         │                                                              │
+│         │ Lines 1452-1772 in feature_extractor.cpp                    │
+│         │                                                              │
+│         ├─► Validate input data                                       │
+│         │                                                              │
+│         ├─► For each TF (parallel with OpenMP):                       │
+│         │     │                                                        │
+│         │     ├─► Resample 5min → TF                                  │
+│         │     │                                                        │
+│         │     ├─► Extract TSLA price (58)                             │
+│         │     │                                                        │
+│         │     ├─► Extract tech indicators (59)                        │
+│         │     │                                                        │
+│         │     ├─► Extract SPY features (117)                          │
+│         │     │                                                        │
+│         │     ├─► Extract VIX features (25)                           │
+│         │     │                                                        │
+│         │     ├─► Extract cross-asset (59)                            │
+│         │     │                                                        │
+│         │     ├─► Extract channel features (116 × 8 windows)          │
+│         │     │                                                        │
+│         │     ├─► Extract window scores (50)                          │
+│         │     │                                                        │
+│         │     └─► Extract channel history (67)                        │
+│         │           │                                                  │
+│         │           └─► NO HISTORY PROVIDED                           │
+│         │               → empty vectors                               │
+│         │               → all 67 features = 0.0                       │
+│         │                                                              │
+│         ├─► Extract event features (30)                               │
+│         │                                                              │
+│         ├─► Extract bar metadata (30)                                 │
+│         │                                                              │
+│         └─► Return 14,170 features                                    │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+
+
+┌────────────────────────────────────────────────────────────────────────┐
+│                         OVERLOAD #2                                    │
+│              (DataView + SlimMaps, no history)                         │
+│                      [DEPRECATED]                                      │
+│                                                                        │
+│   extract_all_features(DataView, DataView, DataView, ...)             │
+│         │                                                              │
+│         │ Lines 1779-1805 in feature_extractor.cpp                    │
+│         │                                                              │
+│         ├─► Create empty history maps                                 │
+│         │     empty_tsla_history = {}                                 │
+│         │     empty_spy_history = {}                                  │
+│         │                                                              │
+│         └─► Delegate to Overload #3 ──────────┐                       │
+│                                                │                       │
+│                                                ▼                       │
+└────────────────────────────────────────────────┼───────────────────────┘
+                                                 │
+                                                 │
+┌────────────────────────────────────────────────┼───────────────────────┐
+│                         OVERLOAD #3            │                       │
+│           (DataView + SlimMaps + History)      │                       │
+│                   [MAIN PATH]                  │                       │
+│                                                │                       │
+│   extract_all_features(DataView, ..., history_maps)                   │
+│         │                                      ▲                       │
+│         │ Lines 1811-2090                      │                       │
+│         │                                      │                       │
+│         │◄─────────────────────────────────────┘                       │
+│         │  (called from Overload #2 OR directly from Pass 1/2)        │
+│         │                                                              │
+│         ├─► Convert DataView → vectors                                │
+│         │                                                              │
+│         ├─► Validate input data                                       │
+│         │                                                              │
+│         ├─► For each TF (parallel with OpenMP):                       │
+│         │     │                                                        │
+│         │     ├─► Resample 5min → TF                                  │
+│         │     │                                                        │
+│         │     ├─► Extract TSLA price (58)                             │
+│         │     │                                                        │
+│         │     ├─► Extract tech indicators (59)                        │
+│         │     │                                                        │
+│         │     ├─► Extract SPY features (117)                          │
+│         │     │                                                        │
+│         │     ├─► Extract VIX features (25)                           │
+│         │     │                                                        │
+│         │     ├─► Extract cross-asset (59)                            │
+│         │     │                                                        │
+│         │     ├─► Extract channel features (116 × 8 windows)          │
+│         │     │                                                        │
+│         │     ├─► Extract window scores (50)                          │
+│         │     │                                                        │
+│         │     └─► Extract channel history (67)                        │
+│         │           │                                                  │
+│         │           ├─► Look up tsla_history_by_tf[tf_str]            │
+│         │           │     • If found → use real history ✓             │
+│         │           │     • If not found → empty vector               │
+│         │           │                                                  │
+│         │           ├─► Look up spy_history_by_tf[tf_str]             │
+│         │           │     • If found → use real history ✓             │
+│         │           │     • If not found → empty vector               │
+│         │           │                                                  │
+│         │           └─► extract_channel_history_features()            │
+│         │                 • If real history: 67 features with data    │
+│         │                 • If empty: 67 features = 0.0               │
+│         │                                                              │
+│         ├─► Extract event features (30)                               │
+│         │                                                              │
+│         ├─► Extract bar metadata (30)                                 │
+│         │                                                              │
+│         └─► Return 14,170 or 14,840 features                          │
+│               (depends on whether history was provided)               │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+                    CHANNEL HISTORY FEATURE EXTRACTION
+================================================================================
+
+Called from all 3 overloads, but with different input data:
+
+extract_channel_history_features(tsla_history, spy_history)
+    │
+    │ Lines 2034-2052 in Overload #3
+    │
+    ├─► Input: vector<ChannelHistoryEntry> tsla_history
+    │   Input: vector<ChannelHistoryEntry> spy_history
+    │
+    │   Scenario A: Pass 1/2 Scanner
+    │   ─────────────────────────────
+    │   • tsla_history = [ch1, ch2, ch3, ch4, ch5]  ◄─ Last 5 channels
+    │   • spy_history = [ch1, ch2, ch3, ch4, ch5]
+    │   • Returns 67 features with REAL DATA ✓
+    │
+    │   Scenario B: Pass 3 Scanner OR Overload #2
+    │   ────────────────────────────────────────
+    │   • tsla_history = []  ◄─ Empty
+    │   • spy_history = []   ◄─ Empty
+    │   • Returns 67 features = 0.0 (default values)
+    │
+    └─► Output: 67 features per TF × 10 TFs = 670 total features
+
+
+Channel History Features (67 per TF):
+────────────────────────────────────────────────────────────────────────────
+
+  TSLA History (40 features):
+  ──────────────────────────
+    • hist_tsla_count                     (how many channels in history)
+    • hist_tsla_avg_duration              (average channel duration)
+    • hist_tsla_avg_slope                 (average channel slope)
+    • hist_tsla_avg_width                 (average channel width)
+    • hist_tsla_avg_confidence            (average channel confidence)
+    • hist_tsla_direction_sequence        (encoded: 0-4)
+    • hist_tsla_break_sequence            (encoded: 0-4)
+    • hist_tsla_alternating_score         (direction changes)
+    • hist_tsla_trend_duration            (trend in durations)
+    • hist_tsla_trend_slope               (trend in slopes)
+    • hist_tsla_trend_width               (trend in widths)
+    • hist_tsla_momentum                  (direction momentum)
+    • hist_tsla_regime_shift              (regime change score)
+    ... (40 total)
+
+  SPY History (40 features):
+  ─────────────────────────
+    • hist_spy_count
+    • hist_spy_avg_duration
+    • hist_spy_avg_slope
+    ... (40 total, same structure as TSLA)
+
+  Cross-History Features (27 features):
+  ────────────────────────────────────
+    • hist_direction_alignment           (TSLA/SPY direction match)
+    • hist_break_alignment               (TSLA/SPY break alignment)
+    • hist_duration_correlation          (duration sync)
+    • hist_slope_correlation             (slope sync)
+    • hist_width_ratio                   (relative widths)
+    ... (27 total)
+
+  TOTAL: 40 + 40 + 27 = 107 features
+  But only 67 are currently implemented (simplified version)
+
+
+================================================================================
+                        MEMORY & PERFORMANCE FLOW
+================================================================================
+
+┌───────────────────────────────────────────────────────────────────┐
+│  Overload #1: Vector-based                                        │
+├───────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  vector<OHLCV> tsla_5min  ◄─── OWNS DATA (heap allocation)       │
+│       │                                                           │
+│       ├──► resample_to_tf() ──► NEW vector (copy)                │
+│       │                                                           │
+│       └──► feature extraction                                    │
+│                                                                   │
+│  Memory Cost: High (owns + resamples = 2x data)                  │
+│  CPU Cost:    Medium (no delegation overhead)                    │
+│                                                                   │
+└───────────────────────────────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────────────────────────┐
+│  Overload #2: DataView (delegating)                              │
+├───────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  DataView tsla_view  ◄─── ZERO-COPY (pointer + size)             │
+│       │                                                           │
+│       └──► create empty history                                  │
+│              │                                                    │
+│              └──► DELEGATE to Overload #3                        │
+│                      │                                            │
+│                      └──► convert DataView → vector (copy)       │
+│                              │                                    │
+│                              └──► resample_to_tf() ──► NEW vec   │
+│                                                                   │
+│  Memory Cost: Medium (1x copy + resamples)                       │
+│  CPU Cost:    Medium (delegation + copy overhead)                │
+│                                                                   │
+└───────────────────────────────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────────────────────────┐
+│  Overload #3: DataView + History (direct)                        │
+├───────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  DataView tsla_view  ◄─── ZERO-COPY (pointer + size)             │
+│  map<tf, history>    ◄─── PRE-COMPUTED (from Pass 1/2)           │
+│       │                                                           │
+│       ├──► convert DataView → vector (1x copy)                   │
+│       │                                                           │
+│       ├──► resample_to_tf() ──► NEW vector (copy)                │
+│       │                                                           │
+│       └──► feature extraction + REAL HISTORY                     │
+│                                                                   │
+│  Memory Cost: Medium (1x copy + resamples)                       │
+│  CPU Cost:    Low (direct, no delegation)                        │
+│  Features:    COMPLETE (14,840) ✓                                │
+│                                                                   │
+└───────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+                           RECOMMENDATION
+================================================================================
+
+Current State:
+──────────────
+  3 overloads: #1 (vector), #2 (DataView delegation), #3 (DataView+history)
+
+Recommended State:
+──────────────────
+  2 overloads: #1 (vector), #3 (DataView+history)
+
+Reason:
+───────
+  • Overload #2 is pure delegation with no added value
+  • Callers can directly call Overload #3 with empty history if needed
+  • Reduces API surface and maintenance burden
+  • No performance or functionality loss
+
+Migration:
+──────────
+  If any code calls Overload #2:
+    extract_all_features(view, view, view, ts, slim1, slim2, count, meta)
+
+  Replace with Overload #3:
+    std::unordered_map<std::string, std::vector<ChannelHistoryEntry>> empty;
+    extract_all_features(view, view, view, ts, slim1, slim2, empty, empty, count, meta)
+
+================================================================================

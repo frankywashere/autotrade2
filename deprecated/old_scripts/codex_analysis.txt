@@ -1,0 +1,35 @@
+Compared `TECH_SPEC.md` to `v7/models/hierarchical_cfc.py`, `v7/features/feature_ordering.py`, `v7/features/full_features.py`, `v7/training/trainer.py`, `v7/training/losses.py`, and `train.py`. Several sections are out of date.
+
+**Feature Definitions**
+- `TECH_SPEC.md:67` lists a 2week timeframe; code uses `monthly` instead (`v7/core/timeframe.py`).
+- `TECH_SPEC.md:56`, `TECH_SPEC.md:57`, `TECH_SPEC.md:59`, `TECH_SPEC.md:63`, `TECH_SPEC.md:65` misstate TSLA per‑TF makeup: code has 18 base features (adds `channel_quality`, `rsi_confidence`), 15 exit/return features (10 exit + 5 return tracking like `return_rate`, `channel_resilience_score`, `avg_duration_after_return`, `max_duration_after_return`, `returns_leading_to_new_channel`), and break triggers are `nearest_boundary_dist` + `rsi_alignment_with_boundary`; VIX interactions and window scores are shared, not per‑TF (`v7/features/full_features.py`, `v7/features/feature_ordering.py`).
+- `TECH_SPEC.md:72`, `TECH_SPEC.md:73` cross‑asset names do not match: code uses `rsi_correlation` and `rsi_correlation_trend`, not `rsi_spread` or `breakout_alignment` (`v7/features/full_features.py`).
+- `TECH_SPEC.md:75`, `TECH_SPEC.md:78` VIX regime is incorrect: code defines 6 base + 15 VIX‑channel interaction fields (e.g., `vix_at_channel_start`, `vix_at_last_bounce`, `vix_trend_during_channel`, `vix_bounce_quality_diff`), not 3 features per 5 TFs (`v7/features/full_features.py`).
+- `TECH_SPEC.md:96`, `TECH_SPEC.md:97` window scores are wrong: code uses 8 windows x 5 metrics (bounce_count, r_squared, quality, alternation_ratio, width) as shared `window_scores`, not 4 per TF x 10 TFs (`v7/features/full_features.py`, `v7/features/feature_ordering.py`).
+
+**Architecture & Components**
+- `TECH_SPEC.md:25`, `TECH_SPEC.md:27`, `TECH_SPEC.md:28` parameter count and branch dims are stale: TFBranch input is 56 + 160 = 216, projection is 216 -> hidden_dim (default 128), CfC units default 192, and actual parameter counts depend on config (`v7/models/hierarchical_cfc.py`).
+- `TECH_SPEC.md:30`, `TECH_SPEC.md:32` CrossTFAttention output size is off: code mean‑pools then projects to 2 * hidden_dim (e.g., 256 when hidden_dim=128), and head count is configurable (CLI defaults vary) (`v7/models/hierarchical_cfc.py`, `train.py`).
+- `TECH_SPEC.md:34`, `TECH_SPEC.md:35`, `TECH_SPEC.md:36`, `TECH_SPEC.md:37`, `TECH_SPEC.md:38` assumes shared per‑TF heads; code supports shared or per‑TF heads (CLI default is separate) and adds a 21‑class `TriggerTFHead` in aggregate outputs (`v7/models/hierarchical_cfc.py`, `train.py`).
+- `TECH_SPEC.md:39` aggregate head sizing is not accurate with current defaults and now includes `trigger_tf` (`v7/models/hierarchical_cfc.py`).
+- `TECH_SPEC.md:25`, `TECH_SPEC.md:39` omit window selection components: code has `PerTFWindowSelector` with `window_logits`/`window_probs` and Phase 2b `SharedWindowEncoder` + `DifferentiableWindowSelector` + `EndToEndWindowModel` (`v7/models/hierarchical_cfc.py`, `v7/models/end_to_end_window_model.py`, `v7/models/window_encoder.py`).
+
+**Training & Losses**
+- `TECH_SPEC.md:41`, `TECH_SPEC.md:43` optimizer/scheduler are inaccurate: trainer defaults to Adam + cosine_restarts; CLI defaults to AdamW + cosine_restarts; cosine annealing does not target 1e‑5 (`v7/training/trainer.py`, `train.py`).
+- `TECH_SPEC.md:41`, `TECH_SPEC.md:42` loss description is incomplete: `CombinedLoss` adds calibration (Brier/ECE), trigger_tf loss, optional window selection loss, and duration uncertainty penalties; Phase 2b uses `EndToEndLoss` (`v7/training/losses.py`, `v7/training/trainer.py`).
+- `TECH_SPEC.md:46`, `TECH_SPEC.md:112`, `TECH_SPEC.md:113` early stopping metrics differ: code uses `total`, `duration`, `direction_acc`, or `next_channel_acc` (no `combined_metric`) and defaults differ by CLI settings (`v7/training/trainer.py`, `train.py`).
+- `TECH_SPEC.md:117`, `TECH_SPEC.md:118`, `TECH_SPEC.md:119` SE‑blocks placement is wrong: code applies SE‑blocks per TF after projection to hidden_dim and before CfC; there is no global SE mode (`v7/models/hierarchical_cfc.py`).
+- `TECH_SPEC.md:123`, `TECH_SPEC.md:124` run index path is wrong: code writes to `runs/experiments_index.json`, not `experiments/index.json` (`v7/training/run_manager.py`).
+
+**Performance & Evidence**
+- `TECH_SPEC.md:9`, `TECH_SPEC.md:138`, `TECH_SPEC.md:141` speedup claims are not backed by benchmarks in the codebase; caching and parallel scanning exist but no measured results are recorded.
+- `TECH_SPEC.md:145`, `TECH_SPEC.md:146`, `TECH_SPEC.md:147` claims about 19/19 tests passing and deterministic behavior are not backed by recorded outputs; tests exist but results are not stored.
+- `TECH_SPEC.md:142` says 14 window sizes; code uses 8 (STANDARD_WINDOWS and `window_scores` 8 x 5) (`train.py`, `v7/features/full_features.py`).
+- `TECH_SPEC.md:150`, `TECH_SPEC.md:151`, `TECH_SPEC.md:152`, `TECH_SPEC.md:154` cache size/time numbers are not enforced or measured in code.
+
+Confirmed: the total feature count is 776 with per‑TF 35/11/10 and shared 160, and the model does produce per‑TF predictions plus aggregate duration/direction/next_channel/confidence outputs (`v7/features/feature_ordering.py`, `v7/models/hierarchical_cfc.py`).
+
+If you want, I can:
+1. Update `TECH_SPEC.md` to match current feature names, timeframes, window scoring, and training defaults.
+2. Compute exact parameter counts for your chosen config and replace the 469K estimate.
+3. Run tests or benchmarks and document the real performance numbers.

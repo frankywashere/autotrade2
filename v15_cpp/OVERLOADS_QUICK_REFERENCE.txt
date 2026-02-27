@@ -1,0 +1,440 @@
+================================================================================
+           extract_all_features() OVERLOADS - QUICK REFERENCE CARD
+================================================================================
+
+                        ┌─────────────────────────────────┐
+                        │   "Which overload should I use?" │
+                        └─────────────────────────────────┘
+
+                    Do you have DataView or vector?
+                                  │
+                    ┌─────────────┴─────────────┐
+                    │                           │
+               DataView                      vector
+                    │                           │
+                    ▼                           ▼
+        Do you have channel history?      OVERLOAD #1
+                    │                     (Pass 3 Scanner)
+        ┌───────────┴───────────┐         14,170 features
+        │                       │
+       Yes                     No
+        │                       │
+        ▼                       │
+  OVERLOAD #3                   │
+  (Pass 1/2)                    │
+  14,840 features               └──► OVERLOAD #3
+                                    with empty maps
+                                    14,170 features
+
+
+================================================================================
+                            AT-A-GLANCE COMPARISON
+================================================================================
+
+┌──────────┬──────────────┬──────────────┬──────────────┬─────────────────┐
+│ Overload │ Data Type    │ History      │ Features     │ Used By         │
+├──────────┼──────────────┼──────────────┼──────────────┼─────────────────┤
+│    #1    │ vector       │ None         │ 14,170       │ Pass 3          │
+│    #2    │ DataView     │ None (empty) │ 14,170       │ DEPRECATED      │
+│    #3    │ DataView     │ Real/Empty   │ 14,840/14170 │ Pass 1/2 (main) │
+└──────────┴──────────────┴──────────────┴──────────────┴─────────────────┘
+
+Status: ✓ Keep    ✗ Remove    ⚠ Deprecated
+
+┌──────────┬────────┐
+│ Overload │ Status │
+├──────────┼────────┤
+│    #1    │   ✓    │
+│    #2    │   ✗    │
+│    #3    │   ✓    │
+└──────────┴────────┘
+
+
+================================================================================
+                            SIGNATURE REFERENCE
+================================================================================
+
+Overload #1: Vector-based (Pass 3 Scanner)
+───────────────────────────────────────────
+
+  std::unordered_map<std::string, double> extract_all_features(
+      const std::vector<OHLCV>& tsla_5min,
+      const std::vector<OHLCV>& spy_5min,
+      const std::vector<OHLCV>& vix_5min,
+      int64_t timestamp,
+      const SlimLabeledChannelMap& tsla_slim_map,
+      const SlimLabeledChannelMap& spy_slim_map,
+      int source_bar_count = -1,
+      bool include_bar_metadata = true
+  );
+
+  Location: feature_extractor.hpp:146-155
+            feature_extractor.cpp:1452-1772
+  Caller:   scanner_pass3.cpp:104
+
+
+Overload #2: DataView without history (DEPRECATED)
+───────────────────────────────────────────────────
+
+  std::unordered_map<std::string, double> extract_all_features(
+      const DataView& tsla_view,
+      const DataView& spy_view,
+      const DataView& vix_view,
+      int64_t timestamp,
+      const SlimLabeledChannelMap& tsla_slim_map,
+      const SlimLabeledChannelMap& spy_slim_map,
+      int source_bar_count = -1,
+      bool include_bar_metadata = true
+  );
+
+  Location: feature_extractor.hpp:162-171
+            feature_extractor.cpp:1779-1805
+  Caller:   NONE (delegates to #3)
+  Action:   REMOVE THIS
+
+
+Overload #3: DataView with history (PRODUCTION)
+────────────────────────────────────────────────
+
+  std::unordered_map<std::string, double> extract_all_features(
+      const DataView& tsla_view,
+      const DataView& spy_view,
+      const DataView& vix_view,
+      int64_t timestamp,
+      const SlimLabeledChannelMap& tsla_slim_map,
+      const SlimLabeledChannelMap& spy_slim_map,
+      const std::unordered_map<std::string, std::vector<ChannelHistoryEntry>>& tsla_history_by_tf,
+      const std::unordered_map<std::string, std::vector<ChannelHistoryEntry>>& spy_history_by_tf,
+      int source_bar_count = -1,
+      bool include_bar_metadata = true
+  );
+
+  Location: feature_extractor.hpp:191-202
+            feature_extractor.cpp:1811-2090
+  Caller:   scanner.cpp:1569 (Pass 1/2)
+
+
+================================================================================
+                        FEATURE COUNT REFERENCE
+================================================================================
+
+All Overloads Extract:
+──────────────────────────────────────────────────
+  Per-TF Features (× 10 timeframes):
+    TSLA price                    58 × 10 =    580
+    Technical indicators          59 × 10 =    590
+    SPY features                 117 × 10 =  1,170
+    VIX features                  25 × 10 =    250
+    Cross-asset                   59 × 10 =    590
+    Channel features         116×8×10    =  9,280
+    Window scores                 50 × 10 =    500
+    Channel correlation           15 × 10 =    150
+                                          ────────
+  Subtotal:                                 13,110
+
+  TF-Independent Features:
+    Event features                          =     30
+    Bar metadata                  3 × 10 =      30
+                                          ────────
+  TOTAL (Base):                             14,170  ◄─ Overload #1 & #2
+
+
+Only Overload #3 Adds (when history provided):
+──────────────────────────────────────────────────
+  Channel History Features (× 10 TFs):
+    TSLA history                  40 × 10 =    400
+    SPY history                   40 × 10 =    400
+    Cross-history                 27 × 10 =    270
+                                          ────────
+  History Total:                                670
+                                          ────────
+  TOTAL (Full):                             14,840  ◄─ Overload #3 only
+
+
+Note: Actual implementation has 67 history features per TF = 670 total
+
+
+================================================================================
+                        CALLER DECISION TREE
+================================================================================
+
+START: Need to extract features?
+    │
+    ├─ Do you have DataView or vector?
+    │
+    ├──► vector
+    │      └─► Use Overload #1
+    │          Example:
+    │            auto features = FeatureExtractor::extract_all_features(
+    │                tsla_vec, spy_vec, vix_vec,
+    │                timestamp, tsla_map, spy_map,
+    │                source_bar_count, true
+    │            );
+    │
+    └──► DataView
+           │
+           ├─ Do you have channel history?
+           │
+           ├──► YES (Pass 1/2 context)
+           │      └─► Use Overload #3 with history
+           │          Example:
+           │            auto features = FeatureExtractor::extract_all_features(
+           │                tsla_view, spy_view, vix_view,
+           │                timestamp, tsla_map, spy_map,
+           │                tsla_history_by_tf, spy_history_by_tf,
+           │                source_bar_count, true
+           │            );
+           │          Output: 14,840 features ✓
+           │
+           └──► NO
+                  └─► Use Overload #3 with empty maps
+                      Example:
+                        std::unordered_map<std::string, std::vector<ChannelHistoryEntry>> empty;
+                        auto features = FeatureExtractor::extract_all_features(
+                            tsla_view, spy_view, vix_view,
+                            timestamp, tsla_map, spy_map,
+                            empty, empty,  // ◄─ Empty history
+                            source_bar_count, true
+                        );
+                      Output: 14,170 features (history = 0.0)
+
+
+================================================================================
+                        HISTORY FEATURE NAMES
+================================================================================
+
+Channel history features (67 per TF, repeated for each of 10 TFs):
+
+  TSLA History (40 features with "hist_tsla_" prefix):
+    count, avg_duration, std_duration, min_duration, max_duration,
+    avg_slope, std_slope, min_slope, max_slope,
+    avg_width, std_width, min_width, max_width,
+    avg_confidence, std_confidence, min_confidence, max_confidence,
+    direction_sequence, break_sequence, alternating_score,
+    trend_duration, trend_slope, trend_width, trend_confidence,
+    momentum, regime_shift, recency_weighted_slope,
+    recency_weighted_width, recency_weighted_confidence,
+    last_direction, last_break_direction, last_slope, last_width,
+    last_confidence, last_duration, volatility_slope, volatility_width,
+    volatility_confidence, channel_stability, pattern_consistency
+
+  SPY History (40 features with "hist_spy_" prefix):
+    [Same structure as TSLA]
+
+  Cross-History (27 features with "hist_" prefix):
+    direction_alignment, break_alignment, avg_direction_match,
+    alternating_correlation, momentum_alignment,
+    regime_sync, tsla_spy_duration_corr, tsla_spy_slope_corr,
+    tsla_spy_width_corr, tsla_spy_confidence_corr,
+    duration_ratio, slope_ratio, width_ratio, confidence_ratio,
+    tsla_dominates_duration, spy_dominates_duration,
+    tsla_dominates_slope, spy_dominates_slope,
+    tsla_dominates_width, spy_dominates_width,
+    synchronized_trends, divergent_trends,
+    cross_volatility, market_harmony, regime_divergence,
+    leadership_switch, co_movement
+
+Note: Exact count and names may vary by implementation version.
+
+
+================================================================================
+                        COMMON PITFALLS & TIPS
+================================================================================
+
+❌ MISTAKE: Calling wrong overload for data type
+  vector<OHLCV> data;
+  FeatureExtractor::extract_all_features(
+      DataView(data), ...  // ❌ Unnecessary conversion
+  );
+
+✓ CORRECT: Match data type to overload
+  vector<OHLCV> data;
+  FeatureExtractor::extract_all_features(
+      data, ...  // ✓ Direct vector overload
+  );
+
+
+❌ MISTAKE: Expecting history features without providing history
+  DataView view;
+  auto features = extract_all_features(view, ..., NO HISTORY);
+  // features["5min_hist_tsla_count"] is 0.0 ❌
+
+✓ CORRECT: Provide history for history features
+  DataView view;
+  auto history = build_channel_history(...);
+  auto features = extract_all_features(view, ..., history);
+  // features["5min_hist_tsla_count"] is real value ✓
+
+
+❌ MISTAKE: Using Overload #2
+  auto features = extract_all_features(
+      view, view, view, ts, map1, map2, count, true  // ❌ Overload #2 (deprecated)
+  );
+
+✓ CORRECT: Use Overload #3 directly
+  std::unordered_map<string, vector<ChannelHistoryEntry>> empty;
+  auto features = extract_all_features(
+      view, view, view, ts, map1, map2, empty, empty, count, true  // ✓ Overload #3
+  );
+
+
+❌ MISTAKE: Assuming all overloads return same feature count
+  auto features = extract_all_features(...);
+  assert(features.size() == 14840);  // ❌ May fail for #1 and #2
+
+✓ CORRECT: Check actual feature count or use history-aware overload
+  auto features = extract_all_features(..., history_maps);
+  assert(features.size() == 14840);  // ✓ Only true for #3 with history
+
+
+================================================================================
+                        PERFORMANCE TIPS
+================================================================================
+
+1. Prefer Overload #3 for main pipeline
+   - Zero-copy DataView
+   - Complete feature set
+   - Direct implementation (no delegation)
+
+2. Use Overload #1 only when you already have vectors
+   - Don't convert DataView → vector just to use #1
+   - #1 is for Pass 3 context where vectors already exist
+
+3. Avoid Overload #2 entirely
+   - Pure delegation overhead
+   - Will be removed in future cleanup
+
+4. Pre-allocate history maps
+   - Build history incrementally during scanning
+   - Reuse maps across multiple extract_all_features calls
+
+5. Consider source_bar_count
+   - Affects bar completion percentage calculation
+   - Use actual bar count for accurate partial bar features
+
+
+================================================================================
+                        MIGRATION CHECKLIST
+================================================================================
+
+Removing Overload #2:
+
+  ☐ 1. Search for all calls to Overload #2
+       grep -n "extract_all_features.*DataView.*8 params" *.cpp
+
+  ☐ 2. For each call, replace with Overload #3:
+       Before:
+         extract_all_features(view, view, view, ts, m1, m2, count, meta)
+
+       After:
+         std::unordered_map<string, vector<ChannelHistoryEntry>> empty;
+         extract_all_features(view, view, view, ts, m1, m2, empty, empty, count, meta)
+
+  ☐ 3. Remove declaration from feature_extractor.hpp (lines 162-171)
+
+  ☐ 4. Remove implementation from feature_extractor.cpp (lines 1779-1805)
+
+  ☐ 5. Update documentation
+
+  ☐ 6. Run tests to ensure no breakage
+
+  ☐ 7. Commit with message: "Remove deprecated extract_all_features overload #2"
+
+
+================================================================================
+                        TESTING REFERENCE
+================================================================================
+
+Test that Overload #1 and #3 (with empty history) return same features:
+
+  std::vector<OHLCV> tsla_vec, spy_vec, vix_vec;
+  // ... populate vectors ...
+
+  // Call Overload #1
+  auto features1 = extract_all_features(
+      tsla_vec, spy_vec, vix_vec, ts, m1, m2, count, true
+  );
+
+  // Call Overload #3 with empty history
+  DataView tsla_view(tsla_vec);
+  DataView spy_view(spy_vec);
+  DataView vix_view(vix_vec);
+  std::unordered_map<string, vector<ChannelHistoryEntry>> empty;
+  auto features3 = extract_all_features(
+      tsla_view, spy_view, vix_view, ts, m1, m2, empty, empty, count, true
+  );
+
+  // Verify same feature count
+  assert(features1.size() == 14170);
+  assert(features3.size() == 14170);
+
+  // Verify all history features are 0.0
+  for (auto& [name, value] : features1) {
+      if (name.find("hist_") != string::npos) {
+          assert(value == 0.0);
+      }
+  }
+
+
+Test that Overload #3 with real history returns more features:
+
+  // ... build real history ...
+  auto history_tsla = build_channel_history(tsla_channels);
+  auto history_spy = build_channel_history(spy_channels);
+
+  auto features = extract_all_features(
+      tsla_view, spy_view, vix_view, ts, m1, m2,
+      history_tsla, history_spy, count, true
+  );
+
+  assert(features.size() == 14840);
+
+  // Verify history features are non-zero
+  bool found_nonzero_history = false;
+  for (auto& [name, value] : features) {
+      if (name.find("hist_") != string::npos && value != 0.0) {
+          found_nonzero_history = true;
+          break;
+      }
+  }
+  assert(found_nonzero_history);
+
+
+================================================================================
+                        SUMMARY DIAGRAM
+================================================================================
+
+                    extract_all_features() Overloads
+                                  │
+                ┌─────────────────┼─────────────────┐
+                │                 │                 │
+           OVERLOAD #1       OVERLOAD #2       OVERLOAD #3
+             Vector          DataView          DataView +
+                            (deprecated)        History
+                │                 │                 │
+                │                 │                 │
+         Pass 3 Scanner      REMOVE           Pass 1/2 Scanner
+                │            THIS ONE              │
+                │                 │                 │
+         14,170 features     Delegates        14,840 features
+         (no history)       to Overload #3     (with history)
+                                  │
+                                  │
+                            14,170 features
+                            (empty history)
+
+
+                    Recommended Final State:
+                                  │
+                ┌─────────────────┴─────────────────┐
+                │                                   │
+           OVERLOAD #1                         OVERLOAD #3
+             Vector                           DataView + History
+                │                                   │
+         Pass 3 Scanner                      Pass 1/2 Scanner
+                │                                   │
+         14,170 features                    14,840 or 14,170
+         (no history)                       (based on history)
+
+
+================================================================================

@@ -1,0 +1,16 @@
+{
+  "best_auc": 0.8062076246402693,
+  "best_params": {
+    "n_estimators": 626,
+    "num_leaves": 120,
+    "learning_rate": 0.006077128133428215,
+    "min_child_samples": 111,
+    "feature_fraction": 0.44166746149932906,
+    "bagging_fraction": 0.9658251309672676,
+    "bagging_freq": 1,
+    "reg_alpha": 0.003323035264776406,
+    "reg_lambda": 0.00361562723900409,
+    "max_depth": 6
+  },
+  "n_trials": 98
+}

@@ -1,0 +1,52 @@
+# Makefile for integration test
+# Usage: make -f Makefile.integration
+
+CXX = clang++
+CXXFLAGS = -std=c++17 -O3 -march=native -Wall -Wextra \
+           -I../include \
+           -I/opt/homebrew/Cellar/eigen/5.0.1/include/eigen3 \
+           -I/usr/local/include/eigen3
+LDFLAGS = -L/opt/homebrew/lib -L/usr/local/lib
+
+# Source files
+SRC_DIR = ../src
+SRCS = $(SRC_DIR)/data_loader.cpp \
+       $(SRC_DIR)/channel_detector.cpp \
+       $(SRC_DIR)/indicators.cpp \
+       $(SRC_DIR)/scanner.cpp \
+       $(SRC_DIR)/serialization.cpp \
+       $(SRC_DIR)/feature_extractor.cpp \
+       $(SRC_DIR)/label_generator.cpp
+
+TEST_SRC = integration_test.cpp
+
+# Object files
+OBJS = $(SRCS:.cpp=.o)
+TEST_OBJ = integration_test.o
+
+# Output
+TARGET = integration_test
+
+.PHONY: all clean run
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS) $(TEST_OBJ)
+	@echo "Linking $@..."
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+%.o: %.cpp
+	@echo "Compiling $<..."
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+run: $(TARGET)
+	@echo ""
+	@echo "=========================================="
+	@echo "Running integration test..."
+	@echo "=========================================="
+	@./$(TARGET)
+
+clean:
+	rm -f $(OBJS) $(TEST_OBJ) $(TARGET)
+	rm -f $(SRC_DIR)/*.o
+	@echo "Clean complete"

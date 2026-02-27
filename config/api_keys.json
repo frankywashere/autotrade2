@@ -1,0 +1,26 @@
+{
+  "telegram": {
+    "bot_token": "7978931435:AAGdqdfcbK-GT8Q_BEw7dvmISkN9035FzZQ",
+    "chat_id": "7910666732"
+  },
+  "alpha_vantage": {
+    "api_key": "PYUPDHCVHQQT5I5L",
+    "note": "Free key from https://www.alphavantage.co/support/#api-key",
+    "purpose": "Fetch TSLA earnings calendar and EPS estimates"
+  },
+  "fred": {
+    "api_key": "8e8fc56308f78390f4b44222c01fd449",
+    "note": "Free key from https://fred.stlouisfed.org/docs/api/api_key.html",
+    "purpose": "Fetch economic data (CPI, NFP, Fed Funds Rate)"
+  },
+  "newsapi": {
+    "api_key": "7958854e1a644a109cf28488af5b6d8c",
+    "note": "From https://newsapi.org/",
+    "purpose": "Fetch news articles for sentiment analysis"
+  },
+  "finnhub": {
+    "api_key": "d4qh0u9r01quli1cimbgd4qh0u9r01quli1cimc0",
+    "note": "Free key from https://finnhub.io/",
+    "purpose": "Fetch earnings calendar, company news, and economic calendar"
+  }
+}
