@@ -37,8 +37,8 @@ def _load_data():
         tsla_path = 'data/TSLAMin.txt'
 
     tf_data = load_all_tfs(tsla_path, start, end)
-    daily_df = tf_data['daily']
-    weekly_df = tf_data['weekly']
+    daily_df = tf_data['daily'].copy()
+    weekly_df = tf_data['weekly'].copy()
 
     # SPY
     spy = _norm_cols(fetch_native_tf('SPY', 'daily', start, end))
@@ -67,7 +67,6 @@ def _load_data():
     atr_pct_s = pd.Series(atr_d / d_close, index=daily_df.index)
 
     # Drawdown from 20-day peak
-    daily_df = daily_df.copy()
     daily_df['rolling_max_20'] = daily_df['high'].rolling(20, min_periods=1).max()
     daily_df['dd_from_peak'] = (daily_df['close'] / daily_df['rolling_max_20'] - 1) * 100
     daily_df['daily_return'] = daily_df['close'].pct_change() * 100
