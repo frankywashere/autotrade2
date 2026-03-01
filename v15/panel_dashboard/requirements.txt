@@ -1,0 +1,11 @@
+panel>=1.4
+bokeh>=3.4
+plotly>=5.18
+param>=2.0
+websocket-client
+yfinance>=0.2.36
+pandas>=2.0
+numpy>=1.24
+scipy
+pytz
+requests
