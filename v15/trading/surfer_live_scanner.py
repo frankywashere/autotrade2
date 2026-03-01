@@ -511,6 +511,120 @@ class SurferLiveScanner:
 
         return alert
 
+    def evaluate_intraday_signal(
+        self, current_price: float,
+        cp5: float, vwap_dist: float,
+        daily_cp: float, h1_cp: float, h4_cp: float,
+        vol_ratio: float = float('nan'),
+        vwap_slope: float = float('nan'),
+        bullish_1m: float = float('nan'),
+        gap_pct: float = float('nan'),
+        rsi_slope: float = float('nan'),
+        daily_slope: float = float('nan'),
+        h1_slope: float = float('nan'),
+        h4_slope: float = float('nan'),
+        spread_pct: float = float('nan'),
+    ) -> Optional[ScannerAlert]:
+        """Evaluate intraday 5-min signal and return ENTRY alert if warranted.
+
+        Uses the FD Enhanced-Union signal from intraday_signals.py.
+        Only fires during PM hours (13:00-15:25 ET).
+        """
+        self._reset_daily_if_needed()
+        now = _now_et()
+        now_iso = now.isoformat()
+
+        if not _is_market_open():
+            return None
+
+        # Intraday window: 13:00-15:25 ET (PM session)
+        from datetime import time as _time
+        t = now.time()
+        if not (_time(13, 0) <= t <= _time(15, 25)):
+            return None
+
+        # Kill switch / daily loss limit
+        if self.config.kill_switch:
+            return None
+        if self.daily_pnl <= self.config.daily_loss_limit:
+            return None
+
+        # Don't open intraday if already have an intraday position
+        for pos in self.positions.values():
+            if pos.signal_type == 'intraday':
+                return None
+
+        # Evaluate signal
+        try:
+            from v15.trading.intraday_signals import sig_union_enhanced, compute_intraday_trail
+        except ImportError:
+            return None
+
+        result = sig_union_enhanced(
+            cp5=cp5, vwap_dist=vwap_dist,
+            daily_cp=daily_cp, h1_cp=h1_cp, h4_cp=h4_cp,
+            vol_ratio=vol_ratio, vwap_slope=vwap_slope,
+            bullish_1m=bullish_1m, gap_pct=gap_pct,
+            rsi_slope=rsi_slope, daily_slope=daily_slope,
+            h1_slope=h1_slope, h4_slope=h4_slope,
+            spread_pct=spread_pct,
+        )
+
+        if result is None:
+            return None
+
+        direction_str, confidence, stop_pct, tp_pct = result
+        direction = 'long'  # Intraday system is long-only
+
+        if confidence < self.config.min_confidence:
+            return None
+
+        # Record in signal history
+        self.signal_history.append({
+            'time': now_iso,
+            'action': 'BUY',
+            'confidence': confidence,
+            'primary_tf': '5min',
+            'signal_type': 'intraday',
+            'reason': 'Intraday FD Enh-Union',
+        })
+
+        # Position sizing (same logic as CS)
+        risk_dollars = self.equity * self.config.risk_per_trade_pct
+        stop_distance = stop_pct * current_price
+        shares = int(risk_dollars / stop_distance) if stop_distance > 0 else 0
+        buying_power = self.equity * self.config.max_leverage
+        max_notional = buying_power * self.config.max_buying_power_pct
+        max_shares = int(max_notional / current_price) if current_price > 0 else 0
+        shares = min(shares, max_shares)
+        if shares <= 0:
+            return None
+
+        notional = shares * current_price
+        stop_price = current_price * (1 - stop_pct)
+        tp_price_val = current_price * (1 + tp_pct)
+        rr = tp_pct / max(stop_pct, 0.001)
+
+        alert = ScannerAlert(
+            alert_type='ENTRY',
+            timestamp=now_iso,
+            action='BUY',
+            price=current_price,
+            shares=shares,
+            stop_price=stop_price,
+            tp_price=tp_price_val,
+            risk_reward=rr,
+            confidence=confidence,
+            signal_type='intraday',
+            primary_tf='5min',
+            reason='Intraday FD Enh-Union',
+            notional=notional,
+        )
+
+        self._enter_hypothetical(alert, direction)
+        self._save_state()
+        return alert
+
     def _enter_hypothetical(self, alert: ScannerAlert, direction: str):
         pos_id = str(uuid.uuid4())[:8]
         pos = HypotheticalPosition(
@@ -673,6 +787,12 @@ class SurferLiveScanner:
                 if bar_low < pos.best_price:
                     pos.best_price = bar_low
 
+            # --- Intraday auto-close at 15:55 ET (5 min before market close) ---
+            if exit_reason is None and pos.signal_type == 'intraday':
+                from datetime import time as _time
+                if now.time() >= _time(15, 55):
+                    exit_reason = 'intraday_eod'
+
             # --- EOD force close (3:45 PM ET) ---
             if exit_reason is None and _is_eod:
                 exit_reason = 'eod_close'
@@ -714,19 +834,27 @@ class SurferLiveScanner:
                     exit_reason = 'take_profit'
                     exit_price = pos.tp_price
 
-            # --- Trailing stop (profit-tier based, matching surfer_backtest.py) ---
-            # Tiers based on how far price has moved toward TP (profit_ratio).
-            # Near TP → ultra-tight trail (lock profits). Early profit → wider trail.
-            # Mirrors the bounce trail logic in surfer_backtest.py evaluate_position().
+            # --- Trailing stop ---
             if exit_reason is None:
-                trail_price = self._calc_trail_price(pos)
-                if trail_price is not None:
-                    if pos.direction == 'long' and bar_low <= trail_price:
-                        exit_reason = 'trailing_stop'
-                        exit_price = trail_price
-                    elif pos.direction == 'short' and bar_high >= trail_price:
-                        exit_reason = 'trailing_stop'
-                        exit_price = trail_price
+                if pos.signal_type == 'intraday':
+                    # Intraday trailing: trail = 0.006 * (1 - conf)^6
+                    trail_pct = 0.006 * (1.0 - pos.confidence) ** 6
+                    if pos.direction == 'long' and pos.best_price > pos.entry_price:
+                        trail_price = pos.best_price * (1.0 - trail_pct)
+                        trail_price = max(trail_price, pos.stop_price)
+                        if bar_low <= trail_price:
+                            exit_reason = 'trailing_stop'
+                            exit_price = trail_price
+                else:
+                    # CS Daily: profit-tier based, matching surfer_backtest.py
+                    trail_price = self._calc_trail_price(pos)
+                    if trail_price is not None:
+                        if pos.direction == 'long' and bar_low <= trail_price:
+                            exit_reason = 'trailing_stop'
+                            exit_price = trail_price
+                        elif pos.direction == 'short' and bar_high >= trail_price:
+                            exit_reason = 'trailing_stop'
+                            exit_price = trail_price
 
             # --- Timeout (5 hours) ---
             if exit_reason is None:

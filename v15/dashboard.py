@@ -3080,16 +3080,12 @@ def _get_surfer_scanner(initial_capital: float = 100_000.0) -> 'SurferLiveScanne
 
 def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
                                  current_tsla, run_analysis: bool):
-    """Render the live scanner panel: positions, alerts, trade history."""
+    """Render the live scanner panel: dual-system positions, alerts, trade history."""
     st.subheader("Live Scanner")
 
-    # Auto-refresh every 60s when positions are open for real-time stop/TP monitoring
+    # Tab-level refresh now handles dynamic 1s/60s rate based on position state
     if scanner.positions:
-        if AUTOREFRESH_AVAILABLE:
-            st_autorefresh(interval=60_000, key="scanner_position_monitor")
-            st.caption("🔄 Auto-checking stop/TP every 60s")
-        else:
-            st.info("Install streamlit-autorefresh for automatic 1-min stop/TP monitoring")
+        st.caption("Real-time exit monitoring active (1s refresh)")
 
     col_cap, col_eq, col_unrealized = st.columns(3)
     unrealized = scanner.get_unrealized_pnl(current_price)
@@ -3105,14 +3101,24 @@ def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
 
     # --- Real-time exit monitoring (runs on EVERY render, not just analysis runs) ---
     if current_tsla is not None and len(current_tsla) > 0:
-        # Get best available price — prefer real-time over stale bar
+        # Get best available price: WebSocket → REST → bar close
         rt_price = current_price
         try:
-            _rt = _get_realtime_prices()
-            if _rt.get('TSLA'):
-                rt_price = float(_rt['TSLA'])
+            from v15.data.finnhub_ws import get_ws_client
+            _ws = get_ws_client()
+            if _ws:
+                _ws_tick = _ws.get_price('TSLA')
+                if _ws_tick and _ws_tick.price > 0:
+                    rt_price = _ws_tick.price
         except Exception:
             pass
+        if rt_price == current_price:
+            try:
+                _rt = _get_realtime_prices()
+                if _rt.get('TSLA'):
+                    rt_price = float(_rt['TSLA'])
+            except Exception:
+                pass
 
         if run_analysis:
             # Full OHLC bar: catches intrabar wicks
@@ -3131,7 +3137,7 @@ def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
                 _render_scanner_exit_alert(ea)
                 _play_exit_alert_sound(ea.exit_reason)
 
-        # Evaluate new entry signal (only on explicit analysis run)
+        # --- Channel Surfer (Daily) signal evaluation ---
         if run_analysis and sig.action != 'HOLD':
             entry_alert = scanner.evaluate_signal(analysis, rt_price)
             if entry_alert and entry_alert.alert_type == 'ENTRY':
@@ -3140,7 +3146,7 @@ def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
                     f'<div style="background:#1a2233;padding:10px;border-radius:6px;margin:4px 0;'
                     f'border:2px solid {action_color};">'
                     f'<b style="color:{action_color};font-size:16px">'
-                    f'{entry_alert.action} ENTRY [{entry_alert.pos_id}]</b>  '
+                    f'CS Daily {entry_alert.action} [{entry_alert.pos_id}]</b>  '
                     f'{entry_alert.shares} shares @ ${entry_alert.price:.2f} | '
                     f'Stop: ${entry_alert.stop_price:.2f} | '
                     f'TP: ${entry_alert.tp_price:.2f} | '
@@ -3148,35 +3154,42 @@ def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
                     f'</div>', unsafe_allow_html=True,
                 )
             elif entry_alert and entry_alert.alert_type == 'RISK_WARNING':
-                st.warning(f"Scanner: {entry_alert.warning_msg}")
+                st.warning(f"CS Daily: {entry_alert.warning_msg}")
 
-    # Open positions — show distance to stop and TP
+        # --- Intraday (5-Min) signal evaluation ---
+        if run_analysis:
+            _intraday_alert = _evaluate_intraday_from_analysis(scanner, analysis, current_tsla, rt_price)
+            if _intraday_alert and _intraday_alert.alert_type == 'ENTRY':
+                st.markdown(
+                    f'<div style="background:#1a2233;padding:10px;border-radius:6px;margin:4px 0;'
+                    f'border:2px solid #4fc3f7;">'
+                    f'<b style="color:#4fc3f7;font-size:16px">'
+                    f'Intraday 5m BUY [{_intraday_alert.pos_id}]</b>  '
+                    f'{_intraday_alert.shares} shares @ ${_intraday_alert.price:.2f} | '
+                    f'Stop: ${_intraday_alert.stop_price:.2f} | '
+                    f'TP: ${_intraday_alert.tp_price:.2f} | '
+                    f'Conf: {_intraday_alert.confidence:.0%}'
+                    f'</div>', unsafe_allow_html=True,
+                )
+
+    # --- Open Positions (split by system) ---
     if scanner.positions:
-        st.markdown("**Open Positions**")
-        for pos in scanner.positions.values():
-            if pos.direction == 'long':
-                upnl = (current_price - pos.entry_price) * pos.shares
-                dist_stop = (current_price - pos.stop_price) / current_price
-                dist_tp = (pos.tp_price - current_price) / current_price
-            else:
-                upnl = (pos.entry_price - current_price) * pos.shares
-                dist_stop = (pos.stop_price - current_price) / current_price
-                dist_tp = (current_price - pos.tp_price) / current_price
-            upnl_color = "#00e676" if upnl >= 0 else "#ff5252"
-            stop_color = '#ff5252' if dist_stop < 0.003 else ('#ff9800' if dist_stop < 0.01 else '#888')
-            st.markdown(
-                f'<div style="background:#1a2233;padding:8px;border-radius:6px;margin:3px 0;">'
-                f'[{pos.pos_id}] <b>{pos.direction.upper()}</b> {pos.shares}sh '
-                f'@ ${pos.entry_price:.2f} | '
-                f'<span style="color:{stop_color}">SL: ${pos.stop_price:.2f} ({dist_stop:.1%} away)</span> | '
-                f'TP: ${pos.tp_price:.2f} ({dist_tp:.1%} away) | '
-                f'Unrealized: <b style="color:{upnl_color}">${upnl:+,.0f}</b>'
-                f'</div>', unsafe_allow_html=True,
-            )
+        cs_positions = {k: v for k, v in scanner.positions.items() if v.signal_type != 'intraday'}
+        id_positions = {k: v for k, v in scanner.positions.items() if v.signal_type == 'intraday'}
+
+        if cs_positions:
+            st.markdown("**CS Daily Positions**")
+            for pos in cs_positions.values():
+                _render_position_card(pos, current_price)
+
+        if id_positions:
+            st.markdown("**Intraday 5m Positions**")
+            for pos in id_positions.values():
+                _render_position_card(pos, current_price)
     else:
         st.caption("No open positions.")
 
-    # Closed trade history
+    # Closed trade history (combined, with system tag)
     if scanner.closed_trades:
         total_trades = len(scanner.closed_trades)
         total_pnl = sum(t.pnl for t in scanner.closed_trades)
@@ -3187,6 +3200,10 @@ def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
             expanded=False
         ):
             hist_rows = [{
+                'System': 'ID 5m' if getattr(t, 'exit_reason', '') == 'intraday_eod' or
+                          any(p.signal_type == 'intraday' for p in scanner.positions.values()
+                              if p.pos_id == t.pos_id)
+                          else 'CS',
                 'ID': t.pos_id,
                 'Dir': t.direction.upper(),
                 'Entry $': f"${t.entry_price:.2f}",
@@ -3202,6 +3219,101 @@ def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
     if st.button("Reset Scanner (clear all positions/history)", key="surfer_scanner_reset"):
         scanner.reset()
         st.rerun()
+
+
+def _render_position_card(pos, current_price: float):
+    """Render a single position card with stop/TP distances."""
+    sys_tag = "ID 5m" if pos.signal_type == 'intraday' else "CS"
+    if pos.direction == 'long':
+        upnl = (current_price - pos.entry_price) * pos.shares
+        dist_stop = (current_price - pos.stop_price) / current_price
+        dist_tp = (pos.tp_price - current_price) / current_price
+    else:
+        upnl = (pos.entry_price - current_price) * pos.shares
+        dist_stop = (pos.stop_price - current_price) / current_price
+        dist_tp = (current_price - pos.tp_price) / current_price
+    upnl_color = "#00e676" if upnl >= 0 else "#ff5252"
+    stop_color = '#ff5252' if dist_stop < 0.003 else ('#ff9800' if dist_stop < 0.01 else '#888')
+    tag_color = '#4fc3f7' if pos.signal_type == 'intraday' else '#ff9800'
+    st.markdown(
+        f'<div style="background:#1a2233;padding:8px;border-radius:6px;margin:3px 0;">'
+        f'<span style="background:{tag_color};color:#fff;padding:1px 6px;border-radius:4px;'
+        f'font-size:11px;font-weight:600;">{sys_tag}</span> '
+        f'[{pos.pos_id}] <b>{pos.direction.upper()}</b> {pos.shares}sh '
+        f'@ ${pos.entry_price:.2f} | '
+        f'<span style="color:{stop_color}">SL: ${pos.stop_price:.2f} ({dist_stop:.1%} away)</span> | '
+        f'TP: ${pos.tp_price:.2f} ({dist_tp:.1%} away) | '
+        f'Unrealized: <b style="color:{upnl_color}">${upnl:+,.0f}</b>'
+        f'</div>', unsafe_allow_html=True,
+    )
+
+
+def _evaluate_intraday_from_analysis(scanner, analysis, current_tsla, rt_price: float):
+    """Extract 5-min features from analysis and evaluate intraday signal."""
+    if analysis is None or not analysis.tf_states:
+        return None
+    if current_tsla is None or len(current_tsla) == 0:
+        return None
+
+    # Extract channel positions from TF states
+    tf_states = analysis.tf_states
+    state_5m = tf_states.get('5min')
+    state_1h = tf_states.get('1h')
+    state_4h = tf_states.get('4h')
+    state_daily = tf_states.get('daily')
+
+    if not state_5m or not state_5m.valid:
+        return None
+
+    cp5 = state_5m.position_pct if state_5m.valid else float('nan')
+    h1_cp = state_1h.position_pct if state_1h and state_1h.valid else float('nan')
+    h4_cp = state_4h.position_pct if state_4h and state_4h.valid else float('nan')
+    daily_cp = state_daily.position_pct if state_daily and state_daily.valid else float('nan')
+
+    # Compute VWAP distance from 5-min bar data
+    vwap_dist = float('nan')
+    try:
+        close_arr = current_tsla['close'].values
+        high_arr = current_tsla['high'].values
+        low_arr = current_tsla['low'].values
+        vol_arr = current_tsla['volume'].values
+        tp = (high_arr + low_arr + close_arr) / 3.0
+        # Simple cumulative VWAP for current day
+        dates = current_tsla.index.date
+        today = dates[-1]
+        today_mask = dates == today
+        if today_mask.sum() > 0:
+            today_tp = tp[today_mask]
+            today_vol = vol_arr[today_mask]
+            cum_tv = (today_tp * today_vol).cumsum()
+            cum_v = today_vol.cumsum()
+            valid = cum_v > 0
+            if valid.any():
+                vwap_val = cum_tv[valid][-1] / cum_v[valid][-1]
+                vwap_dist = (close_arr[-1] - vwap_val) / vwap_val * 100.0
+    except Exception:
+        pass
+
+    # Channel slopes from TF states (if available)
+    daily_slope = float('nan')
+    h1_slope = float('nan')
+    h4_slope = float('nan')
+    try:
+        if state_daily and hasattr(state_daily, 'channel_direction'):
+            daily_slope = 1.0 if state_daily.channel_direction == 'bull' else (-1.0 if state_daily.channel_direction == 'bear' else 0.0)
+        if state_1h and hasattr(state_1h, 'channel_direction'):
+            h1_slope = 1.0 if state_1h.channel_direction == 'bull' else (-1.0 if state_1h.channel_direction == 'bear' else 0.0)
+        if state_4h and hasattr(state_4h, 'channel_direction'):
+            h4_slope = 1.0 if state_4h.channel_direction == 'bull' else (-1.0 if state_4h.channel_direction == 'bear' else 0.0)
+    except Exception:
+        pass
+
+    return scanner.evaluate_intraday_signal(
+        current_price=rt_price,
+        cp5=cp5, vwap_dist=vwap_dist,
+        daily_cp=daily_cp, h1_cp=h1_cp, h4_cp=h4_cp,
+        daily_slope=daily_slope, h1_slope=h1_slope, h4_slope=h4_slope,
+    )
 
 
 def show_channel_surfer_tab(
@@ -3280,9 +3392,8 @@ def show_channel_surfer_tab(
     # --- Section 1: Signal Banner ---
     current_price = float(current_tsla['close'].iloc[-1]) if current_tsla is not None and len(current_tsla) > 0 else 0.0
 
-    # Override with real-time price if available (5-min bar may be stale over weekends/gaps)
+    # Override with real-time price: WebSocket (sub-second) → REST → bar close
     _market_session = get_market_status()
-    # Premarket = weekday, before 9:30 AM ET, after 4 AM ET (extended hours window)
     _is_premarket = False
     if _market_session and not _market_session.get('is_open', True):
         _time_et = _market_session.get('current_time_et', '')
@@ -3294,18 +3405,33 @@ def show_channel_surfer_tab(
                 _is_premarket = 4 <= _h < 9 or (_h == 9 and _m < 30)
         except Exception:
             pass
-    try:
-        _rt_prices = _get_realtime_prices()
-        _rt_tsla = _rt_prices.get('TSLA')
-        if _rt_tsla and _rt_tsla > 0:
-            current_price = float(_rt_tsla)
-            _price_source = "premarket" if _is_premarket else "live"
-        else:
-            _price_source = "bar close"
-    except Exception:
-        _price_source = "bar close"
 
-    # Also check if last 5-min bar is from today (prepost=True should include premarket bars)
+    _price_source = "bar close"
+    _ws_age = None
+    # Try WebSocket first (sub-second freshness)
+    try:
+        from v15.data.finnhub_ws import get_ws_client
+        _ws = get_ws_client()
+        if _ws:
+            _ws_tick = _ws.get_price('TSLA')
+            if _ws_tick and _ws_tick.price > 0:
+                current_price = _ws_tick.price
+                _ws_age = _ws_tick.age_seconds
+                _price_source = "LIVE" if _ws_tick.is_fresh else f"WS ({_ws_age:.0f}s ago)"
+    except Exception:
+        pass
+
+    # Fall back to REST if WebSocket unavailable
+    if _price_source == "bar close":
+        try:
+            _rt_prices = _get_realtime_prices()
+            _rt_tsla = _rt_prices.get('TSLA')
+            if _rt_tsla and _rt_tsla > 0:
+                current_price = float(_rt_tsla)
+                _price_source = "premarket" if _is_premarket else "REST"
+        except Exception:
+            pass
+
     if _price_source == "bar close" and current_tsla is not None and len(current_tsla) > 0:
         _last_bar_ts = current_tsla.index[-1]
         if hasattr(_last_bar_ts, 'date') and _last_bar_ts.date() == datetime.now().date():
@@ -3316,6 +3442,13 @@ def show_channel_surfer_tab(
         prev_price = float(current_tsla['close'].iloc[-2]) if current_tsla is not None and len(current_tsla) > 1 else current_price
         price_delta = current_price - prev_price
         _premarket_note = " [PREMARKET]" if _is_premarket else ""
+        # LIVE indicator for WebSocket prices
+        if _price_source == "LIVE":
+            _live_dot = '<span style="color:#00e676;font-size:10px;">&#9679;</span> '
+            st.markdown(
+                f'{_live_dot}<span style="font-size:11px;color:#00e676;font-weight:600;">LIVE</span>',
+                unsafe_allow_html=True,
+            )
         st.metric("TSLA", f"${current_price:.2f}{_premarket_note}", delta=f"{price_delta:+.2f} ({price_delta/prev_price*100:+.2f}%)",
                   help=f"Source: {_price_source}. Signal analysis uses completed bars (last session close).")
         st.caption(f"Price updated: {datetime.now().strftime('%H:%M:%S')} ({_price_source})")
@@ -3327,9 +3460,6 @@ def show_channel_surfer_tab(
         _render_market_insights(analysis)
     except Exception:
         pass
-
-    # --- ML Signal Quality Panel ---
-    _render_ml_signal_quality(analysis, sig, current_tsla, spy_df=current_spy, vix_df=current_vix)
 
     # --- Live Scanner Panel ---
     if SURFER_SCANNER_AVAILABLE:
@@ -3371,9 +3501,6 @@ def show_channel_surfer_tab(
             </div>""",
             unsafe_allow_html=True,
         )
-
-    # --- ML Predictions Section ---
-    _show_ml_predictions(analysis, current_tsla, native_tf_data)
 
     # --- Break Direction Predictor (Phase 4 evolved heuristic) ---
     _render_break_predictor(analysis, native_tf_data, current_spy=current_spy, current_vix=current_vix)
@@ -3549,126 +3676,6 @@ def show_channel_surfer_tab(
         else:
             st.info("No BUY/SELL signals recorded yet.")
 
-    # --- Section 8: Quick Backtest ---
-    with st.expander("Quick Backtest", expanded=False):
-        st.caption("Run a quick backtest of Channel Surfer on recent 5min data")
-        bt_col1, bt_col2 = st.columns(2)
-        with bt_col1:
-            bt_days = st.selectbox("Backtest period", [30, 60], index=1, key="bt_days")
-        with bt_col2:
-            bt_pos_size = st.number_input("Position size ($)", value=10000, step=5000, key="bt_pos")
-
-        if st.button("Run Backtest", key="run_bt"):
-            with st.spinner("Running Channel Surfer backtest..."):
-                try:
-                    from v15.core.surfer_backtest import run_backtest as surfer_backtest
-                    metrics, trades, eq_curve = surfer_backtest(
-                        days=bt_days,
-                        eval_interval=6,  # Must match training default
-                        max_hold_bars=60,
-                        position_size=bt_pos_size,
-                        min_confidence=0.45,
-                        use_multi_tf=True,
-                    )
-                    st.session_state['bt_results'] = (metrics, trades, eq_curve)
-                except Exception as e:
-                    st.error(f"Backtest failed: {e}")
-                    import traceback
-                    st.code(traceback.format_exc())
-
-        bt_data = st.session_state.get('bt_results')
-        if bt_data:
-            metrics, trades, eq_curve = bt_data
-            m_cols = st.columns(5)
-            m_cols[0].metric("Trades", metrics.total_trades)
-            m_cols[1].metric("Win Rate", f"{metrics.win_rate:.0%}")
-            m_cols[2].metric("Profit Factor", f"{metrics.profit_factor:.1f}")
-            m_cols[3].metric("Total P&L", f"${metrics.total_pnl:,.2f}")
-            m_cols[4].metric("$/Trade", f"${metrics.expectancy:,.2f}")
-
-            if eq_curve:
-                eq_df = pd.DataFrame(eq_curve, columns=['bar', 'equity'])
-                fig_eq = go.Figure()
-                fig_eq.add_trace(go.Scatter(
-                    x=eq_df['bar'], y=eq_df['equity'],
-                    mode='lines+markers',
-                    line=dict(color='#00c853', width=2),
-                    marker=dict(size=6),
-                    fill='tozeroy',
-                    fillcolor='rgba(0,200,83,0.1)',
-                ))
-                fig_eq.update_layout(
-                    title='Equity Curve',
-                    xaxis_title='Bar', yaxis_title='Equity ($)',
-                    template='plotly_dark', height=300,
-                    margin=dict(l=50, r=20, t=40, b=30),
-                )
-                st.plotly_chart(fig_eq, width="stretch")
-
-            # Signal type breakdown
-            if trades:
-                bounce_t = [t for t in trades if getattr(t, 'signal_type', 'bounce') == 'bounce']
-                break_t = [t for t in trades if getattr(t, 'signal_type', 'bounce') == 'break']
-                b_cols = st.columns(2)
-                if bounce_t:
-                    bwr = sum(1 for t in bounce_t if t.pnl > 0) / len(bounce_t)
-                    bpnl = sum(t.pnl for t in bounce_t)
-                    b_cols[0].metric("Bounce", f"{len(bounce_t)} trades | {bwr:.0%} WR | ${bpnl:,.0f}")
-                if break_t:
-                    kwr = sum(1 for t in break_t if t.pnl > 0) / len(break_t)
-                    kpnl = sum(t.pnl for t in break_t)
-                    b_cols[1].metric("Breakout", f"{len(break_t)} trades | {kwr:.0%} WR | ${kpnl:,.0f}")
-
-                trade_data = [{
-                    'Type': getattr(t, 'signal_type', 'bounce')[:3].upper(),
-                    'Dir': t.direction,
-                    'Entry$': f"${t.entry_price:.2f}",
-                    'Exit$': f"${t.exit_price:.2f}",
-                    'P&L': f"${t.pnl:+.2f}",
-                    '%': f"{t.pnl_pct:+.2%}",
-                    'Hold': f"{t.hold_bars}b",
-                    'Reason': t.exit_reason,
-                    'Conf': f"{t.confidence:.2f}",
-                    'Size': f"${getattr(t, 'trade_size', 10000):,.0f}",
-                } for t in trades]
-                st.dataframe(pd.DataFrame(trade_data), hide_index=True, width="stretch")
-
-                # --- MAE/MFE Scatter Plot ---
-                maes = [getattr(t, 'mae_pct', 0) for t in trades]
-                mfes = [getattr(t, 'mfe_pct', 0) for t in trades]
-                if any(m > 0 for m in maes) and any(m > 0 for m in mfes):
-                    with st.expander("Trade Quality (MAE/MFE)", expanded=False):
-                        winners = [t for t in trades if t.pnl > 0]
-                        losers = [t for t in trades if t.pnl <= 0]
-
-                        q_cols = st.columns(4)
-                        avg_mae = np.mean([m for m in maes if m > 0]) if any(m > 0 for m in maes) else 0
-                        avg_mfe = np.mean([m for m in mfes if m > 0]) if any(m > 0 for m in mfes) else 0
-                        win_eff_vals = [t.pnl_pct / max(t.mfe_pct, 1e-6) for t in winners if getattr(t, 'mfe_pct', 0) > 0]
-                        win_eff = np.mean(win_eff_vals) if win_eff_vals else 0
-                        q_cols[0].metric("Avg MAE", f"{avg_mae:.2%}")
-                        q_cols[1].metric("Avg MFE", f"{avg_mfe:.2%}")
-                        q_cols[2].metric("Win Efficiency", f"{win_eff:.0%}")
-                        q_cols[3].metric("Max DD", f"{metrics.max_drawdown_pct:.1%}")
-
-                        fig_mfe = go.Figure()
-                        for label, group, color in [('Winners', winners, '#00c853'), ('Losers', losers, '#ff1744')]:
-                            fig_mfe.add_trace(go.Scatter(
-                                x=[getattr(t, 'mae_pct', 0) * 100 for t in group],
-                                y=[getattr(t, 'mfe_pct', 0) * 100 for t in group],
-                                mode='markers',
-                                name=label,
-                                marker=dict(color=color, size=8, opacity=0.7),
-                                text=[f"{t.signal_type} {t.direction} {t.pnl_pct:+.2%}" for t in group],
-                            ))
-                        fig_mfe.update_layout(
-                            title='MAE vs MFE (closer to top-left = better)',
-                            xaxis_title='MAE % (worst drawdown)',
-                            yaxis_title='MFE % (best unrealized)',
-                            template='plotly_dark', height=350,
-                            margin=dict(l=50, r=20, t=40, b=30),
-                        )
-                        st.plotly_chart(fig_mfe, width="stretch")
 
 
 def show_model_comparisons_tab():
@@ -4890,7 +4897,11 @@ def main():
         )
 
     elif selected_tab == "Channel Surfer":
-        st_autorefresh(interval=60_000, key="channel_surfer_price_monitor")
+        # Dynamic refresh: 1s when positions open (real-time exit monitoring), 60s otherwise
+        _scanner_for_refresh = st.session_state.get('surfer_live_scanner')
+        _has_positions = _scanner_for_refresh and _scanner_for_refresh.positions
+        _refresh_ms = 1_000 if _has_positions else 60_000
+        st_autorefresh(interval=_refresh_ms, key="channel_surfer_price_monitor")
         show_channel_surfer_tab(
             current_tsla=current_tsla,
             native_tf_data=native_tf_data,
