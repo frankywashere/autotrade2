@@ -53,10 +53,14 @@ class DashboardState(param.Parameterized):
         # Load native TF data
         try:
             from v15.data.native_tf import load_native_tf_data
+            from pathlib import Path
+            # Use /tmp for cache in Docker (home dir may not be writable on HF Spaces)
+            cache_dir = Path('/tmp/.x14_native_tf_cache') if os.environ.get('SPACE_ID') else None
             self.native_tf_data = load_native_tf_data(
                 symbols=['TSLA', 'SPY', '^VIX'],
                 timeframes=['daily', 'weekly', 'monthly', '1h', '2h', '3h', '4h'],
                 verbose=True,
+                cache_dir=cache_dir,
             )
             logger.info("Native TF data loaded: %s", list(self.native_tf_data.keys()))
         except Exception as e:
