@@ -41,7 +41,12 @@ from .exceptions import (
 )
 
 from .dtypes import ChannelSample, ChannelLabels
-from .inference import Prediction, PerTFPrediction
+
+try:
+    from .inference import Prediction, PerTFPrediction
+except ImportError:
+    Prediction = None
+    PerTFPrediction = None
 
 # Lazy imports for optional components
 def load_market_data(data_dir: str):
