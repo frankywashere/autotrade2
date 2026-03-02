@@ -21,7 +21,6 @@ param>=2.0
 plotly
 matplotlib
 pytz
-websocket-client
 
 # Scientific computing
 scipy

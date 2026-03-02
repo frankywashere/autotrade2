@@ -20,11 +20,11 @@ class DashboardState(param.Parameterized):
     When params change, only bound components re-render.
     """
 
-    # Price (updated every 500ms by periodic callback)
+    # Price (updated every 5s by periodic callback via REST)
     tsla_price = param.Number(0.0)
     spy_price = param.Number(0.0)
     price_delta = param.Number(0.0)
-    price_source = param.String('bar close')  # 'LIVE', 'REST', 'bar close'
+    price_source = param.String('bar close')  # 'REST', 'bar close'
 
     # Market data (loaded on startup, refreshed every 5 min)
     current_tsla = param.Parameter(None)      # 5-min OHLCV DataFrame
@@ -47,7 +47,6 @@ class DashboardState(param.Parameterized):
 
     # Internal
     _prev_price = param.Number(0.0, precedence=-1)
-    _ws_client = param.Parameter(None, precedence=-1)
 
     def load_market_data(self):
         """Startup: load native TF data, fetch 5-min bars, initialize scanner."""
@@ -89,15 +88,6 @@ class DashboardState(param.Parameterized):
         except Exception as e:
             logger.error("Failed to fetch 5-min data: %s", e)
 
-        # Initialize WebSocket client
-        try:
-            from v15.data.finnhub_ws import get_ws_client
-            self._ws_client = get_ws_client()
-            if self._ws_client:
-                logger.info("WebSocket client initialized")
-        except Exception:
-            pass
-
         # Initialize scanner
         self._init_scanner()
 
@@ -105,39 +95,21 @@ class DashboardState(param.Parameterized):
         self.run_analysis()
 
     def update_prices(self):
-        """500ms periodic callback: read WebSocket prices, check exits."""
+        """5s periodic callback: poll REST for prices, check exits."""
         price = 0.0
         source = 'bar close'
 
-        # Try WebSocket first
-        if self._ws_client:
-            try:
-                tick = self._ws_client.get_price('TSLA')
-                if tick and tick.price > 0:
-                    price = tick.price
-                    source = 'LIVE' if tick.is_fresh else f'WS ({tick.age_seconds:.0f}s ago)'
-            except Exception:
-                pass
-
-            try:
-                spy_tick = self._ws_client.get_price('SPY')
-                if spy_tick and spy_tick.price > 0:
-                    self.spy_price = spy_tick.price
-            except Exception:
-                pass
-
-        # Fall back to REST
-        if price == 0.0:
-            try:
-                from v15.live_data import YFinanceLiveData
-                rt = YFinanceLiveData().get_realtime_prices()
-                if rt.get('TSLA'):
-                    price = float(rt['TSLA'])
-                    source = 'REST'
-                if rt.get('SPY'):
-                    self.spy_price = float(rt['SPY'])
-            except Exception:
-                pass
+        # REST quote via yfinance
+        try:
+            from v15.live_data import YFinanceLiveData
+            rt = YFinanceLiveData().get_realtime_prices()
+            if rt.get('TSLA'):
+                price = float(rt['TSLA'])
+                source = 'REST'
+            if rt.get('SPY'):
+                self.spy_price = float(rt['SPY'])
+        except Exception:
+            pass
 
         # Fall back to bar close
         if price == 0.0 and self.current_tsla is not None and len(self.current_tsla) > 0:
@@ -152,14 +124,19 @@ class DashboardState(param.Parameterized):
             self.price_source = source
 
         # Check exits on single scanner
+        any_exits = False
         if self.scanner and self.scanner.positions and price > 0:
             try:
                 exit_alerts = self.scanner.check_exits(price, price, price)
                 if exit_alerts:
                     html_parts = [_exit_alert_html(ea) for ea in exit_alerts]
                     self.exit_alert_html = '\n'.join(html_parts)
+                    any_exits = True
             except Exception as e:
                 logger.warning("Exit check failed: %s", e)
+
+        if any_exits:
+            self.positions_version += 1  # Re-render banner to clear exited positions
 
         # Bump version for live P&L updates
         if self.scanner and self.scanner.positions and price > 0:

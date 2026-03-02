@@ -40,7 +40,7 @@ def create_app():
     state.load_model_data()
 
     # Periodic callbacks
-    pn.state.add_periodic_callback(state.update_prices, period=500)
+    pn.state.add_periodic_callback(state.update_prices, period=5_000)  # 5s REST poll
     pn.state.add_periodic_callback(state.run_analysis, period=300_000)   # 5 min
     pn.state.add_periodic_callback(state.load_model_data, period=3_600_000)  # 1 hour
 
