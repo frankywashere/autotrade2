@@ -18,19 +18,20 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Fetch gist content
-          GIST_JSON=$(curl -sf -H "Authorization: token $GH_TOKEN" \
-            "https://api.github.com/gists/$GIST_ID")
+          # Fetch gist content to a temp file (too large for shell variables)
+          curl -sf -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/gists/$GIST_ID" > /tmp/gist_api.json
 
-          # Extract the scanner state file content
-          CONTENT=$(echo "$GIST_JSON" | jq -r '.files["surfer_scanner_state.json"].content // empty')
-          if [ -z "$CONTENT" ]; then
+          # Extract the scanner state JSON to a file
+          jq -r '.files["surfer_scanner_state.json"].content // empty' /tmp/gist_api.json > /tmp/state.json
+
+          if [ ! -s /tmp/state.json ]; then
             echo "No scanner state found in gist"
             exit 0
           fi
 
           # Check for pending alerts
-          ALERT_COUNT=$(echo "$CONTENT" | jq '._pending_telegram | length // 0')
+          ALERT_COUNT=$(jq '._pending_telegram | length // 0' /tmp/state.json)
           echo "Pending alerts: $ALERT_COUNT"
 
           if [ "$ALERT_COUNT" -eq 0 ] || [ "$ALERT_COUNT" = "null" ]; then
@@ -41,7 +42,7 @@ jobs:
           # Send each alert
           SENT=0
           for i in $(seq 0 $(($ALERT_COUNT - 1))); do
-            MSG=$(echo "$CONTENT" | jq -r "._pending_telegram[$i]")
+            MSG=$(jq -r "._pending_telegram[$i]" /tmp/state.json)
             echo "Sending alert $((i+1))/$ALERT_COUNT: ${MSG:0:80}..."
 
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
@@ -65,15 +66,15 @@ jobs:
 
           # Clear the pending queue in the gist
           if [ "$SENT" -gt 0 ]; then
-            UPDATED=$(echo "$CONTENT" | jq '._pending_telegram = []')
-            PAYLOAD=$(jq -n --arg content "$UPDATED" \
-              '{files: {"surfer_scanner_state.json": {content: $content}}}')
+            jq '._pending_telegram = []' /tmp/state.json > /tmp/state_cleared.json
+            jq -n --rawfile content /tmp/state_cleared.json \
+              '{files: {"surfer_scanner_state.json": {content: $content}}}' > /tmp/gist_patch.json
 
             curl -sf -X PATCH \
               -H "Authorization: token $GH_TOKEN" \
               -H "Content-Type: application/json" \
               "https://api.github.com/gists/$GIST_ID" \
-              -d "$PAYLOAD" > /dev/null
+              -d @/tmp/gist_patch.json > /dev/null
 
             echo "Cleared pending alerts from gist"
           fi
