@@ -2,10 +2,12 @@
 
 import os
 import logging
+import threading
 import traceback
 from datetime import datetime
 
 import param
+import panel as pn
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -98,9 +100,15 @@ class DashboardState(param.Parameterized):
 
         # Initialize scanner
         self._init_scanner()
+        self._analysis_running = False
 
-        # Run initial analysis
-        self.run_analysis()
+        # Run initial analysis (synchronous at startup — no UI to block yet)
+        try:
+            results = self._run_analysis_core()
+            if results:
+                self._apply_analysis_results(*results)
+        except Exception as e:
+            logger.error("Initial analysis failed: %s\n%s", e, traceback.format_exc())
 
     def update_prices(self):
         """500ms periodic callback: read WebSocket prices, check exits."""
@@ -119,7 +127,7 @@ class DashboardState(param.Parameterized):
 
             try:
                 spy_tick = self._ws_client.get_price('SPY')
-                if spy_tick and spy_tick.price > 0:
+                if spy_tick and spy_tick.price > 0 and spy_tick.price != self.spy_price:
                     self.spy_price = spy_tick.price
             except Exception:
                 pass
@@ -133,7 +141,9 @@ class DashboardState(param.Parameterized):
                     price = float(rt['TSLA'])
                     source = 'REST'
                 if rt.get('SPY'):
-                    self.spy_price = float(rt['SPY'])
+                    spy = float(rt['SPY'])
+                    if spy != self.spy_price:
+                        self.spy_price = spy
             except Exception:
                 pass
 
@@ -143,11 +153,16 @@ class DashboardState(param.Parameterized):
             source = 'bar close'
 
         if price > 0:
+            price_changed = price != self.tsla_price
             if self._prev_price > 0:
-                self.price_delta = price - self._prev_price
+                new_delta = price - self._prev_price
+                if new_delta != self.price_delta:
+                    self.price_delta = new_delta
             self._prev_price = self.tsla_price if self.tsla_price > 0 else price
-            self.tsla_price = price
-            self.price_source = source
+            if price_changed:
+                self.tsla_price = price
+            if source != self.price_source:
+                self.price_source = source
 
         # Check exits if positions are open (both scanners)
         html_parts = []
@@ -165,77 +180,113 @@ class DashboardState(param.Parameterized):
         if any_exits:
             self.exit_alert_html = '\n'.join(html_parts)
             self.positions_version += 1  # Re-render banner to clear exited positions
-        # Bump version for live P&L updates
-        has_positions = ((self.scanner and self.scanner.positions)
-                         or (self.scanner_dw and self.scanner_dw.positions))
-        if has_positions and price > 0:
-            self.positions_version += 1
+        # Bump version for live P&L updates only when price actually changed
+        elif price_changed if price > 0 else False:
+            has_positions = ((self.scanner and self.scanner.positions)
+                             or (self.scanner_dw and self.scanner_dw.positions))
+            if has_positions:
+                self.positions_version += 1
 
     def run_analysis(self):
-        """5-min periodic callback + manual button: run Channel Surfer analysis."""
+        """5-min periodic callback + manual button: launch analysis in background thread."""
         if not self.native_tf_data:
             logger.warning("No native TF data available for analysis")
             return
+        if self._analysis_running:
+            logger.debug("Analysis already running, skipping")
+            return
+
+        self._analysis_running = True
+
+        def _bg():
+            try:
+                results = self._run_analysis_core()
+                if results:
+                    # Schedule UI/param updates on the main Bokeh thread
+                    pn.state.execute(lambda: self._apply_analysis_results(*results))
+            except Exception as e:
+                logger.error("Analysis failed: %s\n%s", e, traceback.format_exc())
+            finally:
+                self._analysis_running = False
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _run_analysis_core(self):
+        """Heavy lifting: fetch bars + compute analysis. Runs in background thread.
+
+        Returns (tsla_df, analysis, dw_analysis) or None.
+        """
+        from v15.core.channel_surfer import prepare_multi_tf_analysis
 
         # Refresh 5-min bars
+        tsla_df = None
         try:
             from v15.live_data import fetch_live_data
             tsla_df, spy_df, vix_df = fetch_live_data(period='5d', interval='5m')
-            if tsla_df is not None and len(tsla_df) > 0:
-                self.current_tsla = tsla_df
         except Exception as e:
             logger.warning("Failed to refresh 5-min data: %s", e)
 
-        # Run multi-TF analysis
-        try:
-            from v15.core.channel_surfer import prepare_multi_tf_analysis
-            analysis = prepare_multi_tf_analysis(
+        effective_tsla = tsla_df if tsla_df is not None and len(tsla_df) > 0 else self.current_tsla
+
+        # CS-5TF analysis
+        analysis = prepare_multi_tf_analysis(
+            native_data=self.native_tf_data,
+            live_5min_tsla=effective_tsla,
+            target_tfs=['5min', '1h', '4h', 'daily', 'weekly'],
+        )
+
+        # CS-DW analysis
+        dw_analysis = None
+        if self.scanner_dw:
+            dw_analysis = prepare_multi_tf_analysis(
                 native_data=self.native_tf_data,
-                live_5min_tsla=self.current_tsla,
-                target_tfs=['5min', '1h', '4h', 'daily', 'weekly'],
+                live_5min_tsla=effective_tsla,
+                target_tfs=['daily', 'weekly'],
             )
-            self.analysis = analysis
-            self.last_analysis = datetime.now().strftime('%H:%M:%S')
-            logger.info("Analysis complete: %s %s (%.0f%%)",
-                        analysis.signal.action,
-                        analysis.signal.primary_tf,
-                        analysis.signal.confidence * 100)
 
-            # Evaluate signals if scanner is ready
-            if self.scanner and self.tsla_price > 0:
-                # --- CS-5TF: Original 5-timeframe signal ---
-                sig = analysis.signal
-                if sig.action != 'HOLD':
-                    entry_alert = self.scanner.evaluate_signal(
-                        analysis, self.tsla_price, signal_source='CS-5TF')
-                    if entry_alert and entry_alert.alert_type == 'ENTRY':
-                        self.positions_version += 1
+        return tsla_df, analysis, dw_analysis
 
-                # --- CS-DW: Daily+Weekly only signal (separate scanner/model) ---
-                if self.scanner_dw and self.tsla_price > 0:
-                    try:
-                        dw_analysis = prepare_multi_tf_analysis(
-                            native_data=self.native_tf_data,
-                            live_5min_tsla=self.current_tsla,
-                            target_tfs=['daily', 'weekly'],
-                        )
-                        dw_sig = dw_analysis.signal
-                        if dw_sig.action != 'HOLD':
-                            dw_alert = self.scanner_dw.evaluate_signal(
-                                dw_analysis, self.tsla_price, signal_source='CS-DW')
-                            if dw_alert and dw_alert.alert_type == 'ENTRY':
-                                self.positions_version += 1
-                        logger.info("DW analysis: %s %s (%.0f%%)",
-                                    dw_sig.action, dw_sig.primary_tf,
-                                    dw_sig.confidence * 100)
-                    except Exception as e:
-                        logger.warning("DW analysis failed: %s", e)
+    def _apply_analysis_results(self, tsla_df, analysis, dw_analysis):
+        """Apply computed results on the main thread: update params + evaluate signals."""
+        self._analysis_running = False
 
-                # Evaluate intraday signal
-                self._evaluate_intraday(analysis)
+        if tsla_df is not None and len(tsla_df) > 0:
+            self.current_tsla = tsla_df
 
-        except Exception as e:
-            logger.error("Analysis failed: %s\n%s", e, traceback.format_exc())
+        self.analysis = analysis
+        self.last_analysis = datetime.now().strftime('%H:%M:%S')
+        logger.info("Analysis complete: %s %s (%.0f%%)",
+                     analysis.signal.action,
+                     analysis.signal.primary_tf,
+                     analysis.signal.confidence * 100)
+
+        # Evaluate signals if scanner is ready
+        if self.scanner and self.tsla_price > 0:
+            # --- CS-5TF: Original 5-timeframe signal ---
+            sig = analysis.signal
+            if sig.action != 'HOLD':
+                entry_alert = self.scanner.evaluate_signal(
+                    analysis, self.tsla_price, signal_source='CS-5TF')
+                if entry_alert and entry_alert.alert_type == 'ENTRY':
+                    self.positions_version += 1
+
+            # --- CS-DW: Daily+Weekly only signal (separate scanner/model) ---
+            if self.scanner_dw and dw_analysis and self.tsla_price > 0:
+                try:
+                    dw_sig = dw_analysis.signal
+                    if dw_sig.action != 'HOLD':
+                        dw_alert = self.scanner_dw.evaluate_signal(
+                            dw_analysis, self.tsla_price, signal_source='CS-DW')
+                        if dw_alert and dw_alert.alert_type == 'ENTRY':
+                            self.positions_version += 1
+                    logger.info("DW analysis: %s %s (%.0f%%)",
+                                dw_sig.action, dw_sig.primary_tf,
+                                dw_sig.confidence * 100)
+                except Exception as e:
+                    logger.warning("DW analysis failed: %s", e)
+
+            # Evaluate intraday signal
+            self._evaluate_intraday(analysis)
 
     def _init_scanner(self):
         """Create SurferLiveScanners with Gist credentials from env vars."""

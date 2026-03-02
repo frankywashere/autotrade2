@@ -34,6 +34,16 @@ def _is_market_open() -> bool:
     from datetime import time as _time
     return _time(9, 30) <= t < _time(16, 0)
 
+
+def _is_extended_hours() -> bool:
+    """True if in premarket (4:00-9:30 ET) or after-hours (16:00-20:00 ET) on weekdays."""
+    now = _now_et()
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    from datetime import time as _time
+    return _time(4, 0) <= t < _time(9, 30) or _time(16, 0) <= t < _time(20, 0)
+
 STATE_PATH = Path.home() / ".x14" / "surfer_scanner_state.json"
 MAX_SIGNAL_HISTORY = 200
 GIST_FILE_NAME = 'surfer_scanner_state.json'
@@ -44,13 +54,17 @@ SLIPPAGE_PCT = 0.0005     # 0.05% slippage per side
 COMMISSION_PER_SHARE = 0.005  # $0.005/share (IBKR tiered)
 
 # Telegram alerts
-_TG_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
-_TG_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
+_TG_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
+_TG_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
+print(f"[SCANNER] Telegram config: token={'SET' if _TG_TOKEN else 'MISSING'} "
+      f"({len(_TG_TOKEN)} chars), chat_id={'SET' if _TG_CHAT_ID else 'MISSING'}")
 
 
 def _send_telegram(msg: str, model_tag: str = ''):
     """Send a Telegram message (best-effort, non-blocking)."""
     if not _TG_TOKEN or not _TG_CHAT_ID:
+        print(f"[SCANNER] Telegram skipped — token={'SET' if _TG_TOKEN else 'MISSING'}, "
+              f"chat_id={'SET' if _TG_CHAT_ID else 'MISSING'}")
         return
     tag = model_tag or MODEL_TAG
     msg = f"[{tag}] {msg}"
@@ -200,6 +214,8 @@ class SurferLiveScanner:
         self.daily_pnl: float = 0.0
         self.daily_trade_count: int = 0
         self._daily_date: str = ''
+        self._ext_opens_today: int = 0    # Extended-hours entries used today
+        self._ext_closes_today: int = 0   # Extended-hours exits used today
         self._load_state()
 
     # ------------------------------------------------------------------
@@ -281,6 +297,8 @@ class SurferLiveScanner:
         self.daily_pnl = data.get('daily_pnl', 0.0)
         self.daily_trade_count = data.get('daily_trade_count', 0)
         self._daily_date = data.get('daily_date', '')
+        self._ext_opens_today = data.get('ext_opens_today', 0)
+        self._ext_closes_today = data.get('ext_closes_today', 0)
         self.positions = {
             k: HypotheticalPosition.from_dict(v)
             for k, v in data.get('positions', {}).items()
@@ -408,6 +426,8 @@ class SurferLiveScanner:
             'daily_pnl': self.daily_pnl,
             'daily_trade_count': self.daily_trade_count,
             'daily_date': self._daily_date,
+            'ext_opens_today': self._ext_opens_today,
+            'ext_closes_today': self._ext_closes_today,
             'positions': {k: v.to_dict() for k, v in self.positions.items()},
             'closed_trades': [t.to_dict() for t in self.closed_trades[-200:]],
             'signal_history': self.signal_history[-MAX_SIGNAL_HISTORY:],
@@ -426,6 +446,8 @@ class SurferLiveScanner:
         if today != self._daily_date:
             self.daily_pnl = 0.0
             self.daily_trade_count = 0
+            self._ext_opens_today = 0
+            self._ext_closes_today = 0
             self._daily_date = today
 
     # ------------------------------------------------------------------
@@ -446,9 +468,10 @@ class SurferLiveScanner:
 
         sig = analysis.signal
 
-        # Block entries outside regular trading hours (9:30 AM - 4:00 PM ET)
+        # Block entries outside regular + extended trading hours
         if not _is_market_open():
-            return None
+            if not _is_extended_hours() or self._ext_opens_today >= 1:
+                return None
 
         # Record in history
         self.signal_history.append({
@@ -546,6 +569,8 @@ class SurferLiveScanner:
 
         # Auto-enter hypothetical position
         self._enter_hypothetical(alert, direction, signal_source=signal_source)
+        if not _is_market_open() and _is_extended_hours():
+            self._ext_opens_today += 1
         self._save_state()
 
         return alert
@@ -795,6 +820,7 @@ class SurferLiveScanner:
         alerts: List[ScannerAlert] = []
         to_close: List[str] = []
         now = _now_et()
+        ext_session = not _is_market_open() and _is_extended_hours()
 
         # EOD check using ET time
         _is_eod = (
@@ -918,9 +944,13 @@ class SurferLiveScanner:
                     exit_reason = 'timeout'
 
             if exit_reason:
+                if ext_session and self._ext_closes_today >= 1:
+                    continue  # Already used extended-hours close allowance
                 alert = self._close_position(pos_id, pos, exit_price, exit_reason)
                 alerts.append(alert)
                 to_close.append(pos_id)
+                if ext_session:
+                    self._ext_closes_today += 1
 
         for pos_id in to_close:
             del self.positions[pos_id]
