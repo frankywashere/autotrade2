@@ -164,6 +164,7 @@ class DashboardState(param.Parameterized):
                     logger.warning("Exit check failed: %s", e)
         if any_exits:
             self.exit_alert_html = '\n'.join(html_parts)
+            self.positions_version += 1  # Re-render banner to clear exited positions
         # Bump version for live P&L updates
         has_positions = ((self.scanner and self.scanner.positions)
                          or (self.scanner_dw and self.scanner_dw.positions))
