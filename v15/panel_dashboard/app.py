@@ -54,6 +54,7 @@ def create_app():
         if state.scanner:
             state.scanner.reset()
             state.positions_version += 1
+            state.trades_version += 1
 
     reset_btn.on_click(_reset_scanner)
 

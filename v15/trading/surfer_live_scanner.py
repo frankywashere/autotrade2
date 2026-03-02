@@ -59,20 +59,24 @@ _TG_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
 print(f"[SCANNER] Telegram config: token={'SET' if _TG_TOKEN else 'MISSING'} "
       f"({len(_TG_TOKEN)} chars), chat_id={'SET' if _TG_CHAT_ID else 'MISSING'}")
 
+# Queue for alerts that fail to send directly (flushed to Gist on next save)
+_PENDING_TG_ALERTS: list = []
+
 
 def _send_telegram(msg: str, model_tag: str = ''):
-    """Send a Telegram message (best-effort, non-blocking)."""
-    if not _TG_TOKEN or not _TG_CHAT_ID:
-        print(f"[SCANNER] Telegram skipped — token={'SET' if _TG_TOKEN else 'MISSING'}, "
-              f"chat_id={'SET' if _TG_CHAT_ID else 'MISSING'}")
-        return
+    """Send a Telegram message directly, or queue for relay via GitHub Actions."""
     tag = model_tag or MODEL_TAG
-    msg = f"[{tag}] {msg}"
+    full_msg = f"[{tag}] {msg}"
+    if not _TG_TOKEN or not _TG_CHAT_ID:
+        # No direct creds — queue for Gist relay
+        _PENDING_TG_ALERTS.append(full_msg)
+        print(f"[SCANNER] Telegram queued for relay (no creds): {full_msg[:80]}")
+        return
     try:
         url = f'https://api.telegram.org/bot{_TG_TOKEN}/sendMessage'
         payload = json.dumps({
             'chat_id': _TG_CHAT_ID,
-            'text': msg,
+            'text': full_msg,
             'parse_mode': 'HTML',
         }).encode()
         req = urllib.request.Request(
@@ -82,7 +86,9 @@ def _send_telegram(msg: str, model_tag: str = ''):
         with urllib.request.urlopen(req, timeout=5):
             pass
     except Exception as e:
-        print(f"[SCANNER] Telegram send failed: {e}")
+        # Direct send failed (e.g. DNS blocked on HF Spaces) — queue for relay
+        _PENDING_TG_ALERTS.append(full_msg)
+        print(f"[SCANNER] Telegram direct failed, queued for relay: {e}")
 
 
 @dataclass
@@ -271,7 +277,8 @@ class SurferLiveScanner:
         """Push this model's state to GitHub Gist (read-modify-write, non-blocking best-effort).
 
         Reads existing Gist, updates only our MODEL_TAG slot, writes back.
-        Other models' data is preserved.
+        Other models' data is preserved. Also flushes any pending Telegram
+        alerts into `_pending_telegram` for the GitHub Actions relay.
         """
         if not self.gist_id or not self.github_token:
             return
@@ -279,6 +286,13 @@ class SurferLiveScanner:
             full = self._gist_load_full()
             full[self.model_tag] = data
             full['_last_updated'] = _now_et().isoformat()
+            # Flush pending Telegram alerts into Gist for relay
+            if _PENDING_TG_ALERTS:
+                existing = full.get('_pending_telegram', [])
+                existing.extend(_PENDING_TG_ALERTS)
+                full['_pending_telegram'] = existing[-50:]  # Cap at 50
+                _PENDING_TG_ALERTS.clear()
+                print(f"[SCANNER] Flushed {len(existing)} Telegram alerts to Gist")
             url = f'https://api.github.com/gists/{self.gist_id}'
             payload = json.dumps({
                 'files': {GIST_FILE_NAME: {'content': json.dumps(full, indent=2)}}

@@ -25,8 +25,8 @@ def channel_surfer_tab(state) -> pn.Column:
         # Price banner — re-renders on price change
         pn.bind(_price_banner, state.param.tsla_price, state.param.price_source,
                 state.param.price_delta),
-        # Active trades banner — only re-renders on position changes (not price ticks)
-        pn.bind(_active_trades_banner, state.param.positions_version,
+        # Active trades banner — only re-renders on actual trade open/close
+        pn.bind(_active_trades_banner, state.param.trades_version,
                 scanner=state.scanner, scanner_dw=state.scanner_dw),
         # Market insights
         pn.bind(_market_insights, state.param.analysis),
@@ -38,8 +38,8 @@ def channel_surfer_tab(state) -> pn.Column:
         # Open positions with live P&L — re-renders on price change
         pn.bind(_open_positions_pane, state.param.positions_version, state.param.tsla_price,
                 scanner=state.scanner, scanner_dw=state.scanner_dw),
-        # Trade history — only re-renders on position changes (preserves <details> state)
-        pn.bind(_trade_history_pane, state.param.positions_version,
+        # Trade history — only re-renders on actual trade open/close (preserves <details> state)
+        pn.bind(_trade_history_pane, state.param.trades_version,
                 scanner=state.scanner, scanner_dw=state.scanner_dw),
         # Regime indicator
         pn.bind(_regime_indicator, state.param.analysis),
@@ -102,11 +102,11 @@ def _price_banner(tsla_price, price_source, price_delta):
 # Active Trades Banner — only renders when positions are open
 # ---------------------------------------------------------------------------
 
-def _active_trades_banner(positions_version, scanner=None, scanner_dw=None):
+def _active_trades_banner(trades_version, scanner=None, scanner_dw=None):
     """Prominent banner showing active trades with entry/stop/TP and signal source.
 
-    Bound to positions_version only (not tsla_price) so it doesn't re-render
-    on every price tick — preserves DOM state.
+    Bound to trades_version only — re-renders on actual trade open/close,
+    not on every price tick or position P&L update.
     """
     all_positions = []
     for scnr in [scanner, scanner_dw]:
@@ -341,11 +341,11 @@ def _open_positions_pane(positions_version, tsla_price, scanner=None, scanner_dw
     return pn.pane.HTML(position_html, sizing_mode='stretch_width')
 
 
-def _trade_history_pane(positions_version, scanner=None, scanner_dw=None):
-    """Trade history. Bound to positions_version ONLY — not tsla_price.
+def _trade_history_pane(trades_version, scanner=None, scanner_dw=None):
+    """Trade history. Bound to trades_version ONLY — not tsla_price or positions_version.
 
-    This means the <details> element won't be destroyed/recreated on price
-    ticks, so it preserves its open/closed state.
+    Only re-renders when a trade actually opens or closes, so the <details>
+    element preserves its open/closed state between price ticks.
     """
     all_closed = []
     for scnr in [scanner, scanner_dw]:

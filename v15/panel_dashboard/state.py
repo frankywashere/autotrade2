@@ -34,7 +34,8 @@ class DashboardState(param.Parameterized):
     # Scanners
     scanner = param.Parameter(None)           # SurferLiveScanner (CS-5TF + intraday)
     scanner_dw = param.Parameter(None)        # SurferLiveScanner (CS-DW)
-    positions_version = param.Integer(0)      # Bump to trigger position card re-render
+    positions_version = param.Integer(0)      # Bump to trigger position card re-render (price-sensitive)
+    trades_version = param.Integer(0)        # Bump only on actual trade open/close (not price ticks)
     exit_alert_html = param.String('')        # Latest exit alert HTML
 
     # Config (sidebar widgets bind to these)
@@ -180,6 +181,7 @@ class DashboardState(param.Parameterized):
         if any_exits:
             self.exit_alert_html = '\n'.join(html_parts)
             self.positions_version += 1  # Re-render banner to clear exited positions
+            self.trades_version += 1     # Update trade history
         # Bump version for live P&L updates only when price actually changed
         elif price_changed if price > 0 else False:
             has_positions = ((self.scanner and self.scanner.positions)
@@ -269,6 +271,7 @@ class DashboardState(param.Parameterized):
                     analysis, self.tsla_price, signal_source='CS-5TF')
                 if entry_alert and entry_alert.alert_type == 'ENTRY':
                     self.positions_version += 1
+                    self.trades_version += 1
 
             # --- CS-DW: Daily+Weekly only signal (separate scanner/model) ---
             if self.scanner_dw and dw_analysis and self.tsla_price > 0:
@@ -279,6 +282,7 @@ class DashboardState(param.Parameterized):
                             dw_analysis, self.tsla_price, signal_source='CS-DW')
                         if dw_alert and dw_alert.alert_type == 'ENTRY':
                             self.positions_version += 1
+                            self.trades_version += 1
                     logger.info("DW analysis: %s %s (%.0f%%)",
                                 dw_sig.action, dw_sig.primary_tf,
                                 dw_sig.confidence * 100)
