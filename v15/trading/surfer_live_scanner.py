@@ -527,7 +527,7 @@ class SurferLiveScanner:
         risk_dollars = self.equity * self.config.risk_per_trade_pct
         stop_pct = sig.suggested_stop_pct
         if stop_pct <= 0:
-            stop_pct = 0.02
+            stop_pct = 0.01
 
         # shares = risk / (stop_distance)
         stop_distance = stop_pct * current_price
