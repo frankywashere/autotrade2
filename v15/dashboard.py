@@ -3139,7 +3139,7 @@ def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
 
         # --- Channel Surfer (Daily) signal evaluation ---
         if run_analysis and sig.action != 'HOLD':
-            entry_alert = scanner.evaluate_signal(analysis, rt_price)
+            entry_alert = scanner.evaluate_signal(analysis, rt_price, signal_source='CS-5TF')
             if entry_alert and entry_alert.alert_type == 'ENTRY':
                 action_color = "#00e676" if entry_alert.action == 'BUY' else "#ff5252"
                 st.markdown(
@@ -3155,6 +3155,35 @@ def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
                 )
             elif entry_alert and entry_alert.alert_type == 'RISK_WARNING':
                 st.warning(f"CS Daily: {entry_alert.warning_msg}")
+
+        # --- CS-DW: Daily+Weekly only signal ---
+        if run_analysis:
+            try:
+                dw_analysis = prepare_multi_tf_analysis(
+                    native_data=native_tf_data,
+                    live_5min_tsla=current_tsla,
+                    target_tfs=['daily', 'weekly'],
+                )
+                dw_sig = dw_analysis.signal
+                if dw_sig.action != 'HOLD':
+                    dw_alert = scanner.evaluate_signal(
+                        dw_analysis, rt_price, signal_source='CS-DW')
+                    if dw_alert and dw_alert.alert_type == 'ENTRY':
+                        st.markdown(
+                            f'<div style="background:#1a2233;padding:10px;border-radius:6px;margin:4px 0;'
+                            f'border:2px solid #ffd54f;">'
+                            f'<b style="color:#ffd54f;font-size:16px">'
+                            f'CS-DW {dw_alert.action} [{dw_alert.pos_id}]</b>  '
+                            f'{dw_alert.shares} shares @ ${dw_alert.price:.2f} | '
+                            f'Stop: ${dw_alert.stop_price:.2f} | '
+                            f'TP: ${dw_alert.tp_price:.2f} | '
+                            f'Notional: ${dw_alert.notional:,.0f}'
+                            f'</div>', unsafe_allow_html=True,
+                        )
+                    elif dw_alert and dw_alert.alert_type == 'RISK_WARNING':
+                        st.warning(f"CS-DW: {dw_alert.warning_msg}")
+            except Exception as e:
+                logger.warning("DW analysis failed: %s", e)
 
         # --- Intraday (5-Min) signal evaluation ---
         if run_analysis:
@@ -3174,12 +3203,22 @@ def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
 
     # --- Open Positions (split by system) ---
     if scanner.positions:
-        cs_positions = {k: v for k, v in scanner.positions.items() if v.signal_type != 'intraday'}
-        id_positions = {k: v for k, v in scanner.positions.items() if v.signal_type == 'intraday'}
+        cs5_positions = {k: v for k, v in scanner.positions.items()
+                         if getattr(v, 'signal_source', '') == 'CS-5TF'
+                         or (v.signal_type != 'intraday' and getattr(v, 'signal_source', '') not in ('CS-DW', 'intraday'))}
+        dw_positions = {k: v for k, v in scanner.positions.items()
+                        if getattr(v, 'signal_source', '') == 'CS-DW'}
+        id_positions = {k: v for k, v in scanner.positions.items()
+                        if v.signal_type == 'intraday' or getattr(v, 'signal_source', '') == 'intraday'}
 
-        if cs_positions:
-            st.markdown("**CS Daily Positions**")
-            for pos in cs_positions.values():
+        if cs5_positions:
+            st.markdown("**CS-5TF Positions**")
+            for pos in cs5_positions.values():
+                _render_position_card(pos, current_price)
+
+        if dw_positions:
+            st.markdown("**CS-DW Positions**")
+            for pos in dw_positions.values():
                 _render_position_card(pos, current_price)
 
         if id_positions:
@@ -3223,7 +3262,13 @@ def _render_surfer_live_section(scanner, analysis, sig, current_price: float,
 
 def _render_position_card(pos, current_price: float):
     """Render a single position card with stop/TP distances."""
-    sys_tag = "ID 5m" if pos.signal_type == 'intraday' else "CS"
+    source = getattr(pos, 'signal_source', '')
+    if source:
+        sys_tag = source
+    elif pos.signal_type == 'intraday':
+        sys_tag = "ID 5m"
+    else:
+        sys_tag = "CS"
     if pos.direction == 'long':
         upnl = (current_price - pos.entry_price) * pos.shares
         dist_stop = (current_price - pos.stop_price) / current_price
@@ -3234,7 +3279,12 @@ def _render_position_card(pos, current_price: float):
         dist_tp = (current_price - pos.tp_price) / current_price
     upnl_color = "#00e676" if upnl >= 0 else "#ff5252"
     stop_color = '#ff5252' if dist_stop < 0.003 else ('#ff9800' if dist_stop < 0.01 else '#888')
-    tag_color = '#4fc3f7' if pos.signal_type == 'intraday' else '#ff9800'
+    if source == 'CS-DW':
+        tag_color = '#ffd54f'
+    elif pos.signal_type == 'intraday' or source == 'intraday':
+        tag_color = '#4fc3f7'
+    else:
+        tag_color = '#ff9800'
     st.markdown(
         f'<div style="background:#1a2233;padding:8px;border-radius:6px;margin:3px 0;">'
         f'<span style="background:{tag_color};color:#fff;padding:1px 6px;border-radius:4px;'

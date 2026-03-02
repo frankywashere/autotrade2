@@ -72,6 +72,7 @@ class HypotheticalPosition:
     confidence: float
     best_price: float        # For trailing stop
     reason: str = ''
+    signal_source: str = ''  # Which combo produced this: 'CS-5TF', 'CS-DW', 'intraday'
     breakeven_applied: bool = False  # True once stop moved to entry after 30 min
 
     def to_dict(self) -> dict:
@@ -96,6 +97,7 @@ class ClosedTrade:
     exit_time: str
     exit_reason: str
     hold_minutes: float
+    signal_source: str = ''  # Which combo produced this: 'CS-5TF', 'CS-DW', 'intraday'
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -130,6 +132,9 @@ class ScannerAlert:
     pnl: float = 0.0
     pnl_pct: float = 0.0
 
+    # Source tracking
+    signal_source: str = ''  # 'CS-5TF', 'CS-DW', 'intraday'
+
     # Warning fields
     warning_msg: str = ''
 
@@ -154,10 +159,12 @@ class SurferLiveScanner:
     BREAKEVEN_TRIGGER_MIN = 30  # Move stop to entry after 30 min if in profit
     OUTLIER_MULT = 2.0          # Close if unrealized >= 2x expected TP gain
 
-    def __init__(self, config: ScannerConfig, gist_id: str = '', github_token: str = ''):
+    def __init__(self, config: ScannerConfig, gist_id: str = '', github_token: str = '',
+                 model_tag: str = ''):
         self.config = config
         self.gist_id = gist_id.strip()
         self.github_token = github_token.strip()
+        self.model_tag = model_tag or MODEL_TAG
         self.equity = config.initial_capital
         self.positions: Dict[str, HypotheticalPosition] = {}
         self.closed_trades: List[ClosedTrade] = []
@@ -197,7 +204,7 @@ class SurferLiveScanner:
                 return None
             full = json.loads(content)
             # Multi-model format: top-level keys are model tags
-            return full.get(MODEL_TAG)
+            return full.get(self.model_tag)
         except Exception as e:
             print(f"[SCANNER] Gist load failed: {e}")
             return None
@@ -226,7 +233,7 @@ class SurferLiveScanner:
             return
         try:
             full = self._gist_load_full()
-            full[MODEL_TAG] = data
+            full[self.model_tag] = data
             full['_last_updated'] = _now_et().isoformat()
             url = f'https://api.github.com/gists/{self.gist_id}'
             payload = json.dumps({
@@ -237,7 +244,7 @@ class SurferLiveScanner:
             )
             with urllib.request.urlopen(req, timeout=8):
                 pass
-            print(f"[SCANNER] Gist saved ({MODEL_TAG})")
+            print(f"[SCANNER] Gist saved ({self.model_tag})")
         except Exception as e:
             print(f"[SCANNER] Gist save failed: {e}")
 
@@ -397,12 +404,14 @@ class SurferLiveScanner:
     # Signal evaluation
     # ------------------------------------------------------------------
 
-    def evaluate_signal(self, analysis, current_price: float) -> Optional[ScannerAlert]:
+    def evaluate_signal(self, analysis, current_price: float,
+                        signal_source: str = 'CS-5TF') -> Optional[ScannerAlert]:
         """Evaluate a ChannelAnalysis and return an ENTRY alert if warranted.
 
         Args:
             analysis: ChannelAnalysis from prepare_multi_tf_analysis()
             current_price: Latest TSLA price
+            signal_source: Which combo produced this signal ('CS-5TF', 'CS-DW', etc.)
         """
         self._reset_daily_if_needed()
         now = _now_et().isoformat()
@@ -421,6 +430,7 @@ class SurferLiveScanner:
             'primary_tf': sig.primary_tf,
             'signal_type': getattr(sig, 'signal_type', 'bounce'),
             'reason': sig.reason,
+            'signal_source': signal_source,
         })
 
         # Kill switch
@@ -503,10 +513,11 @@ class SurferLiveScanner:
             primary_tf=sig.primary_tf,
             reason=sig.reason,
             notional=notional,
+            signal_source=signal_source,
         )
 
         # Auto-enter hypothetical position
-        self._enter_hypothetical(alert, direction)
+        self._enter_hypothetical(alert, direction, signal_source=signal_source)
         self._save_state()
 
         return alert
@@ -587,6 +598,7 @@ class SurferLiveScanner:
             'primary_tf': '5min',
             'signal_type': 'intraday',
             'reason': 'Intraday FD Enh-Union',
+            'signal_source': 'intraday',
         })
 
         # Position sizing (same logic as CS)
@@ -619,13 +631,15 @@ class SurferLiveScanner:
             primary_tf='5min',
             reason='Intraday FD Enh-Union',
             notional=notional,
+            signal_source='intraday',
         )
 
-        self._enter_hypothetical(alert, direction)
+        self._enter_hypothetical(alert, direction, signal_source='intraday')
         self._save_state()
         return alert
 
-    def _enter_hypothetical(self, alert: ScannerAlert, direction: str):
+    def _enter_hypothetical(self, alert: ScannerAlert, direction: str,
+                            signal_source: str = ''):
         pos_id = str(uuid.uuid4())[:8]
         pos = HypotheticalPosition(
             pos_id=pos_id,
@@ -641,6 +655,7 @@ class SurferLiveScanner:
             confidence=alert.confidence,
             best_price=alert.price,
             reason=alert.reason,
+            signal_source=signal_source,
         )
         self.positions[pos_id] = pos
         alert.pos_id = pos_id
@@ -916,6 +931,7 @@ class SurferLiveScanner:
             exit_time=now.isoformat(),
             exit_reason=exit_reason,
             hold_minutes=hold_minutes,
+            signal_source=pos.signal_source,
         )
         self.closed_trades.append(trade)
 
@@ -928,6 +944,7 @@ class SurferLiveScanner:
             pnl_pct=pnl_pct,
             price=exit_price,
             action=pos.direction,
+            signal_source=pos.signal_source,
         )
 
     # ------------------------------------------------------------------

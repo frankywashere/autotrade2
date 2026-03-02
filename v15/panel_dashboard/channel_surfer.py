@@ -25,13 +25,14 @@ def channel_surfer_tab(state) -> pn.Column:
         # Price banner — re-renders on price change (~500ms)
         pn.bind(_price_banner, state.param.tsla_price, state.param.price_source,
                 state.param.price_delta),
-        # Signal banner — re-renders on analysis change (~5 min)
-        pn.bind(_signal_banner, state.param.analysis, state.param.tsla_price),
+        # Active trades banner — re-renders on position changes + price updates
+        pn.bind(_active_trades_banner, state.param.positions_version,
+                state.param.tsla_price, scanner=state.scanner, scanner_dw=state.scanner_dw),
         # Market insights
         pn.bind(_market_insights, state.param.analysis),
         # Live scanner panel
         pn.bind(_scanner_panel, state.param.positions_version, state.param.tsla_price,
-                state.param.exit_alert_html, scanner=state.scanner),
+                state.param.exit_alert_html, scanner=state.scanner, scanner_dw=state.scanner_dw),
         # Regime indicator
         pn.bind(_regime_indicator, state.param.analysis),
         # Break direction predictor
@@ -90,95 +91,83 @@ def _price_banner(tsla_price, price_source, price_delta):
 
 
 # ---------------------------------------------------------------------------
-# Signal Banner
+# Active Trades Banner — only renders when positions are open
 # ---------------------------------------------------------------------------
 
-def _signal_banner(analysis, tsla_price):
-    if analysis is None:
-        return pn.pane.HTML(
-            '<div style="text-align:center;padding:20px;color:#888;">Run analysis to see signal...</div>',
-            sizing_mode='stretch_width',
-        )
+def _active_trades_banner(positions_version, tsla_price, scanner=None, scanner_dw=None):
+    """Prominent banner showing active trades with entry/stop/TP and signal source."""
+    all_positions = []
+    for scnr in [scanner, scanner_dw]:
+        if scnr and scnr.positions:
+            all_positions.extend(scnr.positions.values())
+    if not all_positions:
+        return pn.pane.HTML('')
 
-    sig = analysis.signal
-    sig_type = getattr(sig, 'signal_type', 'bounce')
-    type_label = 'BREAKOUT' if sig_type == 'break' else 'BOUNCE'
-    type_icon = '&#x26A1;' if sig_type == 'break' else '&#x21C4;'
+    cards = []
+    for pos in all_positions:
+        source = getattr(pos, 'signal_source', '') or 'CS'
+        sig_type = getattr(pos, 'signal_type', 'bounce')
+        type_label = 'BREAKOUT' if sig_type == 'break' else 'BOUNCE'
+        type_icon = '&#x26A1;' if sig_type == 'break' else '&#x21C4;'
+        action = 'BUY' if pos.direction == 'long' else 'SELL'
 
-    if sig.action == 'BUY':
-        if sig_type == 'break':
-            bg = "linear-gradient(135deg,#1a3300,#336600)"
-            border, glow = "#76ff03", "#76ff03"
-        else:
+        # Colors by direction
+        if action == 'BUY':
             bg = "linear-gradient(135deg,#004d1a,#00802b)"
             border, glow = "#00c853", "#00ff55"
-
-        entry_info = ""
-        if tsla_price > 0:
-            stop = tsla_price * (1 - sig.suggested_stop_pct)
-            tp = tsla_price * (1 + sig.suggested_tp_pct)
-            rr = sig.suggested_tp_pct / max(sig.suggested_stop_pct, 0.001)
-            entry_info = (
-                f"<div style='font-size:16px;color:#ccffcc;margin-top:8px;font-family:monospace;'>"
-                f"Entry: ${tsla_price:.2f} &nbsp; Stop: ${stop:.2f} &nbsp; "
-                f"TP: ${tp:.2f} &nbsp; R:R {rr:.1f}:1</div>"
-            )
-
-        html = f"""<div style="background:{bg};border:2px solid {border};
-        border-radius:12px;padding:20px;text-align:center;margin:10px 0;">
-        <div style="font-size:12px;font-weight:700;color:#ffcc00;letter-spacing:2px;margin-bottom:4px;">
-        {type_icon} {type_label}</div>
-        <div style="font-size:48px;font-weight:900;color:{glow};text-shadow:0 0 20px {glow};">
-        BUY</div>
-        <div style="font-size:18px;color:#aaffcc;margin-top:8px;">
-        Confidence: {sig.confidence:.0%} | {sig.primary_tf} | Stop: {sig.suggested_stop_pct:.2%} | TP: {sig.suggested_tp_pct:.2%}
-        </div>
-        {entry_info}
-        <div style="font-size:14px;color:#88cc99;margin-top:4px;">{sig.reason}</div>
-        </div>"""
-
-    elif sig.action == 'SELL':
-        if sig_type == 'break':
-            bg = "linear-gradient(135deg,#330000,#661a00)"
-            border, glow = "#ff6d00", "#ff6d00"
+            info_color, reason_color = '#ccffcc', '#88cc99'
         else:
             bg = "linear-gradient(135deg,#4d0000,#800000)"
             border, glow = "#ff1744", "#ff4444"
+            info_color, reason_color = '#ffcccc', '#cc8888'
 
-        entry_info = ""
+        # Source badge color
+        if source == 'CS-DW':
+            src_bg = '#e6a800'
+        elif source == 'intraday':
+            src_bg = '#0288d1'
+        else:
+            src_bg = '#e65100'
+
+        # Unrealized P&L
         if tsla_price > 0:
-            stop = tsla_price * (1 + sig.suggested_stop_pct)
-            tp = tsla_price * (1 - sig.suggested_tp_pct)
-            rr = sig.suggested_tp_pct / max(sig.suggested_stop_pct, 0.001)
-            entry_info = (
-                f"<div style='font-size:16px;color:#ffcccc;margin-top:8px;font-family:monospace;'>"
-                f"Entry: ${tsla_price:.2f} &nbsp; Stop: ${stop:.2f} &nbsp; "
-                f"TP: ${tp:.2f} &nbsp; R:R {rr:.1f}:1</div>"
-            )
+            if pos.direction == 'long':
+                upnl = (tsla_price - pos.entry_price) * pos.shares
+            else:
+                upnl = (pos.entry_price - tsla_price) * pos.shares
+        else:
+            upnl = 0.0
+        upnl_color = '#00e676' if upnl >= 0 else '#ff5252'
 
-        html = f"""<div style="background:{bg};border:2px solid {border};
+        # R:R from entry
+        stop_dist = abs(pos.entry_price - pos.stop_price)
+        tp_dist = abs(pos.tp_price - pos.entry_price)
+        rr = tp_dist / stop_dist if stop_dist > 0 else 0
+
+        cards.append(f"""
+        <div style="background:{bg};border:2px solid {border};
         border-radius:12px;padding:20px;text-align:center;margin:10px 0;">
-        <div style="font-size:12px;font-weight:700;color:#ffcc00;letter-spacing:2px;margin-bottom:4px;">
-        {type_icon} {type_label}</div>
-        <div style="font-size:48px;font-weight:900;color:{glow};text-shadow:0 0 20px {glow};">
-        SELL</div>
-        <div style="font-size:18px;color:#ffaaaa;margin-top:8px;">
-        Confidence: {sig.confidence:.0%} | {sig.primary_tf} | Stop: {sig.suggested_stop_pct:.2%} | TP: {sig.suggested_tp_pct:.2%}
+        <div style="display:flex;justify-content:center;align-items:center;gap:10px;margin-bottom:4px;">
+            <span style="font-size:12px;font-weight:700;color:#ffcc00;letter-spacing:2px;">
+            {type_icon} {type_label}</span>
+            <span style="background:{src_bg};color:#fff;padding:2px 10px;border-radius:6px;
+            font-size:13px;font-weight:700;">{source}</span>
         </div>
-        {entry_info}
-        <div style="font-size:14px;color:#cc8888;margin-top:4px;">{sig.reason}</div>
-        </div>"""
+        <div style="font-size:48px;font-weight:900;color:{glow};text-shadow:0 0 20px {glow};">
+        {action}</div>
+        <div style="font-size:18px;color:{info_color};margin-top:8px;">
+        Confidence: {pos.confidence:.0%} | {pos.primary_tf} | {pos.shares} shares
+        </div>
+        <div style="font-size:16px;color:{info_color};margin-top:8px;font-family:monospace;">
+        Entry: ${pos.entry_price:.2f} &nbsp; Stop: ${pos.stop_price:.2f} &nbsp;
+        TP: ${pos.tp_price:.2f} &nbsp; R:R {rr:.1f}:1</div>
+        <div style="font-size:20px;margin-top:10px;">
+        Unrealized: <b style="color:{upnl_color}">${upnl:+,.0f}</b>
+        <span style="color:#aaa;font-size:14px;">&nbsp; Now: ${tsla_price:.2f}</span></div>
+        <div style="font-size:13px;color:{reason_color};margin-top:4px;">{pos.reason}</div>
+        </div>""")
 
-    else:
-        html = f"""<div style="background:linear-gradient(135deg,#1a1a2e,#2a2a4e);border:2px solid #555;
-        border-radius:12px;padding:16px;text-align:center;margin:10px 0;">
-        <div style="font-size:36px;font-weight:700;color:#aaa;">
-        HOLD</div>
-        <div style="font-size:14px;color:#888;margin-top:4px;">
-        {sig.reason} (conf: {sig.confidence:.0%})</div>
-        </div>"""
-
-    return pn.pane.HTML(html, sizing_mode='stretch_width')
+    return pn.pane.HTML('\n'.join(cards), sizing_mode='stretch_width')
 
 
 # ---------------------------------------------------------------------------
@@ -259,27 +248,43 @@ def _market_insights(analysis):
 # Scanner Panel
 # ---------------------------------------------------------------------------
 
-def _scanner_panel(positions_version, tsla_price, exit_alert_html, scanner=None):
+def _scanner_panel(positions_version, tsla_price, exit_alert_html, scanner=None, scanner_dw=None):
     if scanner is None:
         return pn.pane.HTML(
             '<div style="color:#888;padding:8px;">Scanner not available</div>',
             sizing_mode='stretch_width',
         )
 
-    unrealized = scanner.get_unrealized_pnl(tsla_price) if tsla_price > 0 else 0.0
+    # Aggregate metrics across both scanners
+    all_scanners = [s for s in [scanner, scanner_dw] if s is not None]
+    total_equity = sum(s.equity for s in all_scanners)
+    total_capital = sum(s.config.initial_capital for s in all_scanners)
+    unrealized = sum(s.get_unrealized_pnl(tsla_price) for s in all_scanners) if tsla_price > 0 else 0.0
+
+    # Per-model equity breakdown
+    model_rows = ''
+    for s in all_scanners:
+        tag = getattr(s, 'model_tag', '?')
+        eq_delta = s.equity - s.config.initial_capital
+        eq_color = '#00e676' if eq_delta >= 0 else '#ff5252'
+        model_rows += (
+            f'<span style="color:#888;font-size:11px;margin-left:12px;">'
+            f'{tag}: ${s.equity:,.0f} (<span style="color:{eq_color}">{eq_delta:+,.0f}</span>)</span>'
+        )
 
     # Header metrics
     metrics_html = f"""
     <div style="display:flex;gap:24px;padding:8px 12px;background:#111;border-radius:8px;margin:4px 0;">
         <div>
             <div style="font-size:11px;color:#888;">Starting Capital</div>
-            <div style="font-size:18px;font-weight:600;color:#ccc;">${scanner.config.initial_capital:,.0f}</div>
+            <div style="font-size:18px;font-weight:600;color:#ccc;">${total_capital:,.0f}</div>
         </div>
         <div>
             <div style="font-size:11px;color:#888;">Equity</div>
-            <div style="font-size:18px;font-weight:600;color:#ccc;">${scanner.equity:,.0f}</div>
-            <div style="font-size:11px;color:{'#00e676' if scanner.equity >= scanner.config.initial_capital else '#ff5252'};">
-            {scanner.equity - scanner.config.initial_capital:+,.0f}</div>
+            <div style="font-size:18px;font-weight:600;color:#ccc;">${total_equity:,.0f}</div>
+            <div style="font-size:11px;color:{'#00e676' if total_equity >= total_capital else '#ff5252'};">
+            {total_equity - total_capital:+,.0f}</div>
+            <div>{model_rows}</div>
         </div>
         <div>
             <div style="font-size:11px;color:#888;">Unrealized P&L</div>
@@ -294,15 +299,30 @@ def _scanner_panel(positions_version, tsla_price, exit_alert_html, scanner=None)
     if exit_alert_html:
         alert_section = exit_alert_html
 
-    # Position cards
-    position_html = ''
-    if scanner.positions:
-        cs_pos = {k: v for k, v in scanner.positions.items() if v.signal_type != 'intraday'}
-        id_pos = {k: v for k, v in scanner.positions.items() if v.signal_type == 'intraday'}
+    # Merge positions from both scanners
+    all_positions = {}
+    for scnr in [scanner, scanner_dw]:
+        if scnr and scnr.positions:
+            all_positions.update(scnr.positions)
 
-        if cs_pos:
-            position_html += '<div style="font-weight:600;color:#ccc;margin:6px 0;">CS Daily Positions</div>'
-            for pos in cs_pos.values():
+    position_html = ''
+    if all_positions:
+        cs5_pos = {k: v for k, v in all_positions.items()
+                   if getattr(v, 'signal_source', '') == 'CS-5TF'
+                   or (v.signal_type != 'intraday' and getattr(v, 'signal_source', '') not in ('CS-DW', 'intraday'))}
+        dw_pos = {k: v for k, v in all_positions.items()
+                  if getattr(v, 'signal_source', '') == 'CS-DW'}
+        id_pos = {k: v for k, v in all_positions.items()
+                  if v.signal_type == 'intraday' or getattr(v, 'signal_source', '') == 'intraday'}
+
+        if cs5_pos:
+            position_html += '<div style="font-weight:600;color:#ccc;margin:6px 0;">CS-5TF Positions</div>'
+            for pos in cs5_pos.values():
+                position_html += _position_card_html(pos, tsla_price)
+
+        if dw_pos:
+            position_html += '<div style="font-weight:600;color:#ccc;margin:6px 0;">CS-DW Positions</div>'
+            for pos in dw_pos.values():
                 position_html += _position_card_html(pos, tsla_price)
 
         if id_pos:
@@ -312,12 +332,17 @@ def _scanner_panel(positions_version, tsla_price, exit_alert_html, scanner=None)
     else:
         position_html = '<div style="color:#888;font-size:12px;padding:4px 0;">No open positions.</div>'
 
-    # Trade history
+    # Trade history (merge from both scanners)
+    all_closed = []
+    for scnr in [scanner, scanner_dw]:
+        if scnr and scnr.closed_trades:
+            all_closed.extend(scnr.closed_trades)
+
     trade_html = ''
-    if scanner.closed_trades:
-        total = len(scanner.closed_trades)
-        total_pnl = sum(t.pnl for t in scanner.closed_trades)
-        wins = sum(1 for t in scanner.closed_trades if t.pnl > 0)
+    if all_closed:
+        total = len(all_closed)
+        total_pnl = sum(t.pnl for t in all_closed)
+        wins = sum(1 for t in all_closed if t.pnl > 0)
         wr = wins / total if total > 0 else 0
         trade_html = f"""
         <details style="margin-top:8px;">
@@ -325,7 +350,7 @@ def _scanner_panel(positions_version, tsla_price, exit_alert_html, scanner=None)
                 Trade History: {total} trades | WR {wr:.0%} | Total P&L ${total_pnl:+,.0f}
             </summary>
             <div style="max-height:300px;overflow-y:auto;margin-top:4px;">
-                {_trade_history_html(scanner.closed_trades)}
+                {_trade_history_html(all_closed)}
             </div>
         </details>
         """
@@ -343,7 +368,13 @@ def _scanner_panel(positions_version, tsla_price, exit_alert_html, scanner=None)
 
 
 def _position_card_html(pos, current_price: float) -> str:
-    sys_tag = "ID 5m" if pos.signal_type == 'intraday' else "CS"
+    source = getattr(pos, 'signal_source', '')
+    if source:
+        sys_tag = source
+    elif pos.signal_type == 'intraday':
+        sys_tag = "ID 5m"
+    else:
+        sys_tag = "CS"
     if pos.direction == 'long':
         upnl = (current_price - pos.entry_price) * pos.shares if current_price > 0 else 0
         dist_stop = (current_price - pos.stop_price) / current_price if current_price > 0 else 0
@@ -355,7 +386,12 @@ def _position_card_html(pos, current_price: float) -> str:
 
     upnl_color = "#00e676" if upnl >= 0 else "#ff5252"
     stop_color = '#ff5252' if dist_stop < 0.003 else ('#ff9800' if dist_stop < 0.01 else '#888')
-    tag_color = '#4fc3f7' if pos.signal_type == 'intraday' else '#ff9800'
+    if source == 'CS-DW':
+        tag_color = '#ffd54f'
+    elif pos.signal_type == 'intraday' or source == 'intraday':
+        tag_color = '#4fc3f7'
+    else:
+        tag_color = '#ff9800'
 
     return (
         f'<div style="background:#1a2233;padding:8px;border-radius:6px;margin:3px 0;">'
@@ -374,9 +410,14 @@ def _trade_history_html(closed_trades) -> str:
     rows = []
     for t in reversed(closed_trades[-50:]):
         pnl_color = '#00e676' if t.pnl >= 0 else '#ff5252'
+        source = getattr(t, 'signal_source', '')
+        source_tag = (f'<span style="color:#64b5f6;font-size:10px;background:#1a237e;'
+                      f'padding:1px 4px;border-radius:3px;margin-right:4px;">'
+                      f'{source}</span>') if source else ''
         rows.append(
             f'<div style="font-size:12px;border-left:3px solid {pnl_color};'
             f'padding:3px 8px;margin:2px 0;">'
+            f'{source_tag}'
             f'<b style="color:{pnl_color}">${t.pnl:+,.0f}</b> '
             f'<span style="color:#888">{t.direction.upper()} | {t.exit_reason} | '
             f'{t.hold_minutes:.0f}m | Entry ${t.entry_price:.2f} Exit ${t.exit_price:.2f}</span>'

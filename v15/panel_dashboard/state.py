@@ -29,8 +29,9 @@ class DashboardState(param.Parameterized):
     analysis = param.Parameter(None)          # ChannelAnalysis object
     last_analysis = param.String('')          # Timestamp string
 
-    # Scanner
-    scanner = param.Parameter(None)           # SurferLiveScanner instance
+    # Scanners
+    scanner = param.Parameter(None)           # SurferLiveScanner (CS-5TF + intraday)
+    scanner_dw = param.Parameter(None)        # SurferLiveScanner (CS-DW)
     positions_version = param.Integer(0)      # Bump to trigger position card re-render
     exit_alert_html = param.String('')        # Latest exit alert HTML
 
@@ -148,22 +149,26 @@ class DashboardState(param.Parameterized):
             self.tsla_price = price
             self.price_source = source
 
-        # Check exits if positions are open
-        if self.scanner and self.scanner.positions and price > 0:
-            try:
-                exit_alerts = self.scanner.check_exits(price, price, price)
-                if exit_alerts:
-                    # Build exit alert HTML
-                    html_parts = []
-                    for ea in exit_alerts:
-                        html_parts.append(_exit_alert_html(ea))
-                    self.exit_alert_html = '\n'.join(html_parts)
-                    self.positions_version += 1
-                else:
-                    # Still bump version for live P&L updates
-                    self.positions_version += 1
-            except Exception as e:
-                logger.warning("Exit check failed: %s", e)
+        # Check exits if positions are open (both scanners)
+        html_parts = []
+        any_exits = False
+        for scnr in [self.scanner, self.scanner_dw]:
+            if scnr and scnr.positions and price > 0:
+                try:
+                    exit_alerts = scnr.check_exits(price, price, price)
+                    if exit_alerts:
+                        for ea in exit_alerts:
+                            html_parts.append(_exit_alert_html(ea))
+                        any_exits = True
+                except Exception as e:
+                    logger.warning("Exit check failed: %s", e)
+        if any_exits:
+            self.exit_alert_html = '\n'.join(html_parts)
+        # Bump version for live P&L updates
+        has_positions = ((self.scanner and self.scanner.positions)
+                         or (self.scanner_dw and self.scanner_dw.positions))
+        if has_positions and price > 0:
+            self.positions_version += 1
 
     def run_analysis(self):
         """5-min periodic callback + manual button: run Channel Surfer analysis."""
@@ -197,11 +202,33 @@ class DashboardState(param.Parameterized):
 
             # Evaluate signals if scanner is ready
             if self.scanner and self.tsla_price > 0:
+                # --- CS-5TF: Original 5-timeframe signal ---
                 sig = analysis.signal
                 if sig.action != 'HOLD':
-                    entry_alert = self.scanner.evaluate_signal(analysis, self.tsla_price)
+                    entry_alert = self.scanner.evaluate_signal(
+                        analysis, self.tsla_price, signal_source='CS-5TF')
                     if entry_alert and entry_alert.alert_type == 'ENTRY':
                         self.positions_version += 1
+
+                # --- CS-DW: Daily+Weekly only signal (separate scanner/model) ---
+                if self.scanner_dw and self.tsla_price > 0:
+                    try:
+                        dw_analysis = prepare_multi_tf_analysis(
+                            native_data=self.native_tf_data,
+                            live_5min_tsla=self.current_tsla,
+                            target_tfs=['daily', 'weekly'],
+                        )
+                        dw_sig = dw_analysis.signal
+                        if dw_sig.action != 'HOLD':
+                            dw_alert = self.scanner_dw.evaluate_signal(
+                                dw_analysis, self.tsla_price, signal_source='CS-DW')
+                            if dw_alert and dw_alert.alert_type == 'ENTRY':
+                                self.positions_version += 1
+                        logger.info("DW analysis: %s %s (%.0f%%)",
+                                    dw_sig.action, dw_sig.primary_tf,
+                                    dw_sig.confidence * 100)
+                    except Exception as e:
+                        logger.warning("DW analysis failed: %s", e)
 
                 # Evaluate intraday signal
                 self._evaluate_intraday(analysis)
@@ -210,7 +237,7 @@ class DashboardState(param.Parameterized):
             logger.error("Analysis failed: %s\n%s", e, traceback.format_exc())
 
     def _init_scanner(self):
-        """Create SurferLiveScanner with Gist credentials from env vars."""
+        """Create SurferLiveScanners with Gist credentials from env vars."""
         try:
             from v15.trading.surfer_live_scanner import SurferLiveScanner, ScannerConfig
             config = ScannerConfig(initial_capital=self.scanner_capital)
@@ -218,11 +245,18 @@ class DashboardState(param.Parameterized):
             github_token = os.environ.get('GITHUB_TOKEN', '')
             self.scanner = SurferLiveScanner(
                 config, gist_id=gist_id, github_token=github_token,
+                model_tag='c13a',
             )
-            logger.info("Scanner initialized (capital=$%,.0f)", self.scanner_capital)
+            self.scanner_dw = SurferLiveScanner(
+                config, gist_id=gist_id, github_token=github_token,
+                model_tag='c13a-dw',
+            )
+            logger.info("Scanners initialized (c13a + c13a-dw, capital=$%,.0f)",
+                         self.scanner_capital)
         except Exception as e:
             logger.error("Scanner init failed: %s", e)
             self.scanner = None
+            self.scanner_dw = None
 
     def _evaluate_intraday(self, analysis):
         """Extract 5-min features from analysis and evaluate intraday signal."""
@@ -342,12 +376,17 @@ def _exit_alert_html(ea) -> str:
     else:
         bg, border, icon, label = '#1a1a2e', '#888888', '&#9201;', ea.exit_reason.upper()
     pnl_color = '#00e676' if ea.pnl >= 0 else '#ff5252'
+    source_tag = ''
+    if getattr(ea, 'signal_source', ''):
+        source_tag = (f' <span style="color:#64b5f6;font-size:12px;'
+                      f'background:#1a237e;padding:2px 6px;border-radius:4px">'
+                      f'{ea.signal_source}</span>')
     return (
         f'<div style="background:{bg};padding:12px 16px;border-radius:8px;margin:6px 0;'
         f'border:2px solid {border};">'
         f'<span style="font-size:18px">{icon}</span> '
         f'<b style="color:{border};font-size:15px"> {label}</b> '
-        f'<span style="color:#aaa">[{ea.pos_id}]</span> @ '
+        f'<span style="color:#aaa">[{ea.pos_id}]</span>{source_tag} @ '
         f'<b>${ea.price:.2f}</b> &mdash; '
         f'P&L: <b style="color:{pnl_color}">${ea.pnl:+,.0f}</b> ({ea.pnl_pct:+.2%})'
         f'</div>'
