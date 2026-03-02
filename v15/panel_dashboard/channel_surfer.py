@@ -25,17 +25,25 @@ def channel_surfer_tab(state) -> pn.Column:
     """Build the Channel Surfer tab. Each section is bound to the specific param it depends on."""
 
     return pn.Column(
-        # Price banner — re-renders on price change (~500ms)
+        # Price banner — re-renders on price change
         pn.bind(_price_banner, state.param.tsla_price, state.param.price_source,
                 state.param.price_delta),
-        # Active trades banner — re-renders on position changes + price updates
-        pn.bind(_active_trades_banner, state.param.positions_version,
-                state.param.tsla_price, scanner=state.scanner),
+        # Active trades banner — only re-renders on actual trade open/close
+        pn.bind(_active_trades_banner, state.param.trades_version,
+                scanner=state.scanner),
         # Market insights
         pn.bind(_market_insights, state.param.analysis),
-        # Live scanner panel
-        pn.bind(_scanner_panel, state.param.positions_version, state.param.tsla_price,
-                state.param.exit_alert_html, scanner=state.scanner),
+        # Scanner metrics + live P&L — re-renders on price change
+        pn.bind(_scanner_metrics, state.param.positions_version, state.param.tsla_price,
+                scanner=state.scanner),
+        # Exit alerts — only re-renders when exit_alert_html changes
+        pn.bind(_exit_alerts_pane, state.param.exit_alert_html),
+        # Open positions with live P&L — re-renders on price change
+        pn.bind(_open_positions_pane, state.param.positions_version, state.param.tsla_price,
+                scanner=state.scanner),
+        # Trade history — only re-renders on actual trade open/close (preserves <details> state)
+        pn.bind(_trade_history_pane, state.param.trades_version,
+                scanner=state.scanner),
         # Regime indicator
         pn.bind(_regime_indicator, state.param.analysis),
         # Break direction predictor
@@ -97,8 +105,12 @@ def _price_banner(tsla_price, price_source, price_delta):
 # Active Trades Banner — only renders when positions are open
 # ---------------------------------------------------------------------------
 
-def _active_trades_banner(positions_version, tsla_price, scanner=None):
-    """Prominent banner showing active trades with entry/stop/TP."""
+def _active_trades_banner(trades_version, scanner=None):
+    """Prominent banner showing active trades with entry/stop/TP.
+
+    Bound to trades_version only — re-renders on actual trade open/close,
+    not on every price tick.
+    """
     if not scanner or not scanner.positions:
         return pn.pane.HTML('')
 
@@ -118,16 +130,6 @@ def _active_trades_banner(positions_version, tsla_price, scanner=None):
             bg = "linear-gradient(135deg,#4d0000,#800000)"
             border, glow = "#ff1744", "#ff4444"
             info_color, reason_color = '#ffcccc', '#cc8888'
-
-        # Unrealized P&L
-        if tsla_price > 0:
-            if pos.direction == 'long':
-                upnl = (tsla_price - pos.entry_price) * pos.shares
-            else:
-                upnl = (pos.entry_price - tsla_price) * pos.shares
-        else:
-            upnl = 0.0
-        upnl_color = '#00e676' if upnl >= 0 else '#ff5252'
 
         # R:R from entry
         stop_dist = abs(pos.entry_price - pos.stop_price)
@@ -149,9 +151,6 @@ def _active_trades_banner(positions_version, tsla_price, scanner=None):
         <div style="font-size:16px;color:{info_color};margin-top:8px;font-family:monospace;">
         Entry: ${pos.entry_price:.2f} &nbsp; Stop: ${pos.stop_price:.2f} &nbsp;
         TP: ${pos.tp_price:.2f} &nbsp; R:R {rr:.1f}:1</div>
-        <div style="font-size:20px;margin-top:10px;">
-        Unrealized: <b style="color:{upnl_color}">${upnl:+,.0f}</b>
-        <span style="color:#aaa;font-size:14px;">&nbsp; Now: ${tsla_price:.2f}</span></div>
         <div style="font-size:13px;color:{reason_color};margin-top:4px;">{pos.reason}</div>
         </div>""")
 
@@ -236,7 +235,8 @@ def _market_insights(analysis):
 # Scanner Panel
 # ---------------------------------------------------------------------------
 
-def _scanner_panel(positions_version, tsla_price, exit_alert_html, scanner=None):
+def _scanner_metrics(positions_version, tsla_price, scanner=None):
+    """Scanner equity/P&L metrics. Bound to tsla_price for live unrealized updates."""
     if scanner is None:
         return pn.pane.HTML(
             '<div style="color:#888;padding:8px;">Scanner not available</div>',
@@ -249,63 +249,74 @@ def _scanner_panel(positions_version, tsla_price, exit_alert_html, scanner=None)
     eq_delta = equity - capital
     eq_color = '#00e676' if eq_delta >= 0 else '#ff5252'
 
-    # Header metrics
-    metrics_html = f"""
-    <div style="display:flex;gap:24px;padding:8px 12px;background:#111;border-radius:8px;margin:4px 0;">
-        <div>
-            <div style="font-size:11px;color:#888;">Starting Capital</div>
-            <div style="font-size:18px;font-weight:600;color:#ccc;">${capital:,.0f}</div>
-        </div>
-        <div>
-            <div style="font-size:11px;color:#888;">Equity</div>
-            <div style="font-size:18px;font-weight:600;color:#ccc;">${equity:,.0f}</div>
-            <div style="font-size:11px;color:{eq_color};">{eq_delta:+,.0f}</div>
-        </div>
-        <div>
-            <div style="font-size:11px;color:#888;">Unrealized P&L</div>
-            <div style="font-size:18px;font-weight:600;color:{'#00e676' if unrealized >= 0 else '#ff5252'};">
-            ${unrealized:+,.0f}</div>
-        </div>
-    </div>
-    """
-
-    # Exit alerts
-    alert_section = exit_alert_html if exit_alert_html else ''
-
-    # Positions
-    position_html = ''
-    if scanner.positions:
-        for pos in scanner.positions.values():
-            position_html += _position_card_html(pos, tsla_price)
-    else:
-        position_html = '<div style="color:#888;font-size:12px;padding:4px 0;">No open positions.</div>'
-
-    # Trade history
-    trade_html = ''
-    if scanner.closed_trades:
-        total = len(scanner.closed_trades)
-        total_pnl = sum(t.pnl for t in scanner.closed_trades)
-        wins = sum(1 for t in scanner.closed_trades if t.pnl > 0)
-        wr = wins / total if total > 0 else 0
-        trade_html = f"""
-        <details style="margin-top:8px;">
-            <summary style="cursor:pointer;font-size:13px;color:#aaa;">
-                Trade History: {total} trades | WR {wr:.0%} | Total P&L ${total_pnl:+,.0f}
-            </summary>
-            <div style="max-height:300px;overflow-y:auto;margin-top:4px;">
-                {_trade_history_html(scanner.closed_trades)}
-            </div>
-        </details>
-        """
-
     html = f"""
     <div style="border:1px solid #333;border-radius:8px;padding:12px;margin:6px 0;">
         <div style="font-size:14px;font-weight:700;color:#ccc;margin-bottom:8px;">Live Scanner</div>
-        {metrics_html}
-        {alert_section}
-        {position_html}
-        {trade_html}
+        <div style="display:flex;gap:24px;padding:8px 12px;background:#111;border-radius:8px;margin:4px 0;">
+            <div>
+                <div style="font-size:11px;color:#888;">Starting Capital</div>
+                <div style="font-size:18px;font-weight:600;color:#ccc;">${capital:,.0f}</div>
+            </div>
+            <div>
+                <div style="font-size:11px;color:#888;">Equity</div>
+                <div style="font-size:18px;font-weight:600;color:#ccc;">${equity:,.0f}</div>
+                <div style="font-size:11px;color:{eq_color};">{eq_delta:+,.0f}</div>
+            </div>
+            <div>
+                <div style="font-size:11px;color:#888;">Unrealized P&L</div>
+                <div style="font-size:18px;font-weight:600;color:{'#00e676' if unrealized >= 0 else '#ff5252'};">
+                ${unrealized:+,.0f}</div>
+            </div>
+        </div>
     </div>
+    """
+    return pn.pane.HTML(html, sizing_mode='stretch_width')
+
+
+def _exit_alerts_pane(exit_alert_html):
+    """Exit alerts. Only re-renders when an exit actually happens."""
+    if not exit_alert_html:
+        return pn.pane.HTML('')
+    return pn.pane.HTML(exit_alert_html, sizing_mode='stretch_width')
+
+
+def _open_positions_pane(positions_version, tsla_price, scanner=None):
+    """Open positions with live P&L. Bound to tsla_price for live updates."""
+    if not scanner or not scanner.positions:
+        return pn.pane.HTML(
+            '<div style="color:#888;font-size:12px;padding:4px 0;">No open positions.</div>',
+            sizing_mode='stretch_width',
+        )
+
+    position_html = ''
+    for pos in scanner.positions.values():
+        position_html += _position_card_html(pos, tsla_price)
+    return pn.pane.HTML(position_html, sizing_mode='stretch_width')
+
+
+def _trade_history_pane(trades_version, scanner=None):
+    """Trade history. Bound to trades_version ONLY — not tsla_price or positions_version.
+
+    Only re-renders when a trade actually opens or closes, so the <details>
+    element preserves its open/closed state between price ticks.
+    """
+    if not scanner or not scanner.closed_trades:
+        return pn.pane.HTML('')
+
+    total = len(scanner.closed_trades)
+    total_pnl = sum(t.pnl for t in scanner.closed_trades)
+    wins = sum(1 for t in scanner.closed_trades if t.pnl > 0)
+    wr = wins / total if total > 0 else 0
+
+    html = f"""
+    <details style="margin-top:8px;">
+        <summary style="cursor:pointer;font-size:13px;color:#aaa;">
+            Trade History: {total} trades | WR {wr:.0%} | Total P&L ${total_pnl:+,.0f}
+        </summary>
+        <div style="max-height:300px;overflow-y:auto;margin-top:4px;">
+            {_trade_history_html(scanner.closed_trades)}
+        </div>
+    </details>
     """
     return pn.pane.HTML(html, sizing_mode='stretch_width')
 
