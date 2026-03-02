@@ -1,3 +1,12 @@
+---
+title: c12a
+emoji: 📈
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+---
+
 # TSLA Channel Prediction System v7
 
 **Status:** 🟢 Production Ready | **Tests:** 19/19 Passing | **Training Speedup:** 8-11x

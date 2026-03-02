@@ -7,6 +7,7 @@ Docker: see Dockerfile
 import sys
 import os
 import logging
+import traceback
 
 # Ensure project root is on sys.path so v15.* imports work
 _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -26,23 +27,36 @@ logger = logging.getLogger('x14.panel')
 
 
 def create_app():
-    from v15.panel_dashboard.state import DashboardState
-    from v15.panel_dashboard.channel_surfer import channel_surfer_tab
-    from v15.panel_dashboard.model_compare import model_comparisons_tab
+    logger.info("create_app() called — importing modules...")
+    try:
+        from v15.panel_dashboard.state import DashboardState
+        logger.info("  DashboardState imported")
+        from v15.panel_dashboard.channel_surfer import channel_surfer_tab
+        logger.info("  channel_surfer_tab imported")
+        from v15.panel_dashboard.model_compare import model_comparisons_tab
+        logger.info("  model_comparisons_tab imported")
+    except Exception:
+        logger.error("Import failed:\n%s", traceback.format_exc())
+        raise
 
     state = DashboardState()
 
     # Load market data (blocking on startup)
     logger.info("Starting X14 Panel Dashboard...")
     state.load_market_data()
+    logger.info("Market data loaded. TSLA price=%.2f, scanner=%s",
+                state.tsla_price, "OK" if state.scanner else "NONE")
 
     # Load initial model comparison data
     state.load_model_data()
+    logger.info("Model data loaded. Keys=%d", len(state.model_data))
 
     # Periodic callbacks
+    logger.info("Registering periodic callbacks...")
     pn.state.add_periodic_callback(state.update_prices, period=5_000)  # 5s REST poll
     pn.state.add_periodic_callback(state.run_analysis, period=150_000)   # 2.5 min
     pn.state.add_periodic_callback(state.load_model_data, period=3_600_000)  # 1 hour
+    logger.info("Periodic callbacks registered: price=5s, analysis=150s, model=3600s")
 
     # Sidebar controls
     run_btn = pn.widgets.Button(name='Run Analysis Now', button_type='primary')
@@ -105,12 +119,23 @@ def create_app():
             ),
         ],
     )
+    logger.info("c12a Dashboard template built successfully — ready to serve")
     return template
 
 
 if __name__.startswith('bokeh'):
     # When served via `panel serve app.py`
-    create_app().servable()
+    logger.info("Bokeh entry point — calling create_app().servable()")
+    try:
+        create_app().servable()
+        logger.info("servable() completed — app should be available at /app")
+    except Exception:
+        logger.error("FATAL: create_app() failed:\n%s", traceback.format_exc())
+        # Serve a minimal error page so the app doesn't 404
+        pn.pane.HTML(
+            f"<h1>c12a Startup Error</h1><pre>{traceback.format_exc()}</pre>",
+            sizing_mode='stretch_width',
+        ).servable()
 elif __name__ == '__main__':
     # When run directly: `python app.py`
     pn.serve(
