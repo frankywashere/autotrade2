@@ -7,6 +7,7 @@ or GitHub Gist (when GIST_ID + GITHUB_TOKEN are provided, e.g. Streamlit Cloud).
 """
 
 import json
+import os
 import urllib.request
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -41,6 +42,33 @@ MODEL_TAG = 'c13a'  # Identifies this branch in the multi-model Gist
 # Slippage + commission assumptions
 SLIPPAGE_PCT = 0.0005     # 0.05% slippage per side
 COMMISSION_PER_SHARE = 0.005  # $0.005/share (IBKR tiered)
+
+# Telegram alerts
+_TG_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+_TG_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
+
+
+def _send_telegram(msg: str, model_tag: str = ''):
+    """Send a Telegram message (best-effort, non-blocking)."""
+    if not _TG_TOKEN or not _TG_CHAT_ID:
+        return
+    tag = model_tag or MODEL_TAG
+    msg = f"[{tag}] {msg}"
+    try:
+        url = f'https://api.telegram.org/bot{_TG_TOKEN}/sendMessage'
+        payload = json.dumps({
+            'chat_id': _TG_CHAT_ID,
+            'text': msg,
+            'parse_mode': 'HTML',
+        }).encode()
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={'Content-Type': 'application/json'},
+        )
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+    except Exception as e:
+        print(f"[SCANNER] Telegram send failed: {e}")
 
 
 @dataclass
@@ -660,6 +688,19 @@ class SurferLiveScanner:
         self.positions[pos_id] = pos
         alert.pos_id = pos_id
 
+        # Telegram entry alert
+        action = 'BUY' if direction == 'long' else 'SELL'
+        rr = abs(pos.tp_price - pos.entry_price) / max(abs(pos.entry_price - pos.stop_price), 0.01)
+        _send_telegram(
+            f"🟢 <b>TRADE OPENED</b>\n"
+            f"<b>{action}</b> {pos.shares} shares @ ${pos.entry_price:.2f}\n"
+            f"Signal: <b>{signal_source or 'CS'}</b>\n"
+            f"Stop: ${pos.stop_price:.2f} | TP: ${pos.tp_price:.2f} | R:R {rr:.1f}:1\n"
+            f"Confidence: {pos.confidence:.0%} | {pos.primary_tf}\n"
+            f"Notional: ${pos.notional:,.0f}",
+            model_tag=self.model_tag,
+        )
+
     # ------------------------------------------------------------------
     # Exit checks
     # ------------------------------------------------------------------
@@ -934,6 +975,20 @@ class SurferLiveScanner:
             signal_source=pos.signal_source,
         )
         self.closed_trades.append(trade)
+
+        # Telegram exit alert
+        pnl_emoji = '🟢' if pnl >= 0 else '🔴'
+        action = 'LONG' if pos.direction == 'long' else 'SHORT'
+        hold_str = f'{hold_minutes:.0f}m' if hold_minutes < 120 else f'{hold_minutes/60:.1f}h'
+        _send_telegram(
+            f"{pnl_emoji} <b>TRADE CLOSED</b>\n"
+            f"<b>{action}</b> {pos.shares} shares\n"
+            f"Signal: <b>{pos.signal_source or 'CS'}</b>\n"
+            f"Entry: ${pos.entry_price:.2f} → Exit: ${exit_price:.2f}\n"
+            f"P&L: <b>${pnl:+,.0f}</b> ({pnl_pct:+.2%})\n"
+            f"Reason: {exit_reason} | Held: {hold_str}",
+            model_tag=self.model_tag,
+        )
 
         return ScannerAlert(
             alert_type='EXIT',
