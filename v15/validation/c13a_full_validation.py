@@ -90,6 +90,17 @@ SETTINGS = {
         'commission_per_share': 0.005,
         'long_only': True,
     },
+    'surfer_ml': {
+        'name': 'Surfer ML (26 models, realistic mode)',
+        'resolution': '5-min bars',
+        'stop': 'ATR-based, ML-adjusted (EL/IS tightening)',
+        'tp': 'CS suggested, bounce TP widened 1.3x',
+        'trail': 'profit-tier based (surfer_backtest)',
+        'sizing': 'risk-normalized + ML signal quality + win-streak ramp',
+        'capital': 100_000, 'max_leverage': 4.0,
+        'slippage_bps': 3.0, 'commission_per_share': 0.005,
+        'models': '26 pkl/pt models in surfer_models/',
+    },
 }
 
 WALK_FORWARD_WINDOWS = [
@@ -632,6 +643,284 @@ def validate_intraday(tsla_min_path):
 
 
 # ---------------------------------------------------------------------------
+# D. Surfer ML (5-min bars, 26 models, realistic mode)
+# ---------------------------------------------------------------------------
+
+def _compute_metrics_surfer(trades) -> dict:
+    """Compute metrics from surfer_backtest Trade objects."""
+    n = len(trades)
+    if n == 0:
+        return {'trades': 0, 'win_rate': 0, 'total_pnl': 0, 'sharpe': 0, 'max_dd_pct': 0,
+                'avg_win': 0, 'avg_loss': 0, 'biggest_loss': 0}
+    pnls = np.array([t.pnl for t in trades])
+    wins = sum(1 for p in pnls if p > 0)
+    wr = wins / n * 100
+    total = float(pnls.sum())
+    avg_w = float(np.mean([p for p in pnls if p > 0])) if wins > 0 else 0
+    avg_l = float(np.mean([p for p in pnls if p <= 0])) if wins < n else 0
+    bl = float(pnls.min())
+    avg_hold = float(np.mean([t.hold_bars for t in trades]))
+    # Annualize assuming ~78 bars/day
+    bars_per_day = 78
+    trades_per_year = 252 * bars_per_day / max(avg_hold, 1)
+    sharpe = (float(pnls.mean() / pnls.std() * np.sqrt(trades_per_year))
+              if pnls.std() > 0 else 0.0)
+    cum = np.cumsum(pnls)
+    dd = np.maximum.accumulate(cum) - cum
+    mdd = float(dd.max()) / CAPITAL * 100 if len(dd) > 0 else 0
+    return {
+        'trades': n, 'wins': wins, 'win_rate': round(wr, 1),
+        'total_pnl': round(total), 'avg_win': round(avg_w),
+        'avg_loss': round(avg_l), 'biggest_loss': round(bl),
+        'sharpe': round(sharpe, 2), 'max_dd_pct': round(mdd, 1),
+        'avg_hold_bars': round(avg_hold, 1),
+    }
+
+
+def _load_surfer_data(tsla_min_path, start, end):
+    """Load 1-min data and resample to 5-min + higher TFs for surfer_backtest."""
+    from v15.validation.intraday_v14b_janfeb import load_1min
+
+    MKT_OPEN = dt.time(9, 30)
+    MKT_CLOSE = dt.time(16, 0)
+
+    print("  Loading 1-min data...")
+    df1m = load_1min(tsla_min_path)
+
+    # Resample to 5-min
+    print("  Resampling to 5-min...")
+    tsla_5m = df1m.resample('5min').agg(
+        {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+    ).dropna()
+    print(f"  5-min bars: {len(tsla_5m):,}")
+
+    # Higher TFs
+    print("  Building higher TFs...")
+    higher_tf = {}
+    higher_tf['1h'] = df1m.resample('1h').agg(
+        {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+    ).dropna()
+    higher_tf['4h'] = df1m.resample('4h').agg(
+        {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+    ).dropna()
+    higher_tf['daily'] = df1m.resample('1D').agg(
+        {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+    ).dropna()
+    higher_tf['weekly'] = df1m.resample('W-FRI').agg(
+        {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+    ).dropna()
+
+    for tf, df in higher_tf.items():
+        print(f"    {tf}: {len(df):,} bars")
+
+    # SPY + VIX (daily, via yfinance — needed for ML correlation features)
+    from v15.data.native_tf import fetch_native_tf
+    print("  Loading SPY daily...")
+    spy_daily = fetch_native_tf('SPY', 'daily', start, end)
+    spy_daily.columns = [c.lower() for c in spy_daily.columns]
+    spy_daily.index = pd.to_datetime(spy_daily.index).tz_localize(None)
+
+    print("  Loading VIX daily...")
+    try:
+        vix_daily = fetch_native_tf('^VIX', 'daily', start, end)
+        vix_daily.columns = [c.lower() for c in vix_daily.columns]
+        vix_daily.index = pd.to_datetime(vix_daily.index).tz_localize(None)
+    except Exception:
+        vix_daily = None
+
+    return tsla_5m, higher_tf, spy_daily, vix_daily
+
+
+def _load_ml_model():
+    """Load the best ML model for surfer_backtest."""
+    model_path = Path('surfer_models/best_model.pt')
+    if not model_path.exists():
+        print(f"  WARNING: {model_path} not found, running without ML model")
+        return None
+    try:
+        from v15.core.surfer_ml import GBTModel
+        import torch
+        model = torch.load(str(model_path), map_location='cpu', weights_only=False)
+        print(f"  ML model loaded from {model_path}")
+        return model
+    except Exception as e:
+        print(f"  WARNING: Failed to load ML model: {e}")
+        return None
+
+
+def _load_sq_model():
+    """Load signal quality model for ML position sizing."""
+    for name in ('signal_quality_model_c10_arch2.pkl',
+                 'signal_quality_model_tuned.pkl',
+                 'signal_quality_model.pkl'):
+        p = Path('v15/validation') / name
+        if p.exists():
+            try:
+                with open(p, 'rb') as f:
+                    model = pickle.load(f)
+                print(f"  Signal quality model loaded: {name}")
+                return model
+            except Exception as e:
+                print(f"  WARNING: Failed to load {name}: {e}")
+    print("  WARNING: No signal quality model found")
+    return None
+
+
+def _run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
+                          ml_model, sq_model, year_start, year_end):
+    """Run surfer_backtest for a year range, return trades in that range."""
+    from v15.core.surfer_backtest import run_backtest
+
+    # Slice 5-min data to year range (with warmup: include 60 days before)
+    range_start = pd.Timestamp(f'{year_start}-01-01') - pd.Timedelta(days=90)
+    range_end = pd.Timestamp(f'{year_end}-12-31 23:59:59')
+    mask = (tsla_5m.index >= range_start) & (tsla_5m.index <= range_end)
+    tsla_slice = tsla_5m.loc[mask]
+
+    if len(tsla_slice) < 100:
+        return []
+
+    # Slice higher TFs similarly (wider warmup)
+    htf_warmup = pd.Timestamp(f'{year_start}-01-01') - pd.Timedelta(days=365)
+    htf_slice = {}
+    for tf, df in higher_tf.items():
+        htf_slice[tf] = df.loc[(df.index >= htf_warmup) & (df.index <= range_end)]
+
+    # ML sizing function
+    ml_size_fn = None
+    if sq_model is not None:
+        def ml_size_fn(quality_score):
+            # Scale 0.5x to 2x based on quality score
+            return max(0.5, min(2.0, quality_score * 2.0))
+
+    metrics, trades, equity_curve = run_backtest(
+        days=0,  # Ignored when tsla_df provided
+        eval_interval=3,
+        max_hold_bars=60,
+        position_size=10000.0,
+        min_confidence=0.01,
+        use_multi_tf=True,
+        ml_model=ml_model,
+        tsla_df=tsla_slice,
+        higher_tf_dict=htf_slice,
+        spy_df_input=spy_daily,
+        vix_df_input=vix_daily,
+        realistic=True,
+        slippage_bps=3.0,
+        commission_per_share=0.005,
+        max_leverage=4.0,
+        initial_capital=100_000.0,
+        signal_quality_model=sq_model,
+        ml_size_fn=ml_size_fn,
+    )
+
+    # Filter trades to only the requested year range
+    filtered = []
+    for t in trades:
+        if t.entry_time:
+            try:
+                entry_dt = pd.Timestamp(t.entry_time)
+                if year_start <= entry_dt.year <= year_end:
+                    filtered.append(t)
+            except (ValueError, TypeError):
+                pass
+    return filtered
+
+
+def validate_surfer_ml(tsla_min_path, start, end):
+    """Validate surfer_backtest with full ML stack in realistic mode."""
+    print("\n" + "#"*75)
+    print("  D. Surfer ML — 26 Models, Realistic Mode, 5-Min Bars")
+    print("#"*75)
+
+    print("\n  Loading data...")
+    tsla_5m, higher_tf, spy_daily, vix_daily = _load_surfer_data(tsla_min_path, start, end)
+
+    print("\n  Loading models...")
+    ml_model = _load_ml_model()
+    sq_model = _load_sq_model()
+
+    # 1. Per-year ($100K fresh each year)
+    year_results = {}
+    for yr in range(2016, 2027):
+        print(f"\n  Running year {yr}...")
+        trades = _run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
+                                        ml_model, sq_model, yr, yr)
+        if trades:
+            year_results[yr] = _compute_metrics_surfer(trades)
+            m = year_results[yr]
+            print(f"    {yr}: {m['trades']} trades, {m['win_rate']}% WR, ${m['total_pnl']:+,}")
+        else:
+            print(f"    {yr}: 0 trades")
+    _print_year_table(year_results, 'Surfer ML (realistic)')
+
+    # 2. Holdout
+    print("\n  Running holdout (train ≤2021, test 2022-2025)...")
+    train_trades = _run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
+                                          ml_model, sq_model, 2016, 2021)
+    test_trades = _run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
+                                         ml_model, sq_model, 2022, 2025)
+    _print_holdout(_compute_metrics_surfer(train_trades), _compute_metrics_surfer(test_trades))
+
+    # 3. Walk-forward
+    print("\n  Running walk-forward...")
+    wf_results = []
+    for train_range, test_yr in WALK_FORWARD_WINDOWS:
+        ty_start, ty_end = [int(y) for y in train_range.split('-')]
+        print(f"    {train_range} → {test_yr}...")
+        tr_trades = _run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
+                                           ml_model, sq_model, ty_start, ty_end)
+        te_trades = _run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
+                                           ml_model, sq_model, int(test_yr), int(test_yr))
+        wf_results.append({
+            'train_period': train_range, 'test_year': test_yr,
+            'train': _compute_metrics_surfer(tr_trades),
+            'test': _compute_metrics_surfer(te_trades),
+        })
+    _print_walkforward(wf_results)
+
+    # 4. 2026 OOS
+    print("\n  Running 2026 OOS...")
+    oos_trades = _run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
+                                        ml_model, sq_model, 2026, 2026)
+    # Print trade log for 2026
+    print(f"\n  --- 2026 OOS Trade Log ---")
+    if oos_trades:
+        print(f"  {'#':>3} {'Entry':>20} {'Dir':<5} {'EntryPx':>9} {'ExitPx':>9} "
+              f"{'Conf':>5} {'Size':>9} {'PnL':>9} {'Type':<8} {'Reason'}")
+        print(f"  {'-'*100}")
+        for i, t in enumerate(oos_trades, 1):
+            print(f"  {i:>3} {t.entry_time[:19]:>20} {t.direction:<5} ${t.entry_price:>7.2f} "
+                  f"${t.exit_price:>7.2f} {t.confidence:>5.2f} ${t.trade_size:>7,.0f} "
+                  f"${t.pnl:>+7,.0f} {t.signal_type:<8} {t.exit_reason}")
+    else:
+        print("  No 2026 trades.")
+
+    # All-years combined
+    all_trades = []
+    for yr in range(2016, 2027):
+        all_trades.extend(_run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
+                                                  ml_model, sq_model, yr, yr))
+    all_metrics = _compute_metrics_surfer(all_trades) if all_trades else {
+        'trades': 0, 'win_rate': 0, 'total_pnl': 0, 'sharpe': 0, 'max_dd_pct': 0,
+        'avg_win': 0, 'avg_loss': 0, 'biggest_loss': 0}
+    print(f"\n  ALL PERIODS: {all_metrics['trades']} trades, "
+          f"{all_metrics['win_rate']}% WR, ${all_metrics['total_pnl']:+,}, "
+          f"Sharpe={all_metrics['sharpe']}")
+
+    return {
+        'signal_type': 'Surfer ML',
+        'settings': SETTINGS['surfer_ml'],
+        'per_year': year_results,
+        'holdout': {'train': _compute_metrics_surfer(train_trades),
+                    'test': _compute_metrics_surfer(test_trades)},
+        'walk_forward': wf_results,
+        'oos_2026': _compute_metrics_surfer(oos_trades),
+        'all': all_metrics,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
@@ -689,6 +978,10 @@ def main():
                         help='Skip intraday validation (requires 1-min data)')
     parser.add_argument('--skip-dw', action='store_true',
                         help='Skip CS-DW validation (slow phase 1)')
+    parser.add_argument('--skip-ml', action='store_true',
+                        help='Skip Surfer ML validation (slow, needs models)')
+    parser.add_argument('--only-ml', action='store_true',
+                        help='Run ONLY Surfer ML validation')
     args = parser.parse_args()
 
     # Auto-detect TSLAMin.txt
@@ -708,40 +1001,58 @@ def main():
 
     results = {}
 
-    # ── A. CS-5TF ─────────────────────────────────────────────────────────
-    print("\n[A] Loading CS-5TF signals...")
-    if args.phase2_only and CACHE_FILE.exists():
-        print("  Loading from cache...")
-        with open(CACHE_FILE, 'rb') as f:
-            cache = pickle.load(f)
-        signals = cache['signals']
-        daily_df = cache['daily_df']
-        spy_daily = cache['spy_daily']
-        vix_daily = cache.get('vix_daily')
-        print(f"  Loaded {len(signals):,} days from cache")
+    if args.only_ml:
+        # Skip A/B/C, go straight to D
+        if args.tsla and os.path.isfile(args.tsla):
+            print("\n[D] Running Surfer ML validation ONLY (realistic, 26 models)...")
+            results['surfer_ml'] = validate_surfer_ml(args.tsla, args.start, args.end)
+        else:
+            print("\n[D] Cannot run Surfer ML (no TSLAMin.txt found)")
     else:
-        signals, daily_df, spy_daily, vix_daily, _ = phase1_precompute(
-            args.tsla, args.start, args.end)
+        # ── A. CS-5TF ────────────────────────────────────────────────────
+        print("\n[A] Loading CS-5TF signals...")
+        if args.phase2_only and CACHE_FILE.exists():
+            print("  Loading from cache...")
+            with open(CACHE_FILE, 'rb') as f:
+                cache = pickle.load(f)
+            signals = cache['signals']
+            daily_df = cache['daily_df']
+            spy_daily = cache['spy_daily']
+            vix_daily = cache.get('vix_daily')
+            print(f"  Loaded {len(signals):,} days from cache")
+        else:
+            signals, daily_df, spy_daily, vix_daily, _ = phase1_precompute(
+                args.tsla, args.start, args.end)
 
-    results['cs_5tf'] = validate_cs_5tf(signals, daily_df, spy_daily, vix_daily)
+        results['cs_5tf'] = validate_cs_5tf(signals, daily_df, spy_daily, vix_daily)
 
-    # ── B. CS-DW ──────────────────────────────────────────────────────────
-    if not args.skip_dw:
-        print("\n[B] Computing CS-DW signals (daily+weekly only)...")
-        signals_dw, daily_df_dw, spy_daily_dw, vix_daily_dw = _phase1_precompute_dw(
-            args.tsla, args.start, args.end)
-        results['cs_dw'] = validate_cs_dw(signals_dw, daily_df_dw, spy_daily_dw, vix_daily_dw)
-    else:
-        print("\n[B] Skipping CS-DW (--skip-dw)")
+        # ── B. CS-DW ─────────────────────────────────────────────────────
+        if not args.skip_dw:
+            print("\n[B] Computing CS-DW signals (daily+weekly only)...")
+            signals_dw, daily_df_dw, spy_daily_dw, vix_daily_dw = _phase1_precompute_dw(
+                args.tsla, args.start, args.end)
+            results['cs_dw'] = validate_cs_dw(signals_dw, daily_df_dw, spy_daily_dw, vix_daily_dw)
+        else:
+            print("\n[B] Skipping CS-DW (--skip-dw)")
 
-    # ── C. Intraday ───────────────────────────────────────────────────────
-    if not args.skip_intraday and args.tsla and os.path.isfile(args.tsla):
-        print("\n[C] Running intraday validation...")
-        results['intraday'] = validate_intraday(args.tsla)
-    elif args.skip_intraday:
-        print("\n[C] Skipping intraday (--skip-intraday)")
-    else:
-        print("\n[C] Skipping intraday (no TSLAMin.txt found)")
+        # ── C. Intraday ──────────────────────────────────────────────────
+        if not args.skip_intraday and args.tsla and os.path.isfile(args.tsla):
+            print("\n[C] Running intraday validation...")
+            results['intraday'] = validate_intraday(args.tsla)
+        elif args.skip_intraday:
+            print("\n[C] Skipping intraday (--skip-intraday)")
+        else:
+            print("\n[C] Skipping intraday (no TSLAMin.txt found)")
+
+        # ── D. Surfer ML ──────────────────────────────────────────────────
+        if not args.skip_ml:
+            if args.tsla and os.path.isfile(args.tsla):
+                print("\n[D] Running Surfer ML validation (realistic, 26 models)...")
+                results['surfer_ml'] = validate_surfer_ml(args.tsla, args.start, args.end)
+            else:
+                print("\n[D] Skipping Surfer ML (no TSLAMin.txt found)")
+        else:
+            print("\n[D] Skipping Surfer ML (--skip-ml)")
 
     # ── Comparison ────────────────────────────────────────────────────────
     if len(results) > 1:
