@@ -7,6 +7,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+ENV PYTHONUNBUFFERED=1
+
 EXPOSE 7860
 
 CMD ["panel", "serve", "v15/panel_dashboard/app.py", \

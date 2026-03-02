@@ -299,6 +299,9 @@ class DashboardState(param.Parameterized):
             config = ScannerConfig(initial_capital=self.scanner_capital)
             gist_id = os.environ.get('GIST_ID', '')
             github_token = os.environ.get('GITHUB_TOKEN', '')
+            logger.info("Scanner init: gist_id=%s, github_token=%s",
+                         gist_id[:8] + '...' if gist_id else 'MISSING',
+                         github_token[:8] + '...' if github_token else 'MISSING')
             self.scanner = SurferLiveScanner(
                 config, gist_id=gist_id, github_token=github_token,
                 model_tag='c13a',
@@ -307,10 +310,12 @@ class DashboardState(param.Parameterized):
                 config, gist_id=gist_id, github_token=github_token,
                 model_tag='c13a-dw',
             )
-            logger.info("Scanners initialized (c13a + c13a-dw, capital=$%,.0f)",
-                         self.scanner_capital)
+            logger.info("Scanners initialized (c13a + c13a-dw, capital=$%,.0f, positions=%d+%d, closed=%d+%d)",
+                         self.scanner_capital,
+                         len(self.scanner.positions), len(self.scanner_dw.positions),
+                         len(self.scanner.closed_trades), len(self.scanner_dw.closed_trades))
         except Exception as e:
-            logger.error("Scanner init failed: %s", e)
+            logger.error("Scanner init failed: %s\n%s", e, traceback.format_exc())
             self.scanner = None
             self.scanner_dw = None
 
