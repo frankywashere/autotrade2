@@ -37,7 +37,7 @@ def _is_market_open() -> bool:
 STATE_PATH = Path.home() / ".x14" / "surfer_scanner_state.json"
 MAX_SIGNAL_HISTORY = 200
 GIST_FILE_NAME = 'surfer_scanner_state.json'
-MODEL_TAG = 'c12'  # Identifies this branch in the multi-model Gist
+MODEL_TAG = 'c12a'  # Identifies this branch in the multi-model Gist
 
 # Slippage + commission assumptions
 SLIPPAGE_PCT = 0.0005     # 0.05% slippage per side

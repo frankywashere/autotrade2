@@ -14,12 +14,14 @@ InquirerPy
 pandas_market_calendars
 yfinance
 
-# Dashboard (optional)
-streamlit>=1.45.0
+# Dashboard
+panel>=1.4
+bokeh>=3.4
+param>=2.0
 plotly
 matplotlib
 pytz
-streamlit-autorefresh
+websocket-client
 
 # Scientific computing
 scipy
