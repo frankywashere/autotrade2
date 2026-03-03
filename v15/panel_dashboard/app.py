@@ -53,9 +53,16 @@ def create_app():
 
     # Log ML model status
     if hasattr(state, '_ml_model') and state._ml_model is not None:
-        logger.info("ML model: LOADED (%d features)", len(state._ml_feature_names or []))
+        logger.info("ML model (GBT): LOADED (%d features)", len(state._ml_feature_names or []))
     else:
-        logger.warning("ML model: NOT LOADED — Surfer ML signals will be skipped")
+        logger.warning("ML model (GBT): NOT LOADED — c14-ml signals will be skipped")
+
+    if hasattr(state, '_intraday_ml_model') and state._intraday_ml_model is not None:
+        logger.info("ML model (Intraday): LOADED (%d features, threshold=%.2f)",
+                    len(getattr(state, '_intraday_ml_features', []) or []),
+                    getattr(state, '_intraday_ml_threshold', 0.5))
+    else:
+        logger.warning("ML model (Intraday): NOT LOADED — c14-intra ML filter disabled")
 
     # Load initial model comparison data
     state.load_model_data()
