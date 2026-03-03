@@ -386,12 +386,14 @@ class DashboardState(param.Parameterized):
             if intra_data:
                 self._intraday_ml_model = intra_data['model']
                 self._intraday_ml_features = intra_data['feature_names']
+                self._intraday_ml_threshold = intra_data.get('threshold', 0.5)
                 self._intraday_trade_state = {
                     'bars_since_last': 999, 'daily_trades': 0,
                     'consec_wins': 0, 'consec_losses': 0,
                     'last_trade_date': None,
                 }
-                logger.info("Intraday ML model ready: %d features", len(self._intraday_ml_features))
+                logger.info("Intraday ML model ready: %d features, threshold=%.2f",
+                            len(self._intraday_ml_features), self._intraday_ml_threshold)
         except Exception as e:
             logger.warning("Intraday ML model load failed: %s", e)
             self._intraday_ml_model = None
@@ -508,6 +510,9 @@ class DashboardState(param.Parameterized):
         atr_5m_pct = float('nan')
         return_5bar = float('nan')
         return_20bar = float('nan')
+        rsi_5m_val = float('nan')
+        bvc_5m_val = float('nan')
+        rsi_slope_val = float('nan')
         try:
             close_arr = self.current_tsla['close'].values
             high_arr = self.current_tsla['high'].values
@@ -574,6 +579,52 @@ class DashboardState(param.Parameterized):
                 return_5bar = (close_arr[-1] - close_arr[-6]) / close_arr[-6] * 100.0
             if n >= 21 and close_arr[-21] > 0:
                 return_20bar = (close_arr[-1] - close_arr[-21]) / close_arr[-21] * 100.0
+
+            # RSI(14) from 5-min close -- Wilder smoothing (matches training)
+            if n >= 16:
+                deltas = np.diff(close_arr)
+                gains = np.maximum(deltas, 0)
+                losses = np.maximum(-deltas, 0)
+                p = 14
+                ag = gains[:p].mean()
+                al = losses[:p].mean()
+                for ki in range(p, len(deltas)):
+                    ag = (ag * (p - 1) + gains[ki]) / p
+                    al = (al * (p - 1) + losses[ki]) / p
+                rsi_5m_val = 100.0 if al < 1e-10 else 100.0 - 100.0 / (1.0 + ag / al)
+
+                # RSI slope: linear regression over last 5 RSI values
+                if n >= 20:
+                    rsi_arr = np.full(n, np.nan)
+                    ag2 = gains[:p].mean()
+                    al2 = losses[:p].mean()
+                    for ki in range(p, len(deltas)):
+                        ag2 = (ag2 * (p - 1) + gains[ki]) / p
+                        al2 = (al2 * (p - 1) + losses[ki]) / p
+                        rsi_arr[ki + 1] = 100.0 if al2 < 1e-10 else 100.0 - 100.0 / (1.0 + ag2 / al2)
+                    seg = rsi_arr[-5:]
+                    if not np.any(np.isnan(seg)):
+                        x = np.arange(5, dtype=np.float64)
+                        mx, my = x.mean(), seg.mean()
+                        rsi_slope_val = float(np.sum((x - mx) * (seg - my)) / np.sum((x - mx) ** 2))
+
+            # BVC(20) -- bullish volume confirmed (matches training)
+            if n >= 21:
+                from scipy.stats import norm as _norm
+                dp = np.diff(close_arr)
+                dp = np.concatenate([[0], dp])
+                lb = 20
+                s = pd.Series(dp).rolling(lb, min_periods=lb).std().values
+                z = np.zeros(n)
+                vl = s > 1e-10
+                z[vl] = dp[vl] / s[vl]
+                bp = _norm.cdf(z)
+                nf = vol_arr * (2 * bp - 1)
+                nc = pd.Series(nf).rolling(lb, min_periods=lb).sum().values
+                tv = pd.Series(vol_arr.astype(float)).rolling(lb, min_periods=lb).sum().values
+                valid_tv = tv > 0
+                if valid_tv[-1]:
+                    bvc_5m_val = float(nc[-1] / tv[-1])
         except Exception:
             pass
 
@@ -611,11 +662,10 @@ class DashboardState(param.Parameterized):
                     daily_cp=daily_cp, h1_cp=h1_cp, h4_cp=h4_cp,
                     daily_slope=daily_slope, h1_slope=h1_slope, h4_slope=h4_slope,
                     confidence=alert.confidence,
-                    stop_pct=abs(alert.price - alert.stop_price) / alert.price if alert.price > 0 else 0.008,
-                    tp_pct=abs(alert.tp_price - alert.price) / alert.price if alert.price > 0 else 0.02,
                     atr_5m_pct=atr_5m_pct, range_today_pct=range_today_pct,
                     volume_today_ratio=volume_today_ratio,
                     return_5bar=return_5bar, return_20bar=return_20bar,
+                    rsi_5m=rsi_5m_val, bvc_5m=bvc_5m_val, rsi_slope=rsi_slope_val,
                     cp_15m=state_15m.position_pct if state_15m and state_15m.valid else float('nan'),
                     cp_30m=state_30m.position_pct if state_30m and state_30m.valid else float('nan'),
                 ):
@@ -657,13 +707,13 @@ class DashboardState(param.Parameterized):
 
             # 5-min features
             _set('cp_5m', kwargs.get('cp5', float('nan')))
-            _set('rsi_5m', float('nan'))  # Not available in live TF states
-            _set('bvc_5m', float('nan'))
+            _set('rsi_5m', kwargs.get('rsi_5m', float('nan')))
+            _set('bvc_5m', kwargs.get('bvc_5m', float('nan')))
             _set('vwap_dist', kwargs.get('vwap_dist', float('nan')))
             _set('vol_ratio', kwargs.get('vol_ratio', float('nan')))
             _set('vwap_slope', kwargs.get('vwap_slope', float('nan')))
             _set('spread_pct', kwargs.get('spread_pct', float('nan')))
-            _set('rsi_slope', float('nan'))
+            _set('rsi_slope', kwargs.get('rsi_slope', float('nan')))
             _set('gap_pct', kwargs.get('gap_pct', float('nan')))
 
             # Higher TF positions
@@ -708,16 +758,10 @@ class DashboardState(param.Parameterized):
 
             # Signal quality
             _set('confidence', kwargs.get('confidence', float('nan')))
-            _set('stop_pct', kwargs.get('stop_pct', float('nan')))
-            _set('tp_pct', kwargs.get('tp_pct', float('nan')))
 
             # Momentum
             _set('return_5bar', kwargs.get('return_5bar', float('nan')))
             _set('return_20bar', kwargs.get('return_20bar', float('nan')))
-
-            # RSI at higher TFs (not available from TF states)
-            _set('rsi_1h', float('nan'))
-            _set('rsi_daily', float('nan'))
 
             # Trade state
             _set('bars_since_last_trade', ts['bars_since_last'])
@@ -727,8 +771,9 @@ class DashboardState(param.Parameterized):
 
             # Run prediction
             prob = self._intraday_ml_model.predict(feat.reshape(1, -1))[0]
-            accept = prob >= 0.5
-            logger.debug("Intraday ML: prob=%.3f, accept=%s", prob, accept)
+            thresh = getattr(self, '_intraday_ml_threshold', 0.5)
+            accept = prob >= thresh
+            logger.info("Intraday ML: prob=%.3f, thresh=%.2f, accept=%s", prob, thresh, accept)
 
             # Update trade state
             ts['bars_since_last'] = 0

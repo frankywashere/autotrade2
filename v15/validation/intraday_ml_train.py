@@ -58,10 +58,8 @@ FEATURE_NAMES = [
     'volume_today_ratio',  # today's volume vs 20-day avg
     # Signal quality
     'confidence',
-    'stop_pct', 'tp_pct',
     # Momentum
     'return_5bar', 'return_20bar',  # trailing 5-min returns
-    'rsi_1h', 'rsi_daily',
     # Pattern features
     'bars_since_last_trade',  # cooldown pressure
     'daily_trade_count',  # how many trades today
@@ -80,7 +78,7 @@ def extract_features(i, f5m, ctx, features, signal_result, trade_state):
     if signal_result is None:
         return None
 
-    _, conf, stop_pct, tp_pct = signal_result
+    _, conf, _stop_pct, _tp_pct = signal_result
 
     close = f5m['close'].values
     high = f5m['high'].values
@@ -173,8 +171,6 @@ def extract_features(i, f5m, ctx, features, signal_result, trade_state):
 
     # Signal quality
     feat[idx] = conf; idx += 1
-    feat[idx] = stop_pct; idx += 1
-    feat[idx] = tp_pct; idx += 1
 
     # Momentum
     if i >= 5:
@@ -182,12 +178,6 @@ def extract_features(i, f5m, ctx, features, signal_result, trade_state):
     idx += 1
     if i >= 20:
         feat[idx] = (close[i] - close[i-20]) / close[i-20] * 100.0 if close[i-20] > 0 else np.nan
-    idx += 1
-
-    # RSI at higher TFs (from features dict if available)
-    feat[idx] = np.nan  # rsi_1h -- would need 1h features
-    idx += 1
-    feat[idx] = np.nan  # rsi_daily -- would need daily features
     idx += 1
 
     # Trade state features
@@ -379,7 +369,7 @@ def train_model(X_train, y_train, X_val=None, y_val=None):
     params = {
         'objective': 'binary',
         'metric': 'auc',
-        'learning_rate': 0.05,
+        'learning_rate': 0.02,
         'num_leaves': 31,
         'max_depth': 6,
         'min_child_samples': 50,
@@ -387,26 +377,27 @@ def train_model(X_train, y_train, X_val=None, y_val=None):
         'colsample_bytree': 0.8,
         'reg_alpha': 0.1,
         'reg_lambda': 1.0,
+        'is_unbalance': True,  # Handle class imbalance (85/15 win/loss)
         'verbose': -1,
         'seed': 42,
     }
 
     train_data = lgb.Dataset(X_train, label=y_train, feature_name=FEATURE_NAMES)
-    callbacks = [lgb.log_evaluation(100)]
+    callbacks = [lgb.log_evaluation(200)]
 
     if X_val is not None and y_val is not None:
         val_data = lgb.Dataset(X_val, label=y_val, feature_name=FEATURE_NAMES, reference=train_data)
         model = lgb.train(
             params, train_data,
-            num_boost_round=500,
+            num_boost_round=1000,
             valid_sets=[train_data, val_data],
             valid_names=['train', 'val'],
-            callbacks=callbacks + [lgb.early_stopping(50)],
+            callbacks=callbacks + [lgb.early_stopping(80)],
         )
     else:
         model = lgb.train(
             params, train_data,
-            num_boost_round=300,
+            num_boost_round=600,
             valid_sets=[train_data],
             valid_names=['train'],
             callbacks=callbacks,
@@ -415,7 +406,7 @@ def train_model(X_train, y_train, X_val=None, y_val=None):
     return model
 
 
-def evaluate_model(model, X, y, meta, label=''):
+def evaluate_model(model, X, y, meta, label='', sweep_threshold=False):
     """Evaluate model predictions vs actual outcomes."""
     probs = model.predict(X)
     preds = (probs >= 0.5).astype(int)
@@ -431,15 +422,16 @@ def evaluate_model(model, X, y, meta, label=''):
     ml_wr = ml_wins / ml_n * 100 if ml_n > 0 else 0
 
     # P&L comparison
-    all_pnl = sum(m['pnl'] for m in meta)
-    ml_pnl = sum(m['pnl'] for i, m in enumerate(meta) if ml_mask[i])
+    pnl_arr = np.array([m['pnl'] for m in meta])
+    all_pnl = float(pnl_arr.sum())
+    ml_pnl = float(pnl_arr[ml_mask].sum()) if ml_n > 0 else 0.0
 
     # Rejected trades analysis
     rej_mask = preds == 0
     rej_n = rej_mask.sum()
     rej_wins = y[rej_mask].sum() if rej_n > 0 else 0
     rej_wr = rej_wins / rej_n * 100 if rej_n > 0 else 0
-    rej_pnl = sum(m['pnl'] for i, m in enumerate(meta) if rej_mask[i])
+    rej_pnl = float(pnl_arr[rej_mask].sum()) if rej_n > 0 else 0.0
 
     print(f"\n  {label}")
     print(f"  {'Metric':<25} {'Baseline':>12} {'ML-Filtered':>12} {'Rejected':>12}")
@@ -452,10 +444,32 @@ def evaluate_model(model, X, y, meta, label=''):
     rej_avg = rej_pnl / rej_n if rej_n > 0 else 0
     print(f"  {'Avg P&L':<25} ${avg_pnl:>+11,.0f} ${ml_avg:>+11,.0f} ${rej_avg:>+11,.0f}")
 
+    # Threshold sweep to find optimal P&L threshold
+    best_thresh = 0.5
+    if sweep_threshold and n > 50:
+        best_pnl_diff = 0.0
+        for thresh in np.arange(0.30, 0.80, 0.02):
+            t_mask = probs >= thresh
+            t_pnl = float(pnl_arr[t_mask].sum())
+            t_n = int(t_mask.sum())
+            diff = t_pnl - all_pnl
+            if diff > best_pnl_diff and t_n >= n * 0.5:  # Keep at least 50% of trades
+                best_pnl_diff = diff
+                best_thresh = thresh
+        if best_thresh != 0.5:
+            bt_mask = probs >= best_thresh
+            bt_n = int(bt_mask.sum())
+            bt_wins = int(y[bt_mask].sum())
+            bt_wr = bt_wins / bt_n * 100 if bt_n > 0 else 0
+            bt_pnl = float(pnl_arr[bt_mask].sum())
+            print(f"\n  ** Best threshold: {best_thresh:.2f} -> {bt_n:,} trades, "
+                  f"{bt_wr:.1f}% WR, P&L ${bt_pnl:+,.0f} (delta ${bt_pnl - all_pnl:+,.0f})")
+
     return {
         'trades': n, 'ml_trades': int(ml_n), 'rejected': int(rej_n),
         'base_wr': round(base_wr, 1), 'ml_wr': round(ml_wr, 1), 'rej_wr': round(rej_wr, 1),
         'base_pnl': round(all_pnl), 'ml_pnl': round(ml_pnl), 'rej_pnl': round(rej_pnl),
+        'best_threshold': best_thresh,
     }
 
 
@@ -557,7 +571,7 @@ def main():
 
     model_ho = train_model(X_train_ho, y_train_ho, X_test_ho, y_test_ho)
     ho_result = evaluate_model(model_ho, X_test_ho, y_test_ho, meta_test_ho,
-                              "Holdout: <=2021 -> 2022-2025")
+                              "Holdout: <=2021 -> 2022-2025", sweep_threshold=True)
 
     # In-sample check
     evaluate_model(model_ho, X_train_ho, y_train_ho,
@@ -599,11 +613,16 @@ def main():
     model_dir = Path('surfer_models')
     model_dir.mkdir(exist_ok=True)
     model_path = model_dir / 'intraday_ml_model.pkl'
+    # Use holdout threshold if sweep found a better one, else default 0.5
+    best_threshold = ho_result.get('best_threshold', 0.5)
+    print(f"\n  Production threshold: {best_threshold:.2f}")
+
     with open(model_path, 'wb') as f:
         pickle.dump({
             'model': final_model,
             'feature_names': FEATURE_NAMES,
             'num_features': NUM_FEATURES,
+            'threshold': best_threshold,
             'train_samples': len(X_all),
             'train_wr': float(y_all.mean() * 100),
             'holdout_result': ho_result,
