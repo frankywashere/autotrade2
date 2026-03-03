@@ -97,18 +97,27 @@ def _send_telegram(msg: str, model_tag: str = ''):
                     return
             print(f"[SCANNER] Telegram HTTP {resp.status_code}: {resp.text[:100]}")
         except _req.exceptions.ConnectionError:
-            # DNS failed — try hardcoded IPs
+            # DNS failed — force resolve via socket-level override
+            # so TLS SNI still sends 'api.telegram.org' (not raw IP)
+            from urllib3.util.connection import create_connection as _orig_cc
             for ip in _TG_IPS:
                 try:
-                    ip_url = f'https://{ip}/bot{_TG_TOKEN}/sendMessage'
-                    resp = _req.post(
-                        ip_url, json=payload, timeout=10,
-                        headers={'Host': 'api.telegram.org'},
-                        verify=False,
-                    )
-                    if resp.status_code == 200:
-                        print(f"[SCANNER] Telegram sent OK (IP {ip}): {full_msg[:60]}")
-                        return
+                    def _patched_cc(address, *args, _fip=ip, **kwargs):
+                        host, port = address
+                        if host == 'api.telegram.org':
+                            return _orig_cc((_fip, port), *args, **kwargs)
+                        return _orig_cc(address, *args, **kwargs)
+
+                    import urllib3.util.connection
+                    urllib3.util.connection.create_connection = _patched_cc
+                    try:
+                        sess = _req.Session()
+                        resp = sess.post(url, json=payload, timeout=10, verify=False)
+                        if resp.status_code == 200:
+                            print(f"[SCANNER] Telegram sent OK (IP {ip}): {full_msg[:60]}")
+                            return
+                    finally:
+                        urllib3.util.connection.create_connection = _orig_cc
                 except Exception:
                     continue
             print(f"[SCANNER] Telegram: DNS and IP fallbacks all failed")

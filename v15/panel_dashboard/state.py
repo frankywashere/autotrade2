@@ -893,22 +893,35 @@ class DashboardState(param.Parameterized):
             except _req.exceptions.ConnectionError as e:
                 logger.warning("Telegram normal DNS failed: %s, trying IP fallback", e)
 
-            # DNS failed — try with hardcoded IP (api.telegram.org = 149.154.167.220)
-            # Use forced IP via custom session
+            # DNS failed — force resolve api.telegram.org to hardcoded IPs
+            # Use custom adapter that overrides DNS at the socket level
+            # so TLS SNI still sends 'api.telegram.org' (not the raw IP)
+            from urllib3.util.connection import create_connection as _orig_create_connection
             _TG_IPS = ['149.154.167.220', '149.154.166.110']
             for ip in _TG_IPS:
                 try:
-                    ip_url = f'https://{ip}/bot{token}/sendMessage'
-                    logger.info("Telegram: trying IP fallback %s", ip)
-                    resp = _req.post(
-                        ip_url, json=payload, timeout=15,
-                        headers={'Host': 'api.telegram.org'},
-                        verify=False,  # IP won't match cert CN
-                    )
-                    logger.info("Telegram IP %s: HTTP %d, body=%s",
-                                ip, resp.status_code, resp.text[:200])
-                    if resp.status_code == 200:
-                        return 'OK'
+                    logger.info("Telegram: trying DNS override to %s", ip)
+
+                    # Monkey-patch urllib3 connection to force IP for this host
+                    def _patched_create_connection(address, *args, _forced_ip=ip, **kwargs):
+                        host, port = address
+                        if host == 'api.telegram.org':
+                            logger.info("Telegram: DNS override %s -> %s", host, _forced_ip)
+                            return _orig_create_connection((_forced_ip, port), *args, **kwargs)
+                        return _orig_create_connection(address, *args, **kwargs)
+
+                    import urllib3.util.connection
+                    urllib3.util.connection.create_connection = _patched_create_connection
+                    try:
+                        sess = _req.Session()
+                        resp = sess.post(url, json=payload, timeout=15, verify=False)
+                        logger.info("Telegram IP %s: HTTP %d, body=%s",
+                                    ip, resp.status_code, resp.text[:200])
+                        if resp.status_code == 200:
+                            return 'OK'
+                    finally:
+                        urllib3.util.connection.create_connection = _orig_create_connection
+
                 except Exception as ip_e:
                     logger.warning("Telegram IP %s failed: %s", ip, ip_e)
                     continue
