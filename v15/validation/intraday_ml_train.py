@@ -5,7 +5,7 @@ Intraday ML Model Training — LightGBM classifier for intraday signal quality.
 Extracts features per candidate intraday trade signal, labels as win/loss based
 on actual simulation outcome, trains LightGBM binary classifier.
 
-Validation: Walk-forward (5yr train → 1yr test) + holdout (≤2021 → 2022-2025) + 2026 OOS.
+Validation: Walk-forward (5yr train -> 1yr test) + holdout (≤2021 -> 2022-2025) + 2026 OOS.
 
 Usage:
     python -m v15.validation.intraday_ml_train
@@ -515,7 +515,7 @@ def main():
     print(f"\n  Total: {total:,} signals, {total_wins:,} wins ({total_wins/total*100:.1f}%)")
 
     # --- Walk-Forward Validation ---
-    print("\n[3] Walk-Forward Validation (5yr train → 1yr test)...")
+    print("\n[3] Walk-Forward Validation (5yr train -> 1yr test)...")
     print("=" * 70)
 
     wf_results = []
@@ -529,18 +529,18 @@ def main():
         meta_test = all_meta_by_year.get(test_yr, [])
 
         if len(X_train) == 0 or len(X_test) == 0:
-            print(f"\n  WF {train_yrs[0]}-{train_yrs[-1]} → {test_yr}: SKIPPED (no data)")
+            print(f"\n  WF {train_yrs[0]}-{train_yrs[-1]} -> {test_yr}: SKIPPED (no data)")
             continue
 
         print(f"\n  Training on {train_yrs[0]}-{train_yrs[-1]} ({len(X_train):,} samples, {y_train.sum()/len(y_train)*100:.1f}% WR)...")
         model = train_model(X_train, y_train)
 
         result = evaluate_model(model, X_test, y_test, meta_test,
-                               f"WF {train_yrs[0]}-{train_yrs[-1]} → {test_yr}")
+                               f"WF {train_yrs[0]}-{train_yrs[-1]} -> {test_yr}")
         wf_results.append((test_yr, result))
 
     # --- Holdout Validation ---
-    print("\n\n[4] Holdout Validation (≤2021 train → 2022-2025 test)...")
+    print("\n\n[4] Holdout Validation (≤2021 train -> 2022-2025 test)...")
     print("=" * 70)
 
     train_yrs_ho = list(range(2016, 2022))
@@ -557,7 +557,7 @@ def main():
 
     model_ho = train_model(X_train_ho, y_train_ho, X_test_ho, y_test_ho)
     ho_result = evaluate_model(model_ho, X_test_ho, y_test_ho, meta_test_ho,
-                              "Holdout: ≤2021 → 2022-2025")
+                              "Holdout: ≤2021 -> 2022-2025")
 
     # In-sample check
     evaluate_model(model_ho, X_train_ho, y_train_ho,
@@ -585,10 +585,8 @@ def main():
     X_all = np.vstack([all_X_by_year[yr] for yr in all_yrs if yr in all_X_by_year and len(all_X_by_year[yr]) > 0])
     y_all = np.concatenate([all_y_by_year[yr] for yr in all_yrs if yr in all_y_by_year and len(all_y_by_year[yr]) > 0])
 
-    # Replace NaN with -999 for LightGBM
-    X_all_clean = np.nan_to_num(X_all, nan=-999.0)
-
-    final_model = train_model(X_all_clean, y_all)
+    # LightGBM handles NaN natively — no need to replace
+    final_model = train_model(X_all, y_all)
 
     # Feature importance
     importance = final_model.feature_importance(importance_type='gain')
@@ -621,7 +619,7 @@ def main():
     print(f"  DONE in {total_time:.0f}s ({total_time/60:.1f}m)")
     print(f"  Features: {NUM_FEATURES}")
     print(f"  Training samples: {len(X_all):,}")
-    print(f"  Holdout WR improvement: {ho_result['base_wr']:.1f}% → {ho_result['ml_wr']:.1f}%")
+    print(f"  Holdout WR improvement: {ho_result['base_wr']:.1f}% -> {ho_result['ml_wr']:.1f}%")
     print(f"  Model: {model_path}")
     print(f"{'='*70}")
 
