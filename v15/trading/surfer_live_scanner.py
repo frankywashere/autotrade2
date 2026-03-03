@@ -47,10 +47,10 @@ def _is_extended_hours() -> bool:
 STATE_PATH = Path.home() / ".x14" / "surfer_scanner_state.json"
 MAX_SIGNAL_HISTORY = 200
 GIST_FILE_NAME = 'surfer_scanner_state.json'
-MODEL_TAG = 'c13a'  # Identifies this branch in the multi-model Gist
+MODEL_TAG = 'c14'  # Identifies this branch in the multi-model Gist
 
-# Slippage + commission assumptions
-SLIPPAGE_PCT = 0.0005     # 0.05% slippage per side
+# Slippage + commission assumptions (aligned with surfer_backtest 3 bps)
+SLIPPAGE_PCT = 0.0003     # 0.03% slippage per side (was 0.05%)
 COMMISSION_PER_SHARE = 0.005  # $0.005/share (IBKR tiered)
 
 # Telegram alerts
@@ -122,6 +122,8 @@ class HypotheticalPosition:
     reason: str = ''
     signal_source: str = ''  # Which combo produced this: 'CS-5TF', 'CS-DW', 'intraday'
     breakeven_applied: bool = False  # True once stop moved to entry after 30 min
+    initial_stop_pct: float = 0.02  # Original stop % (before ATR clipping) for trail calc
+    ou_half_life: float = 5.0       # OU half-life from signal, for OU timeout
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -196,16 +198,11 @@ class SurferLiveScanner:
     """
 
     # Trailing stop uses profit-tier logic matching surfer_backtest.py (see _calc_trail_price)
-    # TRAILING_STOP_PCT removed — replaced by profit-ratio tiers
-    TIMEOUT_MINUTES = 300       # 5 hours
-    EOD_CLOSE_HOUR_ET = 15      # Force-close at 3:45 PM ET
+    TIMEOUT_MINUTES_BOUNCE = 300   # 5 hours for bounces (60 bars × 5 min)
+    TIMEOUT_MINUTES_BREAK = 600    # 10 hours for breaks (120 bars × 5 min) — doubled per backtest
+    EOD_CLOSE_HOUR_ET = 15         # Force-close at 3:45 PM ET
     EOD_CLOSE_MINUTE_ET = 45
-    EQUITY_CEILING_PCT = 0.05   # Close if unrealized >= 5% of equity
-    NEAR_TP_PCT = 0.01          # Close early if within 1% of TP price
-    NEAR_TP_MIN_GAIN = 100.0    # Minimum dollar gain for near-TP early close
-    NEAR_TP_WINDOW_MIN = 30     # Near-TP rule only active within first 30 min
-    BREAKEVEN_TRIGGER_MIN = 30  # Move stop to entry after 30 min if in profit
-    OUTLIER_MULT = 2.0          # Close if unrealized >= 2x expected TP gain
+    # near_tp, equity_ceiling, outlier_winner REMOVED — not in backtest, may hurt performance
 
     def __init__(self, config: ScannerConfig, gist_id: str = '', github_token: str = '',
                  model_tag: str = ''):
@@ -527,21 +524,65 @@ class SurferLiveScanner:
                 warning_msg=f'Max positions ({self.config.max_positions}) reached — signal ignored',
             )
 
-        # Duplicate direction check
+        # Anti-pyramid: no duplicate direction
         direction = 'long' if sig.action == 'BUY' else 'short'
         for pos in self.positions.values():
             if pos.direction == direction:
-                return None  # Already have a position in this direction
+                return None
 
-        # Position sizing
-        risk_dollars = self.equity * self.config.risk_per_trade_pct
+        # Anti-double-type: no two bounces or two breaks open (matches backtest)
+        signal_type = getattr(sig, 'signal_type', 'bounce')
+        for pos in self.positions.values():
+            if pos.signal_type == signal_type:
+                return None
+
+        # --- ATR-clipped stops (matching backtest realistic mode) ---
         stop_pct = sig.suggested_stop_pct
         if stop_pct <= 0:
             stop_pct = 0.02
 
-        # shares = risk / (stop_distance)
+        # ATR clipping: use analysis ATR if available
+        atr_val = getattr(analysis, 'atr', None) or getattr(sig, 'atr', None)
+        if atr_val and atr_val > 0 and current_price > 0:
+            if signal_type == 'bounce':
+                atr_floor = (0.5 * atr_val) / current_price
+                atr_cap = (1.5 * atr_val) / current_price
+            else:  # break
+                atr_floor = (1.5 * atr_val) / current_price
+                atr_cap = (3.0 * atr_val) / current_price
+            stop_pct = max(atr_floor, min(stop_pct, atr_cap))
+            # Breakout ultra-tight: ×0.05 (matching backtest Arch 73)
+            if signal_type == 'break':
+                stop_pct *= 0.05
+                # Skip ultra-narrow breaks where slippage eats profit
+                if stop_pct < 0.00030:
+                    return None
+
+        # --- TP widening for high-confidence bounces (matching backtest) ---
+        tp_pct = sig.suggested_tp_pct
+        if signal_type == 'bounce' and sig.confidence > 0.65:
+            tp_pct *= 1.30  # 30% wider TP, let winners run
+
+        # --- Position sizing (2% risk, signal-type boosts) ---
+        risk_dollars = self.equity * self.config.risk_per_trade_pct
         stop_distance = stop_pct * current_price
         shares = int(risk_dollars / stop_distance) if stop_distance > 0 else 0
+
+        # Signal-type sizing boosts (matching backtest Arch 65+69)
+        size_mult = 1.0
+        if signal_type == 'bounce':
+            if direction == 'short':  # SELL bounces: highest WR
+                size_mult = 2.5
+            else:  # BUY bounces
+                size_mult = 1.5
+        elif signal_type == 'break':
+            # Inverse channel health: weak channel → real breakout
+            ch_health = getattr(sig, 'channel_health', 0.5)
+            if ch_health > 0.50:
+                size_mult = 0.6
+            elif ch_health < 0.30:
+                size_mult = 1.4
+        shares = int(shares * size_mult)
 
         # Cap at max buying power
         buying_power = self.equity * self.config.max_leverage
@@ -557,10 +598,10 @@ class SurferLiveScanner:
         # Compute stop/TP prices
         if direction == 'long':
             stop_price = current_price * (1 - stop_pct)
-            tp_price = current_price * (1 + sig.suggested_tp_pct)
+            tp_price = current_price * (1 + tp_pct)
         else:
             stop_price = current_price * (1 + stop_pct)
-            tp_price = current_price * (1 - sig.suggested_tp_pct)
+            tp_price = current_price * (1 - tp_pct)
 
         rr = sig.suggested_tp_pct / max(stop_pct, 0.001)
 
@@ -582,7 +623,9 @@ class SurferLiveScanner:
         )
 
         # Auto-enter hypothetical position
-        self._enter_hypothetical(alert, direction, signal_source=signal_source)
+        ou_hl = getattr(sig, 'ou_half_life', 5.0) or 5.0
+        self._enter_hypothetical(alert, direction, signal_source=signal_source,
+                                 initial_stop_pct=stop_pct, ou_half_life=ou_hl)
         if not _is_market_open() and _is_extended_hours():
             self._ext_opens_today += 1
         self._save_state()
@@ -706,7 +749,9 @@ class SurferLiveScanner:
         return alert
 
     def _enter_hypothetical(self, alert: ScannerAlert, direction: str,
-                            signal_source: str = ''):
+                            signal_source: str = '',
+                            initial_stop_pct: float = 0.02,
+                            ou_half_life: float = 5.0):
         pos_id = str(uuid.uuid4())[:8]
         pos = HypotheticalPosition(
             pos_id=pos_id,
@@ -723,6 +768,8 @@ class SurferLiveScanner:
             best_price=alert.price,
             reason=alert.reason,
             signal_source=signal_source,
+            initial_stop_pct=initial_stop_pct,
+            ou_half_life=ou_half_life,
         )
         self.positions[pos_id] = pos
         alert.pos_id = pos_id
@@ -793,6 +840,9 @@ class SurferLiveScanner:
                     trail_pct = initial_stop_dist * 0.02
                 elif profit_ratio >= 0.40:
                     trail_pct = initial_stop_dist * 0.06
+                elif profit_ratio >= 0.15:
+                    # Breakeven tier (matching backtest): lock in at entry + tiny buffer
+                    return max(pos.stop_price, entry * 1.0005)
                 else:
                     return None
             return max(pos.stop_price, pos.best_price * (1.0 - trail_pct))
@@ -819,6 +869,9 @@ class SurferLiveScanner:
                     trail_pct = initial_stop_dist * 0.02
                 elif profit_ratio >= 0.40:
                     trail_pct = initial_stop_dist * 0.06
+                elif profit_ratio >= 0.15:
+                    # Breakeven tier (matching backtest): lock in at entry - tiny buffer
+                    return min(pos.stop_price, entry * 0.9995)
                 else:
                     return None
             return min(pos.stop_price, pos.best_price * (1.0 + trail_pct))
@@ -863,18 +916,6 @@ class SurferLiveScanner:
             else:
                 unrealized_pnl = (pos.entry_price - current_price) * pos.shares
 
-            # --- Breakeven stop adjustment (not an exit — move stop to entry) ---
-            # After 30 min in profit, stop can never be a loss again.
-            if (not pos.breakeven_applied
-                    and hold_minutes >= self.BREAKEVEN_TRIGGER_MIN
-                    and unrealized_pnl > 0):
-                if pos.direction == 'long':
-                    pos.stop_price = max(pos.stop_price, pos.entry_price)
-                else:
-                    pos.stop_price = min(pos.stop_price, pos.entry_price)
-                pos.breakeven_applied = True
-                print(f"[SCANNER] Breakeven stop set for {pos_id} @ ${pos.entry_price:.2f}")
-
             # Update best price (for trailing stop)
             if pos.direction == 'long':
                 if bar_high > pos.best_price:
@@ -893,33 +934,19 @@ class SurferLiveScanner:
             if exit_reason is None and _is_eod:
                 exit_reason = 'eod_close'
 
-            # --- Near-TP early close (within first 30 min) ---
-            # If within 1% of TP price and already up $100+, don't wait for the last tick
-            if exit_reason is None and hold_minutes < self.NEAR_TP_WINDOW_MIN:
-                if unrealized_pnl >= self.NEAR_TP_MIN_GAIN:
-                    if (pos.direction == 'long' and bar_high >= pos.tp_price * (1 - self.NEAR_TP_PCT)):
-                        exit_reason = 'near_tp'
-                    elif (pos.direction == 'short' and bar_low <= pos.tp_price * (1 + self.NEAR_TP_PCT)):
-                        exit_reason = 'near_tp'
-
-            # --- Equity ceiling (unrealized >= 5% of account equity) ---
+            # --- Hard stop (2% max from entry, whichever is tighter) ---
             if exit_reason is None:
-                if unrealized_pnl >= self.equity * self.EQUITY_CEILING_PCT:
-                    exit_reason = 'equity_ceiling'
-
-            # --- Outlier winner (unrealized >= 2x expected TP gain) ---
-            if exit_reason is None:
+                max_stop_dist = 0.02
                 if pos.direction == 'long':
-                    expected_tp_gain = (pos.tp_price - pos.entry_price) * pos.shares
-                else:
-                    expected_tp_gain = (pos.entry_price - pos.tp_price) * pos.shares
-                if expected_tp_gain > 0 and unrealized_pnl >= self.OUTLIER_MULT * expected_tp_gain:
-                    exit_reason = 'outlier_winner'
-
-            # --- Stop loss DISABLED ---
-            # Hard stop removed — relying on trailing stop, EOD close, and
-            # timeout for downside protection.  stop_price still set on entry
-            # for position-sizing math and breakeven adjustment.
+                    hard_stop = min(pos.stop_price, pos.entry_price * (1 - max_stop_dist))
+                    if bar_low <= hard_stop:
+                        exit_reason = 'stop_loss'
+                        exit_price = hard_stop
+                elif pos.direction == 'short':
+                    hard_stop = max(pos.stop_price, pos.entry_price * (1 + max_stop_dist))
+                    if bar_high >= hard_stop:
+                        exit_reason = 'stop_loss'
+                        exit_price = hard_stop
 
             # --- Take profit ---
             if exit_reason is None:
@@ -952,9 +979,19 @@ class SurferLiveScanner:
                             exit_reason = 'trailing_stop'
                             exit_price = trail_price
 
-            # --- Timeout (5 hours) ---
+            # --- OU timeout for bounces (matching backtest) ---
+            if exit_reason is None and pos.signal_type == 'bounce':
+                ou_hl = pos.ou_half_life
+                # Convert OU half-life (in 5-min bars) to minutes: max(6, 3×hl) × 5
+                ou_timeout_min = max(6, int(ou_hl * 3)) * 5
+                if hold_minutes > ou_timeout_min:
+                    exit_reason = 'ou_timeout'
+
+            # --- Timeout (bounce: 5 hrs, break: 10 hrs) ---
             if exit_reason is None:
-                if hold_minutes > self.TIMEOUT_MINUTES:
+                timeout = (self.TIMEOUT_MINUTES_BREAK if pos.signal_type == 'break'
+                           else self.TIMEOUT_MINUTES_BOUNCE)
+                if hold_minutes > timeout:
                     exit_reason = 'timeout'
 
             if exit_reason:

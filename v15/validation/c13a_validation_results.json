@@ -1,0 +1,372 @@
+{
+  "surfer_ml": {
+    "signal_type": "Surfer ML",
+    "settings": {
+      "name": "Surfer ML (26 models, realistic mode)",
+      "resolution": "5-min bars",
+      "stop": "ATR-based, ML-adjusted (EL/IS tightening)",
+      "tp": "CS suggested, bounce TP widened 1.3x",
+      "trail": "profit-tier based (surfer_backtest)",
+      "sizing": "risk-normalized + ML signal quality + win-streak ramp",
+      "capital": 100000,
+      "max_leverage": 4.0,
+      "slippage_bps": 3.0,
+      "commission_per_share": 0.005,
+      "models": "26 pkl/pt models in surfer_models/"
+    },
+    "per_year": {
+      "2016": {
+        "trades": 890,
+        "wins": 793,
+        "win_rate": 89.1,
+        "total_pnl": 32906,
+        "avg_win": 42,
+        "avg_loss": -5,
+        "biggest_loss": -66,
+        "sharpe": 81.57,
+        "max_dd_pct": 0.1,
+        "avg_hold_bars": 2.0
+      },
+      "2017": {
+        "trades": 901,
+        "wins": 798,
+        "win_rate": 88.6,
+        "total_pnl": 28840,
+        "avg_win": 37,
+        "avg_loss": -4,
+        "biggest_loss": -51,
+        "sharpe": 73.88,
+        "max_dd_pct": 0.1,
+        "avg_hold_bars": 2.0
+      },
+      "2018": {
+        "trades": 1074,
+        "wins": 962,
+        "win_rate": 89.6,
+        "total_pnl": 47752,
+        "avg_win": 50,
+        "avg_loss": -7,
+        "biggest_loss": -53,
+        "sharpe": 58.77,
+        "max_dd_pct": 0.1,
+        "avg_hold_bars": 2.1
+      },
+      "2019": {
+        "trades": 1017,
+        "wins": 914,
+        "win_rate": 89.9,
+        "total_pnl": 34571,
+        "avg_win": 38,
+        "avg_loss": -6,
+        "biggest_loss": -43,
+        "sharpe": 75.68,
+        "max_dd_pct": 0.0,
+        "avg_hold_bars": 2.0
+      },
+      "2020": {
+        "trades": 1270,
+        "wins": 1208,
+        "win_rate": 95.1,
+        "total_pnl": 89724,
+        "avg_win": 75,
+        "avg_loss": -9,
+        "biggest_loss": -41,
+        "sharpe": 70.28,
+        "max_dd_pct": 0.0,
+        "avg_hold_bars": 2.0
+      },
+      "2021": {
+        "trades": 1202,
+        "wins": 1112,
+        "win_rate": 92.5,
+        "total_pnl": 51868,
+        "avg_win": 47,
+        "avg_loss": -6,
+        "biggest_loss": -122,
+        "sharpe": 71.54,
+        "max_dd_pct": 0.1,
+        "avg_hold_bars": 2.0
+      },
+      "2022": {
+        "trades": 1426,
+        "wins": 1325,
+        "win_rate": 92.9,
+        "total_pnl": 75595,
+        "avg_win": 57,
+        "avg_loss": -4,
+        "biggest_loss": -47,
+        "sharpe": 80.51,
+        "max_dd_pct": 0.0,
+        "avg_hold_bars": 2.0
+      },
+      "2023": {
+        "trades": 1372,
+        "wins": 1263,
+        "win_rate": 92.1,
+        "total_pnl": 54843,
+        "avg_win": 44,
+        "avg_loss": -6,
+        "biggest_loss": -43,
+        "sharpe": 75.96,
+        "max_dd_pct": 0.0,
+        "avg_hold_bars": 2.0
+      },
+      "2024": {
+        "trades": 1352,
+        "wins": 1237,
+        "win_rate": 91.5,
+        "total_pnl": 63388,
+        "avg_win": 52,
+        "avg_loss": -7,
+        "biggest_loss": -66,
+        "sharpe": 74.87,
+        "max_dd_pct": 0.1,
+        "avg_hold_bars": 2.0
+      },
+      "2025": {
+        "trades": 1421,
+        "wins": 1330,
+        "win_rate": 93.6,
+        "total_pnl": 67988,
+        "avg_win": 52,
+        "avg_loss": -6,
+        "biggest_loss": -83,
+        "sharpe": 65.36,
+        "max_dd_pct": 0.1,
+        "avg_hold_bars": 2.0
+      },
+      "2026": {
+        "trades": 226,
+        "wins": 219,
+        "win_rate": 96.9,
+        "total_pnl": 7418,
+        "avg_win": 34,
+        "avg_loss": -2,
+        "biggest_loss": -4,
+        "sharpe": 84.7,
+        "max_dd_pct": 0.0,
+        "avg_hold_bars": 2.0
+      }
+    },
+    "holdout": {
+      "train": {
+        "trades": 6479,
+        "wins": 5870,
+        "win_rate": 90.6,
+        "total_pnl": 290589,
+        "avg_win": 50,
+        "avg_loss": -6,
+        "biggest_loss": -122,
+        "sharpe": 68.44,
+        "max_dd_pct": 0.1,
+        "avg_hold_bars": 2.0
+      },
+      "test": {
+        "trades": 5859,
+        "wins": 5439,
+        "win_rate": 92.8,
+        "total_pnl": 271360,
+        "avg_win": 50,
+        "avg_loss": -5,
+        "biggest_loss": -47,
+        "sharpe": 72.76,
+        "max_dd_pct": 0.1,
+        "avg_hold_bars": 2.0
+      }
+    },
+    "walk_forward": [
+      {
+        "train_period": "2016-2020",
+        "test_year": "2021",
+        "train": {
+          "trades": 5275,
+          "wins": 4756,
+          "win_rate": 90.2,
+          "total_pnl": 238655,
+          "avg_win": 51,
+          "avg_loss": -6,
+          "biggest_loss": -67,
+          "sharpe": 67.85,
+          "max_dd_pct": 0.1,
+          "avg_hold_bars": 2.0
+        },
+        "test": {
+          "trades": 1202,
+          "wins": 1112,
+          "win_rate": 92.5,
+          "total_pnl": 51868,
+          "avg_win": 47,
+          "avg_loss": -6,
+          "biggest_loss": -122,
+          "sharpe": 71.54,
+          "max_dd_pct": 0.1,
+          "avg_hold_bars": 2.0
+        }
+      },
+      {
+        "train_period": "2017-2021",
+        "test_year": "2022",
+        "train": {
+          "trades": 5592,
+          "wins": 5080,
+          "win_rate": 90.8,
+          "total_pnl": 257837,
+          "avg_win": 51,
+          "avg_loss": -6,
+          "biggest_loss": -122,
+          "sharpe": 67.67,
+          "max_dd_pct": 0.1,
+          "avg_hold_bars": 2.0
+        },
+        "test": {
+          "trades": 1426,
+          "wins": 1325,
+          "win_rate": 92.9,
+          "total_pnl": 75595,
+          "avg_win": 57,
+          "avg_loss": -4,
+          "biggest_loss": -47,
+          "sharpe": 80.51,
+          "max_dd_pct": 0.0,
+          "avg_hold_bars": 2.0
+        }
+      },
+      {
+        "train_period": "2018-2022",
+        "test_year": "2023",
+        "train": {
+          "trades": 6109,
+          "wins": 5600,
+          "win_rate": 91.7,
+          "total_pnl": 303956,
+          "avg_win": 55,
+          "avg_loss": -6,
+          "biggest_loss": -122,
+          "sharpe": 70.75,
+          "max_dd_pct": 0.1,
+          "avg_hold_bars": 2.0
+        },
+        "test": {
+          "trades": 1372,
+          "wins": 1263,
+          "win_rate": 92.1,
+          "total_pnl": 54843,
+          "avg_win": 44,
+          "avg_loss": -6,
+          "biggest_loss": -43,
+          "sharpe": 75.96,
+          "max_dd_pct": 0.0,
+          "avg_hold_bars": 2.0
+        }
+      },
+      {
+        "train_period": "2019-2023",
+        "test_year": "2024",
+        "train": {
+          "trades": 6319,
+          "wins": 5802,
+          "win_rate": 91.8,
+          "total_pnl": 307751,
+          "avg_win": 54,
+          "avg_loss": -6,
+          "biggest_loss": -74,
+          "sharpe": 68.24,
+          "max_dd_pct": 0.1,
+          "avg_hold_bars": 2.0
+        },
+        "test": {
+          "trades": 1352,
+          "wins": 1237,
+          "win_rate": 91.5,
+          "total_pnl": 63388,
+          "avg_win": 52,
+          "avg_loss": -7,
+          "biggest_loss": -66,
+          "sharpe": 74.87,
+          "max_dd_pct": 0.1,
+          "avg_hold_bars": 2.0
+        }
+      },
+      {
+        "train_period": "2020-2024",
+        "test_year": "2025",
+        "train": {
+          "trades": 6691,
+          "wins": 6224,
+          "win_rate": 93.0,
+          "total_pnl": 339940,
+          "avg_win": 55,
+          "avg_loss": -5,
+          "biggest_loss": -58,
+          "sharpe": 71.07,
+          "max_dd_pct": 0.1,
+          "avg_hold_bars": 2.0
+        },
+        "test": {
+          "trades": 1421,
+          "wins": 1330,
+          "win_rate": 93.6,
+          "total_pnl": 67988,
+          "avg_win": 52,
+          "avg_loss": -6,
+          "biggest_loss": -83,
+          "sharpe": 65.36,
+          "max_dd_pct": 0.1,
+          "avg_hold_bars": 2.0
+        }
+      },
+      {
+        "train_period": "2021-2025",
+        "test_year": "2026",
+        "train": {
+          "trades": 7061,
+          "wins": 6551,
+          "win_rate": 92.8,
+          "total_pnl": 323228,
+          "avg_win": 50,
+          "avg_loss": -5,
+          "biggest_loss": -122,
+          "sharpe": 72.53,
+          "max_dd_pct": 0.1,
+          "avg_hold_bars": 2.0
+        },
+        "test": {
+          "trades": 226,
+          "wins": 219,
+          "win_rate": 96.9,
+          "total_pnl": 7418,
+          "avg_win": 34,
+          "avg_loss": -2,
+          "biggest_loss": -4,
+          "sharpe": 84.7,
+          "max_dd_pct": 0.0,
+          "avg_hold_bars": 2.0
+        }
+      }
+    ],
+    "oos_2026": {
+      "trades": 226,
+      "wins": 219,
+      "win_rate": 96.9,
+      "total_pnl": 7418,
+      "avg_win": 34,
+      "avg_loss": -2,
+      "biggest_loss": -4,
+      "sharpe": 84.7,
+      "max_dd_pct": 0.0,
+      "avg_hold_bars": 2.0
+    },
+    "all": {
+      "trades": 12151,
+      "wins": 11161,
+      "win_rate": 91.9,
+      "total_pnl": 554895,
+      "avg_win": 50,
+      "avg_loss": -6,
+      "biggest_loss": -122,
+      "sharpe": 68.78,
+      "max_dd_pct": 0.1,
+      "avg_hold_bars": 2.0
+    }
+  }
+}

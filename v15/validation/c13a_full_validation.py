@@ -647,12 +647,18 @@ def validate_intraday(tsla_min_path):
 # ---------------------------------------------------------------------------
 
 def _compute_metrics_surfer(trades) -> dict:
-    """Compute metrics from surfer_backtest Trade objects."""
+    """Compute metrics from surfer_backtest Trade objects using flat $100K sizing.
+
+    Uses pnl_pct (percentage return per trade) with a fixed $10K position size
+    to avoid compounding distortion from realistic mode.
+    """
+    FLAT_SIZE = 10_000.0  # Fixed position size per trade
     n = len(trades)
     if n == 0:
         return {'trades': 0, 'win_rate': 0, 'total_pnl': 0, 'sharpe': 0, 'max_dd_pct': 0,
                 'avg_win': 0, 'avg_loss': 0, 'biggest_loss': 0}
-    pnls = np.array([t.pnl for t in trades])
+    # Use pnl_pct with flat sizing to avoid compounding distortion
+    pnls = np.array([t.pnl_pct * FLAT_SIZE for t in trades])
     wins = sum(1 for p in pnls if p > 0)
     wr = wins / n * 100
     total = float(pnls.sum())
@@ -793,26 +799,40 @@ def _run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
             # Scale 0.5x to 2x based on quality score
             return max(0.5, min(2.0, quality_score * 2.0))
 
-    metrics, trades, equity_curve = run_backtest(
-        days=0,  # Ignored when tsla_df provided
-        eval_interval=3,
-        max_hold_bars=60,
-        position_size=10000.0,
-        min_confidence=0.01,
-        use_multi_tf=True,
-        ml_model=ml_model,
-        tsla_df=tsla_slice,
-        higher_tf_dict=htf_slice,
-        spy_df_input=spy_daily,
-        vix_df_input=vix_daily,
-        realistic=True,
-        slippage_bps=3.0,
-        commission_per_share=0.005,
-        max_leverage=4.0,
-        initial_capital=100_000.0,
-        signal_quality_model=sq_model,
-        ml_size_fn=ml_size_fn,
-    )
+    # Suppress surfer_backtest's verbose output AND LightGBM C-level stderr
+    import os
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    old_stdout_fd = os.dup(1)
+    old_stderr_fd = os.dup(2)
+    os.dup2(devnull_fd, 1)
+    os.dup2(devnull_fd, 2)
+    try:
+        metrics, trades, equity_curve = run_backtest(
+            days=0,  # Ignored when tsla_df provided
+            eval_interval=3,
+            max_hold_bars=60,
+            position_size=10000.0,
+            min_confidence=0.01,
+            use_multi_tf=True,
+            ml_model=ml_model,
+            tsla_df=tsla_slice,
+            higher_tf_dict=htf_slice,
+            spy_df_input=spy_daily,
+            vix_df_input=vix_daily,
+            realistic=True,
+            slippage_bps=3.0,
+            commission_per_share=0.005,
+            max_leverage=4.0,
+            initial_capital=100_000.0,
+            signal_quality_model=sq_model,
+            ml_size_fn=ml_size_fn,
+        )
+    finally:
+        os.dup2(old_stdout_fd, 1)
+        os.dup2(old_stderr_fd, 2)
+        os.close(devnull_fd)
+        os.close(old_stdout_fd)
+        os.close(old_stderr_fd)
 
     # Filter trades to only the requested year range
     filtered = []
@@ -830,7 +850,8 @@ def _run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
 def validate_surfer_ml(tsla_min_path, start, end):
     """Validate surfer_backtest with full ML stack in realistic mode."""
     print("\n" + "#"*75)
-    print("  D. Surfer ML — 26 Models, Realistic Mode, 5-Min Bars")
+    print("  D. Surfer — Realistic Mode, 5-Min Bars")
+    print("  NOTE: ML models stale (169 vs 177 features) — running base physics signals")
     print("#"*75)
 
     print("\n  Loading data...")
@@ -842,10 +863,12 @@ def validate_surfer_ml(tsla_min_path, start, end):
 
     # 1. Per-year ($100K fresh each year)
     year_results = {}
+    year_trades = {}  # Keep trades for all-years combined metrics
     for yr in range(2016, 2027):
         print(f"\n  Running year {yr}...")
         trades = _run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
                                         ml_model, sq_model, yr, yr)
+        year_trades[yr] = trades
         if trades:
             year_results[yr] = _compute_metrics_surfer(trades)
             m = year_results[yr]
@@ -883,24 +906,25 @@ def validate_surfer_ml(tsla_min_path, start, end):
     print("\n  Running 2026 OOS...")
     oos_trades = _run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
                                         ml_model, sq_model, 2026, 2026)
-    # Print trade log for 2026
-    print(f"\n  --- 2026 OOS Trade Log ---")
+    # Print trade log for 2026 (flat-sized PnL via pnl_pct)
+    FLAT_SIZE = 10_000.0
+    print(f"\n  --- 2026 OOS Trade Log (flat ${FLAT_SIZE:,.0f}/trade) ---")
     if oos_trades:
         print(f"  {'#':>3} {'Entry':>20} {'Dir':<5} {'EntryPx':>9} {'ExitPx':>9} "
-              f"{'Conf':>5} {'Size':>9} {'PnL':>9} {'Type':<8} {'Reason'}")
-        print(f"  {'-'*100}")
+              f"{'Conf':>5} {'PnL%':>7} {'PnL$':>8} {'Type':<8} {'Reason'}")
+        print(f"  {'-'*92}")
         for i, t in enumerate(oos_trades, 1):
+            flat_pnl = t.pnl_pct * FLAT_SIZE
             print(f"  {i:>3} {t.entry_time[:19]:>20} {t.direction:<5} ${t.entry_price:>7.2f} "
-                  f"${t.exit_price:>7.2f} {t.confidence:>5.2f} ${t.trade_size:>7,.0f} "
-                  f"${t.pnl:>+7,.0f} {t.signal_type:<8} {t.exit_reason}")
+                  f"${t.exit_price:>7.2f} {t.confidence:>5.2f} {t.pnl_pct:>+6.2%} "
+                  f"${flat_pnl:>+7,.0f} {t.signal_type:<8} {t.exit_reason}")
     else:
         print("  No 2026 trades.")
 
-    # All-years combined
+    # All-years combined (reuse per-year trades, no redundant re-computation)
     all_trades = []
     for yr in range(2016, 2027):
-        all_trades.extend(_run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
-                                                  ml_model, sq_model, yr, yr))
+        all_trades.extend(year_trades.get(yr, []))
     all_metrics = _compute_metrics_surfer(all_trades) if all_trades else {
         'trades': 0, 'win_rate': 0, 'total_pnl': 0, 'sharpe': 0, 'max_dd_pct': 0,
         'avg_win': 0, 'avg_loss': 0, 'biggest_loss': 0}
