@@ -89,6 +89,8 @@ def create_app():
         logger.warning("ML model (Intraday): %s%s — c14-intra ML filter disabled", intra_msg, intra_diag)
 
     # Send startup status via ntfy
+    scanner_err = getattr(state, '_scanner_init_error', '')
+    gbt_err = getattr(state, '_gbt_load_error', '')
     startup_msg = (
         f"Scanners: c14={'OK' if state.scanner else 'FAIL'}, "
         f"c14-dw={'OK' if state.scanner_dw else 'FAIL'}, "
@@ -98,6 +100,10 @@ def create_app():
         f"Intraday model: {intra_msg}{intra_diag}\n"
         f"TSLA price: ${state.tsla_price:.2f}"
     )
+    if scanner_err:
+        startup_msg += f"\nSCANNER ERROR: {scanner_err[:200]}"
+    if gbt_err:
+        startup_msg += f"\nGBT ERROR: {gbt_err[:200]}"
     state.send_notification(startup_msg, title='c14 Startup')
 
     # Load initial model comparison data

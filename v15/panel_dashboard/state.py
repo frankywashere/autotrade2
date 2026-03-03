@@ -332,6 +332,7 @@ class DashboardState(param.Parameterized):
             logger.info("Scanners initialized (c14 + c14-dw + c14-ml + c14-intra, capital=$%,.0f)",
                          self.scanner_capital)
         except Exception as e:
+            self._scanner_init_error = f"{e}"
             logger.error("Scanner init failed: %s\n%s", e, traceback.format_exc())
             self.scanner = None
             self.scanner_dw = None
@@ -370,6 +371,7 @@ class DashboardState(param.Parameterized):
             else:
                 logger.warning("ML model not found at %s", model_path)
         except Exception as e:
+            self._gbt_load_error = f"{e}"
             logger.warning("ML model load failed: %s — %s", e, traceback.format_exc())
             self._ml_model = None
 
