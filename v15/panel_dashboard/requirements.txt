@@ -9,3 +9,5 @@ numpy>=1.24
 scipy
 pytz
 requests
+lightgbm>=4.0
+scikit-learn>=1.3

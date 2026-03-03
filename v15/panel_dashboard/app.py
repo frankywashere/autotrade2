@@ -42,10 +42,19 @@ def create_app():
     state = DashboardState()
 
     # Load market data (blocking on startup)
-    logger.info("Starting X14 Panel Dashboard...")
+    logger.info("Starting X14 c14 Panel Dashboard...")
     state.load_market_data()
-    logger.info("Market data loaded. TSLA price=%.2f, scanner=%s",
-                state.tsla_price, "OK" if state.scanner else "NONE")
+    logger.info("Market data loaded. TSLA price=%.2f, scanner=%s, scanner_dw=%s, scanner_ml=%s",
+                state.tsla_price,
+                "OK" if state.scanner else "NONE",
+                "OK" if state.scanner_dw else "NONE",
+                "OK" if state.scanner_ml else "NONE")
+
+    # Log ML model status
+    if hasattr(state, '_ml_model') and state._ml_model is not None:
+        logger.info("ML model: LOADED (%d features)", len(state._ml_feature_names or []))
+    else:
+        logger.warning("ML model: NOT LOADED — Surfer ML signals will be skipped")
 
     # Load initial model comparison data
     state.load_model_data()
@@ -95,7 +104,7 @@ def create_app():
 
     # Build template
     template = pn.template.FastListTemplate(
-        title='c13a Trading Dashboard',
+        title='c14 Trading Dashboard',
         theme='dark',
         accent_base_color='#00c853',
         header_background='#111',
@@ -118,7 +127,7 @@ def create_app():
             ),
         ],
     )
-    logger.info("c13a Dashboard template built successfully — ready to serve")
+    logger.info("c14 Dashboard template built successfully — ready to serve")
     return template
 
 
@@ -131,7 +140,7 @@ if __name__.startswith('bokeh'):
     except Exception:
         logger.error("FATAL: create_app() failed:\n%s", traceback.format_exc())
         pn.pane.HTML(
-            f"<h1>c13a Startup Error</h1><pre>{traceback.format_exc()}</pre>",
+            f"<h1>c14 Startup Error</h1><pre>{traceback.format_exc()}</pre>",
             sizing_mode='stretch_width',
         ).servable()
 elif __name__ == '__main__':
@@ -141,6 +150,6 @@ elif __name__ == '__main__':
         port=int(os.environ.get('PORT', 7860)),
         address='0.0.0.0',
         allow_websocket_origin=['*'],
-        title='c13a Dashboard',
+        title='c14 Dashboard',
         show=False,
     )

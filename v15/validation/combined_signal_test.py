@@ -324,12 +324,15 @@ def _run_surfer_ml(tsla_min_path, start, end):
         if entry_date and hold_bars:
             exit_date = (pd.Timestamp(entry_time) + pd.Timedelta(minutes=hold_bars * 5)).date()
         direction = 'long' if getattr(t, 'direction', '') == 'BUY' else 'short'
+        # Use pnl_pct * flat $10K sizing to avoid compounding distortion
+        # (backtest compounds equity; raw t.pnl is astronomical)
+        flat_pnl = float(getattr(t, 'pnl_pct', 0)) * 10_000.0
         normalized.append({
             'source': 'surfer_ml',
             'entry_date': entry_date,
             'exit_date': exit_date,
             'direction': direction,
-            'pnl': float(t.pnl),
+            'pnl': flat_pnl,
             'confidence': float(t.confidence),
             'entry_price': float(t.entry_price),
             'exit_price': float(t.exit_price),

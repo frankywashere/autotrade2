@@ -70,31 +70,59 @@ _PENDING_TG_ALERTS: list = []
 
 
 def _send_telegram(msg: str, model_tag: str = ''):
-    """Send a Telegram message directly, or queue for relay via GitHub Actions."""
+    """Send a Telegram message directly with retries, or queue for Gist relay."""
     tag = model_tag or MODEL_TAG
     full_msg = f"[{tag}] {msg}"
     if not _TG_TOKEN or not _TG_CHAT_ID:
-        # No direct creds — queue for Gist relay
         _PENDING_TG_ALERTS.append(full_msg)
-        print(f"[SCANNER] Telegram queued for relay (no creds): {full_msg[:80]}")
+        print(f"[SCANNER] Telegram queued (no creds): {full_msg[:80]}")
         return
+
+    # Try direct send with retries (requests > urllib for reliability)
+    import time as _time
     try:
-        url = f'https://api.telegram.org/bot{_TG_TOKEN}/sendMessage'
-        payload = json.dumps({
-            'chat_id': _TG_CHAT_ID,
-            'text': full_msg,
-            'parse_mode': 'HTML',
-        }).encode()
-        req = urllib.request.Request(
-            url, data=payload,
-            headers={'Content-Type': 'application/json'},
-        )
-        with urllib.request.urlopen(req, timeout=5):
-            pass
-    except Exception as e:
-        # Direct send failed (e.g. DNS blocked on HF Spaces) — queue for relay
-        _PENDING_TG_ALERTS.append(full_msg)
-        print(f"[SCANNER] Telegram direct failed, queued for relay: {e}")
+        import requests as _req
+        for attempt in range(3):
+            try:
+                resp = _req.post(
+                    f'https://api.telegram.org/bot{_TG_TOKEN}/sendMessage',
+                    json={'chat_id': _TG_CHAT_ID, 'text': full_msg, 'parse_mode': 'HTML'},
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    print(f"[SCANNER] Telegram sent OK: {full_msg[:60]}")
+                    return
+                elif resp.status_code == 429:
+                    # Rate limited — wait and retry
+                    retry_after = resp.json().get('parameters', {}).get('retry_after', 5)
+                    print(f"[SCANNER] Telegram rate limited, waiting {retry_after}s")
+                    _time.sleep(retry_after)
+                else:
+                    print(f"[SCANNER] Telegram HTTP {resp.status_code}: {resp.text[:100]}")
+                    break  # Non-retryable error
+            except (_req.exceptions.ConnectionError, _req.exceptions.Timeout) as e:
+                if attempt < 2:
+                    _time.sleep(2 ** attempt)  # 1s, 2s backoff
+                    continue
+                print(f"[SCANNER] Telegram failed after 3 attempts: {e}")
+    except ImportError:
+        # Fall back to urllib if requests not available
+        try:
+            url = f'https://api.telegram.org/bot{_TG_TOKEN}/sendMessage'
+            payload = json.dumps({
+                'chat_id': _TG_CHAT_ID, 'text': full_msg, 'parse_mode': 'HTML',
+            }).encode()
+            req = urllib.request.Request(
+                url, data=payload, headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=10):
+                print(f"[SCANNER] Telegram sent OK (urllib): {full_msg[:60]}")
+                return
+        except Exception as e:
+            print(f"[SCANNER] Telegram urllib failed: {e}")
+
+    # All direct attempts failed — queue for Gist relay
+    _PENDING_TG_ALERTS.append(full_msg)
+    print(f"[SCANNER] Telegram queued for Gist relay: {full_msg[:60]}")
 
 
 @dataclass

@@ -312,11 +312,11 @@ class DashboardState(param.Parameterized):
                          github_token[:8] + '...' if github_token else 'MISSING')
             self.scanner = SurferLiveScanner(
                 config, gist_id=gist_id, github_token=github_token,
-                model_tag='c13a',
+                model_tag='c14',
             )
             self.scanner_dw = SurferLiveScanner(
                 config, gist_id=gist_id, github_token=github_token,
-                model_tag='c13a-dw',
+                model_tag='c14-dw',
             )
             # Surfer ML scanner: low confidence gate (matching surfer_backtest)
             ml_config = ScannerConfig(
@@ -327,7 +327,7 @@ class DashboardState(param.Parameterized):
                 ml_config, gist_id=gist_id, github_token=github_token,
                 model_tag='c14-ml',
             )
-            logger.info("Scanners initialized (c13a + c13a-dw + c14-ml, capital=$%,.0f)",
+            logger.info("Scanners initialized (c14 + c14-dw + c14-ml, capital=$%,.0f)",
                          self.scanner_capital)
         except Exception as e:
             logger.error("Scanner init failed: %s\n%s", e, traceback.format_exc())
