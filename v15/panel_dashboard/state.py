@@ -34,6 +34,7 @@ class DashboardState(param.Parameterized):
     # Scanners
     scanner = param.Parameter(None)           # SurferLiveScanner (CS-5TF + intraday)
     scanner_dw = param.Parameter(None)        # SurferLiveScanner (CS-DW)
+    scanner_ml = param.Parameter(None)        # SurferLiveScanner (Surfer ML)
     positions_version = param.Integer(0)      # Bump to trigger position card re-render (price-sensitive)
     trades_version = param.Integer(0)        # Bump only on actual trade open/close (not price ticks)
     exit_alert_html = param.String('')        # Latest exit alert HTML
@@ -48,6 +49,9 @@ class DashboardState(param.Parameterized):
 
     # Internal
     _prev_price = param.Number(0.0, precedence=-1)
+    _ml_model = param.Parameter(None, precedence=-1)
+    _ml_feature_names = param.Parameter(None, precedence=-1)
+    _ml_history_buffer = param.Parameter(None, precedence=-1)
     _ws_client = param.Parameter(None, precedence=-1)
 
     def load_market_data(self):
@@ -168,7 +172,7 @@ class DashboardState(param.Parameterized):
         # Check exits if positions are open (both scanners)
         html_parts = []
         any_exits = False
-        for scnr in [self.scanner, self.scanner_dw]:
+        for scnr in [self.scanner, self.scanner_dw, self.scanner_ml]:
             if scnr and scnr.positions and price > 0:
                 try:
                     exit_alerts = scnr.check_exits(price, price, price)
@@ -185,7 +189,8 @@ class DashboardState(param.Parameterized):
         # Bump version for live P&L updates only when price actually changed
         elif price_changed if price > 0 else False:
             has_positions = ((self.scanner and self.scanner.positions)
-                             or (self.scanner_dw and self.scanner_dw.positions))
+                             or (self.scanner_dw and self.scanner_dw.positions)
+                             or (self.scanner_ml and self.scanner_ml.positions))
             if has_positions:
                 self.positions_version += 1
 
@@ -289,6 +294,9 @@ class DashboardState(param.Parameterized):
                 except Exception as e:
                     logger.warning("DW analysis failed: %s", e)
 
+            # --- Surfer ML: physics signal + ML overlay ---
+            self._evaluate_surfer_ml(analysis)
+
             # Evaluate intraday signal
             self._evaluate_intraday(analysis)
 
@@ -310,14 +318,119 @@ class DashboardState(param.Parameterized):
                 config, gist_id=gist_id, github_token=github_token,
                 model_tag='c13a-dw',
             )
-            logger.info("Scanners initialized (c13a + c13a-dw, capital=$%,.0f, positions=%d+%d, closed=%d+%d)",
-                         self.scanner_capital,
-                         len(self.scanner.positions), len(self.scanner_dw.positions),
-                         len(self.scanner.closed_trades), len(self.scanner_dw.closed_trades))
+            # Surfer ML scanner: low confidence gate (matching surfer_backtest)
+            ml_config = ScannerConfig(
+                initial_capital=self.scanner_capital,
+                min_confidence=0.01,  # Very low gate — ML uses all signals
+            )
+            self.scanner_ml = SurferLiveScanner(
+                ml_config, gist_id=gist_id, github_token=github_token,
+                model_tag='c14-ml',
+            )
+            logger.info("Scanners initialized (c13a + c13a-dw + c14-ml, capital=$%,.0f)",
+                         self.scanner_capital)
         except Exception as e:
             logger.error("Scanner init failed: %s\n%s", e, traceback.format_exc())
             self.scanner = None
             self.scanner_dw = None
+            self.scanner_ml = None
+
+        # Load ML model for Surfer ML path
+        try:
+            from v15.core.surfer_ml import GBTModel, get_feature_names
+            from pathlib import Path
+            model_path = Path('surfer_models/gbt_model.pkl')
+            if not model_path.exists():
+                model_path = Path(__file__).parent.parent.parent / 'surfer_models' / 'gbt_model.pkl'
+            if model_path.exists():
+                self._ml_model = GBTModel.load(str(model_path))
+                self._ml_feature_names = get_feature_names()
+                self._ml_history_buffer = []
+                import numpy as np
+                test_pred = self._ml_model.predict(
+                    np.zeros((1, len(self._ml_feature_names)), dtype=np.float32))
+                logger.info("ML model loaded: %d features, keys=%s",
+                            len(self._ml_feature_names), list(test_pred.keys()))
+            else:
+                logger.warning("ML model not found at %s", model_path)
+        except Exception as e:
+            logger.warning("ML model load failed: %s", e)
+            self._ml_model = None
+
+    def _evaluate_surfer_ml(self, analysis):
+        """Evaluate Surfer ML signal: physics signal + ML feature extraction."""
+        if not self.scanner_ml or not self._ml_model or not analysis:
+            return
+        if self.tsla_price <= 0:
+            return
+
+        sig = analysis.signal
+        if sig.action == 'HOLD':
+            return
+
+        # Extract ML features for context
+        try:
+            import numpy as np
+            from v15.core.surfer_backtest import _extract_signal_features
+
+            # Build minimal inputs for feature extraction
+            tsla_df = self.current_tsla
+            if tsla_df is None or len(tsla_df) == 0:
+                return
+
+            bar = len(tsla_df) - 1
+            closes = tsla_df['close'].values
+
+            # SPY/VIX: use native TF data if available
+            spy_df = None
+            vix_df = None
+            if self.native_tf_data:
+                spy_data = self.native_tf_data.get('SPY', {})
+                spy_df = spy_data.get('daily')
+                vix_data = self.native_tf_data.get('^VIX', {})
+                vix_df = vix_data.get('daily')
+
+            # Get trade state from scanner
+            closed = self.scanner_ml.closed_trades
+            wins = sum(1 for t in closed[-10:] if t.pnl >= 0) if closed else 0
+            losses = sum(1 for t in closed[-10:] if t.pnl < 0) if closed else 0
+
+            feature_vec, _ = _extract_signal_features(
+                analysis, tsla_df, bar, closes,
+                spy_df=spy_df, vix_df=vix_df,
+                feature_names=self._ml_feature_names,
+                history_buffer=self._ml_history_buffer,
+                eval_interval=3,
+                closed_trades=[t.to_dict() for t in closed[-50:]] if closed else [],
+                consecutive_wins=wins,
+                consecutive_losses=losses,
+                daily_pnl=self.scanner_ml.daily_pnl,
+                equity=self.scanner_ml.equity,
+            )
+
+            # Run ML prediction (informational context)
+            ml_pred = self._ml_model.predict(feature_vec.reshape(1, -1))
+            ml_action = int(ml_pred.get('action', [0])[0]) if 'action' in ml_pred else 0
+            ml_lifetime = float(ml_pred.get('lifetime', [0])[0]) if 'lifetime' in ml_pred else 0
+
+            # Log ML context
+            action_map = {0: 'HOLD', 1: 'BUY', 2: 'SELL'}
+            logger.info("Surfer ML: signal=%s, ML=%s, lifetime=%.0f bars, conf=%.0f%%",
+                         sig.action, action_map.get(ml_action, '?'),
+                         ml_lifetime, sig.confidence * 100)
+
+        except Exception as e:
+            logger.warning("Surfer ML feature extraction failed: %s", e)
+
+        # Evaluate through scanner_ml (uses surfer_ml signal_source path)
+        try:
+            entry_alert = self.scanner_ml.evaluate_signal(
+                analysis, self.tsla_price, signal_source='surfer_ml')
+            if entry_alert and entry_alert.alert_type == 'ENTRY':
+                self.positions_version += 1
+                self.trades_version += 1
+        except Exception as e:
+            logger.warning("Surfer ML eval failed: %s", e)
 
     def _evaluate_intraday(self, analysis):
         """Extract 5-min features from analysis and evaluate intraday signal."""
