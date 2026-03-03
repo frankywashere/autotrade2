@@ -49,8 +49,14 @@ MAX_SIGNAL_HISTORY = 200
 GIST_FILE_NAME = 'surfer_scanner_state.json'
 MODEL_TAG = 'c14'  # Identifies this branch in the multi-model Gist
 
-# Slippage + commission assumptions (aligned with surfer_backtest 3 bps)
-SLIPPAGE_PCT = 0.0003     # 0.03% slippage per side (was 0.05%)
+# Slippage + commission (per-signal-source, matching each backtest engine)
+SLIPPAGE_BY_SOURCE = {
+    'CS-5TF': 0.0001,   # 0.01% per side (combo_backtest.py)
+    'CS-DW':  0.0001,   # 0.01% per side (combo_backtest.py)
+    'intraday': 0.0002, # 0.02% per side (intraday_v14b_janfeb.py)
+    'surfer_ml': 0.0003, # 0.03% per side (surfer_backtest.py)
+}
+SLIPPAGE_PCT = 0.0003     # fallback if source unknown
 COMMISSION_PER_SHARE = 0.005  # $0.005/share (IBKR tiered)
 
 # Telegram alerts
@@ -197,12 +203,16 @@ class SurferLiveScanner:
     ChannelAnalysis, sizes positions, tracks hypothetical entries/exits.
     """
 
-    # Trailing stop uses profit-tier logic matching surfer_backtest.py (see _calc_trail_price)
-    TIMEOUT_MINUTES_BOUNCE = 300   # 5 hours for bounces (60 bars × 5 min)
-    TIMEOUT_MINUTES_BREAK = 600    # 10 hours for breaks (120 bars × 5 min) — doubled per backtest
+    # CS-5TF/DW: exponential trail from combo_backtest.py
+    # Surfer ML: profit-tier trail from surfer_backtest.py
+    # Intraday: 0.006*(1-conf)^6 from intraday_v14b
+    CS_TRAIL_BASE = 0.025          # combo_backtest TRAILING_STOP_BASE
+    CS_TRAIL_POWER = 8             # DI v36 trail power (tp=8+)
+    CS_MAX_HOLD_DAYS = 10          # combo_backtest MAX_HOLD_DAYS (trading days)
+    TIMEOUT_MINUTES_BOUNCE = 300   # 5 hours for bounces (60 bars × 5 min) — Surfer ML only
+    TIMEOUT_MINUTES_BREAK = 600    # 10 hours for breaks (120 bars × 5 min) — Surfer ML only
     EOD_CLOSE_HOUR_ET = 15         # Force-close at 3:45 PM ET
     EOD_CLOSE_MINUTE_ET = 45
-    # near_tp, equity_ceiling, outlier_winner REMOVED — not in backtest, may hurt performance
 
     def __init__(self, config: ScannerConfig, gist_id: str = '', github_token: str = '',
                  model_tag: str = ''):
@@ -517,8 +527,9 @@ class SurferLiveScanner:
         if sig.confidence < self.config.min_confidence:
             return None
 
-        # Max positions
-        if len(self.positions) >= self.config.max_positions:
+        # Max non-intraday positions (intraday has its own cap of 30)
+        non_intraday = sum(1 for p in self.positions.values() if p.signal_type != 'intraday')
+        if non_intraday >= self.config.max_positions:
             return ScannerAlert(
                 alert_type='RISK_WARNING', timestamp=now,
                 warning_msg=f'Max positions ({self.config.max_positions}) reached — signal ignored',
@@ -536,53 +547,60 @@ class SurferLiveScanner:
             if pos.signal_type == signal_type:
                 return None
 
-        # --- ATR-clipped stops (matching backtest realistic mode) ---
+        # --- Stop/TP logic (branched by signal source) ---
         stop_pct = sig.suggested_stop_pct
         if stop_pct <= 0:
             stop_pct = 0.02
-
-        # ATR clipping: use analysis ATR if available
-        atr_val = getattr(analysis, 'atr', None) or getattr(sig, 'atr', None)
-        if atr_val and atr_val > 0 and current_price > 0:
-            if signal_type == 'bounce':
-                atr_floor = (0.5 * atr_val) / current_price
-                atr_cap = (1.5 * atr_val) / current_price
-            else:  # break
-                atr_floor = (1.5 * atr_val) / current_price
-                atr_cap = (3.0 * atr_val) / current_price
-            stop_pct = max(atr_floor, min(stop_pct, atr_cap))
-            # Breakout ultra-tight: ×0.05 (matching backtest Arch 73)
-            if signal_type == 'break':
-                stop_pct *= 0.05
-                # Skip ultra-narrow breaks where slippage eats profit
-                if stop_pct < 0.00030:
-                    return None
-
-        # --- TP widening for high-confidence bounces (matching backtest) ---
         tp_pct = sig.suggested_tp_pct
-        if signal_type == 'bounce' and sig.confidence > 0.65:
-            tp_pct *= 1.30  # 30% wider TP, let winners run
 
-        # --- Position sizing (2% risk, signal-type boosts) ---
-        risk_dollars = self.equity * self.config.risk_per_trade_pct
-        stop_distance = stop_pct * current_price
-        shares = int(risk_dollars / stop_distance) if stop_distance > 0 else 0
+        if signal_source in ('CS-5TF', 'CS-DW'):
+            # combo_backtest.py: floor at 2%/4%, no ATR clipping
+            stop_pct = max(stop_pct, 0.02)
+            tp_pct = max(tp_pct, 0.04)
+        else:
+            # surfer_backtest.py: ATR-clipped stops
+            atr_val = getattr(analysis, 'atr', None) or getattr(sig, 'atr', None)
+            if atr_val and atr_val > 0 and current_price > 0:
+                if signal_type == 'bounce':
+                    atr_floor = (0.5 * atr_val) / current_price
+                    atr_cap = (1.5 * atr_val) / current_price
+                else:  # break
+                    atr_floor = (1.5 * atr_val) / current_price
+                    atr_cap = (3.0 * atr_val) / current_price
+                stop_pct = max(atr_floor, min(stop_pct, atr_cap))
+                # Breakout ultra-tight: ×0.05 (matching backtest Arch 73)
+                if signal_type == 'break':
+                    stop_pct *= 0.05
+                    if stop_pct < 0.00030:
+                        return None
+            # TP widening for high-confidence bounces (surfer_backtest only)
+            if signal_type == 'bounce' and sig.confidence > 0.65:
+                tp_pct *= 1.30
 
-        # Signal-type sizing boosts (matching backtest Arch 65+69)
-        size_mult = 1.0
-        if signal_type == 'bounce':
-            if direction == 'short':  # SELL bounces: highest WR
-                size_mult = 2.5
-            else:  # BUY bounces
-                size_mult = 1.5
-        elif signal_type == 'break':
-            # Inverse channel health: weak channel → real breakout
-            ch_health = getattr(sig, 'channel_health', 0.5)
-            if ch_health > 0.50:
-                size_mult = 0.6
-            elif ch_health < 0.30:
-                size_mult = 1.4
-        shares = int(shares * size_mult)
+        # --- Position sizing (matches each backtest engine) ---
+        if signal_source in ('CS-5TF', 'CS-DW'):
+            # combo_backtest.py: confidence-scaled, $100K base
+            position_value = self.config.initial_capital * min(sig.confidence, 1.0)
+            shares = max(1, int(position_value / current_price))
+        else:
+            # surfer_backtest.py / default: risk-based sizing
+            risk_dollars = self.equity * self.config.risk_per_trade_pct
+            stop_distance = stop_pct * current_price
+            shares = int(risk_dollars / stop_distance) if stop_distance > 0 else 0
+            # Signal-type sizing boosts (matching backtest Arch 65+69)
+            size_mult = 1.0
+            if signal_type == 'bounce':
+                if direction == 'short':
+                    size_mult = 2.5
+                else:
+                    size_mult = 1.5
+            elif signal_type == 'break':
+                ch_health = getattr(sig, 'channel_health', 0.5)
+                if ch_health > 0.50:
+                    size_mult = 0.6
+                elif ch_health < 0.30:
+                    size_mult = 1.4
+            shares = int(shares * size_mult)
 
         # Cap at max buying power
         buying_power = self.equity * self.config.max_leverage
@@ -670,10 +688,10 @@ class SurferLiveScanner:
         if self.daily_pnl <= self.config.daily_loss_limit:
             return None
 
-        # Don't open intraday if already have an intraday position
-        for pos in self.positions.values():
-            if pos.signal_type == 'intraday':
-                return None
+        # Cap intraday positions at 30 (matching backtest mtd=30)
+        intraday_count = sum(1 for p in self.positions.values() if p.signal_type == 'intraday')
+        if intraday_count >= 30:
+            return None
 
         # Evaluate signal
         try:
@@ -711,14 +729,8 @@ class SurferLiveScanner:
             'signal_source': 'intraday',
         })
 
-        # Position sizing (same logic as CS)
-        risk_dollars = self.equity * self.config.risk_per_trade_pct
-        stop_distance = stop_pct * current_price
-        shares = int(risk_dollars / stop_distance) if stop_distance > 0 else 0
-        buying_power = self.equity * self.config.max_leverage
-        max_notional = buying_power * self.config.max_buying_power_pct
-        max_shares = int(max_notional / current_price) if current_price > 0 else 0
-        shares = min(shares, max_shares)
+        # Position sizing: flat $100K / price (matching intraday backtest, conf_size=False)
+        shares = max(1, int(self.config.initial_capital / current_price)) if current_price > 0 else 0
         if shares <= 0:
             return None
 
@@ -793,23 +805,10 @@ class SurferLiveScanner:
 
     @staticmethod
     def _calc_trail_price(pos: 'HypotheticalPosition') -> Optional[float]:
-        """Compute trailing stop price matching surfer_backtest.py profit-tier logic.
+        """Profit-tier trailing stop for Surfer ML signals (surfer_backtest.py).
 
-        Mirrors evaluate_position() in surfer_backtest.py (simplified: no el_flagged,
-        fast_reversion, or trail_width_mult). Returns the effective trailing stop price,
-        or None if no trail is active yet (price hasn't moved enough to trigger a tier).
-
-        Tiers for bounce trades (profit_ratio = progress toward TP):
-          >= 80% → ultra-tight: initial_stop_dist × 0.005 from best price
-          >= 55% → initial_stop_dist × 0.02 from best price
-          >= 40% → initial_stop_dist × 0.06 from best price
-          < 40%  → None (hard stop only; breakeven managed separately)
-
-        Tiers for break trades (based on absolute % profit from best price):
-          > 1.5% → initial_stop_dist × 0.01 from best price
-          > 0.8% → initial_stop_dist × 0.02 from best price
-          > 0.08% → initial_stop_dist × 0.01 from best price
-          else   → None (hard stop only)
+        Only used for Surfer ML signals. CS-5TF/DW use exponential trail,
+        intraday uses its own formula. See check_exits() for routing.
         """
         entry = pos.entry_price
         if entry <= 0:
@@ -924,14 +923,17 @@ class SurferLiveScanner:
                 if bar_low < pos.best_price:
                     pos.best_price = bar_low
 
-            # --- Intraday auto-close at 15:55 ET (5 min before market close) ---
-            if exit_reason is None and pos.signal_type == 'intraday':
+            is_cs = pos.signal_source in ('CS-5TF', 'CS-DW')
+            is_intraday = pos.signal_type == 'intraday'
+
+            # --- Intraday EOD close at 15:50 ET (matching backtest tfe) ---
+            if exit_reason is None and is_intraday:
                 from datetime import time as _time
-                if now.time() >= _time(15, 55):
+                if now.time() >= _time(15, 50):
                     exit_reason = 'intraday_eod'
 
-            # --- EOD force close (3:45 PM ET) ---
-            if exit_reason is None and _is_eod:
+            # --- EOD force close (3:45 PM ET, non-intraday) ---
+            if exit_reason is None and not is_intraday and _is_eod:
                 exit_reason = 'eod_close'
 
             # --- Hard stop (2% max from entry, whichever is tighter) ---
@@ -957,10 +959,10 @@ class SurferLiveScanner:
                     exit_reason = 'take_profit'
                     exit_price = pos.tp_price
 
-            # --- Trailing stop ---
+            # --- Trailing stop (branched by signal source) ---
             if exit_reason is None:
-                if pos.signal_type == 'intraday':
-                    # Intraday trailing: trail = 0.006 * (1 - conf)^6
+                if is_intraday:
+                    # Intraday: trail = 0.006 * (1 - conf)^6
                     trail_pct = 0.006 * (1.0 - pos.confidence) ** 6
                     if pos.direction == 'long' and pos.best_price > pos.entry_price:
                         trail_price = pos.best_price * (1.0 - trail_pct)
@@ -968,8 +970,23 @@ class SurferLiveScanner:
                         if bar_low <= trail_price:
                             exit_reason = 'trailing_stop'
                             exit_price = trail_price
+                elif is_cs:
+                    # CS-5TF/DW: exponential trail = 0.025 * (1 - conf)^8
+                    trail_pct = self.CS_TRAIL_BASE * (1.0 - pos.confidence) ** self.CS_TRAIL_POWER
+                    if pos.direction == 'long' and pos.best_price > pos.entry_price:
+                        trail_price = pos.best_price * (1.0 - trail_pct)
+                        trail_price = max(trail_price, pos.stop_price)
+                        if bar_low <= trail_price:
+                            exit_reason = 'trailing_stop'
+                            exit_price = trail_price
+                    elif pos.direction == 'short' and pos.best_price < pos.entry_price:
+                        trail_price = pos.best_price * (1.0 + trail_pct)
+                        trail_price = min(trail_price, pos.stop_price)
+                        if bar_high >= trail_price:
+                            exit_reason = 'trailing_stop'
+                            exit_price = trail_price
                 else:
-                    # CS Daily: profit-tier based, matching surfer_backtest.py
+                    # Surfer ML: profit-tier based (surfer_backtest.py)
                     trail_price = self._calc_trail_price(pos)
                     if trail_price is not None:
                         if pos.direction == 'long' and bar_low <= trail_price:
@@ -979,20 +996,25 @@ class SurferLiveScanner:
                             exit_reason = 'trailing_stop'
                             exit_price = trail_price
 
-            # --- OU timeout for bounces (matching backtest) ---
-            if exit_reason is None and pos.signal_type == 'bounce':
-                ou_hl = pos.ou_half_life
-                # Convert OU half-life (in 5-min bars) to minutes: max(6, 3×hl) × 5
-                ou_timeout_min = max(6, int(ou_hl * 3)) * 5
-                if hold_minutes > ou_timeout_min:
-                    exit_reason = 'ou_timeout'
-
-            # --- Timeout (bounce: 5 hrs, break: 10 hrs) ---
+            # --- Timeout (branched by signal source) ---
             if exit_reason is None:
-                timeout = (self.TIMEOUT_MINUTES_BREAK if pos.signal_type == 'break'
-                           else self.TIMEOUT_MINUTES_BOUNCE)
-                if hold_minutes > timeout:
-                    exit_reason = 'timeout'
+                if is_cs:
+                    # CS-5TF/DW: 10 trading days (combo_backtest MAX_HOLD_DAYS)
+                    hold_days = hold_minutes / (60 * 6.5)  # ~6.5 market hours/day
+                    if hold_days > self.CS_MAX_HOLD_DAYS:
+                        exit_reason = 'timeout'
+                elif not is_intraday:
+                    # Surfer ML: OU timeout for bounces, then bar-based timeout
+                    if pos.signal_type == 'bounce':
+                        ou_hl = pos.ou_half_life
+                        ou_timeout_min = max(6, int(ou_hl * 3)) * 5
+                        if hold_minutes > ou_timeout_min:
+                            exit_reason = 'ou_timeout'
+                    if exit_reason is None:
+                        timeout = (self.TIMEOUT_MINUTES_BREAK if pos.signal_type == 'break'
+                                   else self.TIMEOUT_MINUTES_BOUNCE)
+                        if hold_minutes > timeout:
+                            exit_reason = 'timeout'
 
             if exit_reason:
                 if ext_session and self._ext_closes_today >= 1:
@@ -1023,7 +1045,8 @@ class SurferLiveScanner:
         else:
             raw_pnl = (pos.entry_price - exit_price) * pos.shares
 
-        slippage_cost = pos.notional * SLIPPAGE_PCT * 2  # entry + exit
+        slip_pct = SLIPPAGE_BY_SOURCE.get(pos.signal_source, SLIPPAGE_PCT)
+        slippage_cost = pos.notional * slip_pct * 2  # entry + exit
         commission = pos.shares * COMMISSION_PER_SHARE * 2
         pnl = raw_pnl - slippage_cost - commission
         pnl_pct = pnl / pos.notional if pos.notional > 0 else 0

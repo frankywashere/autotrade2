@@ -719,13 +719,30 @@ def _load_surfer_data(tsla_min_path, start, end):
     for tf, df in higher_tf.items():
         print(f"    {tf}: {len(df):,} bars")
 
-    # SPY + VIX (daily, via yfinance — needed for ML correlation features)
-    from v15.data.native_tf import fetch_native_tf
-    print("  Loading SPY daily...")
-    spy_daily = fetch_native_tf('SPY', 'daily', start, end)
-    spy_daily.columns = [c.lower() for c in spy_daily.columns]
-    spy_daily.index = pd.to_datetime(spy_daily.index).tz_localize(None)
+    # SPY 5-min (MUST match training resolution for correlation features)
+    spy_min_path = None
+    for p in ['data/SPYMin.txt', '../data/SPYMin.txt',
+              os.path.expanduser('~/Desktop/Coding/x14/data/SPYMin.txt')]:
+        if os.path.isfile(p):
+            spy_min_path = p
+            break
 
+    if spy_min_path:
+        print(f"  Loading SPY 5-min from {spy_min_path}...")
+        spy_1m = load_1min(spy_min_path)
+        spy_5m = spy_1m.resample('5min').agg(
+            {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+        ).dropna()
+        print(f"  SPY 5-min bars: {len(spy_5m):,}")
+    else:
+        print("  WARNING: SPYMin.txt not found, using yfinance daily (features may differ)")
+        from v15.data.native_tf import fetch_native_tf
+        spy_5m = fetch_native_tf('SPY', 'daily', start, end)
+        spy_5m.columns = [c.lower() for c in spy_5m.columns]
+        spy_5m.index = pd.to_datetime(spy_5m.index).tz_localize(None)
+
+    # VIX daily (OK as daily — features are VIX level + 5-day change)
+    from v15.data.native_tf import fetch_native_tf
     print("  Loading VIX daily...")
     try:
         vix_daily = fetch_native_tf('^VIX', 'daily', start, end)
@@ -734,24 +751,41 @@ def _load_surfer_data(tsla_min_path, start, end):
     except Exception:
         vix_daily = None
 
-    return tsla_5m, higher_tf, spy_daily, vix_daily
+    return tsla_5m, higher_tf, spy_5m, vix_daily
 
 
 def _load_ml_model():
-    """Load the best ML model for surfer_backtest."""
-    model_path = Path('surfer_models/best_model.pt')
-    if not model_path.exists():
-        print(f"  WARNING: {model_path} not found, running without ML model")
-        return None
-    try:
-        from v15.core.surfer_ml import GBTModel
-        import torch
-        model = torch.load(str(model_path), map_location='cpu', weights_only=False)
-        print(f"  ML model loaded from {model_path}")
-        return model
-    except Exception as e:
-        print(f"  WARNING: Failed to load ML model: {e}")
-        return None
+    """Load the primary GBT ML model for surfer_backtest."""
+    from v15.core.surfer_ml import GBTModel, get_feature_names
+
+    # Try GBT first (primary model), then best_model.pt (legacy)
+    for model_path, loader in [
+        (Path('surfer_models/gbt_model.pkl'), 'gbt'),
+        (Path('surfer_models/best_model.pt'), 'torch'),
+    ]:
+        if not model_path.exists():
+            continue
+        try:
+            if loader == 'gbt':
+                model = GBTModel.load(str(model_path))
+            else:
+                import torch
+                model = torch.load(str(model_path), map_location='cpu', weights_only=False)
+
+            # Verify feature count matches current code
+            expected_features = len(get_feature_names())
+            test_input = np.zeros((1, expected_features), dtype=np.float32)
+            test_pred = model.predict(test_input)
+            print(f"  ML model loaded from {model_path}")
+            print(f"  Feature count verified: {expected_features}")
+            print(f"  Prediction keys: {list(test_pred.keys())}")
+            return model
+        except Exception as e:
+            print(f"  WARNING: {model_path} failed: {e}")
+            continue
+
+    print("  WARNING: No working ML model found, running without ML")
+    return None
 
 
 def _load_sq_model():
@@ -772,7 +806,7 @@ def _load_sq_model():
     return None
 
 
-def _run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
+def _run_surfer_for_years(tsla_5m, higher_tf, spy_5m, vix_daily,
                           ml_model, sq_model, year_start, year_end):
     """Run surfer_backtest for a year range, return trades in that range."""
     from v15.core.surfer_backtest import run_backtest
@@ -799,13 +833,17 @@ def _run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
             # Scale 0.5x to 2x based on quality score
             return max(0.5, min(2.0, quality_score * 2.0))
 
-    # Suppress surfer_backtest's verbose output AND LightGBM C-level stderr
+    # Redirect stdout/stderr to temp file (avoid pipe buffer deadlock)
     import os
-    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    import tempfile
+
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix='surfer_ml_', suffix='.log')
     old_stdout_fd = os.dup(1)
     old_stderr_fd = os.dup(2)
-    os.dup2(devnull_fd, 1)
-    os.dup2(devnull_fd, 2)
+    os.dup2(tmp_fd, 1)   # stdout → temp file
+    os.dup2(tmp_fd, 2)   # stderr → temp file (captures LightGBM C-level too)
+    os.close(tmp_fd)
+
     try:
         metrics, trades, equity_curve = run_backtest(
             days=0,  # Ignored when tsla_df provided
@@ -817,7 +855,7 @@ def _run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
             ml_model=ml_model,
             tsla_df=tsla_slice,
             higher_tf_dict=htf_slice,
-            spy_df_input=spy_daily,
+            spy_df_input=spy_5m,
             vix_df_input=vix_daily,
             realistic=True,
             slippage_bps=3.0,
@@ -830,9 +868,24 @@ def _run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
     finally:
         os.dup2(old_stdout_fd, 1)
         os.dup2(old_stderr_fd, 2)
-        os.close(devnull_fd)
         os.close(old_stdout_fd)
         os.close(old_stderr_fd)
+
+    # Read and report ML activity from first year
+    try:
+        with open(tmp_path, 'r', errors='replace') as f:
+            captured = f.read()
+        os.unlink(tmp_path)
+    except Exception:
+        captured = ''
+
+    if year_start == year_end:
+        ml_lines = [l for l in captured.split('\n')
+                     if any(kw in l for kw in ['[ML]', 'ML ', 'PREDICTION FAILED', 'ml_predict',
+                                                'model loaded', 'WARNING'])]
+        if ml_lines:
+            for line in ml_lines[:8]:
+                print(f"    [ML/{year_start}] {line.strip()}")
 
     # Filter trades to only the requested year range
     filtered = []
@@ -851,11 +904,11 @@ def validate_surfer_ml(tsla_min_path, start, end):
     """Validate surfer_backtest with full ML stack in realistic mode."""
     print("\n" + "#"*75)
     print("  D. Surfer — Realistic Mode, 5-Min Bars")
-    print("  NOTE: ML models stale (169 vs 177 features) — running base physics signals")
+    print("  ML models retrained with 177 features — full ML stack active")
     print("#"*75)
 
     print("\n  Loading data...")
-    tsla_5m, higher_tf, spy_daily, vix_daily = _load_surfer_data(tsla_min_path, start, end)
+    tsla_5m, higher_tf, spy_5m, vix_daily = _load_surfer_data(tsla_min_path, start, end)
 
     print("\n  Loading models...")
     ml_model = _load_ml_model()
@@ -866,7 +919,7 @@ def validate_surfer_ml(tsla_min_path, start, end):
     year_trades = {}  # Keep trades for all-years combined metrics
     for yr in range(2016, 2027):
         print(f"\n  Running year {yr}...")
-        trades = _run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
+        trades = _run_surfer_for_years(tsla_5m, higher_tf, spy_5m, vix_daily,
                                         ml_model, sq_model, yr, yr)
         year_trades[yr] = trades
         if trades:
@@ -879,9 +932,9 @@ def validate_surfer_ml(tsla_min_path, start, end):
 
     # 2. Holdout
     print("\n  Running holdout (train ≤2021, test 2022-2025)...")
-    train_trades = _run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
+    train_trades = _run_surfer_for_years(tsla_5m, higher_tf, spy_5m, vix_daily,
                                           ml_model, sq_model, 2016, 2021)
-    test_trades = _run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
+    test_trades = _run_surfer_for_years(tsla_5m, higher_tf, spy_5m, vix_daily,
                                          ml_model, sq_model, 2022, 2025)
     _print_holdout(_compute_metrics_surfer(train_trades), _compute_metrics_surfer(test_trades))
 
@@ -891,9 +944,9 @@ def validate_surfer_ml(tsla_min_path, start, end):
     for train_range, test_yr in WALK_FORWARD_WINDOWS:
         ty_start, ty_end = [int(y) for y in train_range.split('-')]
         print(f"    {train_range} → {test_yr}...")
-        tr_trades = _run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
+        tr_trades = _run_surfer_for_years(tsla_5m, higher_tf, spy_5m, vix_daily,
                                            ml_model, sq_model, ty_start, ty_end)
-        te_trades = _run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
+        te_trades = _run_surfer_for_years(tsla_5m, higher_tf, spy_5m, vix_daily,
                                            ml_model, sq_model, int(test_yr), int(test_yr))
         wf_results.append({
             'train_period': train_range, 'test_year': test_yr,
@@ -904,7 +957,7 @@ def validate_surfer_ml(tsla_min_path, start, end):
 
     # 4. 2026 OOS
     print("\n  Running 2026 OOS...")
-    oos_trades = _run_surfer_for_years(tsla_5m, higher_tf, spy_daily, vix_daily,
+    oos_trades = _run_surfer_for_years(tsla_5m, higher_tf, spy_5m, vix_daily,
                                         ml_model, sq_model, 2026, 2026)
     # Print trade log for 2026 (flat-sized PnL via pnl_pct)
     FLAT_SIZE = 10_000.0
