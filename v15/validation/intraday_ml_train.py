@@ -60,6 +60,10 @@ FEATURE_NAMES = [
     'confidence',
     # Momentum
     'return_5bar', 'return_20bar',  # trailing 5-min returns
+    # Cross-TF alignment (derived)
+    'bullish_tf_count',  # count of TFs with cp > 0.5 (bullish alignment)
+    'cp_dispersion',     # std dev of channel positions across TFs
+    'slope_agreement',   # count of TFs with positive slope direction
     # Pattern features
     'bars_since_last_trade',  # cooldown pressure
     'daily_trade_count',  # how many trades today
@@ -179,6 +183,19 @@ def extract_features(i, f5m, ctx, features, signal_result, trade_state):
     if i >= 20:
         feat[idx] = (close[i] - close[i-20]) / close[i-20] * 100.0 if close[i-20] > 0 else np.nan
     idx += 1
+
+    # Cross-TF alignment (derived)
+    cp_vals = [v for v in [cp5,
+               ctx.get('15m_cp', np.full(1, np.nan))[i] if isinstance(ctx.get('15m_cp'), np.ndarray) and i < len(ctx.get('15m_cp', [])) else np.nan,
+               ctx.get('30m_cp', np.full(1, np.nan))[i] if isinstance(ctx.get('30m_cp'), np.ndarray) and i < len(ctx.get('30m_cp', [])) else np.nan,
+               h1_val, h4_val, dcp] if not np.isnan(v)]
+    feat[idx] = sum(1 for v in cp_vals if v > 0.5); idx += 1  # bullish_tf_count
+    feat[idx] = float(np.std(cp_vals)) if len(cp_vals) >= 2 else np.nan; idx += 1  # cp_dispersion
+    slope_vals = [v for v in [
+        ctx.get('1h_slope', np.full(1, np.nan))[i] if isinstance(ctx.get('1h_slope'), np.ndarray) and i < len(ctx.get('1h_slope', [])) else np.nan,
+        ctx.get('4h_slope', np.full(1, np.nan))[i] if isinstance(ctx.get('4h_slope'), np.ndarray) and i < len(ctx.get('4h_slope', [])) else np.nan,
+        ctx['daily_slope']] if not np.isnan(v)]
+    feat[idx] = sum(1 for v in slope_vals if v > 0); idx += 1  # slope_agreement
 
     # Trade state features
     feat[idx] = trade_state.get('bars_since_last', 999); idx += 1

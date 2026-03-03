@@ -774,6 +774,18 @@ class DashboardState(param.Parameterized):
             _set('return_5bar', kwargs.get('return_5bar', float('nan')))
             _set('return_20bar', kwargs.get('return_20bar', float('nan')))
 
+            # Cross-TF alignment (derived)
+            all_cps = [v for v in [cp5v, kwargs.get('cp_15m', float('nan')),
+                        kwargs.get('cp_30m', float('nan')), h1v, h4v, dcp]
+                       if not np.isnan(v)]
+            _set('bullish_tf_count', sum(1 for v in all_cps if v > 0.5))
+            _set('cp_dispersion', float(np.std(all_cps)) if len(all_cps) >= 2 else float('nan'))
+            slope_vals = [v for v in [kwargs.get('h1_slope', float('nan')),
+                          kwargs.get('h4_slope', float('nan')),
+                          kwargs.get('daily_slope', float('nan'))]
+                         if not np.isnan(v)]
+            _set('slope_agreement', sum(1 for v in slope_vals if v > 0))
+
             # Trade state
             _set('bars_since_last_trade', ts['bars_since_last'])
             _set('daily_trade_count', ts['daily_trades'])
