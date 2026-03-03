@@ -362,8 +362,8 @@ def generate_training_data(f5m, features, precomp,
 # Model training
 # ---------------------------------------------------------------------------
 
-def train_model(X_train, y_train, X_val=None, y_val=None):
-    """Train LightGBM binary classifier."""
+def train_model(X_train, y_train, X_val=None, y_val=None, sample_weight=None):
+    """Train LightGBM binary classifier with optional P&L-based sample weights."""
     import lightgbm as lgb
 
     params = {
@@ -382,7 +382,8 @@ def train_model(X_train, y_train, X_val=None, y_val=None):
         'seed': 42,
     }
 
-    train_data = lgb.Dataset(X_train, label=y_train, feature_name=FEATURE_NAMES)
+    train_data = lgb.Dataset(X_train, label=y_train, feature_name=FEATURE_NAMES,
+                             weight=sample_weight)
     callbacks = [lgb.log_evaluation(200)]
 
     if X_val is not None and y_val is not None:
@@ -404,6 +405,18 @@ def train_model(X_train, y_train, X_val=None, y_val=None):
         )
 
     return model
+
+
+def compute_pnl_weights(meta):
+    """Compute sample weights proportional to |P&L| to prioritize big losers/winners."""
+    pnl = np.array([m['pnl'] for m in meta])
+    abs_pnl = np.abs(pnl)
+    # Normalize to mean=1 so it doesn't change overall scale
+    weights = abs_pnl / (abs_pnl.mean() + 1e-10)
+    # Boost losers extra: the model needs to learn to REJECT big losses
+    loser_mask = pnl < 0
+    weights[loser_mask] *= 2.0
+    return weights
 
 
 def evaluate_model(model, X, y, meta, label='', sweep_threshold=False):
@@ -444,26 +457,29 @@ def evaluate_model(model, X, y, meta, label='', sweep_threshold=False):
     rej_avg = rej_pnl / rej_n if rej_n > 0 else 0
     print(f"  {'Avg P&L':<25} ${avg_pnl:>+11,.0f} ${ml_avg:>+11,.0f} ${rej_avg:>+11,.0f}")
 
-    # Threshold sweep to find optimal P&L threshold
+    # Threshold sweep: find optimal threshold by avg P&L per trade
     best_thresh = 0.5
     if sweep_threshold and n > 50:
-        best_pnl_diff = 0.0
-        for thresh in np.arange(0.30, 0.80, 0.02):
+        print(f"\n  Threshold sweep:")
+        print(f"  {'Thresh':>8} {'Trades':>8} {'WR':>8} {'Total P&L':>12} {'Avg P&L':>10} {'Delta P&L':>12}")
+        best_avg_pnl = avg_pnl
+        for thresh in [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]:
             t_mask = probs >= thresh
-            t_pnl = float(pnl_arr[t_mask].sum())
             t_n = int(t_mask.sum())
-            diff = t_pnl - all_pnl
-            if diff > best_pnl_diff and t_n >= n * 0.5:  # Keep at least 50% of trades
-                best_pnl_diff = diff
+            if t_n < 100:
+                continue
+            t_wins = int(y[t_mask].sum())
+            t_wr = t_wins / t_n * 100
+            t_pnl = float(pnl_arr[t_mask].sum())
+            t_avg = t_pnl / t_n
+            delta = t_pnl - all_pnl
+            marker = ' <--' if t_avg > best_avg_pnl and t_n >= n * 0.4 else ''
+            print(f"  {thresh:>8.2f} {t_n:>8,} {t_wr:>7.1f}% ${t_pnl:>+11,.0f} ${t_avg:>+9,.0f} ${delta:>+11,.0f}{marker}")
+            if t_avg > best_avg_pnl and t_n >= n * 0.4:
+                best_avg_pnl = t_avg
                 best_thresh = thresh
         if best_thresh != 0.5:
-            bt_mask = probs >= best_thresh
-            bt_n = int(bt_mask.sum())
-            bt_wins = int(y[bt_mask].sum())
-            bt_wr = bt_wins / bt_n * 100 if bt_n > 0 else 0
-            bt_pnl = float(pnl_arr[bt_mask].sum())
-            print(f"\n  ** Best threshold: {best_thresh:.2f} -> {bt_n:,} trades, "
-                  f"{bt_wr:.1f}% WR, P&L ${bt_pnl:+,.0f} (delta ${bt_pnl - all_pnl:+,.0f})")
+            print(f"\n  ** Optimal threshold: {best_thresh:.2f} (best avg P&L per trade)")
 
     return {
         'trades': n, 'ml_trades': int(ml_n), 'rejected': int(rej_n),
@@ -546,8 +562,10 @@ def main():
             print(f"\n  WF {train_yrs[0]}-{train_yrs[-1]} -> {test_yr}: SKIPPED (no data)")
             continue
 
+        train_meta = [m for yr in train_yrs for m in all_meta_by_year.get(yr, []) if yr in all_meta_by_year]
+        train_w = compute_pnl_weights(train_meta) if len(train_meta) == len(X_train) else None
         print(f"\n  Training on {train_yrs[0]}-{train_yrs[-1]} ({len(X_train):,} samples, {y_train.sum()/len(y_train)*100:.1f}% WR)...")
-        model = train_model(X_train, y_train)
+        model = train_model(X_train, y_train, sample_weight=train_w)
 
         result = evaluate_model(model, X_test, y_test, meta_test,
                                f"WF {train_yrs[0]}-{train_yrs[-1]} -> {test_yr}")
@@ -569,7 +587,9 @@ def main():
     print(f"  Train: {len(X_train_ho):,} samples ({y_train_ho.sum()/len(y_train_ho)*100:.1f}% WR)")
     print(f"  Test: {len(X_test_ho):,} samples ({y_test_ho.sum()/len(y_test_ho)*100:.1f}% WR)")
 
-    model_ho = train_model(X_train_ho, y_train_ho, X_test_ho, y_test_ho)
+    ho_train_meta = [m for yr in train_yrs_ho for m in all_meta_by_year.get(yr, [])]
+    ho_train_w = compute_pnl_weights(ho_train_meta) if len(ho_train_meta) == len(X_train_ho) else None
+    model_ho = train_model(X_train_ho, y_train_ho, X_test_ho, y_test_ho, sample_weight=ho_train_w)
     ho_result = evaluate_model(model_ho, X_test_ho, y_test_ho, meta_test_ho,
                               "Holdout: <=2021 -> 2022-2025", sweep_threshold=True)
 
@@ -600,7 +620,9 @@ def main():
     y_all = np.concatenate([all_y_by_year[yr] for yr in all_yrs if yr in all_y_by_year and len(all_y_by_year[yr]) > 0])
 
     # LightGBM handles NaN natively -- no need to replace
-    final_model = train_model(X_all, y_all)
+    all_meta_train = [m for yr in all_yrs for m in all_meta_by_year.get(yr, [])]
+    all_w = compute_pnl_weights(all_meta_train) if len(all_meta_train) == len(X_all) else None
+    final_model = train_model(X_all, y_all, sample_weight=all_w)
 
     # Feature importance
     importance = final_model.feature_importance(importance_type='gain')
