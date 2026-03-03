@@ -59,69 +59,26 @@ SLIPPAGE_BY_SOURCE = {
 SLIPPAGE_PCT = 0.0003     # fallback if source unknown
 COMMISSION_PER_SHARE = 0.005  # $0.005/share (IBKR tiered)
 
-# Telegram alerts
-_TG_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
-_TG_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
-print(f"[SCANNER] Telegram config: token={'SET' if _TG_TOKEN else 'MISSING'} "
-      f"({len(_TG_TOKEN)} chars), chat_id={'SET' if _TG_CHAT_ID else 'MISSING'}")
-
-_TG_IPS = ['149.154.167.220', '149.154.166.110']  # api.telegram.org fallback IPs
+# ntfy.sh push notifications
+_NTFY_TOPIC = os.environ.get('NTFY_TOPIC', 'c14-xyz').strip()
+print(f"[SCANNER] ntfy topic: {_NTFY_TOPIC}")
 
 
-def _send_telegram(msg: str, model_tag: str = ''):
-    """Send a Telegram message directly via bot API with DNS fallback."""
+def _send_notification(msg: str, model_tag: str = '', title: str = ''):
+    """Send a push notification via ntfy.sh."""
     tag = model_tag or MODEL_TAG
-    full_msg = f"[{tag}] {msg}"
-    if not _TG_TOKEN or not _TG_CHAT_ID:
-        print(f"[SCANNER] Telegram skipped (no creds): {full_msg[:80]}")
-        return
+    url = f'https://ntfy.sh/{_NTFY_TOPIC}'
 
-    url = f'https://api.telegram.org/bot{_TG_TOKEN}/sendMessage'
-    payload = {'chat_id': _TG_CHAT_ID, 'text': full_msg, 'parse_mode': 'HTML'}
-
-    import time as _time
     try:
         import requests as _req
-        # Try normal DNS first
-        try:
-            resp = _req.post(url, json=payload, timeout=10)
-            if resp.status_code == 200:
-                print(f"[SCANNER] Telegram sent OK: {full_msg[:60]}")
-                return
-            elif resp.status_code == 429:
-                retry_after = resp.json().get('parameters', {}).get('retry_after', 5)
-                _time.sleep(retry_after)
-                resp = _req.post(url, json=payload, timeout=10)
-                if resp.status_code == 200:
-                    print(f"[SCANNER] Telegram sent OK (retry): {full_msg[:60]}")
-                    return
-            print(f"[SCANNER] Telegram HTTP {resp.status_code}: {resp.text[:100]}")
-        except _req.exceptions.ConnectionError:
-            # DNS failed — try hardcoded IPs
-            for ip in _TG_IPS:
-                try:
-                    ip_url = f'https://{ip}/bot{_TG_TOKEN}/sendMessage'
-                    resp = _req.post(
-                        ip_url, json=payload, timeout=10,
-                        headers={'Host': 'api.telegram.org'},
-                        verify=False,
-                    )
-                    if resp.status_code == 200:
-                        print(f"[SCANNER] Telegram sent OK (IP {ip}): {full_msg[:60]}")
-                        return
-                except Exception:
-                    continue
-            print(f"[SCANNER] Telegram: DNS and IP fallbacks all failed")
-    except ImportError:
-        try:
-            req = urllib.request.Request(
-                url, data=json.dumps(payload).encode(),
-                headers={'Content-Type': 'application/json'})
-            with urllib.request.urlopen(req, timeout=10):
-                print(f"[SCANNER] Telegram sent OK (urllib): {full_msg[:60]}")
-                return
-        except Exception as e:
-            print(f"[SCANNER] Telegram urllib failed: {e}")
+        headers = {'Title': title or f'[{tag}] Alert'}
+        resp = _req.post(url, data=msg.encode('utf-8'), headers=headers, timeout=10)
+        if resp.status_code == 200:
+            print(f"[SCANNER] ntfy sent OK: {msg[:60]}")
+        else:
+            print(f"[SCANNER] ntfy HTTP {resp.status_code}: {resp.text[:100]}")
+    except Exception as e:
+        print(f"[SCANNER] ntfy failed: {e}")
 
 
 @dataclass
@@ -807,17 +764,17 @@ class SurferLiveScanner:
         self.positions[pos_id] = pos
         alert.pos_id = pos_id
 
-        # Telegram entry alert
+        # Push notification: entry alert
         action = 'BUY' if direction == 'long' else 'SELL'
         rr = abs(pos.tp_price - pos.entry_price) / max(abs(pos.entry_price - pos.stop_price), 0.01)
-        _send_telegram(
-            f"🟢 <b>TRADE OPENED</b>\n"
-            f"<b>{action}</b> {pos.shares} shares @ ${pos.entry_price:.2f}\n"
-            f"Signal: <b>{signal_source or 'CS'}</b>\n"
+        _send_notification(
+            f"{action} {pos.shares} shares @ ${pos.entry_price:.2f}\n"
+            f"Signal: {signal_source or 'CS'}\n"
             f"Stop: ${pos.stop_price:.2f} | TP: ${pos.tp_price:.2f} | R:R {rr:.1f}:1\n"
             f"Confidence: {pos.confidence:.0%} | {pos.primary_tf}\n"
             f"Notional: ${pos.notional:,.0f}",
             model_tag=self.model_tag,
+            title=f'[{self.model_tag}] TRADE OPENED',
         )
 
     # ------------------------------------------------------------------
@@ -1101,18 +1058,18 @@ class SurferLiveScanner:
         )
         self.closed_trades.append(trade)
 
-        # Telegram exit alert
-        pnl_emoji = '🟢' if pnl >= 0 else '🔴'
+        # Push notification: exit alert
+        pnl_emoji = '+' if pnl >= 0 else '-'
         action = 'LONG' if pos.direction == 'long' else 'SHORT'
         hold_str = f'{hold_minutes:.0f}m' if hold_minutes < 120 else f'{hold_minutes/60:.1f}h'
-        _send_telegram(
-            f"{pnl_emoji} <b>TRADE CLOSED</b>\n"
-            f"<b>{action}</b> {pos.shares} shares\n"
-            f"Signal: <b>{pos.signal_source or 'CS'}</b>\n"
-            f"Entry: ${pos.entry_price:.2f} → Exit: ${exit_price:.2f}\n"
-            f"P&L: <b>${pnl:+,.0f}</b> ({pnl_pct:+.2%})\n"
+        _send_notification(
+            f"{action} {pos.shares} shares\n"
+            f"Signal: {pos.signal_source or 'CS'}\n"
+            f"Entry: ${pos.entry_price:.2f} > Exit: ${exit_price:.2f}\n"
+            f"P&L: ${pnl:+,.0f} ({pnl_pct:+.2%})\n"
             f"Reason: {exit_reason} | Held: {hold_str}",
             model_tag=self.model_tag,
+            title=f'[{self.model_tag}] TRADE CLOSED ({pnl_emoji}${abs(pnl):,.0f})',
         )
 
         return ScannerAlert(

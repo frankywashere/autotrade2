@@ -844,109 +844,37 @@ class DashboardState(param.Parameterized):
             logger.warning("Intraday ML filter error: %s", e)
             return True  # On error, accept the signal
 
-    def send_telegram(self, msg: str) -> str:
-        """Send a Telegram message directly via bot API. Returns status string."""
-        token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
-        chat_id = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
-        logger.info("Telegram send: token=%s (%d chars), chat_id=%s",
-                     'SET' if token else 'MISSING', len(token),
-                     'SET' if chat_id else 'MISSING')
-        if not token or not chat_id:
-            return 'ERROR: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set'
+    def send_notification(self, msg: str, title: str = '') -> str:
+        """Send a push notification via ntfy.sh. Returns status string."""
+        topic = os.environ.get('NTFY_TOPIC', 'c14-xyz').strip()
+        url = f'https://ntfy.sh/{topic}'
 
-        url = f'https://api.telegram.org/bot{token}/sendMessage'
-        payload = {'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML'}
-
-        # Try requests with DNS override if needed
         try:
             import requests as _req
-            from urllib3.util.retry import Retry
-            from requests.adapters import HTTPAdapter
-
-            # First try normal DNS
-            logger.info("Telegram: trying normal request to %s", url[:60])
-            try:
-                resp = _req.post(url, json=payload, timeout=15)
-                logger.info("Telegram: HTTP %d, body=%s", resp.status_code, resp.text[:200])
-                if resp.status_code == 200:
-                    return 'OK'
-                return f'HTTP {resp.status_code}: {resp.text[:100]}'
-            except _req.exceptions.ConnectionError as e:
-                logger.warning("Telegram normal DNS failed: %s, trying IP fallback", e)
-
-            # DNS failed — try with hardcoded IP (api.telegram.org)
-            _TG_IPS = ['149.154.167.220', '149.154.166.110']
-            for ip in _TG_IPS:
-                try:
-                    ip_url = f'https://{ip}/bot{token}/sendMessage'
-                    logger.info("Telegram: trying IP fallback %s", ip)
-                    resp = _req.post(
-                        ip_url, json=payload, timeout=15,
-                        headers={'Host': 'api.telegram.org'},
-                        verify=False,
-                    )
-                    logger.info("Telegram IP %s: HTTP %d, body=%s",
-                                ip, resp.status_code, resp.text[:200])
-                    if resp.status_code == 200:
-                        return 'OK'
-                except Exception as ip_e:
-                    logger.warning("Telegram IP %s failed: %s", ip, ip_e)
-                    _last_ip_err = f'{ip}: {type(ip_e).__name__}: {ip_e}'
-                    continue
-
-            return f'ERROR: DNS and IP fallbacks all failed | Last IP error: {_last_ip_err}'
-        except ImportError:
-            logger.info("Telegram: requests not available, trying urllib")
+            headers = {'Title': title or 'c14 Alert'}
+            resp = _req.post(url, data=msg.encode('utf-8'), headers=headers, timeout=10)
+            logger.info("ntfy: HTTP %d, topic=%s", resp.status_code, topic)
+            if resp.status_code == 200:
+                return 'OK'
+            return f'HTTP {resp.status_code}: {resp.text[:100]}'
         except Exception as e:
-            logger.error("Telegram failed: %s", e, exc_info=True)
+            logger.error("ntfy failed: %s", e)
             return f'ERROR: {e}'
 
-        # Fall back to urllib
-        try:
-            import json as _json
-            data = _json.dumps(payload).encode()
-            import urllib.request
-            req = urllib.request.Request(
-                url, data=data, headers={'Content-Type': 'application/json'})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                body = resp.read().decode()
-                if resp.status == 200:
-                    return 'OK'
-                return f'HTTP {resp.status}'
-        except Exception as e:
-            logger.error("Telegram urllib failed: %s", e, exc_info=True)
-            return f'ERROR: {e}'
-
-    def send_test_telegram(self):
-        """Send a test signal to Telegram with DNS diagnostics."""
+    def send_test_notification(self):
+        """Send a test push notification via ntfy.sh."""
         from datetime import datetime
         import pytz
-        import socket
-
-        # DNS diagnostic
-        dns_info = ''
-        try:
-            ips = socket.getaddrinfo('api.telegram.org', 443, socket.AF_INET)
-            ip_list = [addr[4][0] for addr in ips]
-            dns_info = f'DNS OK: {ip_list[:3]}'
-            logger.info("Telegram DNS resolve: %s", ip_list)
-        except Exception as e:
-            dns_info = f'DNS FAILED: {e}'
-            logger.error("Telegram DNS resolve failed: %s", e)
 
         now = datetime.now(pytz.timezone('US/Eastern'))
         msg = (
-            f"🧪 <b>TEST SIGNAL</b>\n"
             f"Dashboard: c14 Trading Dashboard\n"
             f"TSLA: ${self.tsla_price:.2f}\n"
             f"Time: {now.strftime('%Y-%m-%d %H:%M:%S ET')}\n"
             f"Scanner: {'OK' if self.scanner else 'NONE'}\n"
-            f"Telegram direct sending is working!"
+            f"Notifications are working!"
         )
-        result = self.send_telegram(msg)
-        if result != 'OK':
-            return f'{result} | {dns_info}'
-        return result
+        return self.send_notification(msg, title='Test Notification')
 
     def load_model_data(self):
         """Fetch multi-model state from GitHub Gist API."""
