@@ -364,12 +364,26 @@ class DashboardState(param.Parameterized):
         try:
             import pickle
             from pathlib import Path
+            intra_data = None
             intra_path = Path('surfer_models/intraday_ml_model.pkl')
             if not intra_path.exists():
                 intra_path = Path(__file__).parent.parent.parent / 'surfer_models' / 'intraday_ml_model.pkl'
             if intra_path.exists():
                 with open(intra_path, 'rb') as f:
                     intra_data = pickle.load(f)
+                logger.info("Intraday ML model loaded from file: %s", intra_path)
+            else:
+                # Fall back to embedded base64 model (for HF Spaces)
+                try:
+                    import base64
+                    from v15.trading.intraday_ml_data import MODEL_B64
+                    raw = base64.b64decode(MODEL_B64.strip())
+                    import io
+                    intra_data = pickle.load(io.BytesIO(raw))
+                    logger.info("Intraday ML model loaded from embedded base64")
+                except ImportError:
+                    logger.warning("Intraday ML model not found (no file or embedded data)")
+            if intra_data:
                 self._intraday_ml_model = intra_data['model']
                 self._intraday_ml_features = intra_data['feature_names']
                 self._intraday_trade_state = {
@@ -377,9 +391,7 @@ class DashboardState(param.Parameterized):
                     'consec_wins': 0, 'consec_losses': 0,
                     'last_trade_date': None,
                 }
-                logger.info("Intraday ML model loaded: %d features", len(self._intraday_ml_features))
-            else:
-                logger.warning("Intraday ML model not found at %s", intra_path)
+                logger.info("Intraday ML model ready: %d features", len(self._intraday_ml_features))
         except Exception as e:
             logger.warning("Intraday ML model load failed: %s", e)
             self._intraday_ml_model = None
