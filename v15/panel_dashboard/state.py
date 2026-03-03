@@ -813,31 +813,65 @@ class DashboardState(param.Parameterized):
         """Send a Telegram message directly via bot API. Returns status string."""
         token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
         chat_id = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
+        logger.info("Telegram send: token=%s (%d chars), chat_id=%s",
+                     'SET' if token else 'MISSING', len(token),
+                     'SET' if chat_id else 'MISSING')
         if not token or not chat_id:
             return 'ERROR: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set'
+
+        url = f'https://api.telegram.org/bot{token}/sendMessage'
+        payload = {'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML'}
+
+        # Try requests library first (better DNS/proxy handling)
         try:
-            import urllib.request
-            import json
-            url = f'https://api.telegram.org/bot{token}/sendMessage'
-            payload = json.dumps({
-                'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML',
-            }).encode()
-            req = urllib.request.Request(
-                url, data=payload, headers={'Content-Type': 'application/json'})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status == 200:
-                    logger.info("Telegram sent OK: %s", msg[:60])
-                    return 'OK'
-                else:
-                    return f'HTTP {resp.status}'
+            import requests as _req
+            logger.info("Telegram: using requests library, URL=%s", url[:60])
+            resp = _req.post(url, json=payload, timeout=15)
+            logger.info("Telegram: HTTP %d, body=%s", resp.status_code, resp.text[:200])
+            if resp.status_code == 200:
+                return 'OK'
+            return f'HTTP {resp.status_code}: {resp.text[:100]}'
+        except ImportError:
+            logger.info("Telegram: requests not available, trying urllib")
         except Exception as e:
-            logger.error("Telegram send failed: %s", e)
+            logger.error("Telegram requests failed: %s", e, exc_info=True)
+            # Fall through to urllib
+
+        # Fall back to urllib
+        try:
+            import json as _json
+            import urllib.request
+            data = _json.dumps(payload).encode()
+            logger.info("Telegram: using urllib, payload=%d bytes", len(data))
+            req = urllib.request.Request(
+                url, data=data, headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = resp.read().decode()
+                logger.info("Telegram urllib: HTTP %d, body=%s", resp.status, body[:200])
+                if resp.status == 200:
+                    return 'OK'
+                return f'HTTP {resp.status}'
+        except Exception as e:
+            logger.error("Telegram urllib failed: %s", e, exc_info=True)
             return f'ERROR: {e}'
 
     def send_test_telegram(self):
-        """Send a test signal to Telegram."""
+        """Send a test signal to Telegram with DNS diagnostics."""
         from datetime import datetime
         import pytz
+        import socket
+
+        # DNS diagnostic
+        dns_info = ''
+        try:
+            ips = socket.getaddrinfo('api.telegram.org', 443, socket.AF_INET)
+            ip_list = [addr[4][0] for addr in ips]
+            dns_info = f'DNS OK: {ip_list[:3]}'
+            logger.info("Telegram DNS resolve: %s", ip_list)
+        except Exception as e:
+            dns_info = f'DNS FAILED: {e}'
+            logger.error("Telegram DNS resolve failed: %s", e)
+
         now = datetime.now(pytz.timezone('US/Eastern'))
         msg = (
             f"🧪 <b>TEST SIGNAL</b>\n"
@@ -847,7 +881,10 @@ class DashboardState(param.Parameterized):
             f"Scanner: {'OK' if self.scanner else 'NONE'}\n"
             f"Telegram direct sending is working!"
         )
-        return self.send_telegram(msg)
+        result = self.send_telegram(msg)
+        if result != 'OK':
+            return f'{result} | {dns_info}'
+        return result
 
     def load_model_data(self):
         """Fetch multi-model state from GitHub Gist API."""

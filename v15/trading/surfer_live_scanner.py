@@ -315,11 +315,13 @@ class SurferLiveScanner:
             req = urllib.request.Request(
                 url, data=payload, headers=self._gist_headers(), method='PATCH'
             )
-            with urllib.request.urlopen(req, timeout=8):
-                pass
-            print(f"[SCANNER] Gist saved ({self.model_tag})")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                print(f"[SCANNER] Gist saved ({self.model_tag}, "
+                      f"{len(payload)/1024:.0f}KB, HTTP {resp.status})")
         except Exception as e:
-            print(f"[SCANNER] Gist save failed: {e}")
+            import traceback
+            print(f"[SCANNER] Gist save FAILED ({self.model_tag}): {e}")
+            traceback.print_exc()
 
     def _apply_state(self, data: dict):
         self.equity = data.get('equity', self.equity)
