@@ -340,9 +340,12 @@ class DashboardState(param.Parameterized):
             self.scanner_intra = None
 
         # Load ML model for Surfer ML path
+        # NOTE: Cannot import surfer_ml directly — it pulls in torch which isn't on HF.
+        # Instead, load the pickle directly and wrap in a minimal GBT shim.
         try:
-            from v15.core.surfer_ml import GBTModel, get_feature_names
+            import pickle
             from pathlib import Path
+            import numpy as np
             model_path = Path('surfer_models/gbt_model.pkl')
             logger.info("GBT model check: cwd=%s, path=%s, exists=%s",
                         Path.cwd(), model_path, model_path.exists())
@@ -350,20 +353,30 @@ class DashboardState(param.Parameterized):
                 model_path = Path(__file__).parent.parent.parent / 'surfer_models' / 'gbt_model.pkl'
                 logger.info("GBT fallback path: %s, exists=%s", model_path, model_path.exists())
             if model_path.exists():
-                import os
-                fsize = os.path.getsize(model_path)
+                fsize = model_path.stat().st_size
                 logger.info("GBT model file: %s (%d bytes)", model_path, fsize)
                 if fsize < 200:
-                    # LFS pointer — read first line to confirm
                     with open(model_path, 'rb') as f:
                         head = f.read(200)
                     logger.warning("GBT model file too small (%d bytes) — likely LFS pointer: %s",
                                    fsize, head[:100])
                 else:
-                    self._ml_model = GBTModel.load(str(model_path))
-                    self._ml_feature_names = get_feature_names()
+                    with open(model_path, 'rb') as f:
+                        data = pickle.load(f)
+                    # Build a lightweight GBT wrapper (avoids importing surfer_ml + torch)
+                    class _GBTShim:
+                        def __init__(self, models, feature_names):
+                            self.models = models
+                            self.feature_names = feature_names
+                        def predict(self, X):
+                            results = {}
+                            for name, mdl in self.models.items():
+                                results[name] = mdl.predict(X)
+                            return results
+                    self._ml_model = _GBTShim(data['models'], data['feature_names'])
+                    self._ml_feature_names = data['feature_names']
                     self._ml_history_buffer = []
-                    import numpy as np
+                    # Verify with a test prediction
                     test_pred = self._ml_model.predict(
                         np.zeros((1, len(self._ml_feature_names)), dtype=np.float32))
                     logger.info("ML model loaded: %d features, keys=%s",
@@ -386,8 +399,7 @@ class DashboardState(param.Parameterized):
                 intra_path = Path(__file__).parent.parent.parent / 'surfer_models' / 'intraday_ml_model.pkl'
                 logger.info("Intraday fallback path: %s, exists=%s", intra_path, intra_path.exists())
             if intra_path.exists():
-                import os
-                fsize = os.path.getsize(intra_path)
+                fsize = intra_path.stat().st_size
                 logger.info("Intraday model file: %s (%d bytes)", intra_path, fsize)
                 if fsize < 200:
                     with open(intra_path, 'rb') as f:

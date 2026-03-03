@@ -3203,11 +3203,15 @@ class RegimeConditionalModel:
 # Architecture 7: Temporal Attention Network (Sliding Window)
 # ---------------------------------------------------------------------------
 
-import torch
-import torch.nn as nn
+try:
+    import torch
+    import torch.nn as nn
+except ImportError:
+    torch = None
+    nn = None
 
 
-class TemporalAttentionNet(nn.Module):
+class TemporalAttentionNet(nn.Module if nn is not None else object):
     """
     Compact model that processes a sliding window of top-K feature snapshots.
 
