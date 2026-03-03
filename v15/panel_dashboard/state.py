@@ -98,14 +98,15 @@ class DashboardState(param.Parameterized):
         except Exception as e:
             logger.error("Failed to fetch 5-min data: %s", e)
 
-        # Initialize WebSocket client
+        # Price feed: yfinance REST (no WebSocket)
+        self._ws_client = None
         try:
-            from v15.data.finnhub_ws import get_ws_client
-            self._ws_client = get_ws_client()
-            if self._ws_client:
-                logger.info("WebSocket client initialized")
-        except Exception:
-            pass
+            from v15.live_data import YFinanceLiveData
+            self._live_data = YFinanceLiveData(symbols=['TSLA', 'SPY'])
+            logger.info("yfinance REST price feed initialized")
+        except Exception as e:
+            self._live_data = None
+            logger.warning("yfinance init failed: %s", e)
 
         # Initialize scanner
         self._init_scanner()
@@ -120,46 +121,21 @@ class DashboardState(param.Parameterized):
             logger.error("Initial analysis failed: %s\n%s", e, traceback.format_exc())
 
     def update_prices(self):
-        """500ms periodic callback: read WebSocket prices, check exits."""
+        """2s periodic callback: fetch prices via yfinance REST."""
         price = 0.0
-        source = 'bar close'
+        source = 'REST'
 
-        # Try WebSocket first
-        if self._ws_client:
+        if self._live_data:
             try:
-                tick = self._ws_client.get_price('TSLA')
-                if tick and tick.price > 0:
-                    price = tick.price
-                    source = 'LIVE' if tick.is_fresh else f'WS ({tick.age_seconds:.0f}s ago)'
-            except Exception:
-                pass
-
-            try:
-                spy_tick = self._ws_client.get_price('SPY')
-                if spy_tick and spy_tick.price > 0 and spy_tick.price != self.spy_price:
-                    self.spy_price = spy_tick.price
-            except Exception:
-                pass
-
-        # Fall back to REST
-        if price == 0.0:
-            try:
-                from v15.live_data import YFinanceLiveData
-                rt = YFinanceLiveData().get_realtime_prices()
+                rt = self._live_data.get_realtime_prices()
                 if rt.get('TSLA'):
                     price = float(rt['TSLA'])
-                    source = 'REST'
                 if rt.get('SPY'):
                     spy = float(rt['SPY'])
                     if spy != self.spy_price:
                         self.spy_price = spy
             except Exception:
                 pass
-
-        # Fall back to bar close
-        if price == 0.0 and self.current_tsla is not None and len(self.current_tsla) > 0:
-            price = float(self.current_tsla['close'].iloc[-1])
-            source = 'bar close'
 
         if price > 0:
             price_changed = price != self.tsla_price
@@ -910,9 +886,10 @@ class DashboardState(param.Parameterized):
                         return 'OK'
                 except Exception as ip_e:
                     logger.warning("Telegram IP %s failed: %s", ip, ip_e)
+                    _last_ip_err = f'{ip}: {type(ip_e).__name__}: {ip_e}'
                     continue
 
-            return f'ERROR: DNS and IP fallbacks all failed'
+            return f'ERROR: DNS and IP fallbacks all failed | Last IP error: {_last_ip_err}'
         except ImportError:
             logger.info("Telegram: requests not available, trying urllib")
         except Exception as e:
