@@ -1,0 +1,17 @@
+[Unit]
+Description=x14 c14a Trading Scanner
+After=network.target
+
+[Service]
+Type=simple
+User=opc
+WorkingDirectory=/home/opc/x14
+Environment=PYTHONPATH=/home/opc/x14
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/opc/x14/.env
+ExecStart=/usr/bin/python3.11 v15/panel_dashboard/app.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

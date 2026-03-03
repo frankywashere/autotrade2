@@ -42,7 +42,7 @@ def create_app():
     state = DashboardState()
 
     # Load market data (blocking on startup)
-    logger.info("Starting X14 c14 Panel Dashboard...")
+    logger.info("Starting X14 c14a Panel Dashboard...")
     state.load_market_data()
     logger.info("Market data loaded. TSLA price=%.2f, scanner=%s, scanner_dw=%s, scanner_ml=%s, scanner_intra=%s",
                 state.tsla_price,
@@ -104,17 +104,18 @@ def create_app():
         startup_msg += f"\nSCANNER ERROR: {scanner_err[:200]}"
     if gbt_err:
         startup_msg += f"\nGBT ERROR: {gbt_err[:200]}"
-    state.send_notification(startup_msg, title='c14 Startup')
+    state.send_notification(startup_msg, title='c14a Startup')
 
     # Load initial model comparison data
     state.load_model_data()
     logger.info("Model data loaded. Keys=%d", len(state.model_data))
 
-    # Periodic callbacks
-    logger.info("Registering periodic callbacks...")
-    pn.state.add_periodic_callback(state.update_prices, period=2000)  # 2s REST poll
-    pn.state.add_periodic_callback(state.run_analysis, period=150_000)   # 2.5 min
-    pn.state.add_periodic_callback(state.load_model_data, period=3_600_000)  # 1 hour
+    # Start background loops (run even without browser)
+    logger.info("Starting background loops...")
+    state.start_background_loops()
+
+    # UI refresh only — triggers re-render when browser is connected
+    pn.state.add_periodic_callback(lambda: None, period=2000)
 
     # Sidebar controls
     run_btn = pn.widgets.Button(name='Run Analysis Now', button_type='primary')
@@ -179,7 +180,7 @@ def create_app():
 
     # Build template
     template = pn.template.FastListTemplate(
-        title='c14 Trading Dashboard',
+        title='c14a Trading Dashboard',
         theme='dark',
         accent_base_color='#00c853',
         header_background='#111',
@@ -207,7 +208,7 @@ def create_app():
             ),
         ],
     )
-    logger.info("c14 Dashboard template built successfully — ready to serve")
+    logger.info("c14a Dashboard template built successfully — ready to serve")
     return template
 
 
@@ -220,7 +221,7 @@ if __name__.startswith('bokeh'):
     except Exception:
         logger.error("FATAL: create_app() failed:\n%s", traceback.format_exc())
         pn.pane.HTML(
-            f"<h1>c14 Startup Error</h1><pre>{traceback.format_exc()}</pre>",
+            f"<h1>c14a Startup Error</h1><pre>{traceback.format_exc()}</pre>",
             sizing_mode='stretch_width',
         ).servable()
 elif __name__ == '__main__':

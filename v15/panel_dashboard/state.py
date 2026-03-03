@@ -3,6 +3,7 @@
 import os
 import logging
 import threading
+import time
 import traceback
 from datetime import datetime
 
@@ -98,8 +99,17 @@ class DashboardState(param.Parameterized):
         except Exception as e:
             logger.error("Failed to fetch 5-min data: %s", e)
 
-        # Price feed: yfinance REST only
-        self._ws_client = None
+        # Price feed: WebSocket primary, REST fallback
+        try:
+            from v15.data.finnhub_ws import get_ws_client
+            self._ws_client = get_ws_client()
+            if self._ws_client:
+                logger.info("Finnhub WebSocket enabled")
+            else:
+                logger.warning("Finnhub WebSocket unavailable — REST only")
+        except Exception as e:
+            logger.warning("WebSocket init failed: %s — REST only", e)
+            self._ws_client = None
         self._price_err_count = 0
 
         # Initialize scanner
@@ -115,29 +125,46 @@ class DashboardState(param.Parameterized):
             logger.error("Initial analysis failed: %s\n%s", e, traceback.format_exc())
 
     def update_prices(self):
-        """2s periodic callback: fetch prices via yfinance REST."""
+        """2s periodic callback: fetch prices via WebSocket or yfinance REST."""
         price = 0.0
         source = 'REST'
 
-        try:
-            import yfinance as yf
-            tsla = yf.Ticker('TSLA')
-            fi = tsla.fast_info
-            price = float(fi.last_price) if hasattr(fi, 'last_price') and fi.last_price else 0.0
-            if price > 0:
-                self._price_err_count = 0
+        # Try WebSocket first
+        if self._ws_client:
+            tick = self._ws_client.get_price('TSLA')
+            if tick and tick.is_fresh:
+                price = tick.price
+                source = 'WS'
+            spy_tick = self._ws_client.get_price('SPY')
+            if spy_tick and spy_tick.is_fresh and spy_tick.price > 0:
+                if spy_tick.price != self.spy_price:
+                    self.spy_price = spy_tick.price
 
-            spy = yf.Ticker('SPY')
-            spy_fi = spy.fast_info
-            spy_price = float(spy_fi.last_price) if hasattr(spy_fi, 'last_price') and spy_fi.last_price else 0.0
-            if spy_price > 0 and spy_price != self.spy_price:
-                self.spy_price = spy_price
-        except Exception as e:
-            self._price_err_count += 1
-            if self._price_err_count <= 3 or self._price_err_count % 30 == 0:
-                logger.warning("Price fetch failed (%d): %s", self._price_err_count, e)
+        # REST fallback if WebSocket didn't provide fresh price
+        if price == 0.0:
+            try:
+                import yfinance as yf
+                tsla = yf.Ticker('TSLA')
+                fi = tsla.fast_info
+                price = float(fi.last_price) if hasattr(fi, 'last_price') and fi.last_price else 0.0
+                if price > 0:
+                    self._price_err_count = 0
+                    source = 'REST'
 
-        # Fallback to last bar close if REST fails
+                # Only fetch SPY via REST if WebSocket didn't provide it
+                if not (self._ws_client and self._ws_client.get_price('SPY')
+                        and self._ws_client.get_price('SPY').is_fresh):
+                    spy = yf.Ticker('SPY')
+                    spy_fi = spy.fast_info
+                    spy_price = float(spy_fi.last_price) if hasattr(spy_fi, 'last_price') and spy_fi.last_price else 0.0
+                    if spy_price > 0 and spy_price != self.spy_price:
+                        self.spy_price = spy_price
+            except Exception as e:
+                self._price_err_count += 1
+                if self._price_err_count <= 3 or self._price_err_count % 30 == 0:
+                    logger.warning("Price fetch failed (%d): %s", self._price_err_count, e)
+
+        # Fallback to last bar close if both WS and REST fail
         if price == 0.0 and self.current_tsla is not None and len(self.current_tsla) > 0:
             price = float(self.current_tsla['close'].iloc[-1])
             source = 'bar close'
@@ -296,6 +323,62 @@ class DashboardState(param.Parameterized):
 
             # Evaluate intraday signal
             self._evaluate_intraday(analysis)
+
+    def start_background_loops(self):
+        """Start daemon threads for price/analysis/model — run without browser."""
+        if getattr(self, '_bg_started', False):
+            return
+        self._bg_started = True
+
+        def _price_loop():
+            while True:
+                try:
+                    self.update_prices()
+                except Exception as e:
+                    logger.error("Price loop error: %s", e)
+                time.sleep(2)
+
+        def _analysis_loop():
+            time.sleep(30)  # Initial delay — let prices stabilize
+            while True:
+                try:
+                    self._run_analysis_bg()
+                except Exception as e:
+                    logger.error("Analysis loop error: %s", e)
+                time.sleep(150)
+
+        def _model_loop():
+            while True:
+                time.sleep(3600)
+                try:
+                    self.load_model_data()
+                except Exception as e:
+                    logger.error("Model reload error: %s", e)
+
+        for fn, name in [(_price_loop, 'price'), (_analysis_loop, 'analysis'), (_model_loop, 'model')]:
+            t = threading.Thread(target=fn, daemon=True, name=f'x14-{name}')
+            t.start()
+        logger.info("Background loops started (price/analysis/model)")
+
+    def _run_analysis_bg(self):
+        """Background-safe analysis: compute + apply without requiring Panel session."""
+        if not self.native_tf_data:
+            return
+        if self._analysis_running:
+            return
+        self._analysis_running = True
+        try:
+            results = self._run_analysis_core()
+            if results:
+                # Try Bokeh thread first (if browser connected), else direct
+                try:
+                    pn.state.execute(lambda r=results: self._apply_analysis_results(*r))
+                except Exception:
+                    self._apply_analysis_results(*results)
+        except Exception as e:
+            logger.error("Analysis failed: %s\n%s", e, traceback.format_exc())
+        finally:
+            self._analysis_running = False
 
     def _init_scanner(self):
         """Create SurferLiveScanners with Gist credentials from env vars."""
@@ -883,30 +966,57 @@ class DashboardState(param.Parameterized):
             return True  # On error, accept the signal
 
     def send_notification(self, msg: str, title: str = '') -> str:
-        """Send a push notification via ntfy.sh. Returns status string."""
-        topic = os.environ.get('NTFY_TOPIC', 'c14-xyz').strip()
-        url = f'https://ntfy.sh/{topic}'
+        """Send a push notification via Telegram (primary) or ntfy.sh (fallback).
 
-        try:
-            import requests as _req
-            headers = {'Title': title or 'c14 Alert'}
-            resp = _req.post(url, data=msg.encode('utf-8'), headers=headers, timeout=10)
-            logger.info("ntfy: HTTP %d, topic=%s", resp.status_code, topic)
-            if resp.status_code == 200:
-                return 'OK'
-            return f'HTTP {resp.status_code}: {resp.text[:100]}'
-        except Exception as e:
-            logger.error("ntfy failed: %s", e)
-            return f'ERROR: {e}'
+        Returns status string.
+        """
+        # Try Telegram first
+        bot_token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
+        chat_id = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
+        if bot_token and chat_id:
+            try:
+                import requests as _req
+                text = f"*{title or 'c14a Alert'}*\n{msg}" if title else msg
+                resp = _req.post(
+                    f'https://api.telegram.org/bot{bot_token}/sendMessage',
+                    json={'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'},
+                    timeout=10,
+                )
+                logger.info("Telegram: HTTP %d", resp.status_code)
+                if resp.status_code == 200:
+                    return 'OK'
+                logger.warning("Telegram failed: %s", resp.text[:200])
+            except Exception as e:
+                logger.warning("Telegram error: %s", e)
+
+        # Fallback to ntfy
+        topic = os.environ.get('NTFY_TOPIC', '').strip()
+        if topic:
+            try:
+                import requests as _req
+                headers = {'Title': title or 'c14a Alert'}
+                resp = _req.post(
+                    f'https://ntfy.sh/{topic}',
+                    data=msg.encode('utf-8'), headers=headers, timeout=10,
+                )
+                logger.info("ntfy: HTTP %d, topic=%s", resp.status_code, topic)
+                if resp.status_code == 200:
+                    return 'OK'
+                return f'HTTP {resp.status_code}: {resp.text[:100]}'
+            except Exception as e:
+                logger.error("ntfy failed: %s", e)
+                return f'ERROR: {e}'
+
+        return 'NO_CHANNEL'
 
     def send_test_notification(self):
-        """Send a test push notification via ntfy.sh."""
+        """Send a test push notification."""
         from datetime import datetime
         import pytz
 
         now = datetime.now(pytz.timezone('US/Eastern'))
         msg = (
-            f"Dashboard: c14 Trading Dashboard\n"
+            f"Dashboard: c14a Trading Dashboard\n"
             f"TSLA: ${self.tsla_price:.2f}\n"
             f"Time: {now.strftime('%Y-%m-%d %H:%M:%S ET')}\n"
             f"Scanner: {'OK' if self.scanner else 'NONE'}\n"
