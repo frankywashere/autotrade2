@@ -471,7 +471,7 @@ class SurferLiveScanner:
             'ext_opens_today': self._ext_opens_today,
             'ext_closes_today': self._ext_closes_today,
             'positions': {k: v.to_dict() for k, v in self.positions.items()},
-            'closed_trades': [t.to_dict() for t in self.closed_trades[-200:]],
+            'closed_trades': [t.to_dict() for t in self.closed_trades[-1000:]],
             'signal_history': self.signal_history[-MAX_SIGNAL_HISTORY:],
         }
         # Always save locally
