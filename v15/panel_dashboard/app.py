@@ -70,6 +70,19 @@ def create_app():
     run_btn = pn.widgets.Button(name='Run Analysis Now', button_type='primary')
     run_btn.on_click(lambda e: state.run_analysis())
 
+    tg_test_btn = pn.widgets.Button(name='Test Telegram', button_type='warning')
+    tg_status = pn.pane.Markdown('', width=200)
+
+    def _test_telegram(e):
+        tg_status.object = '*Sending...*'
+        result = state.send_test_telegram()
+        if result == 'OK':
+            tg_status.object = '**Sent OK**'
+        else:
+            tg_status.object = f'**Failed:** {result}'
+
+    tg_test_btn.on_click(_test_telegram)
+
     reset_btn = pn.widgets.Button(name='Reset Scanner', button_type='danger')
 
     def _reset_scanner(e):
@@ -116,6 +129,9 @@ def create_app():
             kill_switch,
             pn.layout.Divider(),
             last_analysis_display,
+            pn.layout.Divider(),
+            tg_test_btn,
+            tg_status,
             pn.layout.Divider(),
             reset_btn,
         ],

@@ -65,20 +65,14 @@ _TG_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
 print(f"[SCANNER] Telegram config: token={'SET' if _TG_TOKEN else 'MISSING'} "
       f"({len(_TG_TOKEN)} chars), chat_id={'SET' if _TG_CHAT_ID else 'MISSING'}")
 
-# Queue for alerts that fail to send directly (flushed to Gist on next save)
-_PENDING_TG_ALERTS: list = []
-
-
 def _send_telegram(msg: str, model_tag: str = ''):
-    """Send a Telegram message directly with retries, or queue for Gist relay."""
+    """Send a Telegram message directly via bot API with retries."""
     tag = model_tag or MODEL_TAG
     full_msg = f"[{tag}] {msg}"
     if not _TG_TOKEN or not _TG_CHAT_ID:
-        _PENDING_TG_ALERTS.append(full_msg)
-        print(f"[SCANNER] Telegram queued (no creds): {full_msg[:80]}")
+        print(f"[SCANNER] Telegram skipped (no creds): {full_msg[:80]}")
         return
 
-    # Try direct send with retries (requests > urllib for reliability)
     import time as _time
     try:
         import requests as _req
@@ -93,20 +87,18 @@ def _send_telegram(msg: str, model_tag: str = ''):
                     print(f"[SCANNER] Telegram sent OK: {full_msg[:60]}")
                     return
                 elif resp.status_code == 429:
-                    # Rate limited — wait and retry
                     retry_after = resp.json().get('parameters', {}).get('retry_after', 5)
                     print(f"[SCANNER] Telegram rate limited, waiting {retry_after}s")
                     _time.sleep(retry_after)
                 else:
                     print(f"[SCANNER] Telegram HTTP {resp.status_code}: {resp.text[:100]}")
-                    break  # Non-retryable error
+                    break
             except (_req.exceptions.ConnectionError, _req.exceptions.Timeout) as e:
                 if attempt < 2:
-                    _time.sleep(2 ** attempt)  # 1s, 2s backoff
+                    _time.sleep(2 ** attempt)
                     continue
                 print(f"[SCANNER] Telegram failed after 3 attempts: {e}")
     except ImportError:
-        # Fall back to urllib if requests not available
         try:
             url = f'https://api.telegram.org/bot{_TG_TOKEN}/sendMessage'
             payload = json.dumps({
@@ -119,10 +111,6 @@ def _send_telegram(msg: str, model_tag: str = ''):
                 return
         except Exception as e:
             print(f"[SCANNER] Telegram urllib failed: {e}")
-
-    # All direct attempts failed — queue for Gist relay
-    _PENDING_TG_ALERTS.append(full_msg)
-    print(f"[SCANNER] Telegram queued for Gist relay: {full_msg[:60]}")
 
 
 @dataclass
@@ -312,8 +300,7 @@ class SurferLiveScanner:
         """Push this model's state to GitHub Gist (read-modify-write, non-blocking best-effort).
 
         Reads existing Gist, updates only our MODEL_TAG slot, writes back.
-        Other models' data is preserved. Also flushes any pending Telegram
-        alerts into `_pending_telegram` for the GitHub Actions relay.
+        Other models' data is preserved.
         """
         if not self.gist_id or not self.github_token:
             return
@@ -321,13 +308,6 @@ class SurferLiveScanner:
             full = self._gist_load_full()
             full[self.model_tag] = data
             full['_last_updated'] = _now_et().isoformat()
-            # Flush pending Telegram alerts into Gist for relay
-            if _PENDING_TG_ALERTS:
-                existing = full.get('_pending_telegram', [])
-                existing.extend(_PENDING_TG_ALERTS)
-                full['_pending_telegram'] = existing[-50:]  # Cap at 50
-                _PENDING_TG_ALERTS.clear()
-                print(f"[SCANNER] Flushed {len(existing)} Telegram alerts to Gist")
             url = f'https://api.github.com/gists/{self.gist_id}'
             payload = json.dumps({
                 'files': {GIST_FILE_NAME: {'content': json.dumps(full, indent=2)}}

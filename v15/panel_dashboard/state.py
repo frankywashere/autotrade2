@@ -809,6 +809,46 @@ class DashboardState(param.Parameterized):
             logger.warning("Intraday ML filter error: %s", e)
             return True  # On error, accept the signal
 
+    def send_telegram(self, msg: str) -> str:
+        """Send a Telegram message directly via bot API. Returns status string."""
+        token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
+        chat_id = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
+        if not token or not chat_id:
+            return 'ERROR: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set'
+        try:
+            import urllib.request
+            import json
+            url = f'https://api.telegram.org/bot{token}/sendMessage'
+            payload = json.dumps({
+                'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML',
+            }).encode()
+            req = urllib.request.Request(
+                url, data=payload, headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status == 200:
+                    logger.info("Telegram sent OK: %s", msg[:60])
+                    return 'OK'
+                else:
+                    return f'HTTP {resp.status}'
+        except Exception as e:
+            logger.error("Telegram send failed: %s", e)
+            return f'ERROR: {e}'
+
+    def send_test_telegram(self):
+        """Send a test signal to Telegram."""
+        from datetime import datetime
+        import pytz
+        now = datetime.now(pytz.timezone('US/Eastern'))
+        msg = (
+            f"🧪 <b>TEST SIGNAL</b>\n"
+            f"Dashboard: c14 Trading Dashboard\n"
+            f"TSLA: ${self.tsla_price:.2f}\n"
+            f"Time: {now.strftime('%Y-%m-%d %H:%M:%S ET')}\n"
+            f"Scanner: {'OK' if self.scanner else 'NONE'}\n"
+            f"Telegram direct sending is working!"
+        )
+        return self.send_telegram(msg)
+
     def load_model_data(self):
         """Fetch multi-model state from GitHub Gist API."""
         import json
