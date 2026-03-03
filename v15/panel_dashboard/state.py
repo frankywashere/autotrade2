@@ -343,21 +343,34 @@ class DashboardState(param.Parameterized):
             from v15.core.surfer_ml import GBTModel, get_feature_names
             from pathlib import Path
             model_path = Path('surfer_models/gbt_model.pkl')
+            logger.info("GBT model check: cwd=%s, path=%s, exists=%s",
+                        Path.cwd(), model_path, model_path.exists())
             if not model_path.exists():
                 model_path = Path(__file__).parent.parent.parent / 'surfer_models' / 'gbt_model.pkl'
+                logger.info("GBT fallback path: %s, exists=%s", model_path, model_path.exists())
             if model_path.exists():
-                self._ml_model = GBTModel.load(str(model_path))
-                self._ml_feature_names = get_feature_names()
-                self._ml_history_buffer = []
-                import numpy as np
-                test_pred = self._ml_model.predict(
-                    np.zeros((1, len(self._ml_feature_names)), dtype=np.float32))
-                logger.info("ML model loaded: %d features, keys=%s",
-                            len(self._ml_feature_names), list(test_pred.keys()))
+                import os
+                fsize = os.path.getsize(model_path)
+                logger.info("GBT model file: %s (%d bytes)", model_path, fsize)
+                if fsize < 200:
+                    # LFS pointer — read first line to confirm
+                    with open(model_path, 'rb') as f:
+                        head = f.read(200)
+                    logger.warning("GBT model file too small (%d bytes) — likely LFS pointer: %s",
+                                   fsize, head[:100])
+                else:
+                    self._ml_model = GBTModel.load(str(model_path))
+                    self._ml_feature_names = get_feature_names()
+                    self._ml_history_buffer = []
+                    import numpy as np
+                    test_pred = self._ml_model.predict(
+                        np.zeros((1, len(self._ml_feature_names)), dtype=np.float32))
+                    logger.info("ML model loaded: %d features, keys=%s",
+                                len(self._ml_feature_names), list(test_pred.keys()))
             else:
                 logger.warning("ML model not found at %s", model_path)
         except Exception as e:
-            logger.warning("ML model load failed: %s", e)
+            logger.warning("ML model load failed: %s — %s", e, traceback.format_exc())
             self._ml_model = None
 
         # Load intraday ML model (LightGBM filter for intraday signals)
@@ -366,12 +379,23 @@ class DashboardState(param.Parameterized):
             from pathlib import Path
             intra_data = None
             intra_path = Path('surfer_models/intraday_ml_model.pkl')
+            logger.info("Intraday model check: path=%s, exists=%s", intra_path, intra_path.exists())
             if not intra_path.exists():
                 intra_path = Path(__file__).parent.parent.parent / 'surfer_models' / 'intraday_ml_model.pkl'
+                logger.info("Intraday fallback path: %s, exists=%s", intra_path, intra_path.exists())
             if intra_path.exists():
-                with open(intra_path, 'rb') as f:
-                    intra_data = pickle.load(f)
-                logger.info("Intraday ML model loaded from file: %s", intra_path)
+                import os
+                fsize = os.path.getsize(intra_path)
+                logger.info("Intraday model file: %s (%d bytes)", intra_path, fsize)
+                if fsize < 200:
+                    with open(intra_path, 'rb') as f:
+                        head = f.read(200)
+                    logger.warning("Intraday model file too small (%d bytes) — likely LFS pointer: %s",
+                                   fsize, head[:100])
+                else:
+                    with open(intra_path, 'rb') as f:
+                        intra_data = pickle.load(f)
+                    logger.info("Intraday ML model loaded from file: %s", intra_path)
             else:
                 # Fall back to embedded base64 model (for HF Spaces)
                 try:
@@ -395,7 +419,7 @@ class DashboardState(param.Parameterized):
                 logger.info("Intraday ML model ready: %d features, threshold=%.2f",
                             len(self._intraday_ml_features), self._intraday_ml_threshold)
         except Exception as e:
-            logger.warning("Intraday ML model load failed: %s", e)
+            logger.warning("Intraday ML model load failed: %s — %s", e, traceback.format_exc())
             self._intraday_ml_model = None
 
     def _evaluate_surfer_ml(self, analysis):

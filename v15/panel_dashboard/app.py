@@ -54,18 +54,39 @@ def create_app():
     # Log ML model status + send startup notification
     gbt_ok = hasattr(state, '_ml_model') and state._ml_model is not None
     intra_ok = hasattr(state, '_intraday_ml_model') and state._intraday_ml_model is not None
+
+    # Build detailed status messages
     gbt_msg = f"LOADED ({len(state._ml_feature_names or [])} features)" if gbt_ok else "NOT LOADED"
     intra_msg = (f"LOADED ({len(getattr(state, '_intraday_ml_features', []) or [])} features, "
                  f"threshold={getattr(state, '_intraday_ml_threshold', 0.5):.2f})") if intra_ok else "NOT LOADED"
 
+    # Check file existence for diagnostics
+    from pathlib import Path
+    gbt_path = Path('surfer_models/gbt_model.pkl')
+    intra_path = Path('surfer_models/intraday_ml_model.pkl')
+    gbt_diag = ""
+    intra_diag = ""
+    if not gbt_ok:
+        if gbt_path.exists():
+            import os
+            gbt_diag = f" (file exists, {os.path.getsize(gbt_path)} bytes — load error)"
+        else:
+            gbt_diag = f" (file missing at {gbt_path.resolve()})"
+    if not intra_ok:
+        if intra_path.exists():
+            import os
+            intra_diag = f" (file exists, {os.path.getsize(intra_path)} bytes — load error)"
+        else:
+            intra_diag = f" (file missing at {intra_path.resolve()})"
+
     if gbt_ok:
         logger.info("ML model (GBT): %s", gbt_msg)
     else:
-        logger.warning("ML model (GBT): %s — c14-ml signals will be skipped", gbt_msg)
+        logger.warning("ML model (GBT): %s%s — c14-ml signals will be skipped", gbt_msg, gbt_diag)
     if intra_ok:
         logger.info("ML model (Intraday): %s", intra_msg)
     else:
-        logger.warning("ML model (Intraday): %s — c14-intra ML filter disabled", intra_msg)
+        logger.warning("ML model (Intraday): %s%s — c14-intra ML filter disabled", intra_msg, intra_diag)
 
     # Send startup status via ntfy
     startup_msg = (
@@ -73,8 +94,8 @@ def create_app():
         f"c14-dw={'OK' if state.scanner_dw else 'FAIL'}, "
         f"c14-ml={'OK' if state.scanner_ml else 'FAIL'}, "
         f"c14-intra={'OK' if state.scanner_intra else 'FAIL'}\n"
-        f"GBT model: {gbt_msg}\n"
-        f"Intraday model: {intra_msg}\n"
+        f"GBT model: {gbt_msg}{gbt_diag}\n"
+        f"Intraday model: {intra_msg}{intra_diag}\n"
         f"TSLA price: ${state.tsla_price:.2f}"
     )
     state.send_notification(startup_msg, title='c14 Startup')
