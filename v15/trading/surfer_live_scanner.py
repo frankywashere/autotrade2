@@ -65,47 +65,58 @@ _TG_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
 print(f"[SCANNER] Telegram config: token={'SET' if _TG_TOKEN else 'MISSING'} "
       f"({len(_TG_TOKEN)} chars), chat_id={'SET' if _TG_CHAT_ID else 'MISSING'}")
 
+_TG_IPS = ['149.154.167.220', '149.154.166.110']  # api.telegram.org fallback IPs
+
+
 def _send_telegram(msg: str, model_tag: str = ''):
-    """Send a Telegram message directly via bot API with retries."""
+    """Send a Telegram message directly via bot API with DNS fallback."""
     tag = model_tag or MODEL_TAG
     full_msg = f"[{tag}] {msg}"
     if not _TG_TOKEN or not _TG_CHAT_ID:
         print(f"[SCANNER] Telegram skipped (no creds): {full_msg[:80]}")
         return
 
+    url = f'https://api.telegram.org/bot{_TG_TOKEN}/sendMessage'
+    payload = {'chat_id': _TG_CHAT_ID, 'text': full_msg, 'parse_mode': 'HTML'}
+
     import time as _time
     try:
         import requests as _req
-        for attempt in range(3):
-            try:
-                resp = _req.post(
-                    f'https://api.telegram.org/bot{_TG_TOKEN}/sendMessage',
-                    json={'chat_id': _TG_CHAT_ID, 'text': full_msg, 'parse_mode': 'HTML'},
-                    timeout=10,
-                )
+        # Try normal DNS first
+        try:
+            resp = _req.post(url, json=payload, timeout=10)
+            if resp.status_code == 200:
+                print(f"[SCANNER] Telegram sent OK: {full_msg[:60]}")
+                return
+            elif resp.status_code == 429:
+                retry_after = resp.json().get('parameters', {}).get('retry_after', 5)
+                _time.sleep(retry_after)
+                resp = _req.post(url, json=payload, timeout=10)
                 if resp.status_code == 200:
-                    print(f"[SCANNER] Telegram sent OK: {full_msg[:60]}")
+                    print(f"[SCANNER] Telegram sent OK (retry): {full_msg[:60]}")
                     return
-                elif resp.status_code == 429:
-                    retry_after = resp.json().get('parameters', {}).get('retry_after', 5)
-                    print(f"[SCANNER] Telegram rate limited, waiting {retry_after}s")
-                    _time.sleep(retry_after)
-                else:
-                    print(f"[SCANNER] Telegram HTTP {resp.status_code}: {resp.text[:100]}")
-                    break
-            except (_req.exceptions.ConnectionError, _req.exceptions.Timeout) as e:
-                if attempt < 2:
-                    _time.sleep(2 ** attempt)
+            print(f"[SCANNER] Telegram HTTP {resp.status_code}: {resp.text[:100]}")
+        except _req.exceptions.ConnectionError:
+            # DNS failed — try hardcoded IPs
+            for ip in _TG_IPS:
+                try:
+                    ip_url = f'https://{ip}/bot{_TG_TOKEN}/sendMessage'
+                    resp = _req.post(
+                        ip_url, json=payload, timeout=10,
+                        headers={'Host': 'api.telegram.org'},
+                        verify=False,
+                    )
+                    if resp.status_code == 200:
+                        print(f"[SCANNER] Telegram sent OK (IP {ip}): {full_msg[:60]}")
+                        return
+                except Exception:
                     continue
-                print(f"[SCANNER] Telegram failed after 3 attempts: {e}")
+            print(f"[SCANNER] Telegram: DNS and IP fallbacks all failed")
     except ImportError:
         try:
-            url = f'https://api.telegram.org/bot{_TG_TOKEN}/sendMessage'
-            payload = json.dumps({
-                'chat_id': _TG_CHAT_ID, 'text': full_msg, 'parse_mode': 'HTML',
-            }).encode()
             req = urllib.request.Request(
-                url, data=payload, headers={'Content-Type': 'application/json'})
+                url, data=json.dumps(payload).encode(),
+                headers={'Content-Type': 'application/json'})
             with urllib.request.urlopen(req, timeout=10):
                 print(f"[SCANNER] Telegram sent OK (urllib): {full_msg[:60]}")
                 return

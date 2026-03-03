@@ -822,32 +822,59 @@ class DashboardState(param.Parameterized):
         url = f'https://api.telegram.org/bot{token}/sendMessage'
         payload = {'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML'}
 
-        # Try requests library first (better DNS/proxy handling)
+        # Try requests with DNS override if needed
         try:
             import requests as _req
-            logger.info("Telegram: using requests library, URL=%s", url[:60])
-            resp = _req.post(url, json=payload, timeout=15)
-            logger.info("Telegram: HTTP %d, body=%s", resp.status_code, resp.text[:200])
-            if resp.status_code == 200:
-                return 'OK'
-            return f'HTTP {resp.status_code}: {resp.text[:100]}'
+            from urllib3.util.retry import Retry
+            from requests.adapters import HTTPAdapter
+
+            # First try normal DNS
+            logger.info("Telegram: trying normal request to %s", url[:60])
+            try:
+                resp = _req.post(url, json=payload, timeout=15)
+                logger.info("Telegram: HTTP %d, body=%s", resp.status_code, resp.text[:200])
+                if resp.status_code == 200:
+                    return 'OK'
+                return f'HTTP {resp.status_code}: {resp.text[:100]}'
+            except _req.exceptions.ConnectionError as e:
+                logger.warning("Telegram normal DNS failed: %s, trying IP fallback", e)
+
+            # DNS failed — try with hardcoded IP (api.telegram.org = 149.154.167.220)
+            # Use forced IP via custom session
+            _TG_IPS = ['149.154.167.220', '149.154.166.110']
+            for ip in _TG_IPS:
+                try:
+                    ip_url = f'https://{ip}/bot{token}/sendMessage'
+                    logger.info("Telegram: trying IP fallback %s", ip)
+                    resp = _req.post(
+                        ip_url, json=payload, timeout=15,
+                        headers={'Host': 'api.telegram.org'},
+                        verify=False,  # IP won't match cert CN
+                    )
+                    logger.info("Telegram IP %s: HTTP %d, body=%s",
+                                ip, resp.status_code, resp.text[:200])
+                    if resp.status_code == 200:
+                        return 'OK'
+                except Exception as ip_e:
+                    logger.warning("Telegram IP %s failed: %s", ip, ip_e)
+                    continue
+
+            return f'ERROR: DNS and IP fallbacks all failed'
         except ImportError:
             logger.info("Telegram: requests not available, trying urllib")
         except Exception as e:
-            logger.error("Telegram requests failed: %s", e, exc_info=True)
-            # Fall through to urllib
+            logger.error("Telegram failed: %s", e, exc_info=True)
+            return f'ERROR: {e}'
 
         # Fall back to urllib
         try:
             import json as _json
-            import urllib.request
             data = _json.dumps(payload).encode()
-            logger.info("Telegram: using urllib, payload=%d bytes", len(data))
+            import urllib.request
             req = urllib.request.Request(
                 url, data=data, headers={'Content-Type': 'application/json'})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 body = resp.read().decode()
-                logger.info("Telegram urllib: HTTP %d, body=%s", resp.status, body[:200])
                 if resp.status == 200:
                     return 'OK'
                 return f'HTTP {resp.status}'
