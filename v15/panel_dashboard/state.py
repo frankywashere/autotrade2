@@ -98,15 +98,9 @@ class DashboardState(param.Parameterized):
         except Exception as e:
             logger.error("Failed to fetch 5-min data: %s", e)
 
-        # Price feed: yfinance REST (no WebSocket)
+        # Price feed: yfinance REST only
         self._ws_client = None
-        try:
-            from v15.live_data import YFinanceLiveData
-            self._live_data = YFinanceLiveData(symbols=['TSLA', 'SPY'])
-            logger.info("yfinance REST price feed initialized")
-        except Exception as e:
-            self._live_data = None
-            logger.warning("yfinance init failed: %s", e)
+        self._price_err_count = 0
 
         # Initialize scanner
         self._init_scanner()
@@ -125,17 +119,28 @@ class DashboardState(param.Parameterized):
         price = 0.0
         source = 'REST'
 
-        if self._live_data:
-            try:
-                rt = self._live_data.get_realtime_prices()
-                if rt.get('TSLA'):
-                    price = float(rt['TSLA'])
-                if rt.get('SPY'):
-                    spy = float(rt['SPY'])
-                    if spy != self.spy_price:
-                        self.spy_price = spy
-            except Exception:
-                pass
+        try:
+            import yfinance as yf
+            tsla = yf.Ticker('TSLA')
+            fi = tsla.fast_info
+            price = float(fi.last_price) if hasattr(fi, 'last_price') and fi.last_price else 0.0
+            if price > 0:
+                self._price_err_count = 0
+
+            spy = yf.Ticker('SPY')
+            spy_fi = spy.fast_info
+            spy_price = float(spy_fi.last_price) if hasattr(spy_fi, 'last_price') and spy_fi.last_price else 0.0
+            if spy_price > 0 and spy_price != self.spy_price:
+                self.spy_price = spy_price
+        except Exception as e:
+            self._price_err_count += 1
+            if self._price_err_count <= 3 or self._price_err_count % 30 == 0:
+                logger.warning("Price fetch failed (%d): %s", self._price_err_count, e)
+
+        # Fallback to last bar close if REST fails
+        if price == 0.0 and self.current_tsla is not None and len(self.current_tsla) > 0:
+            price = float(self.current_tsla['close'].iloc[-1])
+            source = 'bar close'
 
         if price > 0:
             price_changed = price != self.tsla_price
