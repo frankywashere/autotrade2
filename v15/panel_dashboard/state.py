@@ -174,7 +174,7 @@ class DashboardState(param.Parameterized):
 
         # Check exits if positions are open (both scanners)
         html_parts = []
-        any_exits = False
+        all_exit_alerts = []
         for scnr in [self.scanner, self.scanner_dw, self.scanner_ml]:
             if scnr and scnr.positions and price > 0:
                 try:
@@ -182,15 +182,26 @@ class DashboardState(param.Parameterized):
                     if exit_alerts:
                         for ea in exit_alerts:
                             html_parts.append(_exit_alert_html(ea))
-                        any_exits = True
+                            all_exit_alerts.append(ea)
                 except Exception as e:
                     logger.warning("Exit check failed: %s", e)
-        if any_exits:
+        if all_exit_alerts:
             self.exit_alert_html = '\n'.join(html_parts)
             self.positions_version += 1  # Re-render banner to clear exited positions
             self.trades_version += 1     # Update trade history
+            # Update intraday ML trade state from intraday exits
+            if self._intraday_trade_state:
+                for ea in all_exit_alerts:
+                    if getattr(ea, 'signal_source', '') == 'intraday':
+                        ts = self._intraday_trade_state
+                        if getattr(ea, 'pnl', 0) > 0:
+                            ts['consec_wins'] += 1
+                            ts['consec_losses'] = 0
+                        else:
+                            ts['consec_losses'] += 1
+                            ts['consec_wins'] = 0
         # Bump version for live P&L updates only when price actually changed
-        elif price_changed if price > 0 else False:
+        elif not all_exit_alerts and (price_changed if price > 0 else False):
             has_positions = ((self.scanner and self.scanner.positions)
                              or (self.scanner_dw and self.scanner_dw.positions)
                              or (self.scanner_ml and self.scanner_ml.positions))
@@ -689,13 +700,13 @@ class DashboardState(param.Parameterized):
             market_close = now.replace(hour=16, minute=0, second=0)
             minutes_to_close = max(0, (market_close - now).total_seconds() / 60.0)
 
-            # Update trade state
+            # Update trade state (daily reset only, counts updated AFTER accept/reject)
             ts = self._intraday_trade_state
             today_str = now.strftime('%Y-%m-%d')
             if ts['last_trade_date'] != today_str:
                 ts['daily_trades'] = 0
                 ts['last_trade_date'] = today_str
-            ts['daily_trades'] += 1
+            ts['bars_since_last'] += 1
 
             # Build feature vector matching FEATURE_NAMES order from training
             feat = np.full(len(self._intraday_ml_features), np.nan)
@@ -775,8 +786,10 @@ class DashboardState(param.Parameterized):
             accept = prob >= thresh
             logger.info("Intraday ML: prob=%.3f, thresh=%.2f, accept=%s", prob, thresh, accept)
 
-            # Update trade state
-            ts['bars_since_last'] = 0
+            # Update trade state only on acceptance
+            if accept:
+                ts['daily_trades'] += 1
+                ts['bars_since_last'] = 0
 
             return accept
 
