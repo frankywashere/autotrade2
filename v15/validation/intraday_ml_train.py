@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Intraday ML Model Training — LightGBM classifier for intraday signal quality.
+Intraday ML Model Training -- LightGBM classifier for intraday signal quality.
 
 Extracts features per candidate intraday trade signal, labels as win/loss based
 on actual simulation outcome, trains LightGBM binary classifier.
 
-Validation: Walk-forward (5yr train -> 1yr test) + holdout (≤2021 -> 2022-2025) + 2026 OOS.
+Validation: Walk-forward (5yr train -> 1yr test) + holdout (<=2021 -> 2022-2025) + 2026 OOS.
 
 Usage:
     python -m v15.validation.intraday_ml_train
@@ -185,9 +185,9 @@ def extract_features(i, f5m, ctx, features, signal_result, trade_state):
     idx += 1
 
     # RSI at higher TFs (from features dict if available)
-    feat[idx] = np.nan  # rsi_1h — would need 1h features
+    feat[idx] = np.nan  # rsi_1h -- would need 1h features
     idx += 1
-    feat[idx] = np.nan  # rsi_daily — would need daily features
+    feat[idx] = np.nan  # rsi_daily -- would need daily features
     idx += 1
 
     # Trade state features
@@ -201,7 +201,7 @@ def extract_features(i, f5m, ctx, features, signal_result, trade_state):
 
 
 # ---------------------------------------------------------------------------
-# Training data generation — simulate + collect features + labels
+# Training data generation -- simulate + collect features + labels
 # ---------------------------------------------------------------------------
 
 def generate_training_data(f5m, features, precomp,
@@ -211,7 +211,7 @@ def generate_training_data(f5m, features, precomp,
 
     Returns:
         X: np.ndarray of shape (n_signals, NUM_FEATURES)
-        y: np.ndarray of shape (n_signals,) — 1 for win, 0 for loss
+        y: np.ndarray of shape (n_signals,) -- 1 for win, 0 for loss
         meta: list of dicts with entry_time, pnl, confidence
     """
     (dcp_arr, dslope_arr), htf = precomp
@@ -540,7 +540,7 @@ def main():
         wf_results.append((test_yr, result))
 
     # --- Holdout Validation ---
-    print("\n\n[4] Holdout Validation (≤2021 train -> 2022-2025 test)...")
+    print("\n\n[4] Holdout Validation (<=2021 train -> 2022-2025 test)...")
     print("=" * 70)
 
     train_yrs_ho = list(range(2016, 2022))
@@ -557,12 +557,12 @@ def main():
 
     model_ho = train_model(X_train_ho, y_train_ho, X_test_ho, y_test_ho)
     ho_result = evaluate_model(model_ho, X_test_ho, y_test_ho, meta_test_ho,
-                              "Holdout: ≤2021 -> 2022-2025")
+                              "Holdout: <=2021 -> 2022-2025")
 
     # In-sample check
     evaluate_model(model_ho, X_train_ho, y_train_ho,
                   [m for yr in train_yrs_ho for m in all_meta_by_year.get(yr, [])],
-                  "Holdout: In-Sample (≤2021)")
+                  "Holdout: In-Sample (<=2021)")
 
     # --- 2026 OOS ---
     print("\n\n[5] 2026 Out-of-Sample...")
@@ -585,7 +585,7 @@ def main():
     X_all = np.vstack([all_X_by_year[yr] for yr in all_yrs if yr in all_X_by_year and len(all_X_by_year[yr]) > 0])
     y_all = np.concatenate([all_y_by_year[yr] for yr in all_yrs if yr in all_y_by_year and len(all_y_by_year[yr]) > 0])
 
-    # LightGBM handles NaN natively — no need to replace
+    # LightGBM handles NaN natively -- no need to replace
     final_model = train_model(X_all, y_all)
 
     # Feature importance
