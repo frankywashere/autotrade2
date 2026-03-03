@@ -44,11 +44,12 @@ def create_app():
     # Load market data (blocking on startup)
     logger.info("Starting X14 c14 Panel Dashboard...")
     state.load_market_data()
-    logger.info("Market data loaded. TSLA price=%.2f, scanner=%s, scanner_dw=%s, scanner_ml=%s",
+    logger.info("Market data loaded. TSLA price=%.2f, scanner=%s, scanner_dw=%s, scanner_ml=%s, scanner_intra=%s",
                 state.tsla_price,
                 "OK" if state.scanner else "NONE",
                 "OK" if state.scanner_dw else "NONE",
-                "OK" if state.scanner_ml else "NONE")
+                "OK" if state.scanner_ml else "NONE",
+                "OK" if state.scanner_intra else "NONE")
 
     # Log ML model status
     if hasattr(state, '_ml_model') and state._ml_model is not None:
