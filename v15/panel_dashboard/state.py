@@ -52,6 +52,9 @@ class DashboardState(param.Parameterized):
     _ml_model = param.Parameter(None, precedence=-1)
     _ml_feature_names = param.Parameter(None, precedence=-1)
     _ml_history_buffer = param.Parameter(None, precedence=-1)
+    _intraday_ml_model = param.Parameter(None, precedence=-1)
+    _intraday_ml_features = param.Parameter(None, precedence=-1)
+    _intraday_trade_state = param.Parameter(None, precedence=-1)
     _ws_client = param.Parameter(None, precedence=-1)
 
     def load_market_data(self):
@@ -357,6 +360,30 @@ class DashboardState(param.Parameterized):
             logger.warning("ML model load failed: %s", e)
             self._ml_model = None
 
+        # Load intraday ML model (LightGBM filter for intraday signals)
+        try:
+            import pickle
+            from pathlib import Path
+            intra_path = Path('surfer_models/intraday_ml_model.pkl')
+            if not intra_path.exists():
+                intra_path = Path(__file__).parent.parent.parent / 'surfer_models' / 'intraday_ml_model.pkl'
+            if intra_path.exists():
+                with open(intra_path, 'rb') as f:
+                    intra_data = pickle.load(f)
+                self._intraday_ml_model = intra_data['model']
+                self._intraday_ml_features = intra_data['feature_names']
+                self._intraday_trade_state = {
+                    'bars_since_last': 999, 'daily_trades': 0,
+                    'consec_wins': 0, 'consec_losses': 0,
+                    'last_trade_date': None,
+                }
+                logger.info("Intraday ML model loaded: %d features", len(self._intraday_ml_features))
+            else:
+                logger.warning("Intraday ML model not found at %s", intra_path)
+        except Exception as e:
+            logger.warning("Intraday ML model load failed: %s", e)
+            self._intraday_ml_model = None
+
     def _evaluate_surfer_ml(self, analysis):
         """Evaluate Surfer ML signal: physics signal + ML feature extraction."""
         if not self.scanner_ml or not self._ml_model or not analysis:
@@ -446,6 +473,8 @@ class DashboardState(param.Parameterized):
         state_1h = tf_states.get('1h')
         state_4h = tf_states.get('4h')
         state_daily = tf_states.get('daily')
+        state_15m = tf_states.get('15min')
+        state_30m = tf_states.get('30min')
 
         if not state_5m or not state_5m.valid:
             return
@@ -455,26 +484,84 @@ class DashboardState(param.Parameterized):
         h4_cp = state_4h.position_pct if state_4h and state_4h.valid else float('nan')
         daily_cp = state_daily.position_pct if state_daily and state_daily.valid else float('nan')
 
-        # Compute VWAP distance
+        # Compute VWAP distance and other 5-min bar features
+        import numpy as np
         vwap_dist = float('nan')
+        spread_pct = float('nan')
+        vol_ratio = float('nan')
+        vwap_slope = float('nan')
+        gap_pct = float('nan')
+        range_today_pct = float('nan')
+        volume_today_ratio = float('nan')
+        atr_5m_pct = float('nan')
+        return_5bar = float('nan')
+        return_20bar = float('nan')
         try:
             close_arr = self.current_tsla['close'].values
             high_arr = self.current_tsla['high'].values
             low_arr = self.current_tsla['low'].values
             vol_arr = self.current_tsla['volume'].values
+            n = len(close_arr)
             tp = (high_arr + low_arr + close_arr) / 3.0
             dates = self.current_tsla.index.date
             today = dates[-1]
             today_mask = dates == today
+
+            # VWAP distance
             if today_mask.sum() > 0:
                 today_tp = tp[today_mask]
                 today_vol = vol_arr[today_mask]
                 cum_tv = (today_tp * today_vol).cumsum()
                 cum_v = today_vol.cumsum()
-                valid = cum_v > 0
-                if valid.any():
-                    vwap_val = cum_tv[valid][-1] / cum_v[valid][-1]
+                valid_v = cum_v > 0
+                if valid_v.any():
+                    vwap_val = cum_tv[valid_v][-1] / cum_v[valid_v][-1]
                     vwap_dist = (close_arr[-1] - vwap_val) / vwap_val * 100.0
+                    # VWAP slope (last 5 bars)
+                    if valid_v.sum() >= 5:
+                        vwap_5 = cum_tv[valid_v][-5:] / cum_v[valid_v][-5:]
+                        vwap_slope = (vwap_5[-1] - vwap_5[0]) / max(vwap_5[0], 0.01) * 100.0
+
+            # Spread
+            if n > 0 and close_arr[-1] > 0:
+                spread_pct = (high_arr[-1] - low_arr[-1]) / close_arr[-1] * 100.0
+
+            # Volume ratio
+            today_count = int(today_mask.sum())
+            if today_count > 0 and n >= 100:
+                today_vol_total = float(np.sum(vol_arr[today_mask]))
+                avg_daily_vol = float(np.mean(vol_arr[max(0, n - 100):n])) * 78
+                vol_ratio = today_vol_total / max(1.0, avg_daily_vol)
+
+            # Gap %
+            if n >= 2 and close_arr[-2] > 0:
+                yesterday_mask = dates == dates[-1 - today_count] if today_count < n else np.zeros_like(dates, dtype=bool)
+                if yesterday_mask.any():
+                    prev_close = close_arr[yesterday_mask][-1]
+                    today_open = self.current_tsla['open'].values[today_mask][0] if today_mask.any() else close_arr[-1]
+                    gap_pct = (today_open - prev_close) / prev_close * 100.0
+
+            # ATR 5m %
+            if n >= 21 and close_arr[-1] > 0:
+                hl = high_arr[-20:] - low_arr[-20:]
+                hc = np.abs(high_arr[-20:] - close_arr[-21:-1])
+                lc = np.abs(low_arr[-20:] - close_arr[-21:-1])
+                tr = np.maximum(np.maximum(hl, hc), lc)
+                atr_5m_pct = float(np.mean(tr)) / close_arr[-1] * 100.0
+
+            # Range today %
+            if today_mask.any() and close_arr[-1] > 0:
+                range_today_pct = (float(np.max(high_arr[today_mask])) - float(np.min(low_arr[today_mask]))) / close_arr[-1] * 100.0
+
+            # Volume today ratio
+            if today_count > 0 and n >= 100:
+                volume_today_ratio = vol_ratio  # same calculation
+
+            # Returns
+            if n >= 6 and close_arr[-6] > 0:
+                return_5bar = (close_arr[-1] - close_arr[-6]) / close_arr[-6] * 100.0
+            if n >= 21 and close_arr[-21] > 0:
+                return_20bar = (close_arr[-1] - close_arr[-21]) / close_arr[-21] * 100.0
         except Exception:
             pass
 
@@ -501,11 +588,144 @@ class DashboardState(param.Parameterized):
                 cp5=cp5, vwap_dist=vwap_dist,
                 daily_cp=daily_cp, h1_cp=h1_cp, h4_cp=h4_cp,
                 daily_slope=daily_slope, h1_slope=h1_slope, h4_slope=h4_slope,
+                vol_ratio=vol_ratio, vwap_slope=vwap_slope,
+                spread_pct=spread_pct, gap_pct=gap_pct,
             )
             if alert and alert.alert_type == 'ENTRY':
-                self.positions_version += 1
+                # ML filter: check if intraday ML model rejects this signal
+                if self._intraday_ml_filter(
+                    cp5=cp5, vwap_dist=vwap_dist, vol_ratio=vol_ratio,
+                    vwap_slope=vwap_slope, spread_pct=spread_pct, gap_pct=gap_pct,
+                    daily_cp=daily_cp, h1_cp=h1_cp, h4_cp=h4_cp,
+                    daily_slope=daily_slope, h1_slope=h1_slope, h4_slope=h4_slope,
+                    confidence=alert.confidence,
+                    stop_pct=abs(alert.price - alert.stop_price) / alert.price if alert.price > 0 else 0.008,
+                    tp_pct=abs(alert.tp_price - alert.price) / alert.price if alert.price > 0 else 0.02,
+                    atr_5m_pct=atr_5m_pct, range_today_pct=range_today_pct,
+                    volume_today_ratio=volume_today_ratio,
+                    return_5bar=return_5bar, return_20bar=return_20bar,
+                    cp_15m=state_15m.position_pct if state_15m and state_15m.valid else float('nan'),
+                    cp_30m=state_30m.position_pct if state_30m and state_30m.valid else float('nan'),
+                ):
+                    self.positions_version += 1
+                else:
+                    logger.info("Intraday signal REJECTED by ML filter")
         except Exception as e:
             logger.warning("Intraday eval failed: %s", e)
+
+    def _intraday_ml_filter(self, **kwargs) -> bool:
+        """Run intraday ML model to filter signals. Returns True to accept, False to reject."""
+        if self._intraday_ml_model is None:
+            return True  # No model = accept all
+
+        import numpy as np
+        from datetime import datetime
+        import pytz
+
+        try:
+            now = datetime.now(pytz.timezone('US/Eastern'))
+            market_close = now.replace(hour=16, minute=0, second=0)
+            minutes_to_close = max(0, (market_close - now).total_seconds() / 60.0)
+
+            # Update trade state
+            ts = self._intraday_trade_state
+            today_str = now.strftime('%Y-%m-%d')
+            if ts['last_trade_date'] != today_str:
+                ts['daily_trades'] = 0
+                ts['last_trade_date'] = today_str
+            ts['daily_trades'] += 1
+
+            # Build feature vector matching FEATURE_NAMES order from training
+            feat = np.full(len(self._intraday_ml_features), np.nan)
+            feat_map = {name: i for i, name in enumerate(self._intraday_ml_features)}
+
+            def _set(name, val):
+                if name in feat_map:
+                    feat[feat_map[name]] = val
+
+            # 5-min features
+            _set('cp_5m', kwargs.get('cp5', float('nan')))
+            _set('rsi_5m', float('nan'))  # Not available in live TF states
+            _set('bvc_5m', float('nan'))
+            _set('vwap_dist', kwargs.get('vwap_dist', float('nan')))
+            _set('vol_ratio', kwargs.get('vol_ratio', float('nan')))
+            _set('vwap_slope', kwargs.get('vwap_slope', float('nan')))
+            _set('spread_pct', kwargs.get('spread_pct', float('nan')))
+            _set('rsi_slope', float('nan'))
+            _set('gap_pct', kwargs.get('gap_pct', float('nan')))
+
+            # Higher TF positions
+            _set('cp_15m', kwargs.get('cp_15m', float('nan')))
+            _set('cp_30m', kwargs.get('cp_30m', float('nan')))
+            _set('cp_1h', kwargs.get('h1_cp', float('nan')))
+            _set('cp_4h', kwargs.get('h4_cp', float('nan')))
+            _set('cp_daily', kwargs.get('daily_cp', float('nan')))
+
+            # Slopes
+            _set('slope_1h', kwargs.get('h1_slope', float('nan')))
+            _set('slope_4h', kwargs.get('h4_slope', float('nan')))
+            _set('slope_daily', kwargs.get('daily_slope', float('nan')))
+
+            # Cross-TF divergences
+            cp5v = kwargs.get('cp5', float('nan'))
+            dcp = kwargs.get('daily_cp', float('nan'))
+            h1v = kwargs.get('h1_cp', float('nan'))
+            h4v = kwargs.get('h4_cp', float('nan'))
+            if not np.isnan(dcp) and not np.isnan(cp5v):
+                _set('div_daily_5m', dcp - cp5v)
+            if not np.isnan(h1v) and not np.isnan(cp5v):
+                _set('div_1h_5m', h1v - cp5v)
+            if not np.isnan(h4v) and not np.isnan(cp5v):
+                _set('div_4h_5m', h4v - cp5v)
+            vals = [v for v in [dcp, h4v, h1v] if not np.isnan(v)]
+            if vals and not np.isnan(cp5v):
+                weights = [0.35, 0.35, 0.30][:len(vals)]
+                weighted_avg = sum(v * w for v, w in zip(vals, weights)) / sum(weights)
+                _set('div_weighted', weighted_avg - cp5v)
+
+            # Time features
+            _set('hour', now.hour)
+            _set('minute', now.minute)
+            _set('minutes_to_close', minutes_to_close)
+            _set('day_of_week', now.weekday())
+
+            # Volatility / range
+            _set('atr_5m_pct', kwargs.get('atr_5m_pct', float('nan')))
+            _set('range_today_pct', kwargs.get('range_today_pct', float('nan')))
+            _set('volume_today_ratio', kwargs.get('volume_today_ratio', float('nan')))
+
+            # Signal quality
+            _set('confidence', kwargs.get('confidence', float('nan')))
+            _set('stop_pct', kwargs.get('stop_pct', float('nan')))
+            _set('tp_pct', kwargs.get('tp_pct', float('nan')))
+
+            # Momentum
+            _set('return_5bar', kwargs.get('return_5bar', float('nan')))
+            _set('return_20bar', kwargs.get('return_20bar', float('nan')))
+
+            # RSI at higher TFs (not available from TF states)
+            _set('rsi_1h', float('nan'))
+            _set('rsi_daily', float('nan'))
+
+            # Trade state
+            _set('bars_since_last_trade', ts['bars_since_last'])
+            _set('daily_trade_count', ts['daily_trades'])
+            _set('consecutive_wins', ts['consec_wins'])
+            _set('consecutive_losses', ts['consec_losses'])
+
+            # Run prediction
+            prob = self._intraday_ml_model.predict(feat.reshape(1, -1))[0]
+            accept = prob >= 0.5
+            logger.debug("Intraday ML: prob=%.3f, accept=%s", prob, accept)
+
+            # Update trade state
+            ts['bars_since_last'] = 0
+
+            return accept
+
+        except Exception as e:
+            logger.warning("Intraday ML filter error: %s", e)
+            return True  # On error, accept the signal
 
     def load_model_data(self):
         """Fetch multi-model state from GitHub Gist API."""
