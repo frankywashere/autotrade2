@@ -51,18 +51,33 @@ def create_app():
                 "OK" if state.scanner_ml else "NONE",
                 "OK" if state.scanner_intra else "NONE")
 
-    # Log ML model status
-    if hasattr(state, '_ml_model') and state._ml_model is not None:
-        logger.info("ML model (GBT): LOADED (%d features)", len(state._ml_feature_names or []))
-    else:
-        logger.warning("ML model (GBT): NOT LOADED — c14-ml signals will be skipped")
+    # Log ML model status + send startup notification
+    gbt_ok = hasattr(state, '_ml_model') and state._ml_model is not None
+    intra_ok = hasattr(state, '_intraday_ml_model') and state._intraday_ml_model is not None
+    gbt_msg = f"LOADED ({len(state._ml_feature_names or [])} features)" if gbt_ok else "NOT LOADED"
+    intra_msg = (f"LOADED ({len(getattr(state, '_intraday_ml_features', []) or [])} features, "
+                 f"threshold={getattr(state, '_intraday_ml_threshold', 0.5):.2f})") if intra_ok else "NOT LOADED"
 
-    if hasattr(state, '_intraday_ml_model') and state._intraday_ml_model is not None:
-        logger.info("ML model (Intraday): LOADED (%d features, threshold=%.2f)",
-                    len(getattr(state, '_intraday_ml_features', []) or []),
-                    getattr(state, '_intraday_ml_threshold', 0.5))
+    if gbt_ok:
+        logger.info("ML model (GBT): %s", gbt_msg)
     else:
-        logger.warning("ML model (Intraday): NOT LOADED — c14-intra ML filter disabled")
+        logger.warning("ML model (GBT): %s — c14-ml signals will be skipped", gbt_msg)
+    if intra_ok:
+        logger.info("ML model (Intraday): %s", intra_msg)
+    else:
+        logger.warning("ML model (Intraday): %s — c14-intra ML filter disabled", intra_msg)
+
+    # Send startup status via ntfy
+    startup_msg = (
+        f"Scanners: c14={'OK' if state.scanner else 'FAIL'}, "
+        f"c14-dw={'OK' if state.scanner_dw else 'FAIL'}, "
+        f"c14-ml={'OK' if state.scanner_ml else 'FAIL'}, "
+        f"c14-intra={'OK' if state.scanner_intra else 'FAIL'}\n"
+        f"GBT model: {gbt_msg}\n"
+        f"Intraday model: {intra_msg}\n"
+        f"TSLA price: ${state.tsla_price:.2f}"
+    )
+    state.send_notification(startup_msg, title='c14 Startup')
 
     # Load initial model comparison data
     state.load_model_data()
