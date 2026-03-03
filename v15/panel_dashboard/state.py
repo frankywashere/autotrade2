@@ -508,21 +508,18 @@ class DashboardState(param.Parameterized):
                          ml_action_probs[0], ml_action_probs[1], ml_action_probs[2],
                          ml_lifetime, sig.confidence * 100)
 
-            # --- ML GATE: reject if ML disagrees ---
+            # --- ML soft gate (informational only — hard gate tested, hurts P&L) ---
             if ml_action == 0:
-                logger.info("Surfer ML REJECTED: ML predicts HOLD (signal was %s)", sig.action)
-                return
-            if ml_action != physics_action_id:
-                logger.info("Surfer ML REJECTED: ML predicts %s but signal is %s",
+                logger.info("Surfer ML INFO: ML predicts HOLD (signal was %s) — proceeding anyway", sig.action)
+            elif ml_action != physics_action_id:
+                logger.info("Surfer ML INFO: ML predicts %s but signal is %s — proceeding anyway",
                              action_map.get(ml_action, '?'), sig.action)
-                return
-
-            logger.info("Surfer ML ACCEPTED: ML agrees with %s signal", sig.action)
+            else:
+                logger.info("Surfer ML INFO: ML agrees with %s signal", sig.action)
 
         except Exception as e:
-            logger.warning("Surfer ML feature extraction failed: %s\n%s",
-                           e, traceback.format_exc())
-            return  # Don't trade if we can't verify ML agreement
+            logger.warning("Surfer ML feature extraction failed: %s — proceeding anyway",
+                           e)
 
         # ML agrees — evaluate through scanner_ml
         try:
