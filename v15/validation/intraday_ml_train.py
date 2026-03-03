@@ -144,9 +144,10 @@ def extract_features(i, f5m, ctx, features, signal_result, trade_state):
 
     # Volatility context
     if i >= 20:
-        tr = np.maximum(high[i-20:i] - low[i-20:i],
-                       np.abs(high[i-20:i] - close[i-21:i-1]),
-                       np.abs(low[i-20:i] - close[i-21:i-1]))
+        hl = high[i-20:i] - low[i-20:i]
+        hc = np.abs(high[i-20:i] - close[i-21:i-1])
+        lc = np.abs(low[i-20:i] - close[i-21:i-1])
+        tr = np.maximum(np.maximum(hl, hc), lc)
         atr = np.mean(tr)
         feat[idx] = (atr / close[i] * 100.0) if close[i] > 0 else np.nan
     idx += 1
@@ -164,8 +165,10 @@ def extract_features(i, f5m, ctx, features, signal_result, trade_state):
     idx += 1
 
     # Volume today vs 20-day avg
-    if i >= 100:
-        feat[idx] = sum(volume[max(0,i-100+j):max(0,i-100+j)+1] for j in today_bars) / max(1, np.mean(volume[i-100:i]) * len(today_bars))
+    if i >= 100 and today_bars:
+        today_vol = float(np.sum(volume[max(0, i - len(today_bars)):i + 1]))
+        avg_daily_vol = float(np.mean(volume[i-100:i])) * 78  # ~78 bars per day
+        feat[idx] = today_vol / max(1.0, avg_daily_vol)
     idx += 1
 
     # Signal quality
