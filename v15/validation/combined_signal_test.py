@@ -258,21 +258,23 @@ def _run_cs_dw(tsla_min_path, start, end):
 def _run_intraday(tsla_min_path, start, end):
     """Run intraday FD Enhanced-Union and return trades."""
     from v15.validation.intraday_v14b_janfeb import (
-        load_1min, simulate_fixed, compute_channel_position,
-        sig_union_enh, precompute_positions,
+        load_1min, simulate_fixed, build_features, precompute_all,
+        sig_union_enh,
     )
 
     print("  Loading 1-min data for intraday...")
     df1 = load_1min(tsla_min_path)
-    f5m = df1.resample('5min').agg(
-        {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
-    ).dropna()
-    f5m = f5m[(f5m.index >= start) & (f5m.index <= end)]
+    # Filter to date range before building features
+    df1 = df1[(df1.index >= start) & (df1.index <= end)]
+    print("  Building features (resampling + channel positions)...")
+    features = build_features(df1)
+    f5m = features['5m']
     print(f"  5-min bars: {len(f5m):,}")
 
-    pw = {'vw': -0.10, 'dv': 0.20, 'f5': 0.35}
-    precomp = precompute_positions(f5m, win=60)
+    precomp = precompute_all(features, f5m)
 
+    pw = {'stop': 0.008, 'tp': 0.020, 'd_min': 0.20, 'h1_min': 0.15, 'f5_thresh': 0.35,
+          'div_thresh': 0.20, 'vwap_thresh': -0.10, 'min_vol_ratio': 0.8}
     print("  Running intraday simulation...")
     trades = simulate_fixed(f5m, sig_union_enh, 'Intraday', pw, precomp,
                            tb=0.006, tp=6, cd=0, mtd=30,
@@ -284,6 +286,7 @@ def _run_intraday(tsla_min_path, start, end):
 
 def _run_surfer_ml(tsla_min_path, start, end):
     """Run Surfer ML backtest and return trades."""
+    import io
     from v15.validation.c13a_full_validation import (
         _load_surfer_data, _load_ml_model, _load_sq_model,
         _run_surfer_for_years,
@@ -296,12 +299,19 @@ def _run_surfer_ml(tsla_min_path, start, end):
     ml_model = _load_ml_model()
     sq_model = _load_sq_model()
 
-    print("  Running Surfer ML backtest (all years)...")
+    print("  Running Surfer ML backtest (all years, output suppressed)...")
     all_trades = []
     for yr in range(2016, 2027):
-        raw = _run_surfer_for_years(tsla_5m, higher_tf, spy_5m, vix_daily,
-                                     ml_model, sq_model, yr, yr)
+        # Suppress verbose surfer_backtest output to avoid disk space issues
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            raw = _run_surfer_for_years(tsla_5m, higher_tf, spy_5m, vix_daily,
+                                         ml_model, sq_model, yr, yr)
+        finally:
+            sys.stdout = old_stdout
         all_trades.extend(raw)
+        print(f"    {yr}: {len(raw)} trades", flush=True)
 
     # Convert Trade dataclass objects to normalized format
     normalized = []
@@ -531,7 +541,7 @@ def main():
     # --- A. CS-5TF ---
     print("\n[A] Running CS-5TF (DI v36)...")
     try:
-        signals, daily_df, spy_daily, vix_daily = phase1_precompute(tsla_path, start, end)
+        signals, daily_df, spy_daily, vix_daily, _weekly = phase1_precompute(tsla_path, start, end)
         cs5tf_trades = _run_cs_5tf(signals, daily_df, spy_daily, vix_daily)
         all_trades['CS-5TF'] = cs5tf_trades
         print(f"  CS-5TF: {len(cs5tf_trades)} trades in {time.time()-t0:.0f}s")
