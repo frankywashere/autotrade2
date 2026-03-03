@@ -123,6 +123,18 @@ def create_app():
         state.param.last_analysis,
     )
 
+    # ML model status display
+    gbt_ok = hasattr(state, '_ml_model') and state._ml_model is not None
+    intra_ok = hasattr(state, '_intraday_ml_model') and state._intraday_ml_model is not None
+    gbt_info = f"{len(state._ml_feature_names or [])}f" if gbt_ok else "MISSING"
+    intra_info = (f"{len(getattr(state, '_intraday_ml_features', []) or [])}f"
+                  if intra_ok else "MISSING")
+    ml_status = pn.pane.Markdown(
+        f"GBT: **{'OK' if gbt_ok else 'MISSING'}** ({gbt_info})  \n"
+        f"Intra: **{'OK' if intra_ok else 'MISSING'}** ({intra_info})",
+        width=200,
+    )
+
     # Build template
     template = pn.template.FastListTemplate(
         title='c14 Trading Dashboard',
@@ -137,6 +149,8 @@ def create_app():
             kill_switch,
             pn.layout.Divider(),
             last_analysis_display,
+            pn.pane.Markdown("### ML Models"),
+            ml_status,
             pn.layout.Divider(),
             ntfy_test_btn,
             ntfy_status,
