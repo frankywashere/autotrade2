@@ -58,6 +58,7 @@ class DashboardState(param.Parameterized):
     _intraday_ml_features = param.Parameter(None, precedence=-1)
     _intraday_trade_state = param.Parameter(None, precedence=-1)
     _ws_client = param.Parameter(None, precedence=-1)
+    _price_updated_at = param.Number(0.0, precedence=-1)  # time.time() of last successful price fetch
 
     def load_market_data(self):
         """Startup: load native TF data, fetch 5-min bars, initialize scanner."""
@@ -99,17 +100,10 @@ class DashboardState(param.Parameterized):
         except Exception as e:
             logger.error("Failed to fetch 5-min data: %s", e)
 
-        # Price feed: WebSocket primary, REST fallback
-        try:
-            from v15.data.finnhub_ws import get_ws_client
-            self._ws_client = get_ws_client()
-            if self._ws_client:
-                logger.info("Finnhub WebSocket enabled")
-            else:
-                logger.warning("Finnhub WebSocket unavailable — REST only")
-        except Exception as e:
-            logger.warning("WebSocket init failed: %s — REST only", e)
-            self._ws_client = None
+        # Price feed: REST only (yfinance ticker.info every 2s)
+        # WS disabled — source-switching between WS and REST caused price
+        # discontinuities that triggered false trailing stop exits.
+        self._ws_client = None
         self._price_err_count = 0
 
         # Initialize scanner
@@ -180,6 +174,7 @@ class DashboardState(param.Parameterized):
             source = 'bar close'
 
         if price > 0:
+            self._price_updated_at = time.time()
             price_changed = price != self.tsla_price
             if self._prev_price > 0:
                 new_delta = price - self._prev_price
@@ -301,8 +296,11 @@ class DashboardState(param.Parameterized):
                      analysis.signal.primary_tf,
                      analysis.signal.confidence * 100)
 
-        # Evaluate signals if scanner is ready
-        if self.scanner and self.tsla_price > 0:
+        # Evaluate signals if scanner is ready and price is fresh (< 5s old)
+        price_age = time.time() - self._price_updated_at if self._price_updated_at > 0 else 999
+        if price_age > 5:
+            logger.warning("Skipping signal eval — price is %.1fs stale (limit 5s)", price_age)
+        elif self.scanner and self.tsla_price > 0:
             # --- CS-5TF: Original 5-timeframe signal ---
             sig = analysis.signal
             if sig.action != 'HOLD':
@@ -548,7 +546,6 @@ class DashboardState(param.Parameterized):
 
         action_map = {0: 'HOLD', 1: 'BUY', 2: 'SELL'}
         physics_action_id = 1 if sig.action == 'BUY' else 2
-
         # Extract ML features
         try:
             import numpy as np
@@ -620,7 +617,10 @@ class DashboardState(param.Parameterized):
                          ml_action_probs[0], ml_action_probs[1], ml_action_probs[2],
                          ml_lifetime, sig.confidence * 100)
 
-            # --- ML soft gate (informational only — hard gate tested, hurts P&L) ---
+            # --- ML soft gate (informational only) ---
+            # 10-year gate test shows hard gate removes 55% of trades and loses $294K.
+            # The adaptive trail + EL/IS/BMV sub-models handle risk better than
+            # GBT action prediction as a gate.
             if ml_action == 0:
                 logger.info("Surfer ML INFO: ML predicts HOLD (signal was %s) — proceeding anyway", sig.action)
             elif ml_action != physics_action_id:
@@ -630,10 +630,9 @@ class DashboardState(param.Parameterized):
                 logger.info("Surfer ML INFO: ML agrees with %s signal", sig.action)
 
         except Exception as e:
-            logger.warning("Surfer ML feature extraction failed: %s — proceeding anyway",
-                           e)
+            logger.warning("Surfer ML feature extraction failed: %s — proceeding anyway", e)
 
-        # ML agrees — evaluate through scanner_ml
+        # Evaluate through scanner_ml (ML informs but doesn't gate)
         try:
             entry_alert = self.scanner_ml.evaluate_signal(
                 analysis, self.tsla_price, signal_source='surfer_ml')
@@ -1059,9 +1058,12 @@ def _exit_alert_html(ea) -> str:
     pnl_color = '#00e676' if ea.pnl >= 0 else '#ff5252'
     source_tag = ''
     if getattr(ea, 'signal_source', ''):
+        _src_display = {'CS-5TF': 'CS-5TF', 'CS-DW': 'CS-DW',
+                        'surfer_ml': 'Surfer ML', 'intraday': 'Intraday'}
+        display_src = _src_display.get(ea.signal_source, ea.signal_source)
         source_tag = (f' <span style="color:#64b5f6;font-size:12px;'
                       f'background:#1a237e;padding:2px 6px;border-radius:4px">'
-                      f'{ea.signal_source}</span>')
+                      f'{display_src}</span>')
     return (
         f'<div style="background:{bg};padding:12px 16px;border-radius:8px;margin:6px 0;'
         f'border:2px solid {border};">'
