@@ -2,7 +2,7 @@
 OpenEvolve evaluator for the trade gate function.
 
 Runs the forward sim with the evolved gate and scores the result.
-Scoring: combined_score = P&L * WR_factor - hard_stop_penalty
+Returns dict with 'combined_score' as primary metric.
 """
 import os
 import sys
@@ -30,12 +30,8 @@ def _load_data():
     return _DATA
 
 
-def evaluate(program_path: str):
-    """Evaluate a trade gate program.
-
-    Returns EvaluationResult with metrics dict.
-    """
-    from openevolve.evaluation import EvaluationResult
+def evaluate(program_path: str) -> dict:
+    """Evaluate a trade gate program. Returns dict with combined_score."""
 
     data = _load_data()
 
@@ -47,11 +43,7 @@ def evaluate(program_path: str):
         gate_fn = mod.should_take_trade
     except Exception as e:
         print(f"  [evaluator] Import error: {e}")
-        return EvaluationResult(metrics={
-            'combined_score': -1e6,
-            'pnl': 0, 'wr': 0, 'trades': 0,
-            'hard_stops': 999, 'error': str(e),
-        })
+        return {'combined_score': -1e6, 'error': str(e)}
 
     # Run sim on train period (2025-01-02 to 2025-09-30)
     from v15.validation.forward_sim_v2 import run_all_scanners_sim
@@ -71,11 +63,7 @@ def evaluate(program_path: str):
     except Exception as e:
         print(f"  [evaluator] Train sim error: {e}")
         traceback.print_exc()
-        return EvaluationResult(metrics={
-            'combined_score': -1e6,
-            'pnl': 0, 'wr': 0, 'trades': 0,
-            'hard_stops': 999, 'error': str(e),
-        })
+        return {'combined_score': -1e6, 'error': str(e)}
 
     # Run sim on test period (2025-10-01 to 2026-02-27)
     try:
@@ -93,11 +81,7 @@ def evaluate(program_path: str):
     except Exception as e:
         print(f"  [evaluator] Test sim error: {e}")
         traceback.print_exc()
-        return EvaluationResult(metrics={
-            'combined_score': -1e6,
-            'pnl': 0, 'wr': 0, 'trades': 0,
-            'hard_stops': 999, 'error': str(e),
-        })
+        return {'combined_score': -1e6, 'error': str(e)}
 
     # Collect metrics
     def _collect(scanners):
@@ -172,7 +156,12 @@ def evaluate(program_path: str):
 
     combined = pnl_score * wr_factor - hs_penalty - oos_penalty - trade_penalty
 
-    metrics = {
+    print(f"  [evaluator] Score={combined:.0f}  P&L=${total_pnl:+,.0f}  "
+          f"WR={total_wr:.1f}%  Trades={total_trades}  HS={total_hs}  "
+          f"(train: ${train_pnl:+,.0f}/{train_wr:.0f}%/{train_trades}t  "
+          f"test: ${test_pnl:+,.0f}/{test_wr:.0f}%/{test_trades}t)")
+
+    return {
         'combined_score': combined,
         'total_pnl': total_pnl,
         'total_wr': total_wr,
@@ -187,10 +176,3 @@ def evaluate(program_path: str):
         'test_trades': test_trades,
         'test_hs': test_hs,
     }
-
-    print(f"  [evaluator] Score={combined:.0f}  P&L=${total_pnl:+,.0f}  "
-          f"WR={total_wr:.1f}%  Trades={total_trades}  HS={total_hs}  "
-          f"(train: ${train_pnl:+,.0f}/{train_wr:.0f}%/{train_trades}t  "
-          f"test: ${test_pnl:+,.0f}/{test_wr:.0f}%/{test_trades}t)")
-
-    return EvaluationResult(metrics=metrics)
