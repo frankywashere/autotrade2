@@ -59,26 +59,31 @@ SLIPPAGE_BY_SOURCE = {
 SLIPPAGE_PCT = 0.0003     # fallback if source unknown
 COMMISSION_PER_SHARE = 0.005  # $0.005/share (IBKR tiered)
 
-# ntfy.sh push notifications
-_NTFY_TOPIC = os.environ.get('NTFY_TOPIC', 'c14-xyz').strip()
-print(f"[SCANNER] ntfy topic: {_NTFY_TOPIC}")
+# Telegram push notifications
+_TG_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
+_TG_CHAT = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
 
 
 def _send_notification(msg: str, model_tag: str = '', title: str = ''):
-    """Send a push notification via ntfy.sh."""
+    """Send a push notification via Telegram."""
+    if not _TG_TOKEN or not _TG_CHAT:
+        return
     tag = model_tag or MODEL_TAG
-    url = f'https://ntfy.sh/{_NTFY_TOPIC}'
+    text = f"*{title or f'[{tag}] Alert'}*\n{msg}"
 
     try:
         import requests as _req
-        headers = {'Title': title or f'[{tag}] Alert'}
-        resp = _req.post(url, data=msg.encode('utf-8'), headers=headers, timeout=10)
+        resp = _req.post(
+            f'https://api.telegram.org/bot{_TG_TOKEN}/sendMessage',
+            json={'chat_id': _TG_CHAT, 'text': text, 'parse_mode': 'Markdown'},
+            timeout=10,
+        )
         if resp.status_code == 200:
-            print(f"[SCANNER] ntfy sent OK: {msg[:60]}")
+            print(f"[SCANNER] Telegram sent OK: {msg[:60]}")
         else:
-            print(f"[SCANNER] ntfy HTTP {resp.status_code}: {resp.text[:100]}")
+            print(f"[SCANNER] Telegram HTTP {resp.status_code}: {resp.text[:100]}")
     except Exception as e:
-        print(f"[SCANNER] ntfy failed: {e}")
+        print(f"[SCANNER] Telegram failed: {e}")
 
 
 @dataclass

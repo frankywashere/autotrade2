@@ -145,8 +145,13 @@ class DashboardState(param.Parameterized):
             try:
                 import yfinance as yf
                 tsla = yf.Ticker('TSLA')
-                fi = tsla.fast_info
-                price = float(fi.last_price) if hasattr(fi, 'last_price') and fi.last_price else 0.0
+                info = tsla.info
+                price = float(
+                    info.get('preMarketPrice')
+                    or info.get('postMarketPrice')
+                    or info.get('regularMarketPrice')
+                    or 0
+                )
                 if price > 0:
                     self._price_err_count = 0
                     source = 'REST'
@@ -155,8 +160,13 @@ class DashboardState(param.Parameterized):
                 if not (self._ws_client and self._ws_client.get_price('SPY')
                         and self._ws_client.get_price('SPY').is_fresh):
                     spy = yf.Ticker('SPY')
-                    spy_fi = spy.fast_info
-                    spy_price = float(spy_fi.last_price) if hasattr(spy_fi, 'last_price') and spy_fi.last_price else 0.0
+                    spy_info = spy.info
+                    spy_price = float(
+                        spy_info.get('preMarketPrice')
+                        or spy_info.get('postMarketPrice')
+                        or spy_info.get('regularMarketPrice')
+                        or 0
+                    )
                     if spy_price > 0 and spy_price != self.spy_price:
                         self.spy_price = spy_price
             except Exception as e:
@@ -966,48 +976,28 @@ class DashboardState(param.Parameterized):
             return True  # On error, accept the signal
 
     def send_notification(self, msg: str, title: str = '') -> str:
-        """Send a push notification via Telegram (primary) or ntfy.sh (fallback).
-
-        Returns status string.
-        """
-        # Try Telegram first
+        """Send a push notification via Telegram. Returns status string."""
         bot_token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
         chat_id = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
-        if bot_token and chat_id:
-            try:
-                import requests as _req
-                text = f"*{title or 'c14a Alert'}*\n{msg}" if title else msg
-                resp = _req.post(
-                    f'https://api.telegram.org/bot{bot_token}/sendMessage',
-                    json={'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'},
-                    timeout=10,
-                )
-                logger.info("Telegram: HTTP %d", resp.status_code)
-                if resp.status_code == 200:
-                    return 'OK'
-                logger.warning("Telegram failed: %s", resp.text[:200])
-            except Exception as e:
-                logger.warning("Telegram error: %s", e)
+        if not bot_token or not chat_id:
+            return 'NO_CHANNEL'
 
-        # Fallback to ntfy
-        topic = os.environ.get('NTFY_TOPIC', '').strip()
-        if topic:
-            try:
-                import requests as _req
-                headers = {'Title': title or 'c14a Alert'}
-                resp = _req.post(
-                    f'https://ntfy.sh/{topic}',
-                    data=msg.encode('utf-8'), headers=headers, timeout=10,
-                )
-                logger.info("ntfy: HTTP %d, topic=%s", resp.status_code, topic)
-                if resp.status_code == 200:
-                    return 'OK'
-                return f'HTTP {resp.status_code}: {resp.text[:100]}'
-            except Exception as e:
-                logger.error("ntfy failed: %s", e)
-                return f'ERROR: {e}'
-
-        return 'NO_CHANNEL'
+        try:
+            import requests as _req
+            text = f"*{title or 'c14a Alert'}*\n{msg}" if title else msg
+            resp = _req.post(
+                f'https://api.telegram.org/bot{bot_token}/sendMessage',
+                json={'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'},
+                timeout=10,
+            )
+            logger.info("Telegram: HTTP %d", resp.status_code)
+            if resp.status_code == 200:
+                return 'OK'
+            logger.warning("Telegram failed: %s", resp.text[:200])
+            return f'HTTP {resp.status_code}'
+        except Exception as e:
+            logger.warning("Telegram error: %s", e)
+            return f'ERROR: {e}'
 
     def send_test_notification(self):
         """Send a test push notification."""
