@@ -7,6 +7,7 @@ Docker: see Dockerfile
 import sys
 import os
 import logging
+import logging.handlers
 import traceback
 
 # Ensure project root is on sys.path so v15.* imports work
@@ -18,12 +19,28 @@ import panel as pn
 
 pn.extension('plotly', 'tabulator')
 
+_log_dir = os.path.join(_project_root, 'logs')
+os.makedirs(_log_dir, exist_ok=True)
+_log_file = os.path.join(_log_dir, 'dashboard.log')
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
     datefmt='%H:%M:%S',
+    handlers=[
+        logging.StreamHandler(),
+        logging.handlers.RotatingFileHandler(
+            _log_file, maxBytes=5_000_000, backupCount=3,
+        ),
+    ],
 )
 logger = logging.getLogger('x14.panel')
+
+# Also capture unhandled exceptions to log file
+def _exc_hook(exc_type, exc_value, exc_tb):
+    logger.error("Unhandled exception", exc_info=(exc_type, exc_value, exc_tb))
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+sys.excepthook = _exc_hook
 
 
 def create_app():
