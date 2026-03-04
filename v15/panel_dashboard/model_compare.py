@@ -22,8 +22,8 @@ def model_comparisons_tab(state) -> pn.Column:
 def _model_content(version, model_data=None):
     if not model_data:
         return pn.pane.HTML(
-            '<div style="color:#888;padding:16px;">No Gist credentials found or no data loaded yet. '
-            'Set GIST_ID and GITHUB_TOKEN environment variables.</div>',
+            '<div style="color:#888;padding:16px;">No model data loaded yet. '
+            'Scanner state files will appear after the first trade.</div>',
             sizing_mode='stretch_width',
         )
 
@@ -31,7 +31,7 @@ def _model_content(version, model_data=None):
     model_keys = [k for k in model_data if not k.startswith('_')]
     if not model_keys:
         return pn.pane.HTML(
-            '<div style="color:#888;padding:16px;">No model data in Gist yet. '
+            '<div style="color:#888;padding:16px;">No model data found. '
             'Start a live scanner session to populate it.</div>',
             sizing_mode='stretch_width',
         )

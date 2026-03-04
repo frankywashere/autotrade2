@@ -393,33 +393,16 @@ class DashboardState(param.Parameterized):
         try:
             from v15.trading.surfer_live_scanner import SurferLiveScanner, ScannerConfig
             config = ScannerConfig(initial_capital=self.scanner_capital)
-            gist_id = os.environ.get('GIST_ID', '')
-            github_token = os.environ.get('GITHUB_TOKEN', '')
-            logger.info("Scanner init: gist_id=%s, github_token=%s",
-                         gist_id[:8] + '...' if gist_id else 'MISSING',
-                         github_token[:8] + '...' if github_token else 'MISSING')
-            self.scanner = SurferLiveScanner(
-                config, gist_id=gist_id, github_token=github_token,
-                model_tag='c14',
-            )
-            self.scanner_dw = SurferLiveScanner(
-                config, gist_id=gist_id, github_token=github_token,
-                model_tag='c14-dw',
-            )
+            self.scanner = SurferLiveScanner(config, model_tag='c14')
+            self.scanner_dw = SurferLiveScanner(config, model_tag='c14-dw')
             # Surfer ML scanner: low confidence gate (matching surfer_backtest)
             ml_config = ScannerConfig(
                 initial_capital=self.scanner_capital,
                 min_confidence=0.01,  # Very low gate — ML uses all signals
             )
-            self.scanner_ml = SurferLiveScanner(
-                ml_config, gist_id=gist_id, github_token=github_token,
-                model_tag='c14-ml',
-            )
+            self.scanner_ml = SurferLiveScanner(ml_config, model_tag='c14-ml')
             # Intraday scanner: separate tracking for intraday ML signals
-            self.scanner_intra = SurferLiveScanner(
-                config, gist_id=gist_id, github_token=github_token,
-                model_tag='c14-intra',
-            )
+            self.scanner_intra = SurferLiveScanner(config, model_tag='c14-intra')
             logger.info("Scanners initialized (c14 + c14-dw + c14-ml + c14-intra, capital=$%,.0f)",
                          self.scanner_capital)
         except Exception as e:
@@ -1014,35 +997,36 @@ class DashboardState(param.Parameterized):
         return self.send_notification(msg, title='Test Notification')
 
     def load_model_data(self):
-        """Fetch multi-model state from GitHub Gist API."""
+        """Load multi-model state from per-model local JSON files."""
         import json
-        import urllib.request
+        from v15.trading.surfer_live_scanner import _STATE_DIR
 
-        gist_id = os.environ.get('GIST_ID', '')
-        github_token = os.environ.get('GITHUB_TOKEN', '')
+        combined = {}
+        for tag in ('c14', 'c14-dw', 'c14-ml', 'c14-intra'):
+            fpath = _STATE_DIR / f"surfer_state_{tag}.json"
+            if fpath.exists():
+                try:
+                    combined[tag] = json.loads(fpath.read_text())
+                except Exception as e:
+                    logger.warning("Failed to load %s: %s", fpath, e)
+        if combined:
+            combined['_last_updated'] = datetime.now().isoformat()
+            self.model_data = combined
+            self.model_data_version += 1
+            logger.info("Model data loaded: %d models (local files)",
+                        len([k for k in combined if not k.startswith('_')]))
 
-        if not gist_id or not github_token:
-            return
-
-        try:
-            headers = {
-                'Authorization': f'token {github_token}',
-                'Accept': 'application/vnd.github.v3+json',
-            }
-            url = f'https://api.github.com/gists/{gist_id}'
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                gist_data = json.loads(resp.read().decode())
-            content = gist_data.get('files', {}).get(
-                'surfer_scanner_state.json', {}
-            ).get('content', '')
-            if content:
-                self.model_data = json.loads(content)
-                self.model_data_version += 1
-                logger.info("Model data loaded: %d models",
-                            len([k for k in self.model_data if not k.startswith('_')]))
-        except Exception as e:
-            logger.error("Failed to load model data: %s", e)
+    def flush_scanner_state(self):
+        """One-time: write each scanner's in-memory state to its per-model local file."""
+        count = 0
+        for scnr in [self.scanner, self.scanner_dw, self.scanner_ml, self.scanner_intra]:
+            if scnr:
+                scnr._save_state()
+                count += 1
+                logger.info("Flushed state for %s: %d trades, equity=$%.2f",
+                            scnr.model_tag, len(scnr.closed_trades), scnr.equity)
+        self.load_model_data()
+        return count
 
 
 def _exit_alert_html(ea) -> str:

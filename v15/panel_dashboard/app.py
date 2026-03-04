@@ -156,6 +156,16 @@ def create_app():
 
     ntfy_test_btn.on_click(_test_ntfy)
 
+    flush_btn = pn.widgets.Button(name='Flush State to Disk', button_type='success')
+    flush_status = pn.pane.Markdown('', width=200)
+
+    def _flush_state(e):
+        flush_status.object = '*Flushing...*'
+        n = state.flush_scanner_state()
+        flush_status.object = f'**Flushed {n} scanners**'
+
+    flush_btn.on_click(_flush_state)
+
     reset_btn = pn.widgets.Button(name='Reset Scanner', button_type='danger')
 
     def _reset_scanner(e):
@@ -219,6 +229,9 @@ def create_app():
             pn.layout.Divider(),
             ntfy_test_btn,
             ntfy_status,
+            pn.layout.Divider(),
+            flush_btn,
+            flush_status,
             pn.layout.Divider(),
             reset_btn,
         ],

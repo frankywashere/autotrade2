@@ -2,14 +2,12 @@
 Surfer Live Scanner — Channel Surfer signal evaluation + position tracking.
 
 No auto-trading. No broker integration. Dashboard notifications only.
-Persistence via JSON at ~/.x14/surfer_scanner_state.json (local)
-or GitHub Gist (when GIST_ID + GITHUB_TOKEN are provided, e.g. Streamlit Cloud).
+Persistence via per-model JSON at ~/.x14/surfer_state_{model_tag}.json
 """
 
 import json
 import os
 import threading
-import urllib.request
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
@@ -20,9 +18,6 @@ import pytz
 
 _ET = pytz.timezone('US/Eastern')
 
-# Module-level lock shared by ALL SurferLiveScanner instances so concurrent
-# Gist read-modify-write cycles don't clobber each other.
-_gist_lock = threading.Lock()
 
 
 def _now_et() -> datetime:
@@ -49,10 +44,9 @@ def _is_extended_hours() -> bool:
     from datetime import time as _time
     return _time(4, 0) <= t < _time(9, 30) or _time(16, 0) <= t < _time(20, 0)
 
-STATE_PATH = Path.home() / ".x14" / "surfer_scanner_state.json"
+_STATE_DIR = Path.home() / ".x14"
 MAX_SIGNAL_HISTORY = 200
-GIST_FILE_NAME = 'surfer_scanner_state.json'
-MODEL_TAG = 'c14'  # Identifies this branch in the multi-model Gist
+MODEL_TAG = 'c14'  # Default model tag
 
 # Human-readable display names for each model_tag (used in UI + Telegram)
 DISPLAY_NAMES = {
@@ -219,9 +213,10 @@ class SurferLiveScanner:
     def __init__(self, config: ScannerConfig, gist_id: str = '', github_token: str = '',
                  model_tag: str = ''):
         self.config = config
-        self.gist_id = gist_id.strip()
-        self.github_token = github_token.strip()
+        self.gist_id = gist_id.strip()        # kept for backward compat (unused)
+        self.github_token = github_token.strip()  # kept for backward compat (unused)
         self.model_tag = model_tag or MODEL_TAG
+        self._state_path = _STATE_DIR / f"surfer_state_{self.model_tag}.json"
         self.display_name = DISPLAY_NAMES.get(self.model_tag, self.model_tag)
         self.equity = config.initial_capital
         self.positions: Dict[str, HypotheticalPosition] = {}
@@ -239,79 +234,7 @@ class SurferLiveScanner:
     # Persistence
     # ------------------------------------------------------------------
 
-    def _gist_headers(self) -> dict:
-        return {
-            'Authorization': f'token {self.github_token}',
-            'Accept': 'application/vnd.github.v3+json',
-            'Content-Type': 'application/json',
-        }
-
-    def _gist_load(self) -> Optional[dict]:
-        """Load this model's state from GitHub Gist.
-
-        The Gist holds a multi-model dict keyed by MODEL_TAG so multiple
-        branches can share one Gist without overwriting each other.
-        Returns our model's state dict, or None on failure / first run.
-        """
-        if not self.gist_id or not self.github_token:
-            return None
-        try:
-            url = f'https://api.github.com/gists/{self.gist_id}'
-            req = urllib.request.Request(url, headers=self._gist_headers())
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                gist_data = json.loads(resp.read().decode())
-            content = gist_data.get('files', {}).get(GIST_FILE_NAME, {}).get('content', '')
-            if not content:
-                return None
-            full = json.loads(content)
-            # Multi-model format: top-level keys are model tags
-            return full.get(self.model_tag)
-        except Exception as e:
-            print(f"[SCANNER] Gist load failed: {e}")
-            return None
-
-    def _gist_load_full(self) -> dict:
-        """Load the complete multi-model dict from Gist (for read-modify-write saves)."""
-        if not self.gist_id or not self.github_token:
-            return {}
-        try:
-            url = f'https://api.github.com/gists/{self.gist_id}'
-            req = urllib.request.Request(url, headers=self._gist_headers())
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                gist_data = json.loads(resp.read().decode())
-            content = gist_data.get('files', {}).get(GIST_FILE_NAME, {}).get('content', '')
-            return json.loads(content) if content else {}
-        except Exception:
-            return {}
-
-    def _gist_save(self, data: dict):
-        """Push this model's state to GitHub Gist (read-modify-write, non-blocking best-effort).
-
-        Reads existing Gist, updates only our MODEL_TAG slot, writes back.
-        Other models' data is preserved.  Serialised by _gist_lock so
-        concurrent scanners don't clobber each other's read-modify-write.
-        """
-        if not self.gist_id or not self.github_token:
-            return
-        try:
-            with _gist_lock:
-                full = self._gist_load_full()
-                full[self.model_tag] = data
-                full['_last_updated'] = _now_et().isoformat()
-                url = f'https://api.github.com/gists/{self.gist_id}'
-                payload = json.dumps({
-                    'files': {GIST_FILE_NAME: {'content': json.dumps(full, indent=2)}}
-                }).encode()
-                req = urllib.request.Request(
-                    url, data=payload, headers=self._gist_headers(), method='PATCH'
-                )
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    print(f"[SCANNER] Gist saved ({self.model_tag}, "
-                          f"{len(payload)/1024:.0f}KB, HTTP {resp.status})")
-        except Exception as e:
-            import traceback
-            print(f"[SCANNER] Gist save FAILED ({self.model_tag}): {e}")
-            traceback.print_exc()
+    # Gist methods removed — persistence is now local-only per-model files
 
     def _apply_state(self, data: dict):
         self.equity = data.get('equity', self.equity)
@@ -336,7 +259,7 @@ class SurferLiveScanner:
         """Force-close positions from a prior trading day or past today's EOD cutoff.
 
         Handles the scenario where the scanner is restarted after market close
-        and stale positions from the Gist/local state would otherwise stay open.
+        and stale positions from the local state would otherwise stay open.
         """
         if not self.positions:
             return
@@ -464,18 +387,18 @@ class SurferLiveScanner:
         return data
 
     def _load_state(self):
-        # Try Gist first (authoritative on Streamlit Cloud), fall back to local
-        data = self._gist_load()
-        if data is None and STATE_PATH.exists():
+        """Load state from per-model local file."""
+        data = None
+        if self._state_path.exists():
             try:
-                data = json.loads(STATE_PATH.read_text())
+                data = json.loads(self._state_path.read_text())
+                print(f"[SCANNER] Loaded state from {self._state_path}")
             except Exception as e:
-                print(f"[SCANNER] Failed to load local state: {e}")
+                print(f"[SCANNER] Failed to load state from {self._state_path}: {e}")
         if data:
             try:
                 data = self._migrate_utc_to_et(data)
                 self._apply_state(data)
-                # Save migrated state back (persists the fix)
                 if data.get('_migrated_tz_v1'):
                     self._save_state()
             except Exception as e:
@@ -493,14 +416,11 @@ class SurferLiveScanner:
             'closed_trades': [t.to_dict() for t in self.closed_trades[-1000:]],
             'signal_history': self.signal_history[-MAX_SIGNAL_HISTORY:],
         }
-        # Always save locally
         try:
-            STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            STATE_PATH.write_text(json.dumps(data, indent=2))
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            self._state_path.write_text(json.dumps(data, indent=2))
         except Exception as e:
-            print(f"[SCANNER] Local save failed: {e}")
-        # Also push to Gist if configured
-        self._gist_save(data)
+            print(f"[SCANNER] Local save failed ({self.model_tag}): {e}")
 
     def _reset_daily_if_needed(self):
         today = _now_et().strftime('%Y-%m-%d')
