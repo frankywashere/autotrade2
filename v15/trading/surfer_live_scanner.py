@@ -8,6 +8,7 @@ or GitHub Gist (when GIST_ID + GITHUB_TOKEN are provided, e.g. Streamlit Cloud).
 
 import json
 import os
+import threading
 import urllib.request
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -18,6 +19,10 @@ from typing import Dict, List, Optional
 import pytz
 
 _ET = pytz.timezone('US/Eastern')
+
+# Module-level lock shared by ALL SurferLiveScanner instances so concurrent
+# Gist read-modify-write cycles don't clobber each other.
+_gist_lock = threading.Lock()
 
 
 def _now_et() -> datetime:
@@ -48,6 +53,14 @@ STATE_PATH = Path.home() / ".x14" / "surfer_scanner_state.json"
 MAX_SIGNAL_HISTORY = 200
 GIST_FILE_NAME = 'surfer_scanner_state.json'
 MODEL_TAG = 'c14'  # Identifies this branch in the multi-model Gist
+
+# Human-readable display names for each model_tag (used in UI + Telegram)
+DISPLAY_NAMES = {
+    'c14': 'CS-5TF',
+    'c14-dw': 'CS-DW',
+    'c14-ml': 'Surfer ML',
+    'c14-intra': 'Intraday',
+}
 
 # Slippage + commission (per-signal-source, matching each backtest engine)
 SLIPPAGE_BY_SOURCE = {
@@ -209,6 +222,7 @@ class SurferLiveScanner:
         self.gist_id = gist_id.strip()
         self.github_token = github_token.strip()
         self.model_tag = model_tag or MODEL_TAG
+        self.display_name = DISPLAY_NAMES.get(self.model_tag, self.model_tag)
         self.equity = config.initial_capital
         self.positions: Dict[str, HypotheticalPosition] = {}
         self.closed_trades: List[ClosedTrade] = []
@@ -218,6 +232,7 @@ class SurferLiveScanner:
         self._daily_date: str = ''
         self._ext_opens_today: int = 0    # Extended-hours entries used today
         self._ext_closes_today: int = 0   # Extended-hours exits used today
+        self._signal_lock = threading.Lock()  # Guards check-through-enter in evaluate_*
         self._load_state()
 
     # ------------------------------------------------------------------
@@ -273,24 +288,26 @@ class SurferLiveScanner:
         """Push this model's state to GitHub Gist (read-modify-write, non-blocking best-effort).
 
         Reads existing Gist, updates only our MODEL_TAG slot, writes back.
-        Other models' data is preserved.
+        Other models' data is preserved.  Serialised by _gist_lock so
+        concurrent scanners don't clobber each other's read-modify-write.
         """
         if not self.gist_id or not self.github_token:
             return
         try:
-            full = self._gist_load_full()
-            full[self.model_tag] = data
-            full['_last_updated'] = _now_et().isoformat()
-            url = f'https://api.github.com/gists/{self.gist_id}'
-            payload = json.dumps({
-                'files': {GIST_FILE_NAME: {'content': json.dumps(full, indent=2)}}
-            }).encode()
-            req = urllib.request.Request(
-                url, data=payload, headers=self._gist_headers(), method='PATCH'
-            )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                print(f"[SCANNER] Gist saved ({self.model_tag}, "
-                      f"{len(payload)/1024:.0f}KB, HTTP {resp.status})")
+            with _gist_lock:
+                full = self._gist_load_full()
+                full[self.model_tag] = data
+                full['_last_updated'] = _now_et().isoformat()
+                url = f'https://api.github.com/gists/{self.gist_id}'
+                payload = json.dumps({
+                    'files': {GIST_FILE_NAME: {'content': json.dumps(full, indent=2)}}
+                }).encode()
+                req = urllib.request.Request(
+                    url, data=payload, headers=self._gist_headers(), method='PATCH'
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    print(f"[SCANNER] Gist saved ({self.model_tag}, "
+                          f"{len(payload)/1024:.0f}KB, HTTP {resp.status})")
         except Exception as e:
             import traceback
             print(f"[SCANNER] Gist save FAILED ({self.model_tag}): {e}")
@@ -312,6 +329,46 @@ class SurferLiveScanner:
             for t in data.get('closed_trades', [])
         ]
         self.signal_history = data.get('signal_history', [])
+        # Force-close positions left over from a prior day / past market close
+        self._close_stale_positions()
+
+    def _close_stale_positions(self):
+        """Force-close positions from a prior trading day or past today's EOD cutoff.
+
+        Handles the scenario where the scanner is restarted after market close
+        and stale positions from the Gist/local state would otherwise stay open.
+        """
+        if not self.positions:
+            return
+        now = _now_et()
+        from datetime import time as _time
+        eod_time = _time(self.EOD_CLOSE_HOUR_ET, self.EOD_CLOSE_MINUTE_ET)
+
+        stale_ids = []
+        for pos_id, pos in self.positions.items():
+            try:
+                entry_dt = datetime.fromisoformat(pos.entry_time)
+                if entry_dt.tzinfo is None:
+                    entry_dt = _ET.localize(entry_dt)
+            except (ValueError, TypeError):
+                stale_ids.append(pos_id)
+                continue
+            # Stale if: entered on a different date, or today but past EOD cutoff
+            if entry_dt.date() < now.date():
+                stale_ids.append(pos_id)
+            elif entry_dt.date() == now.date() and now.time() >= eod_time:
+                stale_ids.append(pos_id)
+
+        for pos_id in stale_ids:
+            pos = self.positions[pos_id]
+            # Close at entry price (no price data available at startup)
+            self._close_position(pos_id, pos, pos.entry_price, 'stale_recovery')
+            print(f"[SCANNER] Stale position closed on startup: {pos_id} "
+                  f"({pos.signal_source}, entered {pos.entry_time})")
+        for pos_id in stale_ids:
+            del self.positions[pos_id]
+        if stale_ids:
+            self._save_state()
 
     @staticmethod
     def _migrate_utc_to_et(data: dict) -> dict:
@@ -468,7 +525,13 @@ class SurferLiveScanner:
             signal_source: Which combo produced this signal ('CS-5TF', 'CS-DW', etc.)
         """
         self._reset_daily_if_needed()
-        now = _now_et().isoformat()
+        now_et = _now_et()
+        now = now_et.isoformat()
+
+        # AM-only: CS-5TF / CS-DW / ML only enter during first hour (9:30-10:30 ET)
+        from datetime import time as _time
+        if now_et.time() > _time(10, 30):
+            return None
 
         sig = analysis.signal
 
@@ -510,128 +573,130 @@ class SurferLiveScanner:
         if sig.confidence < self.config.min_confidence:
             return None
 
-        # Max non-intraday positions (intraday has its own cap of 30)
-        non_intraday = sum(1 for p in self.positions.values() if p.signal_type != 'intraday')
-        if non_intraday >= self.config.max_positions:
-            return ScannerAlert(
-                alert_type='RISK_WARNING', timestamp=now,
-                warning_msg=f'Max positions ({self.config.max_positions}) reached — signal ignored',
+        # --- Thread-safe check-and-enter (prevents duplicate positions) ---
+        with self._signal_lock:
+            # Max non-intraday positions (intraday has its own cap of 30)
+            non_intraday = sum(1 for p in self.positions.values() if p.signal_type != 'intraday')
+            if non_intraday >= self.config.max_positions:
+                return ScannerAlert(
+                    alert_type='RISK_WARNING', timestamp=now,
+                    warning_msg=f'Max positions ({self.config.max_positions}) reached — signal ignored',
+                )
+
+            # Anti-pyramid: no duplicate direction
+            direction = 'long' if sig.action == 'BUY' else 'short'
+            for pos in self.positions.values():
+                if pos.direction == direction:
+                    return None
+
+            # Anti-double-type: no two bounces or two breaks open (matches backtest)
+            signal_type = getattr(sig, 'signal_type', 'bounce')
+            for pos in self.positions.values():
+                if pos.signal_type == signal_type:
+                    return None
+
+            # --- Stop/TP logic (branched by signal source) ---
+            stop_pct = sig.suggested_stop_pct
+            if stop_pct <= 0:
+                stop_pct = 0.02
+            tp_pct = sig.suggested_tp_pct
+
+            if signal_source in ('CS-5TF', 'CS-DW'):
+                # combo_backtest.py: floor at 2%/4%, no ATR clipping
+                stop_pct = max(stop_pct, 0.02)
+                tp_pct = max(tp_pct, 0.04)
+            else:
+                # surfer_backtest.py: ATR-clipped stops
+                atr_val = getattr(analysis, 'atr', None) or getattr(sig, 'atr', None)
+                if atr_val and atr_val > 0 and current_price > 0:
+                    if signal_type == 'bounce':
+                        atr_floor = (0.5 * atr_val) / current_price
+                        atr_cap = (1.5 * atr_val) / current_price
+                    else:  # break
+                        atr_floor = (1.5 * atr_val) / current_price
+                        atr_cap = (3.0 * atr_val) / current_price
+                    stop_pct = max(atr_floor, min(stop_pct, atr_cap))
+                    # Breakout ultra-tight: ×0.05 (matching backtest Arch 73)
+                    if signal_type == 'break':
+                        stop_pct *= 0.05
+                        if stop_pct < 0.00030:
+                            return None
+                # TP widening for high-confidence bounces (surfer_backtest only)
+                if signal_type == 'bounce' and sig.confidence > 0.65:
+                    tp_pct *= 1.30
+
+            # --- Position sizing (matches each backtest engine) ---
+            if signal_source in ('CS-5TF', 'CS-DW'):
+                # combo_backtest.py: confidence-scaled, $100K base
+                position_value = self.config.initial_capital * min(sig.confidence, 1.0)
+                shares = max(1, int(position_value / current_price))
+            else:
+                # surfer_backtest.py / default: risk-based sizing
+                risk_dollars = self.equity * self.config.risk_per_trade_pct
+                stop_distance = stop_pct * current_price
+                shares = int(risk_dollars / stop_distance) if stop_distance > 0 else 0
+                # Signal-type sizing boosts (matching backtest Arch 65+69)
+                size_mult = 1.0
+                if signal_type == 'bounce':
+                    if direction == 'short':
+                        size_mult = 2.5
+                    else:
+                        size_mult = 1.5
+                elif signal_type == 'break':
+                    ch_health = getattr(sig, 'channel_health', 0.5)
+                    if ch_health > 0.50:
+                        size_mult = 0.6
+                    elif ch_health < 0.30:
+                        size_mult = 1.4
+                shares = int(shares * size_mult)
+
+            # Cap at max buying power
+            buying_power = self.equity * self.config.max_leverage
+            max_notional = buying_power * self.config.max_buying_power_pct
+            max_shares = int(max_notional / current_price) if current_price > 0 else 0
+            shares = min(shares, max_shares)
+
+            if shares <= 0:
+                return None
+
+            notional = shares * current_price
+
+            # Compute stop/TP prices
+            if direction == 'long':
+                stop_price = current_price * (1 - stop_pct)
+                tp_price = current_price * (1 + tp_pct)
+            else:
+                stop_price = current_price * (1 + stop_pct)
+                tp_price = current_price * (1 - tp_pct)
+
+            rr = sig.suggested_tp_pct / max(stop_pct, 0.001)
+
+            alert = ScannerAlert(
+                alert_type='ENTRY',
+                timestamp=now,
+                action=sig.action,
+                price=current_price,
+                shares=shares,
+                stop_price=stop_price,
+                tp_price=tp_price,
+                risk_reward=rr,
+                confidence=sig.confidence,
+                signal_type=getattr(sig, 'signal_type', 'bounce'),
+                primary_tf=sig.primary_tf,
+                reason=sig.reason,
+                notional=notional,
+                signal_source=signal_source,
             )
 
-        # Anti-pyramid: no duplicate direction
-        direction = 'long' if sig.action == 'BUY' else 'short'
-        for pos in self.positions.values():
-            if pos.direction == direction:
-                return None
+            # Auto-enter hypothetical position
+            ou_hl = getattr(sig, 'ou_half_life', 5.0) or 5.0
+            self._enter_hypothetical(alert, direction, signal_source=signal_source,
+                                     initial_stop_pct=stop_pct, ou_half_life=ou_hl)
+            if not _is_market_open() and _is_extended_hours():
+                self._ext_opens_today += 1
+            self._save_state()
 
-        # Anti-double-type: no two bounces or two breaks open (matches backtest)
-        signal_type = getattr(sig, 'signal_type', 'bounce')
-        for pos in self.positions.values():
-            if pos.signal_type == signal_type:
-                return None
-
-        # --- Stop/TP logic (branched by signal source) ---
-        stop_pct = sig.suggested_stop_pct
-        if stop_pct <= 0:
-            stop_pct = 0.02
-        tp_pct = sig.suggested_tp_pct
-
-        if signal_source in ('CS-5TF', 'CS-DW'):
-            # combo_backtest.py: floor at 2%/4%, no ATR clipping
-            stop_pct = max(stop_pct, 0.02)
-            tp_pct = max(tp_pct, 0.04)
-        else:
-            # surfer_backtest.py: ATR-clipped stops
-            atr_val = getattr(analysis, 'atr', None) or getattr(sig, 'atr', None)
-            if atr_val and atr_val > 0 and current_price > 0:
-                if signal_type == 'bounce':
-                    atr_floor = (0.5 * atr_val) / current_price
-                    atr_cap = (1.5 * atr_val) / current_price
-                else:  # break
-                    atr_floor = (1.5 * atr_val) / current_price
-                    atr_cap = (3.0 * atr_val) / current_price
-                stop_pct = max(atr_floor, min(stop_pct, atr_cap))
-                # Breakout ultra-tight: ×0.05 (matching backtest Arch 73)
-                if signal_type == 'break':
-                    stop_pct *= 0.05
-                    if stop_pct < 0.00030:
-                        return None
-            # TP widening for high-confidence bounces (surfer_backtest only)
-            if signal_type == 'bounce' and sig.confidence > 0.65:
-                tp_pct *= 1.30
-
-        # --- Position sizing (matches each backtest engine) ---
-        if signal_source in ('CS-5TF', 'CS-DW'):
-            # combo_backtest.py: confidence-scaled, $100K base
-            position_value = self.config.initial_capital * min(sig.confidence, 1.0)
-            shares = max(1, int(position_value / current_price))
-        else:
-            # surfer_backtest.py / default: risk-based sizing
-            risk_dollars = self.equity * self.config.risk_per_trade_pct
-            stop_distance = stop_pct * current_price
-            shares = int(risk_dollars / stop_distance) if stop_distance > 0 else 0
-            # Signal-type sizing boosts (matching backtest Arch 65+69)
-            size_mult = 1.0
-            if signal_type == 'bounce':
-                if direction == 'short':
-                    size_mult = 2.5
-                else:
-                    size_mult = 1.5
-            elif signal_type == 'break':
-                ch_health = getattr(sig, 'channel_health', 0.5)
-                if ch_health > 0.50:
-                    size_mult = 0.6
-                elif ch_health < 0.30:
-                    size_mult = 1.4
-            shares = int(shares * size_mult)
-
-        # Cap at max buying power
-        buying_power = self.equity * self.config.max_leverage
-        max_notional = buying_power * self.config.max_buying_power_pct
-        max_shares = int(max_notional / current_price) if current_price > 0 else 0
-        shares = min(shares, max_shares)
-
-        if shares <= 0:
-            return None
-
-        notional = shares * current_price
-
-        # Compute stop/TP prices
-        if direction == 'long':
-            stop_price = current_price * (1 - stop_pct)
-            tp_price = current_price * (1 + tp_pct)
-        else:
-            stop_price = current_price * (1 + stop_pct)
-            tp_price = current_price * (1 - tp_pct)
-
-        rr = sig.suggested_tp_pct / max(stop_pct, 0.001)
-
-        alert = ScannerAlert(
-            alert_type='ENTRY',
-            timestamp=now,
-            action=sig.action,
-            price=current_price,
-            shares=shares,
-            stop_price=stop_price,
-            tp_price=tp_price,
-            risk_reward=rr,
-            confidence=sig.confidence,
-            signal_type=getattr(sig, 'signal_type', 'bounce'),
-            primary_tf=sig.primary_tf,
-            reason=sig.reason,
-            notional=notional,
-            signal_source=signal_source,
-        )
-
-        # Auto-enter hypothetical position
-        ou_hl = getattr(sig, 'ou_half_life', 5.0) or 5.0
-        self._enter_hypothetical(alert, direction, signal_source=signal_source,
-                                 initial_stop_pct=stop_pct, ou_half_life=ou_hl)
-        if not _is_market_open() and _is_extended_hours():
-            self._ext_opens_today += 1
-        self._save_state()
-
-        return alert
+            return alert
 
     def evaluate_intraday_signal(
         self, current_price: float,
@@ -671,12 +736,7 @@ class SurferLiveScanner:
         if self.daily_pnl <= self.config.daily_loss_limit:
             return None
 
-        # Cap intraday positions at 30 (matching backtest mtd=30)
-        intraday_count = sum(1 for p in self.positions.values() if p.signal_type == 'intraday')
-        if intraday_count >= 30:
-            return None
-
-        # Evaluate signal
+        # Evaluate signal (outside lock — pure computation, no state mutation)
         try:
             from v15.trading.intraday_signals import sig_union_enhanced, compute_intraday_trail
         except ImportError:
@@ -701,47 +761,54 @@ class SurferLiveScanner:
         if confidence < self.config.min_confidence:
             return None
 
-        # Record in signal history
-        self.signal_history.append({
-            'time': now_iso,
-            'action': 'BUY',
-            'confidence': confidence,
-            'primary_tf': '5min',
-            'signal_type': 'intraday',
-            'reason': 'Intraday FD Enh-Union',
-            'signal_source': 'intraday',
-        })
+        # --- Thread-safe check-and-enter (prevents duplicate positions) ---
+        with self._signal_lock:
+            # Cap intraday positions at 30 (matching backtest mtd=30)
+            intraday_count = sum(1 for p in self.positions.values() if p.signal_type == 'intraday')
+            if intraday_count >= 30:
+                return None
 
-        # Position sizing: flat $100K / price (matching intraday backtest, conf_size=False)
-        shares = max(1, int(self.config.initial_capital / current_price)) if current_price > 0 else 0
-        if shares <= 0:
-            return None
+            # Record in signal history
+            self.signal_history.append({
+                'time': now_iso,
+                'action': 'BUY',
+                'confidence': confidence,
+                'primary_tf': '5min',
+                'signal_type': 'intraday',
+                'reason': 'Intraday FD Enh-Union',
+                'signal_source': 'intraday',
+            })
 
-        notional = shares * current_price
-        stop_price = current_price * (1 - stop_pct)
-        tp_price_val = current_price * (1 + tp_pct)
-        rr = tp_pct / max(stop_pct, 0.001)
+            # Position sizing: flat $100K / price (matching intraday backtest, conf_size=False)
+            shares = max(1, int(self.config.initial_capital / current_price)) if current_price > 0 else 0
+            if shares <= 0:
+                return None
 
-        alert = ScannerAlert(
-            alert_type='ENTRY',
-            timestamp=now_iso,
-            action='BUY',
-            price=current_price,
-            shares=shares,
-            stop_price=stop_price,
-            tp_price=tp_price_val,
-            risk_reward=rr,
-            confidence=confidence,
-            signal_type='intraday',
-            primary_tf='5min',
-            reason='Intraday FD Enh-Union',
-            notional=notional,
-            signal_source='intraday',
-        )
+            notional = shares * current_price
+            stop_price = current_price * (1 - stop_pct)
+            tp_price_val = current_price * (1 + tp_pct)
+            rr = tp_pct / max(stop_pct, 0.001)
 
-        self._enter_hypothetical(alert, direction, signal_source='intraday')
-        self._save_state()
-        return alert
+            alert = ScannerAlert(
+                alert_type='ENTRY',
+                timestamp=now_iso,
+                action='BUY',
+                price=current_price,
+                shares=shares,
+                stop_price=stop_price,
+                tp_price=tp_price_val,
+                risk_reward=rr,
+                confidence=confidence,
+                signal_type='intraday',
+                primary_tf='5min',
+                reason='Intraday FD Enh-Union',
+                notional=notional,
+                signal_source='intraday',
+            )
+
+            self._enter_hypothetical(alert, direction, signal_source='intraday')
+            self._save_state()
+            return alert
 
     def _enter_hypothetical(self, alert: ScannerAlert, direction: str,
                             signal_source: str = '',
@@ -779,7 +846,7 @@ class SurferLiveScanner:
             f"Confidence: {pos.confidence:.0%} | {pos.primary_tf}\n"
             f"Notional: ${pos.notional:,.0f}",
             model_tag=self.model_tag,
-            title=f'[{self.model_tag}] TRADE OPENED',
+            title=f'[{self.display_name}] TRADE OPENED',
         )
 
     # ------------------------------------------------------------------
@@ -1074,7 +1141,7 @@ class SurferLiveScanner:
             f"P&L: ${pnl:+,.0f} ({pnl_pct:+.2%})\n"
             f"Reason: {exit_reason} | Held: {hold_str}",
             model_tag=self.model_tag,
-            title=f'[{self.model_tag}] TRADE CLOSED ({pnl_emoji}${abs(pnl):,.0f})',
+            title=f'[{self.display_name}] TRADE CLOSED ({pnl_emoji}${abs(pnl):,.0f})',
         )
 
         return ScannerAlert(
