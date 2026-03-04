@@ -43,41 +43,36 @@ def _exc_hook(exc_type, exc_value, exc_tb):
 sys.excepthook = _exc_hook
 
 
-def create_app():
-    logger.info("create_app() called — importing modules...")
-    try:
-        from v15.panel_dashboard.state import DashboardState
-        logger.info("  DashboardState imported")
-        from v15.panel_dashboard.channel_surfer import channel_surfer_tab
-        logger.info("  channel_surfer_tab imported")
-        from v15.panel_dashboard.model_compare import model_comparisons_tab
-        logger.info("  model_comparisons_tab imported")
-    except Exception:
-        logger.error("Import failed:\n%s", traceback.format_exc())
-        raise
+# ── Singleton state — initialized once, shared across all sessions ────────────
+_state = None
 
-    state = DashboardState()
 
-    # Load market data (blocking on startup)
-    logger.info("Starting X14 c14a Panel Dashboard...")
-    state.load_market_data()
-    logger.info("Market data loaded. TSLA price=%.2f, scanner=%s, scanner_dw=%s, scanner_ml=%s, scanner_intra=%s",
-                state.tsla_price,
-                "OK" if state.scanner else "NONE",
-                "OK" if state.scanner_dw else "NONE",
-                "OK" if state.scanner_ml else "NONE",
-                "OK" if state.scanner_intra else "NONE")
+def _init_state():
+    """Initialize DashboardState once (data load, scanners, background loops)."""
+    global _state
+    if _state is not None:
+        return _state
 
-    # Log ML model status + send startup notification
-    gbt_ok = hasattr(state, '_ml_model') and state._ml_model is not None
-    intra_ok = hasattr(state, '_intraday_ml_model') and state._intraday_ml_model is not None
+    from v15.panel_dashboard.state import DashboardState
 
-    # Build detailed status messages
-    gbt_msg = f"LOADED ({len(state._ml_feature_names or [])} features)" if gbt_ok else "NOT LOADED"
-    intra_msg = (f"LOADED ({len(getattr(state, '_intraday_ml_features', []) or [])} features, "
-                 f"threshold={getattr(state, '_intraday_ml_threshold', 0.5):.2f})") if intra_ok else "NOT LOADED"
+    logger.info("Initializing DashboardState (one-time)...")
+    _state = DashboardState()
 
-    # Check file existence for diagnostics
+    _state.load_market_data()
+    logger.info("Market data loaded. TSLA=%.2f, scanners: CS=%s DW=%s ML=%s Intra=%s",
+                _state.tsla_price,
+                "OK" if _state.scanner else "NONE",
+                "OK" if _state.scanner_dw else "NONE",
+                "OK" if _state.scanner_ml else "NONE",
+                "OK" if _state.scanner_intra else "NONE")
+
+    # Log ML model status
+    gbt_ok = hasattr(_state, '_ml_model') and _state._ml_model is not None
+    intra_ok = hasattr(_state, '_intraday_ml_model') and _state._intraday_ml_model is not None
+    gbt_msg = f"LOADED ({len(_state._ml_feature_names or [])} features)" if gbt_ok else "NOT LOADED"
+    intra_msg = (f"LOADED ({len(getattr(_state, '_intraday_ml_features', []) or [])} features, "
+                 f"threshold={getattr(_state, '_intraday_ml_threshold', 0.5):.2f})") if intra_ok else "NOT LOADED"
+
     from pathlib import Path
     gbt_path = Path('surfer_models/gbt_model.pkl')
     intra_path = Path('surfer_models/intraday_ml_model.pkl')
@@ -85,13 +80,11 @@ def create_app():
     intra_diag = ""
     if not gbt_ok:
         if gbt_path.exists():
-            import os
             gbt_diag = f" (file exists, {os.path.getsize(gbt_path)} bytes — load error)"
         else:
             gbt_diag = f" (file missing at {gbt_path.resolve()})"
     if not intra_ok:
         if intra_path.exists():
-            import os
             intra_diag = f" (file exists, {os.path.getsize(intra_path)} bytes — load error)"
         else:
             intra_diag = f" (file missing at {intra_path.resolve()})"
@@ -105,31 +98,43 @@ def create_app():
     else:
         logger.warning("ML model (Intraday): %s%s — c14-intra ML filter disabled", intra_msg, intra_diag)
 
-    # Send startup status via Telegram
-    scanner_err = getattr(state, '_scanner_init_error', '')
-    gbt_err = getattr(state, '_gbt_load_error', '')
+    # Send startup notification
+    scanner_err = getattr(_state, '_scanner_init_error', '')
+    gbt_err = getattr(_state, '_gbt_load_error', '')
     startup_msg = (
-        f"Scanners: CS-5TF={'OK' if state.scanner else 'FAIL'}, "
-        f"CS-DW={'OK' if state.scanner_dw else 'FAIL'}, "
-        f"Surfer ML={'OK' if state.scanner_ml else 'FAIL'}, "
-        f"Intraday={'OK' if state.scanner_intra else 'FAIL'}\n"
+        f"Scanners: CS-5TF={'OK' if _state.scanner else 'FAIL'}, "
+        f"CS-DW={'OK' if _state.scanner_dw else 'FAIL'}, "
+        f"Surfer ML={'OK' if _state.scanner_ml else 'FAIL'}, "
+        f"Intraday={'OK' if _state.scanner_intra else 'FAIL'}\n"
         f"GBT model: {gbt_msg}{gbt_diag}\n"
         f"Intraday model: {intra_msg}{intra_diag}\n"
-        f"TSLA price: ${state.tsla_price:.2f}"
+        f"TSLA price: ${_state.tsla_price:.2f}"
     )
     if scanner_err:
         startup_msg += f"\nSCANNER ERROR: {scanner_err[:200]}"
     if gbt_err:
         startup_msg += f"\nGBT ERROR: {gbt_err[:200]}"
-    state.send_notification(startup_msg, title='c14a Startup')
+    _state.send_notification(startup_msg, title='c14a Startup')
 
-    # Load initial model comparison data
-    state.load_model_data()
-    logger.info("Model data loaded. Keys=%d", len(state.model_data))
+    _state.load_model_data()
+    logger.info("Model data loaded. Keys=%d", len(_state.model_data))
 
-    # Start background loops (run even without browser)
     logger.info("Starting background loops...")
-    state.start_background_loops()
+    _state.start_background_loops()
+
+    return _state
+
+
+def create_app():
+    logger.info("create_app() called (session factory)")
+    try:
+        from v15.panel_dashboard.channel_surfer import channel_surfer_tab
+        from v15.panel_dashboard.model_compare import model_comparisons_tab
+    except Exception:
+        logger.error("Import failed:\n%s", traceback.format_exc())
+        raise
+
+    state = _init_state()
 
     # UI refresh only — triggers re-render when browser is connected
     pn.state.add_periodic_callback(lambda: None, period=2000)
