@@ -392,7 +392,7 @@ class SurferLiveScanner:
                 dt = datetime.fromisoformat(iso_str)
                 if dt.tzinfo is not None:
                     return iso_str  # Already tz-aware, skip
-                # Naive → assume UTC (Streamlit Cloud) → convert to ET
+                # Naive -> assume UTC (Streamlit Cloud) -> convert to ET
                 dt_utc = _utc.localize(dt)
                 dt_et = dt_utc.astimezone(_ET)
                 return dt_et.isoformat()
@@ -455,9 +455,9 @@ class SurferLiveScanner:
 
         n_trades_after = len(data['closed_trades'])
         n_pos_after = len(data['positions'])
-        print(f"[SCANNER] TZ migration: trades {n_trades_before}→{n_trades_after} "
+        print(f"[SCANNER] TZ migration: trades {n_trades_before}->{n_trades_after} "
               f"(removed {n_trades_before - n_trades_after} after-hours), "
-              f"positions {n_pos_before}→{n_pos_after}, "
+              f"positions {n_pos_before}->{n_pos_after}, "
               f"equity adjusted by ${-removed_pnl:+,.0f}")
 
         data['_migrated_tz_v1'] = True
