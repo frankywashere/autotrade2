@@ -249,6 +249,40 @@ Event days have ~19% more hourly volatility, but this doesn't concentrate hard s
 
 ---
 
+## Trade Gate Experiments
+
+### Gate V2: No Overnight + ML Break Confidence Filter
+Rules: Block entries after 15:30 ET. Block ML+break+5min if confidence < 0.60.
+
+| Metric | Baseline | Gate V2 | Delta |
+|--------|----------|---------|-------|
+| Trades | 9,368 | 8,275 | -12% |
+| WR | 59% | 60% | +1pp |
+| P&L | +$600,532 | +$502,864 | -$98K |
+| Hard stops | 211 (-$893K) | 161 (-$556K) | -50 HS, +$337K saved |
+| eod_close | 443 (-$282K) | 97 (-$135K) | -346 trades, +$147K saved |
+
+Gate V2 saved $484K in hard_stop+eod losses, but missed some winning trades, netting -$98K.
+The overnight block is effective (eod_close: 443→97, -$147K saved) but also blocks some profitable 15:55 entries.
+
+### OpenEvolve Trade Gate (running on server)
+Started: 2026-03-04 ~03:00 UTC. ~4.5 min/iteration, 200 iterations planned.
+
+Initial seed score: -60,875 (P&L +$443K, 63.6% WR, 114 HS)
+- Train (Jan-Sep 2025): +$429K, 68.2% WR, 4886 trades
+- Test (Oct 2025-Feb 2026): +$14K, 38.1% WR, 884 trades — OOS collapse
+
+Iteration 1: -52,334 (P&L +$591K, 62.7% WR, 93 HS) — improved but test still 36.6% WR
+Iteration 2: -60,350 (no improvement — variant didn't generalize)
+
+**Key challenge**: The gate's train/test split reveals that Oct 2025-Feb 2026 regime
+is fundamentally different (lower volatility, higher prices). The gate must generalize
+across regimes or it will fail in production.
+
+*(Results will be updated as OpenEvolve completes iterations)*
+
+---
+
 ## Key Takeaways
 
 1. **RTH filter is critical** — extended hours data completely invalidated previous long-OOS results
