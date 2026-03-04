@@ -88,14 +88,14 @@ def create_app():
     else:
         logger.warning("ML model (Intraday): %s%s — c14-intra ML filter disabled", intra_msg, intra_diag)
 
-    # Send startup status via ntfy
+    # Send startup status via Telegram
     scanner_err = getattr(state, '_scanner_init_error', '')
     gbt_err = getattr(state, '_gbt_load_error', '')
     startup_msg = (
-        f"Scanners: c14={'OK' if state.scanner else 'FAIL'}, "
-        f"c14-dw={'OK' if state.scanner_dw else 'FAIL'}, "
-        f"c14-ml={'OK' if state.scanner_ml else 'FAIL'}, "
-        f"c14-intra={'OK' if state.scanner_intra else 'FAIL'}\n"
+        f"Scanners: CS-5TF={'OK' if state.scanner else 'FAIL'}, "
+        f"CS-DW={'OK' if state.scanner_dw else 'FAIL'}, "
+        f"Surfer ML={'OK' if state.scanner_ml else 'FAIL'}, "
+        f"Intraday={'OK' if state.scanner_intra else 'FAIL'}\n"
         f"GBT model: {gbt_msg}{gbt_diag}\n"
         f"Intraday model: {intra_msg}{intra_diag}\n"
         f"TSLA price: ${state.tsla_price:.2f}"

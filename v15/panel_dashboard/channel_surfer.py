@@ -17,6 +17,14 @@ ZONE_OVERBOUGHT = 0.85
 
 TF_ORDER = ['5min', '15min', '30min', '1h', '2h', '3h', '4h', 'daily', 'weekly', 'monthly']
 
+# Consistent display names for signal_source values
+SOURCE_DISPLAY = {
+    'CS-5TF': 'CS-5TF',
+    'CS-DW': 'CS-DW',
+    'surfer_ml': 'Surfer ML',
+    'intraday': 'Intraday',
+}
+
 
 def channel_surfer_tab(state) -> pn.Column:
     """Build the Channel Surfer tab. Each section is bound to the specific param it depends on."""
@@ -27,20 +35,24 @@ def channel_surfer_tab(state) -> pn.Column:
                 state.param.price_delta),
         # Active trades banner — only re-renders on actual trade open/close
         pn.bind(_active_trades_banner, state.param.trades_version,
-                scanner=state.scanner, scanner_dw=state.scanner_dw, scanner_ml=state.scanner_ml),
+                scanner=state.scanner, scanner_dw=state.scanner_dw,
+                scanner_ml=state.scanner_ml, scanner_intra=state.scanner_intra),
         # Market insights
         pn.bind(_market_insights, state.param.analysis),
         # Scanner metrics + live P&L — re-renders on price change
         pn.bind(_scanner_metrics, state.param.positions_version, state.param.tsla_price,
-                scanner=state.scanner, scanner_dw=state.scanner_dw, scanner_ml=state.scanner_ml),
+                scanner=state.scanner, scanner_dw=state.scanner_dw,
+                scanner_ml=state.scanner_ml, scanner_intra=state.scanner_intra),
         # Exit alerts — only re-renders when exit_alert_html changes
         pn.bind(_exit_alerts_pane, state.param.exit_alert_html),
         # Open positions with live P&L — re-renders on price change
         pn.bind(_open_positions_pane, state.param.positions_version, state.param.tsla_price,
-                scanner=state.scanner, scanner_dw=state.scanner_dw, scanner_ml=state.scanner_ml),
+                scanner=state.scanner, scanner_dw=state.scanner_dw,
+                scanner_ml=state.scanner_ml, scanner_intra=state.scanner_intra),
         # Trade history — only re-renders on actual trade open/close (preserves <details> state)
         pn.bind(_trade_history_pane, state.param.trades_version,
-                scanner=state.scanner, scanner_dw=state.scanner_dw, scanner_ml=state.scanner_ml),
+                scanner=state.scanner, scanner_dw=state.scanner_dw,
+                scanner_ml=state.scanner_ml, scanner_intra=state.scanner_intra),
         # Regime indicator
         pn.bind(_regime_indicator, state.param.analysis),
         # Break direction predictor
@@ -102,14 +114,14 @@ def _price_banner(tsla_price, price_source, price_delta):
 # Active Trades Banner — only renders when positions are open
 # ---------------------------------------------------------------------------
 
-def _active_trades_banner(trades_version, scanner=None, scanner_dw=None, scanner_ml=None):
+def _active_trades_banner(trades_version, scanner=None, scanner_dw=None, scanner_ml=None, scanner_intra=None):
     """Prominent banner showing active trades with entry/stop/TP and signal source.
 
     Bound to trades_version only — re-renders on actual trade open/close,
     not on every price tick or position P&L update.
     """
     all_positions = []
-    for scnr in [scanner, scanner_dw, scanner_ml]:
+    for scnr in [scanner, scanner_dw, scanner_ml, scanner_intra]:
         if scnr and scnr.positions:
             all_positions.extend(scnr.positions.values())
     if not all_positions:
@@ -117,7 +129,7 @@ def _active_trades_banner(trades_version, scanner=None, scanner_dw=None, scanner
 
     cards = []
     for pos in all_positions:
-        source = getattr(pos, 'signal_source', '') or 'CS'
+        source = SOURCE_DISPLAY.get(getattr(pos, 'signal_source', ''), 'CS')
         sig_type = getattr(pos, 'signal_type', 'bounce')
         type_label = 'BREAKOUT' if sig_type == 'break' else 'BOUNCE'
         type_icon = '&#x26A1;' if sig_type == 'break' else '&#x21C4;'
@@ -136,7 +148,9 @@ def _active_trades_banner(trades_version, scanner=None, scanner_dw=None, scanner
         # Source badge color
         if source == 'CS-DW':
             src_bg = '#e6a800'
-        elif source == 'intraday':
+        elif source == 'Surfer ML':
+            src_bg = '#7b1fa2'
+        elif source == 'Intraday':
             src_bg = '#0288d1'
         else:
             src_bg = '#e65100'
@@ -247,7 +261,7 @@ def _market_insights(analysis):
 # Scanner Panel
 # ---------------------------------------------------------------------------
 
-def _scanner_metrics(positions_version, tsla_price, scanner=None, scanner_dw=None, scanner_ml=None):
+def _scanner_metrics(positions_version, tsla_price, scanner=None, scanner_dw=None, scanner_ml=None, scanner_intra=None):
     """Scanner equity/P&L metrics. Bound to tsla_price for live unrealized updates."""
     if scanner is None:
         return pn.pane.HTML(
@@ -255,19 +269,19 @@ def _scanner_metrics(positions_version, tsla_price, scanner=None, scanner_dw=Non
             sizing_mode='stretch_width',
         )
 
-    all_scanners = [s for s in [scanner, scanner_dw, scanner_ml] if s is not None]
+    all_scanners = [s for s in [scanner, scanner_dw, scanner_ml, scanner_intra] if s is not None]
     total_equity = sum(s.equity for s in all_scanners)
     total_capital = sum(s.config.initial_capital for s in all_scanners)
     unrealized = sum(s.get_unrealized_pnl(tsla_price) for s in all_scanners) if tsla_price > 0 else 0.0
 
     model_rows = ''
     for s in all_scanners:
-        tag = getattr(s, 'model_tag', '?')
+        name = getattr(s, 'display_name', getattr(s, 'model_tag', '?'))
         eq_delta = s.equity - s.config.initial_capital
         eq_color = '#00e676' if eq_delta >= 0 else '#ff5252'
         model_rows += (
             f'<span style="color:#888;font-size:11px;margin-left:12px;">'
-            f'{tag}: ${s.equity:,.0f} (<span style="color:{eq_color}">{eq_delta:+,.0f}</span>)</span>'
+            f'{name}: ${s.equity:,.0f} (<span style="color:{eq_color}">{eq_delta:+,.0f}</span>)</span>'
         )
 
     html = f"""
@@ -303,10 +317,10 @@ def _exit_alerts_pane(exit_alert_html):
     return pn.pane.HTML(exit_alert_html, sizing_mode='stretch_width')
 
 
-def _open_positions_pane(positions_version, tsla_price, scanner=None, scanner_dw=None, scanner_ml=None):
+def _open_positions_pane(positions_version, tsla_price, scanner=None, scanner_dw=None, scanner_ml=None, scanner_intra=None):
     """Open positions with live P&L. Bound to tsla_price for live updates."""
     all_positions = {}
-    for scnr in [scanner, scanner_dw, scanner_ml]:
+    for scnr in [scanner, scanner_dw, scanner_ml, scanner_intra]:
         if scnr and scnr.positions:
             all_positions.update(scnr.positions)
 
@@ -318,12 +332,13 @@ def _open_positions_pane(positions_version, tsla_price, scanner=None, scanner_dw
 
     position_html = ''
     cs5_pos = {k: v for k, v in all_positions.items()
-               if getattr(v, 'signal_source', '') == 'CS-5TF'
-               or (v.signal_type != 'intraday' and getattr(v, 'signal_source', '') not in ('CS-DW', 'intraday'))}
+               if getattr(v, 'signal_source', '') == 'CS-5TF'}
     dw_pos = {k: v for k, v in all_positions.items()
               if getattr(v, 'signal_source', '') == 'CS-DW'}
+    ml_pos = {k: v for k, v in all_positions.items()
+              if getattr(v, 'signal_source', '') == 'surfer_ml'}
     id_pos = {k: v for k, v in all_positions.items()
-              if v.signal_type == 'intraday' or getattr(v, 'signal_source', '') == 'intraday'}
+              if getattr(v, 'signal_source', '') == 'intraday'}
 
     if cs5_pos:
         position_html += '<div style="font-weight:600;color:#ccc;margin:6px 0;">CS-5TF Positions</div>'
@@ -333,22 +348,26 @@ def _open_positions_pane(positions_version, tsla_price, scanner=None, scanner_dw
         position_html += '<div style="font-weight:600;color:#ccc;margin:6px 0;">CS-DW Positions</div>'
         for pos in dw_pos.values():
             position_html += _position_card_html(pos, tsla_price)
+    if ml_pos:
+        position_html += '<div style="font-weight:600;color:#ccc;margin:6px 0;">Surfer ML Positions</div>'
+        for pos in ml_pos.values():
+            position_html += _position_card_html(pos, tsla_price)
     if id_pos:
-        position_html += '<div style="font-weight:600;color:#ccc;margin:6px 0;">Intraday 5m Positions</div>'
+        position_html += '<div style="font-weight:600;color:#ccc;margin:6px 0;">Intraday Positions</div>'
         for pos in id_pos.values():
             position_html += _position_card_html(pos, tsla_price)
 
     return pn.pane.HTML(position_html, sizing_mode='stretch_width')
 
 
-def _trade_history_pane(trades_version, scanner=None, scanner_dw=None, scanner_ml=None):
+def _trade_history_pane(trades_version, scanner=None, scanner_dw=None, scanner_ml=None, scanner_intra=None):
     """Trade history. Bound to trades_version ONLY — not tsla_price or positions_version.
 
     Only re-renders when a trade actually opens or closes, so the <details>
     element preserves its open/closed state between price ticks.
     """
     all_closed = []
-    for scnr in [scanner, scanner_dw, scanner_ml]:
+    for scnr in [scanner, scanner_dw, scanner_ml, scanner_intra]:
         if scnr and scnr.closed_trades:
             all_closed.extend(scnr.closed_trades)
 
@@ -374,13 +393,8 @@ def _trade_history_pane(trades_version, scanner=None, scanner_dw=None, scanner_m
 
 
 def _position_card_html(pos, current_price: float) -> str:
-    source = getattr(pos, 'signal_source', '')
-    if source:
-        sys_tag = source
-    elif pos.signal_type == 'intraday':
-        sys_tag = "ID 5m"
-    else:
-        sys_tag = "CS"
+    raw_source = getattr(pos, 'signal_source', '')
+    sys_tag = SOURCE_DISPLAY.get(raw_source, raw_source or 'CS')
     if pos.direction == 'long':
         upnl = (current_price - pos.entry_price) * pos.shares if current_price > 0 else 0
         dist_stop = (current_price - pos.stop_price) / current_price if current_price > 0 else 0
@@ -392,9 +406,11 @@ def _position_card_html(pos, current_price: float) -> str:
 
     upnl_color = "#00e676" if upnl >= 0 else "#ff5252"
     stop_color = '#ff5252' if dist_stop < 0.003 else ('#ff9800' if dist_stop < 0.01 else '#888')
-    if source == 'CS-DW':
+    if raw_source == 'CS-DW':
         tag_color = '#ffd54f'
-    elif pos.signal_type == 'intraday' or source == 'intraday':
+    elif raw_source == 'surfer_ml':
+        tag_color = '#ce93d8'
+    elif raw_source == 'intraday':
         tag_color = '#4fc3f7'
     else:
         tag_color = '#ff9800'
@@ -416,7 +432,8 @@ def _trade_history_html(closed_trades) -> str:
     rows = []
     for t in reversed(closed_trades[-50:]):
         pnl_color = '#00e676' if t.pnl >= 0 else '#ff5252'
-        source = getattr(t, 'signal_source', '')
+        raw_source = getattr(t, 'signal_source', '')
+        source = SOURCE_DISPLAY.get(raw_source, raw_source)
         source_tag = (f'<span style="color:#64b5f6;font-size:10px;background:#1a237e;'
                       f'padding:1px 4px;border-radius:3px;margin-right:4px;">'
                       f'{source}</span>') if source else ''

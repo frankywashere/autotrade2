@@ -1451,6 +1451,8 @@ def run_all_scanners_sim(data: dict, sim_start: str, sim_end: str,
                          vix_am_threshold: Optional[float] = None,
                          dw_eod_close: bool = True,
                          trade_gate=None,
+                         am_cutoff_minutes: int = 60,
+                         late_short_hard_stop_pct: Optional[float] = None,
                          verbose: bool = True) -> Dict[str, SimScanner]:
     """Run simulation with all 4 scanner types on 5-min bars.
 
@@ -1471,6 +1473,11 @@ def run_all_scanners_sim(data: dict, sim_start: str, sim_end: str,
                           day's VIX close >= this threshold. Ignored if am_only=True.
         dw_eod_close: If False, CS-DW positions are NOT force-closed at EOD,
                       allowing multi-day holds for daily/weekly TF signals.
+        am_cutoff_minutes: Minutes after 9:30 ET for AM cutoff (default 60 = 10:30).
+                           Use 45 for 10:15 cutoff.
+        late_short_hard_stop_pct: If set, SHORT entries by CS/ML AFTER the AM cutoff
+                                  get this tight hard stop (e.g. 0.001 = 0.1%).
+                                  Allows late shorts but with very tight risk.
     """
     from v15.core.channel_surfer import prepare_multi_tf_analysis
     from v15.validation.intraday_features import precompute_5min_features
@@ -1558,11 +1565,14 @@ def run_all_scanners_sim(data: dict, sim_start: str, sim_end: str,
     last_progress = -10
 
     if verbose:
+        _cutoff_time_str = f"9:30-{9 + (30 + am_cutoff_minutes) // 60}:{(30 + am_cutoff_minutes) % 60:02d} ET"
         hs_str = f"  Hard stop: {hard_stop_pct:.0%}" if hard_stop_pct else "  Hard stop: None"
-        am_str = "  AM-only: CS/ML entries restricted to 9:30-10:30 ET" if am_only else ""
+        am_str = f"  AM-only: CS/ML entries restricted to {_cutoff_time_str}" if am_only else ""
         if vix_am_threshold is not None and not am_only:
-            am_str = f"  VIX-gated AM-only: CS/ML restricted to first hour when prev VIX >= {vix_am_threshold}"
-        late_str = f"  Late hard stop: {late_hard_stop_pct:.1%} for CS/ML entries after 10:30 ET" if late_hard_stop_pct else ""
+            am_str = f"  VIX-gated AM-only: CS/ML restricted to first {am_cutoff_minutes}min when prev VIX >= {vix_am_threshold}"
+        late_str = f"  Late hard stop: {late_hard_stop_pct:.1%} for CS/ML entries after {_cutoff_time_str}" if late_hard_stop_pct else ""
+        if late_short_hard_stop_pct is not None:
+            late_str += f"\n  Late SHORT hard stop: {late_short_hard_stop_pct:.1%} for CS/ML shorts after {_cutoff_time_str}"
         print(f"\n{'- '*40}")
         print(f"  ALL 4 SCANNERS: {sim_start} to {sim_end}")
         print(f"  Capital: ${capital:,.0f} per scanner ({equity_mode} mode)")
@@ -1638,7 +1648,7 @@ def run_all_scanners_sim(data: dict, sim_start: str, sim_end: str,
             for s in scanners.values():
                 s.equity = shared_equity[0]
 
-        # Determine if we're in the first hour (9:30-10:30 ET)
+        # Determine if we're past the AM cutoff (default 60min = 10:30 ET)
         _in_first_hour = False
         _past_first_hour = False
         try:
@@ -1650,15 +1660,27 @@ def run_all_scanners_sim(data: dict, sim_start: str, sim_end: str,
                 _bt_et = _et.localize(bar_time)
             from datetime import time as _time
             _bt_tod = _bt_et.time()
-            _in_first_hour = _time(9, 30) <= _bt_tod <= _time(10, 30)
-            _past_first_hour = _bt_tod > _time(10, 30)
+            _cutoff_h = 9 + (30 + am_cutoff_minutes) // 60
+            _cutoff_m = (30 + am_cutoff_minutes) % 60
+            _cutoff_time = _time(_cutoff_h, _cutoff_m)
+            _in_first_hour = _time(9, 30) <= _bt_tod <= _cutoff_time
+            _past_first_hour = _bt_tod > _cutoff_time
         except Exception:
             pass
 
-        # AM-only / VIX-gated AM-only: skip CS/ML entries after 10:30 ET
+        # AM-only / VIX-gated AM-only: skip CS/ML entries after cutoff
         _allow_cs_ml = True
+        _late_short_mode = False  # True when shorts allowed but with tight HS
+        _late_all_mode = False  # True when all trades allowed but with tight HS
         if am_only and _past_first_hour:
-            _allow_cs_ml = False
+            if late_hard_stop_pct is not None:
+                # Don't block — allow all trades through with tight hard stop
+                _late_all_mode = True
+            elif late_short_hard_stop_pct is not None:
+                # Don't block — allow shorts through with tight hard stop
+                _late_short_mode = True
+            else:
+                _allow_cs_ml = False
         elif vix_am_threshold is not None and _past_first_hour:
             _bar_date = bar_time.date() if hasattr(bar_time, 'date') else bar_time
             if getattr(bar_time, 'tzinfo', None) is not None:
@@ -1695,6 +1717,10 @@ def run_all_scanners_sim(data: dict, sim_start: str, sim_end: str,
                 scanner = scanners[name]
                 tf_filt = scanner_configs[name]['tf_filter']
 
+                # Late short mode: only allow SELL signals after AM cutoff
+                if _late_short_mode and _sig_action != 'SELL':
+                    continue
+
                 # Apply trade gate before entry
                 if trade_gate is not None and _sig_action != 'HOLD' and _sig_conf >= scanner.MIN_CONFIDENCE:
                     try:
@@ -1718,8 +1744,12 @@ def run_all_scanners_sim(data: dict, sim_start: str, sim_end: str,
 
                 entered = scanner.evaluate_signal(analysis, price, bar_time, tf_filter=tf_filt)
                 if entered:
+                    # Apply late short hard stop
+                    if _late_short_mode and late_short_hard_stop_pct is not None:
+                        pos = list(scanner.positions.values())[-1]
+                        pos.pos_hard_stop_pct = late_short_hard_stop_pct
                     # Apply late hard stop for entries after first hour
-                    if late_hard_stop_pct is not None and _past_first_hour:
+                    elif late_hard_stop_pct is not None and _past_first_hour:
                         pos = list(scanner.positions.values())[-1]
                         pos.pos_hard_stop_pct = late_hard_stop_pct
                     if shared_equity:
@@ -1755,19 +1785,29 @@ def run_all_scanners_sim(data: dict, sim_start: str, sim_end: str,
                     _gate_ok_dw = True
 
             if _gate_ok_dw:
-                entered = scanner.evaluate_signal(analysis, price, bar_time,
-                                                  tf_filter={'daily', 'weekly'})
-                if entered:
-                    if late_hard_stop_pct is not None and _past_first_hour:
-                        pos = list(scanner.positions.values())[-1]
-                        pos.pos_hard_stop_pct = late_hard_stop_pct
-                    if shared_equity:
-                        shared_equity[0] = scanner.equity
-                    if verbose:
-                        pos = list(scanner.positions.values())[-1]
-                        print(f"    [CS-DW] ENTRY {bar_time}  {pos.direction.upper():<5} "
-                              f"${price:.2f}  {pos.shares}sh  conf={pos.confidence:.2f}  "
-                              f"[{pos.primary_tf}/{pos.signal_type}]")
+                # Late short mode: only allow SELL signals after AM cutoff
+                if _late_short_mode and _sig_action != 'SELL':
+                    pass  # Skip non-short entries in late short mode
+                else:
+                    entered = scanner.evaluate_signal(analysis, price, bar_time,
+                                                      tf_filter={'daily', 'weekly'})
+                    if entered:
+                        # Apply late short hard stop
+                        if _late_short_mode and late_short_hard_stop_pct is not None:
+                            pos = list(scanner.positions.values())[-1]
+                            pos.pos_hard_stop_pct = late_short_hard_stop_pct
+                        # Apply late hard stop for entries after first hour
+                        elif late_hard_stop_pct is not None and _past_first_hour:
+                            pos = list(scanner.positions.values())[-1]
+                            pos.pos_hard_stop_pct = late_hard_stop_pct
+                        if shared_equity:
+                            shared_equity[0] = scanner.equity
+                        if verbose:
+                            pos = list(scanner.positions.values())[-1]
+                            hs_tag = f" HS={pos.pos_hard_stop_pct:.1%}" if pos.pos_hard_stop_pct else ""
+                            print(f"    [CS-DW] ENTRY {bar_time}  {pos.direction.upper():<5} "
+                                  f"${price:.2f}  {pos.shares}sh  conf={pos.confidence:.2f}  "
+                                  f"[{pos.primary_tf}/{pos.signal_type}]{hs_tag}")
 
         # 6. Evaluate Intraday (uses precomputed features + analysis TF states)
         intra_features = dict(intraday_feats)  # Copy array refs
@@ -2331,6 +2371,12 @@ def main():
                         help='Restrict CS/ML to first hour (9:30-10:30 ET)')
     parser.add_argument('--hs-dump', action='store_true',
                         help='Dump all hard_stop trades with VIX context to CSV + analysis')
+    parser.add_argument('--am-cutoff', type=int, default=60,
+                        help='AM cutoff in minutes after 9:30 ET (default: 60 = 10:30)')
+    parser.add_argument('--late-short-hs', type=float, default=None,
+                        help='Late short hard stop pct (e.g. 0.001 = 0.1%%)')
+    parser.add_argument('--late-hs', type=float, default=None,
+                        help='Late hard stop pct for ALL trades after AM cutoff (e.g. 0.0025 = 0.25%%)')
     args = parser.parse_args()
 
     # --sweep flag overrides --mode
@@ -2571,6 +2617,8 @@ def main():
             hard_stop_pct=hs,
             equity_mode=args.equity_mode,
             am_only=args.am_only,
+            am_cutoff_minutes=args.am_cutoff,
+            late_short_hard_stop_pct=args.late_short_hs,
             dw_eod_close=False,
             verbose=not args.quiet,
         )
@@ -2584,8 +2632,15 @@ def main():
 
     # ── Multi-scanner: all 4 signal types ──
     if args.mode == 'multi':
+        am_tag = ""
+        if args.am_only:
+            am_tag = f", AM-only {args.am_cutoff}min"
+        if args.late_short_hs is not None:
+            am_tag += f", late short HS={args.late_short_hs:.1%}"
+        if args.late_hs is not None:
+            am_tag += f", late all HS={args.late_hs:.2%}"
         print(f"\n\n{'#'*80}")
-        print(f"# ALL 4 SCANNERS ({args.equity_mode} mode)")
+        print(f"# ALL 4 SCANNERS ({args.equity_mode} mode{am_tag})")
         print(f"{'#'*80}")
         scanners = run_all_scanners_sim(
             data=data,
@@ -2594,6 +2649,10 @@ def main():
             capital=args.capital,
             hard_stop_pct=args.hard_stop,
             equity_mode=args.equity_mode,
+            am_only=args.am_only,
+            am_cutoff_minutes=args.am_cutoff,
+            late_short_hard_stop_pct=args.late_short_hs,
+            late_hard_stop_pct=args.late_hs,
             verbose=not args.quiet,
         )
         print_multi_scanner_results(scanners, args.start, args.end,

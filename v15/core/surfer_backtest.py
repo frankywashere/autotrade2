@@ -373,6 +373,7 @@ def run_backtest(
     signal_quality_model=None,          # SignalQualityModel for ML position sizing
     ml_size_fn=None,                    # Callable(quality_score) -> scale_factor
     signal_filters=None,                # SignalFilterCascade for unified trade gating
+    ml_hard_gate: bool = False,         # If True, skip signals where ML action disagrees with physics
 ) -> tuple:
     """
     Run Channel Surfer backtest on historical 5-min TSLA data.
@@ -1453,19 +1454,22 @@ def run_backtest(
                     # Run ML prediction
                     ml_prediction = ml_model.predict(feature_vec.reshape(1, -1))
 
-                    # ML Action: 0=HOLD, 1=BUY, 2=SELL -- informational only
-                    # The ultra-tight trail + EL/IS/BMV handle risk better than
-                    # GBT confidence penalties (which degrade trail effectiveness)
+                    # ML Action: 0=HOLD, 1=BUY, 2=SELL
+                    # When ml_hard_gate=True, skip signals where ML disagrees
                     if 'action' in ml_prediction:
                         ml_action_id = int(ml_prediction['action'][0])
                         physics_action_id = 1 if sig.action == 'BUY' else 2
 
                         if ml_action_id == 0:
                             ml_stats['ml_filtered'] += 1
+                            if ml_hard_gate:
+                                continue
                         elif ml_action_id == physics_action_id:
                             ml_stats['ml_agreed'] += 1
                         else:
                             ml_stats['ml_filtered'] += 1
+                            if ml_hard_gate:
+                                continue
 
                     # ML Break direction: informational only
                     # The trail handles adverse moves better than skipping
