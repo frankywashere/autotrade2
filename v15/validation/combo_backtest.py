@@ -3572,6 +3572,8 @@ def main():
     parser.add_argument('--end', type=str, default='2025-12-31')
     parser.add_argument('--phase2-only', action='store_true',
                         help='Skip phase 1, load from cache')
+    parser.add_argument('--am-only', action='store_true',
+                        help='(No-op for combo: entries are always at daily open)')
     args = parser.parse_args()
 
     # Auto-detect TSLAMin.txt
@@ -3583,6 +3585,8 @@ def main():
                 args.tsla = candidate
                 break
 
+    if args.am_only:
+        print("NOTE: --am-only is a no-op for combo backtest (entries are always at daily open)")
     print(f"Combo Backtest -- {args.start} to {args.end}")
     print(f"TSLAMin: {args.tsla or 'not found (yfinance fallback)'}")
     print(f"Cache: {CACHE_FILE}")

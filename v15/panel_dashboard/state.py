@@ -57,6 +57,8 @@ class DashboardState(param.Parameterized):
     _intraday_ml_model = param.Parameter(None, precedence=-1)
     _intraday_ml_features = param.Parameter(None, precedence=-1)
     _intraday_trade_state = param.Parameter(None, precedence=-1)
+    _el_model = param.Parameter(None, precedence=-1)   # ExtremeLoserDetector
+    _er_model = param.Parameter(None, precedence=-1)   # ExtendedRunPredictor
     _ws_client = param.Parameter(None, precedence=-1)
     _price_updated_at = param.Number(0.0, precedence=-1)  # time.time() of last successful price fetch
 
@@ -462,6 +464,32 @@ class DashboardState(param.Parameterized):
             logger.warning("ML model load failed: %s — %s", e, traceback.format_exc())
             self._ml_model = None
 
+        # Load EL (Extreme Loser) + ER (Extended Run) sub-models
+        try:
+            import pickle
+            from pathlib import Path
+            from v15.core.surfer_ml import ExtremeLoserDetector, ExtendedRunPredictor
+
+            el_path = Path('surfer_models/extreme_loser_model.pkl')
+            if not el_path.exists():
+                el_path = Path(__file__).parent.parent.parent / 'surfer_models' / 'extreme_loser_model.pkl'
+            if el_path.exists() and el_path.stat().st_size > 200:
+                self._el_model = ExtremeLoserDetector.load(str(el_path))
+                logger.info("EL model loaded from %s", el_path)
+            else:
+                logger.warning("EL model not found at %s", el_path)
+
+            er_path = Path('surfer_models/extended_run_model.pkl')
+            if not er_path.exists():
+                er_path = Path(__file__).parent.parent.parent / 'surfer_models' / 'extended_run_model.pkl'
+            if er_path.exists() and er_path.stat().st_size > 200:
+                self._er_model = ExtendedRunPredictor.load(str(er_path))
+                logger.info("ER model loaded from %s", er_path)
+            else:
+                logger.warning("ER model not found at %s", er_path)
+        except Exception as e:
+            logger.warning("EL/ER model load failed: %s — %s", e, traceback.format_exc())
+
         # Load intraday ML model (LightGBM filter for intraday signals)
         try:
             import pickle
@@ -612,13 +640,41 @@ class DashboardState(param.Parameterized):
             else:
                 logger.info("Surfer ML INFO: ML agrees with %s signal", sig.action)
 
+            # --- EL / ER sub-model predictions ---
+            el_flagged = False
+            trail_width = 1.0
+            if self._el_model and feature_vec is not None:
+                try:
+                    el_pred = self._el_model.predict(feature_vec.reshape(1, -1))
+                    el_prob = float(el_pred['loser_prob'][0])
+                    el_flagged = el_prob > 0.18
+                    logger.info("EL sub-model: loser_prob=%.3f, flagged=%s", el_prob, el_flagged)
+                except Exception as e:
+                    logger.warning("EL prediction failed: %s", e)
+            if self._er_model and feature_vec is not None:
+                try:
+                    er_pred = self._er_model.predict(feature_vec.reshape(1, -1))
+                    er_prob = float(er_pred.get('run_prob', [0.5])[0])
+                    if er_prob > 0.70:
+                        trail_width = 2.0
+                    elif er_prob > 0.50:
+                        trail_width = 1.5
+                    elif er_prob < 0.30:
+                        trail_width = 0.7
+                    logger.info("ER sub-model: run_prob=%.3f, trail_width=%.1f", er_prob, trail_width)
+                except Exception as e:
+                    logger.warning("ER prediction failed: %s", e)
+
         except Exception as e:
             logger.warning("Surfer ML feature extraction failed: %s — proceeding anyway", e)
+            el_flagged = False
+            trail_width = 1.0
 
         # Evaluate through scanner_ml (ML informs but doesn't gate)
         try:
             entry_alert = self.scanner_ml.evaluate_signal(
-                analysis, self.tsla_price, signal_source='surfer_ml')
+                analysis, self.tsla_price, signal_source='surfer_ml',
+                el_flagged=el_flagged, trail_width_mult=trail_width)
             if entry_alert and entry_alert.alert_type == 'ENTRY':
                 logger.info("Surfer ML trade OPENED: %s @ $%.2f",
                              sig.action, self.tsla_price)

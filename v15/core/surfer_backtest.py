@@ -374,6 +374,7 @@ def run_backtest(
     ml_size_fn=None,                    # Callable(quality_score) -> scale_factor
     signal_filters=None,                # SignalFilterCascade for unified trade gating
     ml_hard_gate: bool = False,         # If True, skip signals where ML action disagrees with physics
+    am_only: bool = False,              # Restrict entries to 9:30-10:30 ET
 ) -> tuple:
     """
     Run Channel Surfer backtest on historical 5-min TSLA data.
@@ -1291,6 +1292,14 @@ def run_backtest(
                 if bar - p_bar > eval_interval:
                     expired_pending.append(pi)
                 continue
+            # AM-only filter for deferred entries
+            if am_only:
+                _pend_ts = tsla.index[bar]
+                _pend_et_h = (_pend_ts.hour - 5) % 24
+                _pend_et_m = _pend_ts.minute
+                if _pend_et_h > 10 or (_pend_et_h == 10 and _pend_et_m > 30):
+                    expired_pending.append(pi)
+                    continue
             # Check if price hasn't blown past stop already
             delayed_price = current_price
             if p_dir == 'BUY':
@@ -1956,8 +1965,15 @@ def run_backtest(
                     ml_stats['circuit_breaker'] += 1
                     continue
 
-                # 10AM ET skip disabled -- testing without in new data window
-                pass
+                # AM-only filter: skip entries after 10:30 ET
+                if am_only:
+                    _bar_ts = tsla.index[bar]
+                    _et_hour = (_bar_ts.hour - 5) % 24  # UTC → ET approx
+                    _et_min = _bar_ts.minute
+                    if _et_hour > 10 or (_et_hour == 10 and _et_min > 30):
+                        ml_stats.setdefault('am_only_skip', 0)
+                        ml_stats['am_only_skip'] += 1
+                        continue
 
                 # Don't enter if we already have a position in the same direction
                 existing_dirs = {p.direction for p in positions}
@@ -6059,6 +6075,10 @@ def run_backtest(
                             except Exception:
                                 pass
 
+                    # Final hard dollar cap (after all TOD/DOW/VIX multipliers)
+                    if max_trade_usd > 0 and trade_size > max_trade_usd:
+                        trade_size = max_trade_usd
+
                     # Skip trades too small to generate meaningful P&L
                     if min_trade_usd > 0 and trade_size < min_trade_usd:
                         ml_stats.setdefault('min_trade_skip', 0)
@@ -6527,6 +6547,14 @@ def main():
                        help='Realistic mode: flat 2%% risk sizing, slippage, commissions')
     parser.add_argument('--refresh', action='store_true',
                        help='Force refresh yfinance data (clear cache)')
+    parser.add_argument('--tsla', type=str, default=None,
+                       help='Path to TSLAMin.txt (1-min data for resampling)')
+    parser.add_argument('--start', type=str, default=None,
+                       help='Start date YYYY-MM-DD (requires --tsla or yfinance)')
+    parser.add_argument('--end', type=str, default=None,
+                       help='End date YYYY-MM-DD')
+    parser.add_argument('--am-only', action='store_true',
+                       help='Restrict entries to 9:30-10:30 ET (AM session only)')
     args = parser.parse_args()
 
     if args.refresh and _SURFER_DATA_CACHE.exists():
@@ -6631,12 +6659,28 @@ def main():
                 max_leverage=4.0,
                 initial_capital=100_000.0,
             )
+
+        # Pre-load data from TSLAMin.txt + date range if specified
+        data_kwargs = {}
+        if args.tsla or args.start:
+            from v15.validation.tf_state_backtest import load_all_tfs
+            from v15.data.native_tf import fetch_native_tf
+            _start = args.start or '2025-01-01'
+            _end = args.end or '2026-12-31'
+            tf_data = load_all_tfs(args.tsla, _start, _end)
+            data_kwargs['tsla_df'] = tf_data['5min']
+            data_kwargs['higher_tf_dict'] = {k: v for k, v in tf_data.items() if k != '5min'}
+            data_kwargs['spy_df_input'] = fetch_native_tf('SPY', 'daily', _start, _end)
+            data_kwargs['vix_df_input'] = fetch_native_tf('^VIX', 'daily', _start, _end)
+
         metrics, trades, eq = run_backtest(
             days=args.days,
             eval_interval=args.eval_interval,
             max_hold_bars=args.max_hold,
             min_confidence=args.min_conf,
             ml_model=ml_model,
+            am_only=args.am_only,
+            **data_kwargs,
             **realistic_kwargs,
         )
 

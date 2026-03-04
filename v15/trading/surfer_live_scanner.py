@@ -126,6 +126,8 @@ class HypotheticalPosition:
     breakeven_applied: bool = False  # True once stop moved to entry after 30 min
     initial_stop_pct: float = 0.02  # Original stop % (before ATR clipping) for trail calc
     ou_half_life: float = 5.0       # OU half-life from signal, for OU timeout
+    el_flagged: bool = False         # Extreme Loser flagged
+    trail_width_mult: float = 1.0   # Extended Run Predictor trail width
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -436,22 +438,21 @@ class SurferLiveScanner:
     # ------------------------------------------------------------------
 
     def evaluate_signal(self, analysis, current_price: float,
-                        signal_source: str = 'CS-5TF') -> Optional[ScannerAlert]:
+                        signal_source: str = 'CS-5TF',
+                        el_flagged: bool = False,
+                        trail_width_mult: float = 1.0) -> Optional[ScannerAlert]:
         """Evaluate a ChannelAnalysis and return an ENTRY alert if warranted.
 
         Args:
             analysis: ChannelAnalysis from prepare_multi_tf_analysis()
             current_price: Latest TSLA price
             signal_source: Which combo produced this signal ('CS-5TF', 'CS-DW', etc.)
+            el_flagged: Extreme Loser flagged by sub-model
+            trail_width_mult: Extended Run Predictor trail width multiplier
         """
         self._reset_daily_if_needed()
         now_et = _now_et()
         now = now_et.isoformat()
-
-        # AM-only: CS-5TF / CS-DW / ML only enter during first hour (9:30-10:30 ET)
-        from datetime import time as _time
-        if now_et.time() > _time(10, 30):
-            return None
 
         sig = analysis.signal
 
@@ -611,7 +612,8 @@ class SurferLiveScanner:
             # Auto-enter hypothetical position
             ou_hl = getattr(sig, 'ou_half_life', 5.0) or 5.0
             self._enter_hypothetical(alert, direction, signal_source=signal_source,
-                                     initial_stop_pct=stop_pct, ou_half_life=ou_hl)
+                                     initial_stop_pct=stop_pct, ou_half_life=ou_hl,
+                                     el_flagged=el_flagged, trail_width_mult=trail_width_mult)
             if not _is_market_open() and _is_extended_hours():
                 self._ext_opens_today += 1
             self._save_state()
@@ -733,7 +735,9 @@ class SurferLiveScanner:
     def _enter_hypothetical(self, alert: ScannerAlert, direction: str,
                             signal_source: str = '',
                             initial_stop_pct: float = 0.02,
-                            ou_half_life: float = 5.0):
+                            ou_half_life: float = 5.0,
+                            el_flagged: bool = False,
+                            trail_width_mult: float = 1.0):
         pos_id = str(uuid.uuid4())[:8]
         pos = HypotheticalPosition(
             pos_id=pos_id,
@@ -752,6 +756,8 @@ class SurferLiveScanner:
             signal_source=signal_source,
             initial_stop_pct=initial_stop_pct,
             ou_half_life=ou_half_life,
+            el_flagged=el_flagged,
+            trail_width_mult=trail_width_mult,
         )
         self.positions[pos_id] = pos
         alert.pos_id = pos_id
@@ -775,8 +781,9 @@ class SurferLiveScanner:
 
     @staticmethod
     def _calc_trail_price(pos: 'HypotheticalPosition') -> Optional[float]:
-        """Profit-tier trailing stop for Surfer ML signals (surfer_backtest.py).
+        """Profit-tier trailing stop for Surfer ML signals (aligned with surfer_backtest.py).
 
+        Uses EL (extreme loser) flag and twm (trail width multiplier) from sub-models.
         Only used for Surfer ML signals. CS-5TF/DW use exponential trail,
         intraday uses its own formula. See check_exits() for routing.
         """
@@ -786,31 +793,40 @@ class SurferLiveScanner:
         initial_stop_dist = abs(pos.stop_price - entry) / entry
         tp_dist = abs(pos.tp_price - entry) / entry
         is_breakout = pos.signal_type == 'break'
+        twm = pos.trail_width_mult
+        el = pos.el_flagged
 
         if pos.direction == 'long':
             if pos.best_price <= entry:
                 return None  # Not yet in profit
             if is_breakout:
                 profit_from_best = (pos.best_price - entry) / entry
-                if profit_from_best > 0.015:
-                    trail_pct = initial_stop_dist * 0.01
+                # Ultra-tight stop breakeven
+                if initial_stop_dist < 0.001 and profit_from_best > 0.0001:
+                    trail_pct = initial_stop_dist * 0.50 * twm
+                # Three-tier breakout trail
+                elif profit_from_best > 0.015:
+                    trail_pct = initial_stop_dist * 0.01 * twm
                 elif profit_from_best > 0.008:
-                    trail_pct = initial_stop_dist * 0.02
-                elif profit_from_best > 0.0008:
-                    trail_pct = initial_stop_dist * 0.01
+                    trail_pct = initial_stop_dist * 0.02 * twm
                 else:
-                    return None
+                    tier3_thresh = 0.002 if el else 0.0008
+                    trail_mult = 0.20 if el else 0.01
+                    if profit_from_best > tier3_thresh:
+                        trail_pct = initial_stop_dist * trail_mult * twm
+                    else:
+                        return None
             else:  # bounce
                 profit_from_entry = (pos.best_price - entry) / entry
                 profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
+                tight = el  # no fast_rev (model not trained)
                 if profit_ratio >= 0.80:
-                    trail_pct = initial_stop_dist * 0.005
-                elif profit_ratio >= 0.55:
-                    trail_pct = initial_stop_dist * 0.02
-                elif profit_ratio >= 0.40:
-                    trail_pct = initial_stop_dist * 0.06
-                elif profit_ratio >= 0.15:
-                    # Breakeven tier (matching backtest): lock in at entry + tiny buffer
+                    trail_pct = initial_stop_dist * 0.005 * twm
+                elif profit_ratio >= (0.60 if tight else 0.55):
+                    trail_pct = initial_stop_dist * 0.02 * twm
+                elif profit_ratio >= (0.30 if tight else 0.40):
+                    trail_pct = initial_stop_dist * (0.08 if tight else 0.06) * twm
+                elif profit_ratio >= (0.10 if tight else 0.15):
                     return max(pos.stop_price, entry * 1.0005)
                 else:
                     return None
@@ -821,25 +837,32 @@ class SurferLiveScanner:
                 return None  # Not yet in profit
             if is_breakout:
                 profit_from_best = (entry - pos.best_price) / entry
-                if profit_from_best > 0.015:
-                    trail_pct = initial_stop_dist * 0.01
+                # Ultra-tight stop breakeven
+                if initial_stop_dist < 0.001 and profit_from_best > 0.0001:
+                    trail_pct = initial_stop_dist * 0.50 * twm
+                # Three-tier breakout trail
+                elif profit_from_best > 0.015:
+                    trail_pct = initial_stop_dist * 0.01 * twm
                 elif profit_from_best > 0.008:
-                    trail_pct = initial_stop_dist * 0.02
-                elif profit_from_best > 0.0008:
-                    trail_pct = initial_stop_dist * 0.01
+                    trail_pct = initial_stop_dist * 0.02 * twm
                 else:
-                    return None
+                    tier3_thresh = 0.002 if el else 0.0003
+                    trail_mult = 0.20 if el else 0.01
+                    if profit_from_best > tier3_thresh:
+                        trail_pct = initial_stop_dist * trail_mult * twm
+                    else:
+                        return None
             else:  # bounce
                 profit_from_entry = (entry - pos.best_price) / entry
                 profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
+                tight = el
                 if profit_ratio >= 0.80:
-                    trail_pct = initial_stop_dist * 0.005
-                elif profit_ratio >= 0.55:
-                    trail_pct = initial_stop_dist * 0.02
-                elif profit_ratio >= 0.40:
-                    trail_pct = initial_stop_dist * 0.06
-                elif profit_ratio >= 0.15:
-                    # Breakeven tier (matching backtest): lock in at entry - tiny buffer
+                    trail_pct = initial_stop_dist * 0.005 * twm
+                elif profit_ratio >= (0.60 if tight else 0.55):
+                    trail_pct = initial_stop_dist * 0.02 * twm
+                elif profit_ratio >= (0.30 if tight else 0.40):
+                    trail_pct = initial_stop_dist * (0.08 if tight else 0.06) * twm
+                elif profit_ratio >= (0.10 if tight else 0.15):
                     return min(pos.stop_price, entry * 0.9995)
                 else:
                     return None
@@ -901,24 +924,6 @@ class SurferLiveScanner:
                 from datetime import time as _time
                 if now.time() >= _time(15, 50):
                     exit_reason = 'intraday_eod'
-
-            # --- EOD force close (3:45 PM ET, non-intraday) ---
-            if exit_reason is None and not is_intraday and _is_eod:
-                exit_reason = 'eod_close'
-
-            # --- Hard stop (2% max from entry, whichever is tighter) ---
-            if exit_reason is None:
-                max_stop_dist = 0.02
-                if pos.direction == 'long':
-                    hard_stop = min(pos.stop_price, pos.entry_price * (1 - max_stop_dist))
-                    if bar_low <= hard_stop:
-                        exit_reason = 'stop_loss'
-                        exit_price = hard_stop
-                elif pos.direction == 'short':
-                    hard_stop = max(pos.stop_price, pos.entry_price * (1 + max_stop_dist))
-                    if bar_high >= hard_stop:
-                        exit_reason = 'stop_loss'
-                        exit_price = hard_stop
 
             # --- Take profit ---
             if exit_reason is None:
