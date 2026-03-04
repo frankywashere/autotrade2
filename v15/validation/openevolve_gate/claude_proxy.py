@@ -1,12 +1,16 @@
 """
-Flask proxy that routes OpenEvolve API calls to Claude Code CLI (haiku).
+Flask proxy that routes OpenEvolve API calls to Claude Code CLI.
 Run on the Windows server alongside OpenEvolve.
+
+Uses stdin instead of CLI args to avoid Windows ~32K command-line limit.
 """
 
 import json
 import subprocess
 import sys
+import tempfile
 import time
+import os
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -14,7 +18,7 @@ app = Flask(__name__)
 # Path to Claude Code CLI on Windows
 CLAUDE_CMD = r"C:\Users\frank\.local\bin\claude.exe"
 MODEL = "haiku"
-PORT = 5560
+PORT = 5563
 
 
 @app.route('/v1/chat/completions', methods=['POST'])
@@ -44,7 +48,9 @@ def chat_completions():
                 "--dangerously-skip-permissions",
             ],
             input=full_prompt,
-            capture_output=True, text=True, timeout=300,
+            capture_output=True,
+            text=True,
+            timeout=300,
             encoding='utf-8',
         )
         response_text = result.stdout.strip()
@@ -59,7 +65,7 @@ def chat_completions():
         "id": f"chatcmpl-{int(time.time())}",
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": "claude-haiku",
+        "model": f"claude-{MODEL}",
         "choices": [{
             "index": 0,
             "message": {
