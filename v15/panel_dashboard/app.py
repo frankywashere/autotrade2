@@ -248,8 +248,10 @@ if __name__.startswith('bokeh'):
         ).servable()
 elif __name__ == '__main__':
     # When run directly: `python app.py`
+    # Build app once — do NOT pass create_app as a factory (causes per-session re-init)
+    app = create_app()
     pn.serve(
-        create_app,
+        {'app': app},
         port=int(os.environ.get('PORT', 7860)),
         address='0.0.0.0',
         allow_websocket_origin=['*'],
