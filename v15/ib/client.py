@@ -304,7 +304,7 @@ class IBClient:
 
     async def _subscribe_account_async(self):
         """Subscribe to account summary (runs in IB event loop)."""
-        self.ib.reqAccountSummary()
+        await self.ib.reqAccountSummaryAsync()
         logger.info("Subscribed to account summary")
 
     def get_account_summary(self) -> dict:
