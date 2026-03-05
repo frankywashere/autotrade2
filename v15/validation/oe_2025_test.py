@@ -244,7 +244,7 @@ def load_data():
     for df in [tsla_d, spy_d, vix_d, tsla_w]:
         df.columns = [c.lower() for c in df.columns]
 
-    print(f"  TSLA daily: {len(tsla_d)} bars ({tsla_d.index[0]} → {tsla_d.index[-1]})")
+    print(f"  TSLA daily: {len(tsla_d)} bars ({tsla_d.index[0]} to {tsla_d.index[-1]})")
     print(f"  SPY daily:  {len(spy_d)} bars")
     print(f"  VIX daily:  {len(vix_d)} bars")
     print(f"  TSLA weekly: {len(tsla_w)} bars")
