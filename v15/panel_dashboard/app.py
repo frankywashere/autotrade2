@@ -114,7 +114,13 @@ def _init_state():
         startup_msg += f"\nSCANNER ERROR: {scanner_err[:200]}"
     if gbt_err:
         startup_msg += f"\nGBT ERROR: {gbt_err[:200]}"
-    _state.send_notification(startup_msg, title='c14a Startup')
+    ib_ok = getattr(_state, 'ib_connected', False)
+    startup_msg += f"\nIB Gateway: {'CONNECTED' if ib_ok else 'NOT CONNECTED (REST fallback)'}"
+    _state.send_notification(startup_msg, title='c16 Startup')
+
+    # Log IB status
+    ib_ok = getattr(_state, 'ib_connected', False)
+    logger.info("IB Gateway: %s", "CONNECTED" if ib_ok else "NOT CONNECTED (using yfinance REST)")
 
     _state.load_model_data()
     logger.info("Model data loaded. Keys=%d", len(_state.model_data))
@@ -210,9 +216,20 @@ def create_app():
         width=200,
     )
 
+    # IB connection status (reactive)
+    ib_status_display = pn.bind(
+        lambda connected: pn.pane.HTML(
+            f'<span style="color:{"#00c853" if connected else "#ff5252"}">'
+            f'{"&#9679;" if connected else "&#9675;"}</span> '
+            f'IB: <b>{"CONNECTED" if connected else "DISCONNECTED"}</b>',
+            width=200,
+        ),
+        state.param.ib_connected,
+    )
+
     # Build template
     template = pn.template.FastListTemplate(
-        title='c14a Trading Dashboard',
+        title='c16 Trading Dashboard',
         theme='dark',
         accent_base_color='#00c853',
         header_background='#111',
@@ -224,6 +241,8 @@ def create_app():
             kill_switch,
             pn.layout.Divider(),
             last_analysis_display,
+            pn.pane.Markdown("### Data Sources"),
+            ib_status_display,
             pn.pane.Markdown("### ML Models"),
             ml_status,
             pn.layout.Divider(),

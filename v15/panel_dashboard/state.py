@@ -50,6 +50,9 @@ class DashboardState(param.Parameterized):
     model_data = param.Dict({})
     model_data_version = param.Integer(0)
 
+    # IB connection
+    ib_connected = param.Boolean(False)
+
     # Internal
     _prev_price = param.Number(0.0, precedence=-1)
     _ml_model = param.Parameter(None, precedence=-1)
@@ -103,11 +106,11 @@ class DashboardState(param.Parameterized):
         except Exception as e:
             logger.error("Failed to fetch 5-min data: %s", e)
 
-        # Price feed: REST only (yfinance ticker.info every 2s)
-        # WS disabled — source-switching between WS and REST caused price
-        # discontinuities that triggered false trailing stop exits.
+        # Price feed: IB first, REST fallback
         self._ws_client = None
         self._price_err_count = 0
+        self.ib_client = None
+        self._init_ib()
 
         # Initialize scanner
         self._init_scanner()
@@ -122,12 +125,28 @@ class DashboardState(param.Parameterized):
             logger.error("Initial analysis failed: %s\n%s", e, traceback.format_exc())
 
     def update_prices(self):
-        """2s periodic callback: fetch prices via WebSocket or yfinance REST."""
+        """2s periodic callback: fetch prices via IB, WebSocket, or yfinance REST."""
         price = 0.0
         source = 'REST'
 
-        # Try WebSocket first
-        if self._ws_client:
+        # Try IB first
+        if self.ib_client and self.ib_client.is_connected():
+            ib_price = self.ib_client.get_last_price('TSLA')
+            if ib_price > 0:
+                price = ib_price
+                source = 'IB LIVE'
+            ib_spy = self.ib_client.get_last_price('SPY')
+            if ib_spy > 0 and ib_spy != self.spy_price:
+                self.spy_price = ib_spy
+            if not self.ib_connected:
+                self.ib_connected = True
+        elif self.ib_client and not self.ib_client.is_connected():
+            if self.ib_connected:
+                self.ib_connected = False
+                logger.warning("IB disconnected — falling back to REST")
+
+        # Try WebSocket if IB didn't provide price
+        if price == 0.0 and self._ws_client:
             tick = self._ws_client.get_price('TSLA')
             if tick and tick.is_fresh:
                 price = tick.price
@@ -137,7 +156,7 @@ class DashboardState(param.Parameterized):
                 if spy_tick.price != self.spy_price:
                     self.spy_price = spy_tick.price
 
-        # REST fallback if WebSocket didn't provide fresh price
+        # REST fallback if IB and WebSocket didn't provide fresh price
         if price == 0.0:
             try:
                 import yfinance as yf
@@ -393,6 +412,21 @@ class DashboardState(param.Parameterized):
             logger.error("Analysis failed: %s\n%s", e, traceback.format_exc())
         finally:
             self._analysis_running = False
+
+    def _init_ib(self):
+        """Try to connect to IB Gateway for real-time price streaming."""
+        try:
+            from v15.ib.client import IBClient
+            self.ib_client = IBClient(host='127.0.0.1', port=4002, client_id=1)
+            self.ib_client.connect()
+            self.ib_client.subscribe('TSLA')
+            self.ib_client.subscribe('SPY')
+            self.ib_connected = True
+            logger.info("IB connected — streaming TSLA + SPY")
+        except Exception as e:
+            logger.warning("IB connection failed (falling back to yfinance): %s", e)
+            self.ib_client = None
+            self.ib_connected = False
 
     def _init_scanner(self):
         """Create SurferLiveScanners with per-model local state files."""
