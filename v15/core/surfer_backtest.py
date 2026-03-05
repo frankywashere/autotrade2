@@ -382,6 +382,8 @@ def run_backtest(
     use_1min: bool = False,             # Use 1-min bars for exit checking
     df1m: 'pd.DataFrame | None' = None, # 1-min DataFrame for high-res exits
     flat_sizing: bool = False,          # Flat $100K equity (no compounding)
+    base_size: float = 0.0,            # Base trade size before multipliers (0 = use risk budget)
+    max_size: float = 0.0,             # Hard cap per trade after multipliers (0 = unlimited)
     ah_rules: bool = False,             # AH gated opens + unlimited closes
     ah_loss_limit: float = 250.0,       # Max loss per AH trade
 ) -> tuple:
@@ -1101,8 +1103,8 @@ def run_backtest(
     position_features: list = []   # Feature vectors for each open position (capture_features)
     max_positions = 2
     pending_entries = []  # Deferred entries: list of (bar, direction, signal_type, confidence, stop_pct, tp_pct, primary_tf, ou_hl, max_hold, el_flagged, fast_rev, trade_size, signal_data)
-    # Flat sizing: fix equity at $100K, no compounding
-    if flat_sizing:
+    # Flat sizing / base_size: fix equity, no compounding
+    if flat_sizing or base_size > 0:
         equity = 100_000.0
         initial_equity = equity
     else:
@@ -1322,7 +1324,7 @@ def run_backtest(
                     entry_time=str(tsla.index[position.entry_bar]) if position.entry_bar < len(tsla) else '',
                 )
                 trades.append(trade)
-                if flat_sizing:
+                if flat_sizing or base_size > 0:
                     # Flat sizing: equity stays fixed at initial_equity (no compounding)
                     # Track P&L separately but don't grow/shrink equity
                     equity = initial_equity
@@ -2254,6 +2256,10 @@ def run_backtest(
                 # Risk-normalized sizing: trade_size = risk_budget / stop_pct
                 # Wider stops -> smaller position, tighter stops -> larger position
                 trade_size = risk_budget / max(adjusted_stop_pct, 0.001)
+
+                # Base-size override: set fixed base, let architectures multiply, cap later
+                if base_size > 0:
+                    trade_size = base_size
 
                 # --- ML Position Sizing ---
                 if signal_quality_model is not None and ml_size_fn is not None and current_signal_features is not None:
@@ -6178,8 +6184,12 @@ def run_backtest(
                     if max_trade_usd > 0 and trade_size > max_trade_usd:
                         trade_size = max_trade_usd
 
+                    # max_size cap (base_size mode: multipliers ran, now cap)
+                    if max_size > 0 and trade_size > max_size:
+                        trade_size = max_size
+
                     # Flat sizing override: $100K per trade, no multipliers
-                    if flat_sizing:
+                    if flat_sizing and base_size <= 0:
                         trade_size = 100_000.0
 
                     # Skip trades too small to generate meaningful P&L
@@ -6662,6 +6672,10 @@ def main():
                        help='Use 1-min bars for exit checking (signals still on 5-min)')
     parser.add_argument('--flat-sizing', action='store_true',
                        help='Flat $100K equity per trade (no compounding)')
+    parser.add_argument('--base-size', type=float, default=0.0,
+                       help='Base trade size before multipliers (e.g. 50000). Multipliers still apply.')
+    parser.add_argument('--max-size', type=float, default=0.0,
+                       help='Hard cap per trade after multipliers (e.g. 100000)')
     parser.add_argument('--ah-rules', action='store_true',
                        help='Enable AH gated opens + unlimited closes')
     parser.add_argument('--ah-loss-limit', type=float, default=250.0,
@@ -6817,6 +6831,7 @@ def main():
 
         if args.use_1min: print(f"  >> 1-MIN EXIT CHECKING (eval_interval={args.eval_interval})")
         if args.flat_sizing: print("  >> FLAT $100K SIZING")
+        if args.base_size > 0: print(f"  >> BASE SIZE ${args.base_size:,.0f} + MULTIPLIERS (cap ${args.max_size:,.0f})")
         if args.ah_rules: print(f"  >> AH RULES (loss limit=${args.ah_loss_limit:.0f})")
 
         metrics, trades, eq = run_backtest(
@@ -6829,6 +6844,8 @@ def main():
             use_1min=args.use_1min,
             df1m=df1m_exits,
             flat_sizing=args.flat_sizing,
+            base_size=args.base_size,
+            max_size=args.max_size,
             ah_rules=args.ah_rules,
             ah_loss_limit=args.ah_loss_limit,
             **data_kwargs,
