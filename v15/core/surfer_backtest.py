@@ -2261,6 +2261,12 @@ def run_backtest(
                 if base_size > 0:
                     trade_size = base_size
 
+                # Flat-sizing early cap: prevent architecture multipliers from inflating
+                # trade_size to billions (which triggers the exposure check at line ~2541).
+                # Final override to exactly $100K still happens after architectures.
+                if flat_sizing and base_size <= 0:
+                    trade_size = 100_000.0
+
                 # --- ML Position Sizing ---
                 if signal_quality_model is not None and ml_size_fn is not None and current_signal_features is not None:
                     try:
