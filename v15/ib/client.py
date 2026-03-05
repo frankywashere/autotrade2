@@ -37,6 +37,9 @@ class IBClient:
         self._trades = {}          # {order_id: ib_async.Trade}
         self._order_log = []       # List of dicts for blotter (max 50)
         self._order_lock = threading.Lock()
+        # Account data (cached from IB event loop, read from Panel thread)
+        self._account = {}         # {tag: value}
+        self._account_lock = threading.Lock()
 
     # ── Connection ───────────────────────────────────────────────────
 
@@ -306,29 +309,40 @@ class IBClient:
         """Subscribe to account summary (runs in IB event loop)."""
         try:
             await asyncio.wait_for(self.ib.reqAccountSummaryAsync(), timeout=10)
-            logger.info("Subscribed to account summary")
+            # Snapshot initial data into our thread-safe cache
+            self._cache_account_data()
+            # Wire up event for live updates
+            self.ib.accountSummaryEvent += self._on_account_summary
+            logger.info("Subscribed to account summary (%d tags cached)",
+                        len(self._account))
         except Exception as e:
             logger.warning("Account summary subscription failed: %s", e)
 
+    def _cache_account_data(self):
+        """Snapshot ib.accountSummary() into thread-safe cache."""
+        try:
+            items = self.ib.accountSummary()
+            with self._account_lock:
+                for item in items:
+                    if item.currency in ('USD', ''):
+                        self._account[item.tag] = item.value
+        except Exception as e:
+            logger.error("_cache_account_data failed: %s", e)
+
+    def _on_account_summary(self, item):
+        """Callback fired by ib_async on account summary update."""
+        if item.currency in ('USD', ''):
+            with self._account_lock:
+                self._account[item.tag] = item.value
+
     def get_account_summary(self) -> dict:
-        """Return account summary as {tag: value} dict.
+        """Return account summary as {tag: value} dict (thread-safe).
 
         Key tags: NetLiquidation, TotalCashValue, BuyingPower,
         GrossPositionValue, UnrealizedPnL, RealizedPnL.
-        Reads from ib_async's cached accountSummary() list.
         """
-        if not self.is_connected():
-            return {}
-        try:
-            items = self.ib.accountSummary()
-            if not items:
-                logger.warning("accountSummary() returned empty list")
-            result = {item.tag: item.value for item in items
-                      if item.currency in ('USD', '')}
-            return result
-        except Exception as e:
-            logger.error("get_account_summary failed: %s", e)
-            return {}
+        with self._account_lock:
+            return dict(self._account)
 
     # ── Order Placement ──────────────────────────────────────────────
 
