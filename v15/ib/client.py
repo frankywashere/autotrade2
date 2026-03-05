@@ -30,6 +30,7 @@ class IBClient:
         self._loop = None
         self._thread = None
         self._contracts = {}       # {symbol: Contract}
+        self._bar_aggregators = {} # {symbol: LiveBarAggregator}
         self._reconnect_delay = 2  # seconds, with exponential backoff
         self.tick_event = threading.Event()  # Set on every tick for instant wakeup
 
@@ -119,7 +120,9 @@ class IBClient:
 
     def _make_contract(self, symbol: str):
         """Create IB contract for a symbol."""
-        from ib_async import Stock
+        from ib_async import Stock, Index
+        if symbol in ('^VIX', 'VIX'):
+            return Index('VIX', 'CBOE', 'USD')
         return Stock(symbol, 'SMART', 'USD')
 
     def subscribe(self, symbol: str):
@@ -145,12 +148,22 @@ class IBClient:
         with self._lock:
             for ticker in tickers:
                 symbol = ticker.contract.symbol
+                price = ticker.last if ticker.last == ticker.last else 0.0
+                bid = ticker.bid if ticker.bid == ticker.bid else 0.0
+                ask = ticker.ask if ticker.ask == ticker.ask else 0.0
                 self._prices[symbol] = {
-                    'last': ticker.last if ticker.last == ticker.last else 0.0,
-                    'bid': ticker.bid if ticker.bid == ticker.bid else 0.0,
-                    'ask': ticker.ask if ticker.ask == ticker.ask else 0.0,
+                    'last': price,
+                    'bid': bid,
+                    'ask': ask,
                     'time': datetime.now(),
                 }
+                # Feed tick into bar aggregator if present
+                effective_price = price if price > 0 else (
+                    (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0)
+                if effective_price > 0 and symbol in self._bar_aggregators:
+                    vol = ticker.volume if (hasattr(ticker, 'volume')
+                           and ticker.volume == ticker.volume) else 0
+                    self._bar_aggregators[symbol].on_tick(effective_price, vol)
         self.tick_event.set()  # Wake up price loop instantly
 
     def get_last_price(self, symbol: str, max_age_s: float = 30.0) -> float:
@@ -228,13 +241,111 @@ class IBClient:
 
     async def _fetch_historical_async(self, contract, duration, bar_size, use_rth):
         """Async wrapper for reqHistoricalData."""
+        # VIX is an index — use TRADES for stocks, TRADES for indices too
+        # (IB accepts TRADES for most; could also use MIDPOINT for indices)
+        what_to_show = 'TRADES'
+        if hasattr(contract, 'secType') and contract.secType == 'IND':
+            what_to_show = 'TRADES'
         bars = await self.ib.reqHistoricalDataAsync(
             contract,
             endDateTime='',
             durationStr=duration,
             barSizeSetting=bar_size,
-            whatToShow='TRADES',
+            whatToShow=what_to_show,
             useRTH=use_rth,
             formatDate=1,
         )
         return bars
+
+    def fetch_all_tf_history(self, symbol: str, use_rth: bool = True) -> dict:
+        """Fetch historical bars at multiple timeframes for channel analysis.
+
+        Returns dict matching native_tf_data format: {tf_name: DataFrame}
+        Each DataFrame has columns: [open, high, low, close, volume] with DatetimeIndex.
+        """
+        tf_configs = {
+            '1h':      ('250 D', '1 hour'),
+            'daily':   ('1 Y',   '1 day'),
+            'weekly':  ('2 Y',   '1 W'),
+            'monthly': ('3 Y',   '1 M'),
+        }
+        result = {}
+        for tf_name, (duration, bar_size) in tf_configs.items():
+            try:
+                df = self.fetch_historical(symbol, duration, bar_size, use_rth=use_rth)
+                if df is not None and len(df) > 0:
+                    df['date'] = pd.to_datetime(df['date'])
+                    df = df.set_index('date')
+                    result[tf_name] = df
+                    logger.info("IB historical %s %s: %d bars", symbol, tf_name, len(df))
+            except Exception as e:
+                logger.warning("Failed to fetch %s %s: %s", symbol, tf_name, e)
+        return result
+
+    def create_bar_aggregator(self, symbol: str, bar_size_minutes: int = 5):
+        """Create and register a LiveBarAggregator for a symbol."""
+        agg = LiveBarAggregator(bar_size_minutes)
+        self._bar_aggregators[symbol] = agg
+        logger.info("Bar aggregator created for %s (%d-min bars)", symbol, bar_size_minutes)
+        return agg
+
+    def get_bar_aggregator(self, symbol: str):
+        """Get the bar aggregator for a symbol, or None."""
+        return self._bar_aggregators.get(symbol)
+
+
+class LiveBarAggregator:
+    """Aggregate streaming ticks into OHLCV bars in real-time."""
+
+    def __init__(self, bar_size_minutes: int = 5):
+        self.bar_size = bar_size_minutes
+        self._current_bar = None       # {open, high, low, close, volume, time}
+        self._completed_bars = []      # List of completed bar dicts
+        self._lock = threading.Lock()
+        self.bar_close_event = threading.Event()  # Set when a bar completes
+
+    def _bar_start_time(self, now: datetime) -> datetime:
+        """Round down to nearest bar boundary."""
+        minute = (now.minute // self.bar_size) * self.bar_size
+        return now.replace(minute=minute, second=0, microsecond=0)
+
+    def on_tick(self, price: float, volume: float = 0):
+        """Process a tick. If it crosses a bar boundary, finalize the bar."""
+        now = datetime.now()
+        bar_start = self._bar_start_time(now)
+
+        with self._lock:
+            if self._current_bar is None or self._current_bar['time'] != bar_start:
+                # New bar boundary — finalize previous, start new
+                if self._current_bar is not None:
+                    self._completed_bars.append(self._current_bar)
+                    self.bar_close_event.set()
+                self._current_bar = {
+                    'time': bar_start,
+                    'open': price, 'high': price, 'low': price, 'close': price,
+                    'volume': volume,
+                }
+            else:
+                # Update current bar
+                self._current_bar['high'] = max(self._current_bar['high'], price)
+                self._current_bar['low'] = min(self._current_bar['low'], price)
+                self._current_bar['close'] = price
+                self._current_bar['volume'] += volume
+
+    def get_bars_df(self, include_current: bool = False) -> pd.DataFrame:
+        """Return completed bars as DataFrame. Optionally include current partial bar."""
+        with self._lock:
+            bars = list(self._completed_bars)
+            if include_current and self._current_bar:
+                bars.append(self._current_bar)
+        if not bars:
+            return pd.DataFrame()
+        df = pd.DataFrame(bars)
+        df['date'] = pd.to_datetime(df['time'])
+        df = df.set_index('date')[['open', 'high', 'low', 'close', 'volume']]
+        return df
+
+    def bar_count(self) -> int:
+        """Number of completed bars."""
+        with self._lock:
+            return len(self._completed_bars)

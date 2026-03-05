@@ -24,7 +24,9 @@ class DashboardState(param.Parameterized):
     tsla_price = param.Number(0.0)
     spy_price = param.Number(0.0)
     price_delta = param.Number(0.0)
+    vix_price = param.Number(0.0)
     price_source = param.String('NONE')  # 'IB LIVE' or 'NONE'
+    data_source = param.String('yfinance')  # 'IB' or 'yfinance'
 
     # Market data (loaded on startup, refreshed every 5 min)
     current_tsla = param.Parameter(None)      # 5-min OHLCV DataFrame
@@ -82,50 +84,82 @@ class DashboardState(param.Parameterized):
         ] if s is not None]
 
     def load_market_data(self):
-        """Startup: load native TF data, fetch 5-min bars, initialize scanner."""
+        """Startup: connect IB, load TF data (IB first, yfinance fallback), init scanner."""
         logger.info("Loading market data...")
 
-        # Load native TF data
-        try:
-            from v15.data.native_tf import load_native_tf_data
-            from pathlib import Path
-            # Use /tmp for cache in Docker (home dir may not be writable on HF Spaces)
-            cache_dir = Path('/tmp/.x14_native_tf_cache') if os.environ.get('SPACE_ID') else None
-            self.native_tf_data = load_native_tf_data(
-                symbols=['TSLA', 'SPY', '^VIX'],
-                timeframes=['daily', 'weekly', 'monthly', '1h', '2h', '3h', '4h'],
-                verbose=True,
-                cache_dir=cache_dir,
-            )
-            logger.info("Native TF data loaded: %s", list(self.native_tf_data.keys()))
-        except Exception as e:
-            logger.error("Failed to load native TF data: %s", e)
-            self.native_tf_data = {}
-
-        # Fetch 5-min bars
-        try:
-            from v15.live_data import fetch_live_data
-            tsla_df, spy_df, vix_df = fetch_live_data(period='5d', interval='5m')
-            self.current_tsla = tsla_df
-            if tsla_df is not None and len(tsla_df) > 0:
-                self.tsla_price = float(tsla_df['close'].iloc[-1])
-                # Use second-to-last bar for initial delta
-                if len(tsla_df) > 1:
-                    self._prev_price = float(tsla_df['close'].iloc[-2])
-                    self.price_delta = self.tsla_price - self._prev_price
-                else:
-                    self._prev_price = self.tsla_price
-            if spy_df is not None and len(spy_df) > 0:
-                self.spy_price = float(spy_df['close'].iloc[-1])
-            logger.info("5-min data loaded: %d bars", len(tsla_df) if tsla_df is not None else 0)
-        except Exception as e:
-            logger.error("Failed to fetch 5-min data: %s", e)
-
-        # Price feed: IB first, REST fallback
+        # Price feed: IB first
         self._ws_client = None
         self._price_err_count = 0
         self.ib_client = None
+        self._bar_aggregator = None
+        self._historical_5min_tsla = None
         self._init_ib()
+
+        # Try IB-based data loading first, fall back to yfinance
+        ib_data_ok = False
+        if self.ib_client and self.ib_client.is_connected():
+            try:
+                self.native_tf_data = self._load_ib_historical()
+                if self.native_tf_data and 'TSLA' in self.native_tf_data:
+                    ib_data_ok = True
+                    self.data_source = 'IB'
+                    logger.info("Data source: IB (all TFs)")
+            except Exception as e:
+                logger.warning("IB historical load failed, falling back to yfinance: %s", e)
+
+        if not ib_data_ok:
+            self.data_source = 'yfinance'
+            logger.info("Data source: yfinance fallback (degraded — no tick-level updates)")
+            try:
+                from v15.data.native_tf import load_native_tf_data
+                from pathlib import Path
+                cache_dir = Path('/tmp/.x14_native_tf_cache') if os.environ.get('SPACE_ID') else None
+                self.native_tf_data = load_native_tf_data(
+                    symbols=['TSLA', 'SPY', '^VIX'],
+                    timeframes=['daily', 'weekly', 'monthly', '1h', '2h', '3h', '4h'],
+                    verbose=True,
+                    cache_dir=cache_dir,
+                )
+                logger.info("Native TF data loaded (yfinance): %s", list(self.native_tf_data.keys()))
+            except Exception as e:
+                logger.error("Failed to load native TF data: %s", e)
+                self.native_tf_data = {}
+
+        # Fetch 5-min bars (IB or yfinance)
+        if ib_data_ok:
+            try:
+                tsla_5m = self.ib_client.fetch_historical('TSLA', '5 D', '5 mins', use_rth=False)
+                if tsla_5m is not None and len(tsla_5m) > 0:
+                    tsla_5m['date'] = pd.to_datetime(tsla_5m['date'])
+                    tsla_5m = tsla_5m.set_index('date')
+                    self.current_tsla = tsla_5m
+                    self._historical_5min_tsla = tsla_5m.copy()
+                    logger.info("5-min data loaded (IB): %d bars", len(tsla_5m))
+                # Set up live 5-min bar aggregator for TSLA
+                self._bar_aggregator = self.ib_client.create_bar_aggregator('TSLA', 5)
+            except Exception as e:
+                logger.warning("IB 5-min fetch failed: %s", e)
+
+        if self.current_tsla is None:
+            try:
+                from v15.live_data import fetch_live_data
+                tsla_df, spy_df, vix_df = fetch_live_data(period='5d', interval='5m')
+                self.current_tsla = tsla_df
+                if spy_df is not None and len(spy_df) > 0:
+                    self.spy_price = float(spy_df['close'].iloc[-1])
+                logger.info("5-min data loaded (yfinance): %d bars",
+                            len(tsla_df) if tsla_df is not None else 0)
+            except Exception as e:
+                logger.error("Failed to fetch 5-min data: %s", e)
+
+        # Set initial prices from loaded data
+        if self.current_tsla is not None and len(self.current_tsla) > 0:
+            self.tsla_price = float(self.current_tsla['close'].iloc[-1])
+            if len(self.current_tsla) > 1:
+                self._prev_price = float(self.current_tsla['close'].iloc[-2])
+                self.price_delta = self.tsla_price - self._prev_price
+            else:
+                self._prev_price = self.tsla_price
 
         # Initialize scanner
         self._init_scanner()
@@ -153,6 +187,9 @@ class DashboardState(param.Parameterized):
             ib_spy = self.ib_client.get_last_price('SPY')
             if ib_spy > 0 and ib_spy != self.spy_price:
                 self.spy_price = ib_spy
+            ib_vix = self.ib_client.get_last_price('VIX')
+            if ib_vix > 0:
+                self.vix_price = ib_vix
             if not self.ib_connected:
                 self.ib_connected = True
         elif self.ib_client and not self.ib_client.is_connected():
@@ -251,13 +288,23 @@ class DashboardState(param.Parameterized):
         """
         from v15.core.channel_surfer import prepare_multi_tf_analysis
 
-        # Refresh 5-min bars
+        # Refresh 5-min bars: IB aggregator first, then yfinance fallback
         tsla_df = None
-        try:
-            from v15.live_data import fetch_live_data
-            tsla_df, spy_df, vix_df = fetch_live_data(period='5d', interval='5m')
-        except Exception as e:
-            logger.warning("Failed to refresh 5-min data: %s", e)
+        if self._bar_aggregator and self._historical_5min_tsla is not None:
+            live_bars = self._bar_aggregator.get_bars_df(include_current=False)
+            if len(live_bars) > 0:
+                tsla_df = pd.concat([self._historical_5min_tsla, live_bars])
+                tsla_df = tsla_df[~tsla_df.index.duplicated(keep='last')]
+                logger.info("5-min bars: %d historical + %d live = %d total",
+                           len(self._historical_5min_tsla), len(live_bars), len(tsla_df))
+            else:
+                tsla_df = self._historical_5min_tsla
+        if tsla_df is None:
+            try:
+                from v15.live_data import fetch_live_data
+                tsla_df, spy_df, vix_df = fetch_live_data(period='5d', interval='5m')
+            except Exception as e:
+                logger.warning("Failed to refresh 5-min data: %s", e)
 
         effective_tsla = tsla_df if tsla_df is not None and len(tsla_df) > 0 else self.current_tsla
 
@@ -379,11 +426,16 @@ class DashboardState(param.Parameterized):
         def _analysis_loop():
             time.sleep(30)  # Initial delay — let prices stabilize
             while True:
+                if self._bar_aggregator:
+                    # Wait for 5-min bar close (instant trigger) or timeout at 300s
+                    self._bar_aggregator.bar_close_event.wait(timeout=300)
+                    self._bar_aggregator.bar_close_event.clear()
+                else:
+                    time.sleep(150)  # fallback if no aggregator
                 try:
                     self._run_analysis_bg()
                 except Exception as e:
                     logger.error("Analysis loop error: %s", e)
-                time.sleep(150)
 
         def _model_loop():
             while True:
@@ -393,10 +445,25 @@ class DashboardState(param.Parameterized):
                 except Exception as e:
                     logger.error("Model reload error: %s", e)
 
-        for fn, name in [(_price_loop, 'price'), (_analysis_loop, 'analysis'), (_model_loop, 'model')]:
+        def _tf_refresh_loop():
+            """Refresh higher TF bars from IB every 30 min."""
+            while True:
+                time.sleep(1800)
+                if self.ib_client and self.ib_client.is_connected() and self.data_source == 'IB':
+                    try:
+                        new_data = self._load_ib_historical()
+                        if new_data and 'TSLA' in new_data:
+                            self.native_tf_data = new_data
+                            logger.info("Higher TF data refreshed from IB")
+                    except Exception as e:
+                        logger.warning("Higher TF refresh failed: %s", e)
+
+        loops = [(_price_loop, 'price'), (_analysis_loop, 'analysis'),
+                 (_model_loop, 'model'), (_tf_refresh_loop, 'tf-refresh')]
+        for fn, name in loops:
             t = threading.Thread(target=fn, daemon=True, name=f'x14-{name}')
             t.start()
-        logger.info("Background loops started (price/analysis/model)")
+        logger.info("Background loops started (price/analysis/model/tf-refresh)")
 
     def _run_analysis_bg(self):
         """Background-safe analysis: compute + apply without requiring Panel session."""
@@ -418,6 +485,36 @@ class DashboardState(param.Parameterized):
         finally:
             self._analysis_running = False
 
+    def _load_ib_historical(self):
+        """Load multi-TF historical data from IB for all symbols."""
+        data = {}
+        for symbol in ['TSLA', 'SPY']:
+            tf_data = self.ib_client.fetch_all_tf_history(symbol)
+            # Resample 2h/3h/4h from 1h
+            if '1h' in tf_data:
+                tf_data['2h'] = self._resample_ohlcv(tf_data['1h'], '2h')
+                tf_data['3h'] = self._resample_ohlcv(tf_data['1h'], '3h')
+                tf_data['4h'] = self._resample_ohlcv(tf_data['1h'], '4h')
+            data[symbol] = tf_data
+
+        # VIX: fetch daily only (all we need — 2 ML features: level + 5d change)
+        vix_data = self.ib_client.fetch_all_tf_history('VIX', use_rth=True)
+        data['^VIX'] = vix_data
+
+        # Log summary
+        for sym, tfs in data.items():
+            tf_summary = ", ".join(f"{tf}={len(df)}" for tf, df in tfs.items() if len(df) > 0)
+            logger.info("IB historical %s: %s", sym, tf_summary)
+        return data
+
+    @staticmethod
+    def _resample_ohlcv(df, rule):
+        """Resample OHLCV data to a coarser timeframe."""
+        return df.resample(rule).agg(
+            {'open': 'first', 'high': 'max', 'low': 'min',
+             'close': 'last', 'volume': 'sum'}
+        ).dropna(subset=['close'])
+
     def _init_ib(self):
         """Connect to IB Gateway for real-time price streaming. Fails loudly."""
         try:
@@ -428,8 +525,9 @@ class DashboardState(param.Parameterized):
             self.ib_client.connect()
             self.ib_client.subscribe('TSLA')
             self.ib_client.subscribe('SPY')
+            self.ib_client.subscribe('VIX')
             self.ib_connected = True
-            logger.info("IB connected — streaming TSLA + SPY")
+            logger.info("IB connected — streaming TSLA + SPY + VIX")
         except Exception as e:
             logger.error("IB CONNECTION FAILED — no live price source! %s", e)
             self.ib_client = None
