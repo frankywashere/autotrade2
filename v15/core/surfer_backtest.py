@@ -6178,6 +6178,10 @@ def run_backtest(
                     if max_trade_usd > 0 and trade_size > max_trade_usd:
                         trade_size = max_trade_usd
 
+                    # Flat sizing override: $100K per trade, no multipliers
+                    if flat_sizing:
+                        trade_size = 100_000.0
+
                     # Skip trades too small to generate meaningful P&L
                     if min_trade_usd > 0 and trade_size < min_trade_usd:
                         ml_stats.setdefault('min_trade_skip', 0)
