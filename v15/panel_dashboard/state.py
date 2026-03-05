@@ -32,12 +32,17 @@ class DashboardState(param.Parameterized):
     analysis = param.Parameter(None)          # ChannelAnalysis object
     last_analysis = param.String('')          # Timestamp string
 
-    # Scanners
+    # Scanners — c16 generation
     scanner = param.Parameter(None)           # SurferLiveScanner (CS-5TF)
     scanner_dw = param.Parameter(None)        # SurferLiveScanner (CS-DW)
     scanner_ml = param.Parameter(None)        # SurferLiveScanner (Surfer ML)
     scanner_intra = param.Parameter(None)     # SurferLiveScanner (Intraday ML)
     scanner_oe = param.Parameter(None)        # SurferLiveScanner (OE Signals_5)
+    # Scanners — c14a generation (alongside c16)
+    scanner_14a = param.Parameter(None)       # SurferLiveScanner (CS-5TF [14a])
+    scanner_14a_dw = param.Parameter(None)    # SurferLiveScanner (CS-DW [14a])
+    scanner_14a_ml = param.Parameter(None)    # SurferLiveScanner (Surfer ML [14a])
+    scanner_14a_intra = param.Parameter(None) # SurferLiveScanner (Intraday [14a])
     positions_version = param.Integer(0)      # Bump to trigger position card re-render (price-sensitive)
     trades_version = param.Integer(0)        # Bump only on actual trade open/close (not price ticks)
     exit_alert_html = param.String('')        # Latest exit alert HTML
@@ -65,6 +70,16 @@ class DashboardState(param.Parameterized):
     _er_model = param.Parameter(None, precedence=-1)   # ExtendedRunPredictor
     _ws_client = param.Parameter(None, precedence=-1)  # UNUSED — kept for param compat
     _price_updated_at = param.Number(0.0, precedence=-1)  # time.time() of last successful price fetch
+
+    @property
+    def _all_scanners(self):
+        """All scanner instances (c16 + c14a) for iteration."""
+        return [s for s in [
+            self.scanner, self.scanner_dw, self.scanner_ml,
+            self.scanner_intra, self.scanner_oe,
+            self.scanner_14a, self.scanner_14a_dw,
+            self.scanner_14a_ml, self.scanner_14a_intra,
+        ] if s is not None]
 
     def load_market_data(self):
         """Startup: load native TF data, fetch 5-min bars, initialize scanner."""
@@ -173,8 +188,8 @@ class DashboardState(param.Parameterized):
         # Check exits if positions are open (both scanners)
         html_parts = []
         all_exit_alerts = []
-        for scnr in [self.scanner, self.scanner_dw, self.scanner_ml, self.scanner_intra, self.scanner_oe]:
-            if scnr and scnr.positions and price > 0:
+        for scnr in self._all_scanners:
+            if scnr.positions and price > 0:
                 try:
                     exit_alerts = scnr.check_exits(price, price, price)
                     if exit_alerts:
@@ -201,10 +216,7 @@ class DashboardState(param.Parameterized):
                             ts['consec_wins'] = 0
         # Bump version for live P&L updates only when price actually changed
         elif not all_exit_alerts and (price_changed if price > 0 else False):
-            has_positions = ((self.scanner and self.scanner.positions)
-                             or (self.scanner_dw and self.scanner_dw.positions)
-                             or (self.scanner_ml and self.scanner_ml.positions)
-                             or (self.scanner_intra and self.scanner_intra.positions))
+            has_positions = any(s.positions for s in self._all_scanners)
             if has_positions:
                 self.positions_version += 1
 
@@ -295,6 +307,14 @@ class DashboardState(param.Parameterized):
                     self.positions_version += 1
                     self.trades_version += 1
                     self.load_model_data()
+                # c14a: same signal, different config
+                if self.scanner_14a:
+                    a14 = self.scanner_14a.evaluate_signal(
+                        analysis, self.tsla_price, signal_source='CS-5TF')
+                    if a14 and a14.alert_type == 'ENTRY':
+                        self.positions_version += 1
+                        self.trades_version += 1
+                        self.load_model_data()
 
             # --- CS-DW: Daily+Weekly only signal (separate scanner/model) ---
             if self.scanner_dw and dw_analysis and self.tsla_price > 0:
@@ -307,6 +327,14 @@ class DashboardState(param.Parameterized):
                             self.positions_version += 1
                             self.trades_version += 1
                             self.load_model_data()
+                        # c14a: same signal, different config
+                        if self.scanner_14a_dw:
+                            a14dw = self.scanner_14a_dw.evaluate_signal(
+                                dw_analysis, self.tsla_price, signal_source='CS-DW')
+                            if a14dw and a14dw.alert_type == 'ENTRY':
+                                self.positions_version += 1
+                                self.trades_version += 1
+                                self.load_model_data()
                     logger.info("DW analysis: %s %s (%.0f%%)",
                                 dw_sig.action, dw_sig.primary_tf,
                                 dw_sig.confidence * 100)
@@ -397,23 +425,52 @@ class DashboardState(param.Parameterized):
         """Create SurferLiveScanners with per-model local state files."""
         try:
             from v15.trading.surfer_live_scanner import SurferLiveScanner, ScannerConfig
+
+            # --- c16 generation: flat $100K, trail^12, full-day intraday, no AM block ---
             config = ScannerConfig(initial_capital=self.scanner_capital)
             self.scanner = SurferLiveScanner(config, model_tag='c16')
             self.scanner_dw = SurferLiveScanner(config, model_tag='c16-dw')
-            # Surfer ML scanner: low confidence gate (matching surfer_backtest)
             ml_config = ScannerConfig(
                 initial_capital=self.scanner_capital,
-                min_confidence=0.01,  # Very low gate — ML uses all signals
+                min_confidence=0.01,
             )
             self.scanner_ml = SurferLiveScanner(ml_config, model_tag='c16-ml')
-            # Intraday scanner: separate tracking for intraday ML signals
             self.scanner_intra = SurferLiveScanner(config, model_tag='c16-intra')
-            # OE Signals_5 scanner: daily evolved signal with combo trail
             self.scanner_oe = SurferLiveScanner(config, model_tag='c16-oe')
-            # Ensure state files exist for all scanners (so model_compare shows all 5)
-            for scnr in [self.scanner, self.scanner_dw, self.scanner_ml, self.scanner_intra, self.scanner_oe]:
+
+            # --- c14a generation: confidence/risk sizing, trail^8, PM intraday, AM block ---
+            c14a_config = ScannerConfig(
+                initial_capital=self.scanner_capital,
+                trail_power=8,
+                flat_sizing=False,
+                am_block_hour=10,           # Block entries after 10:30 ET
+                intraday_start_hour=13,     # PM-only intraday window
+                intraday_start_minute=0,
+            )
+            self.scanner_14a = SurferLiveScanner(c14a_config, model_tag='c14a')
+            self.scanner_14a_dw = SurferLiveScanner(c14a_config, model_tag='c14a-dw')
+            c14a_ml_config = ScannerConfig(
+                initial_capital=self.scanner_capital,
+                min_confidence=0.01,
+                trail_power=8,
+                flat_sizing=False,
+                am_block_hour=10,
+                intraday_start_hour=13,
+                intraday_start_minute=0,
+            )
+            self.scanner_14a_ml = SurferLiveScanner(c14a_ml_config, model_tag='c14a-ml')
+            self.scanner_14a_intra = SurferLiveScanner(c14a_config, model_tag='c14a-intra')
+
+            # Ensure state files exist for all scanners
+            all_scanners = [
+                self.scanner, self.scanner_dw, self.scanner_ml,
+                self.scanner_intra, self.scanner_oe,
+                self.scanner_14a, self.scanner_14a_dw,
+                self.scanner_14a_ml, self.scanner_14a_intra,
+            ]
+            for scnr in all_scanners:
                 scnr._save_state()
-            logger.info("Scanners initialized (c16 + c16-dw + c16-ml + c16-intra + c16-oe, capital=$%.0f)",
+            logger.info("Scanners initialized: 5x c16 + 4x c14a (capital=$%.0f)",
                          self.scanner_capital)
         except Exception as e:
             self._scanner_init_error = f"{e}"
@@ -423,6 +480,10 @@ class DashboardState(param.Parameterized):
             self.scanner_ml = None
             self.scanner_intra = None
             self.scanner_oe = None
+            self.scanner_14a = None
+            self.scanner_14a_dw = None
+            self.scanner_14a_ml = None
+            self.scanner_14a_intra = None
 
         # Load ML model for Surfer ML path
         # NOTE: Cannot import surfer_ml directly — it pulls in torch which isn't on HF.
@@ -697,6 +758,18 @@ class DashboardState(param.Parameterized):
         except Exception as e:
             logger.warning("Surfer ML eval failed: %s", e)
 
+        # c14a-ml: same signal, different config (risk-based sizing, AM block, trail^8)
+        if self.scanner_14a_ml:
+            try:
+                a14ml = self.scanner_14a_ml.evaluate_signal(
+                    analysis, self.tsla_price, signal_source='surfer_ml')
+                if a14ml and a14ml.alert_type == 'ENTRY':
+                    self.positions_version += 1
+                    self.trades_version += 1
+                    self.load_model_data()
+            except Exception as e:
+                logger.warning("c14a ML eval failed: %s", e)
+
     def _evaluate_intraday(self, analysis):
         """Extract 5-min features from analysis and evaluate intraday signal."""
         if analysis is None or not analysis.tf_states:
@@ -901,6 +974,24 @@ class DashboardState(param.Parameterized):
         except Exception as e:
             logger.warning("Intraday eval failed: %s", e)
 
+        # c14a-intra: same signal, different config (PM-only window, confidence sizing)
+        if self.scanner_14a_intra:
+            try:
+                a14i = self.scanner_14a_intra.evaluate_intraday_signal(
+                    current_price=self.tsla_price,
+                    cp5=cp5, vwap_dist=vwap_dist,
+                    daily_cp=daily_cp, h1_cp=h1_cp, h4_cp=h4_cp,
+                    daily_slope=daily_slope, h1_slope=h1_slope, h4_slope=h4_slope,
+                    vol_ratio=vol_ratio, vwap_slope=vwap_slope,
+                    spread_pct=spread_pct, gap_pct=gap_pct,
+                )
+                if a14i and a14i.alert_type == 'ENTRY':
+                    self.positions_version += 1
+                    self.trades_version += 1
+                    self.load_model_data()
+            except Exception as e:
+                logger.warning("c14a intraday eval failed: %s", e)
+
     def _evaluate_oe_signals5(self):
         """Evaluate OE Signals_5 on latest daily bars."""
         if not self.scanner_oe or not self.native_tf_data or self.tsla_price <= 0:
@@ -1093,7 +1184,8 @@ class DashboardState(param.Parameterized):
         from v15.trading.surfer_live_scanner import _STATE_DIR
 
         combined = {}
-        for tag in ('c16', 'c16-dw', 'c16-ml', 'c16-intra', 'c16-oe'):
+        for tag in ('c16', 'c16-dw', 'c16-ml', 'c16-intra', 'c16-oe',
+                    'c14a', 'c14a-dw', 'c14a-ml', 'c14a-intra'):
             fpath = _STATE_DIR / f"surfer_state_{tag}.json"
             if fpath.exists():
                 try:
@@ -1110,12 +1202,11 @@ class DashboardState(param.Parameterized):
     def flush_scanner_state(self):
         """One-time: write each scanner's in-memory state to its per-model local file."""
         count = 0
-        for scnr in [self.scanner, self.scanner_dw, self.scanner_ml, self.scanner_intra, self.scanner_oe]:
-            if scnr:
-                scnr._save_state()
-                count += 1
-                logger.info("Flushed state for %s: %d trades, equity=$%.2f",
-                            scnr.model_tag, len(scnr.closed_trades), scnr.equity)
+        for scnr in self._all_scanners:
+            scnr._save_state()
+            count += 1
+            logger.info("Flushed state for %s: %d trades, equity=$%.2f",
+                        scnr.model_tag, len(scnr.closed_trades), scnr.equity)
         self.load_model_data()
         return count
 

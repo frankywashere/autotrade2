@@ -38,26 +38,34 @@ def channel_surfer_tab(state) -> pn.Column:
         pn.bind(_active_trades_banner, state.param.trades_version,
                 scanner=state.scanner, scanner_dw=state.scanner_dw,
                 scanner_ml=state.scanner_ml, scanner_intra=state.scanner_intra,
-                scanner_oe=state.scanner_oe),
+                scanner_oe=state.scanner_oe,
+                extra_scanners=[state.scanner_14a, state.scanner_14a_dw,
+                                state.scanner_14a_ml, state.scanner_14a_intra]),
         # Market insights
         pn.bind(_market_insights, state.param.analysis),
         # Scanner metrics + live P&L — re-renders on price change
         pn.bind(_scanner_metrics, state.param.positions_version, state.param.tsla_price,
                 scanner=state.scanner, scanner_dw=state.scanner_dw,
                 scanner_ml=state.scanner_ml, scanner_intra=state.scanner_intra,
-                scanner_oe=state.scanner_oe),
+                scanner_oe=state.scanner_oe,
+                extra_scanners=[state.scanner_14a, state.scanner_14a_dw,
+                                state.scanner_14a_ml, state.scanner_14a_intra]),
         # Exit alerts — only re-renders when exit_alert_html changes
         pn.bind(_exit_alerts_pane, state.param.exit_alert_html),
         # Open positions with live P&L — re-renders on price change
         pn.bind(_open_positions_pane, state.param.positions_version, state.param.tsla_price,
                 scanner=state.scanner, scanner_dw=state.scanner_dw,
                 scanner_ml=state.scanner_ml, scanner_intra=state.scanner_intra,
-                scanner_oe=state.scanner_oe),
+                scanner_oe=state.scanner_oe,
+                extra_scanners=[state.scanner_14a, state.scanner_14a_dw,
+                                state.scanner_14a_ml, state.scanner_14a_intra]),
         # Trade history — only re-renders on actual trade open/close (preserves <details> state)
         pn.bind(_trade_history_pane, state.param.trades_version,
                 scanner=state.scanner, scanner_dw=state.scanner_dw,
                 scanner_ml=state.scanner_ml, scanner_intra=state.scanner_intra,
-                scanner_oe=state.scanner_oe),
+                scanner_oe=state.scanner_oe,
+                extra_scanners=[state.scanner_14a, state.scanner_14a_dw,
+                                state.scanner_14a_ml, state.scanner_14a_intra]),
         # Regime indicator
         pn.bind(_regime_indicator, state.param.analysis),
         # Break direction predictor
@@ -124,14 +132,15 @@ def _price_banner(tsla_price, price_source, price_delta):
 # Active Trades Banner — only renders when positions are open
 # ---------------------------------------------------------------------------
 
-def _active_trades_banner(trades_version, scanner=None, scanner_dw=None, scanner_ml=None, scanner_intra=None, scanner_oe=None):
+def _active_trades_banner(trades_version, scanner=None, scanner_dw=None, scanner_ml=None, scanner_intra=None, scanner_oe=None, extra_scanners=None):
     """Prominent banner showing active trades with entry/stop/TP and signal source.
 
     Bound to trades_version only — re-renders on actual trade open/close,
     not on every price tick or position P&L update.
     """
     all_positions = []
-    for scnr in [scanner, scanner_dw, scanner_ml, scanner_intra, scanner_oe]:
+    scanners = [scanner, scanner_dw, scanner_ml, scanner_intra, scanner_oe] + (extra_scanners or [])
+    for scnr in scanners:
         if scnr and scnr.positions:
             all_positions.extend(scnr.positions.values())
     if not all_positions:
@@ -273,7 +282,7 @@ def _market_insights(analysis):
 # Scanner Panel
 # ---------------------------------------------------------------------------
 
-def _scanner_metrics(positions_version, tsla_price, scanner=None, scanner_dw=None, scanner_ml=None, scanner_intra=None, scanner_oe=None):
+def _scanner_metrics(positions_version, tsla_price, scanner=None, scanner_dw=None, scanner_ml=None, scanner_intra=None, scanner_oe=None, extra_scanners=None):
     """Scanner equity/P&L metrics. Bound to tsla_price for live unrealized updates."""
     if scanner is None:
         return pn.pane.HTML(
@@ -281,7 +290,7 @@ def _scanner_metrics(positions_version, tsla_price, scanner=None, scanner_dw=Non
             sizing_mode='stretch_width',
         )
 
-    all_scanners = [s for s in [scanner, scanner_dw, scanner_ml, scanner_intra, scanner_oe] if s is not None]
+    all_scanners = [s for s in [scanner, scanner_dw, scanner_ml, scanner_intra, scanner_oe] + (extra_scanners or []) if s is not None]
     total_equity = sum(s.equity for s in all_scanners)
     total_capital = sum(s.config.initial_capital for s in all_scanners)
     unrealized = sum(s.get_unrealized_pnl(tsla_price) for s in all_scanners) if tsla_price > 0 else 0.0
@@ -329,10 +338,10 @@ def _exit_alerts_pane(exit_alert_html):
     return pn.pane.HTML(exit_alert_html, sizing_mode='stretch_width')
 
 
-def _open_positions_pane(positions_version, tsla_price, scanner=None, scanner_dw=None, scanner_ml=None, scanner_intra=None, scanner_oe=None):
+def _open_positions_pane(positions_version, tsla_price, scanner=None, scanner_dw=None, scanner_ml=None, scanner_intra=None, scanner_oe=None, extra_scanners=None):
     """Open positions with live P&L. Bound to tsla_price for live updates."""
     all_positions = {}
-    for scnr in [scanner, scanner_dw, scanner_ml, scanner_intra, scanner_oe]:
+    for scnr in [scanner, scanner_dw, scanner_ml, scanner_intra, scanner_oe] + (extra_scanners or []):
         if scnr and scnr.positions:
             all_positions.update(scnr.positions)
 
@@ -378,14 +387,14 @@ def _open_positions_pane(positions_version, tsla_price, scanner=None, scanner_dw
     return pn.pane.HTML(position_html, sizing_mode='stretch_width')
 
 
-def _trade_history_pane(trades_version, scanner=None, scanner_dw=None, scanner_ml=None, scanner_intra=None, scanner_oe=None):
+def _trade_history_pane(trades_version, scanner=None, scanner_dw=None, scanner_ml=None, scanner_intra=None, scanner_oe=None, extra_scanners=None):
     """Trade history. Bound to trades_version ONLY — not tsla_price or positions_version.
 
     Only re-renders when a trade actually opens or closes, so the <details>
     element preserves its open/closed state between price ticks.
     """
     all_closed = []
-    for scnr in [scanner, scanner_dw, scanner_ml, scanner_intra, scanner_oe]:
+    for scnr in [scanner, scanner_dw, scanner_ml, scanner_intra, scanner_oe] + (extra_scanners or []):
         if scnr and scnr.closed_trades:
             all_closed.extend(scnr.closed_trades)
 

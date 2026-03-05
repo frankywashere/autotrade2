@@ -60,6 +60,10 @@ DISPLAY_NAMES = {
     'c16-ml': 'Surfer ML',
     'c16-intra': 'Intraday',
     'c16-oe': 'OE-Sig5',
+    'c14a': 'CS-5TF [14a]',
+    'c14a-dw': 'CS-DW [14a]',
+    'c14a-ml': 'Surfer ML [14a]',
+    'c14a-intra': 'Intraday [14a]',
 }
 
 # Slippage + commission (per-signal-source, matching each backtest engine)
@@ -111,6 +115,12 @@ class ScannerConfig:
     max_positions: int = 2
     kill_switch: bool = False
     min_confidence: float = 0.45
+    # Per-generation config overrides (c14a vs c16)
+    trail_power: int = 12               # CS trail exponent (c14a=8, c16=12)
+    flat_sizing: bool = True             # True=flat $100K, False=risk-based/confidence
+    am_block_hour: int = 0               # 0=disabled, 10=block after 10:30 (c14a)
+    intraday_start_hour: int = 9         # Intraday window start hour (c14a=13, c16=9)
+    intraday_start_minute: int = 30      # Intraday window start minute
 
 
 @dataclass
@@ -475,6 +485,12 @@ class SurferLiveScanner:
             if not _is_extended_hours() or self._ext_opens_today >= ext_open_limit:
                 return None
 
+        # AM block: only allow entries before cutoff (c14a: 10:30 ET)
+        from datetime import time as _time
+        if self.config.am_block_hour > 0:
+            if now_et.time() > _time(self.config.am_block_hour, 30):
+                return None
+
         # Record in history
         self.signal_history.append({
             'time': now,
@@ -561,18 +577,29 @@ class SurferLiveScanner:
                     tp_pct *= 1.30
 
             # --- Position sizing (matches each backtest engine) ---
-            if signal_source == 'oe_signals5':
-                # OE Signals_5: flat $100K (matching backtest, no confidence scaling)
+            if self.config.flat_sizing:
+                # c16: flat $100K for all signal types
                 position_value = self.config.initial_capital
                 shares = max(1, int(position_value / current_price))
-            elif signal_source in ('CS-5TF', 'CS-DW'):
-                # combo_backtest.py DI v36: flat $100K (backtest: 10t, 100% WR, $21K)
-                position_value = self.config.initial_capital
+            elif signal_source in ('CS-5TF', 'CS-DW', 'oe_signals5'):
+                # c14a combo: confidence-scaled, $100K base
+                position_value = self.config.initial_capital * min(sig.confidence, 1.0)
                 shares = max(1, int(position_value / current_price))
             else:
-                # surfer_backtest.py: flat $100K (backtest: 4025t, 88% WR, $875K with ML)
-                position_value = self.config.initial_capital
-                shares = max(1, int(position_value / current_price))
+                # c14a surfer_ml / default: risk-based sizing with signal-type boosts
+                risk_dollars = self.equity * self.config.risk_per_trade_pct
+                stop_distance = stop_pct * current_price
+                shares = int(risk_dollars / stop_distance) if stop_distance > 0 else 0
+                size_mult = 1.0
+                if signal_type == 'bounce':
+                    size_mult = 2.5 if direction == 'short' else 1.5
+                elif signal_type == 'break':
+                    ch_health = getattr(sig, 'channel_health', 0.5)
+                    if ch_health > 0.50:
+                        size_mult = 0.6
+                    elif ch_health < 0.30:
+                        size_mult = 1.4
+                shares = int(shares * size_mult)
 
             # Cap at max buying power
             buying_power = self.equity * self.config.max_leverage
@@ -649,10 +676,11 @@ class SurferLiveScanner:
         if not _is_market_open():
             return None
 
-        # Intraday window: 9:30-15:25 ET (full day, backtest config G/I: 3157t, 77% WR, $364K)
+        # Intraday window: configurable start (c16=9:30, c14a=13:00), end always 15:25
         from datetime import time as _time
         t = now.time()
-        if not (_time(9, 30) <= t <= _time(15, 25)):
+        intra_start = _time(self.config.intraday_start_hour, self.config.intraday_start_minute)
+        if not (intra_start <= t <= _time(15, 25)):
             return None
 
         # Kill switch / daily loss limit
@@ -955,8 +983,8 @@ class SurferLiveScanner:
                             exit_reason = 'trailing_stop'
                             exit_price = trail_price
                 elif is_cs:
-                    # CS-5TF/DW: exponential trail = 0.025 * (1 - conf)^8
-                    trail_pct = self.CS_TRAIL_BASE * (1.0 - pos.confidence) ** self.CS_TRAIL_POWER
+                    # CS-5TF/DW: exponential trail = 0.025 * (1 - conf)^N
+                    trail_pct = self.CS_TRAIL_BASE * (1.0 - pos.confidence) ** self.config.trail_power
                     if pos.direction == 'long' and pos.best_price > pos.entry_price:
                         trail_price = pos.best_price * (1.0 - trail_pct)
                         trail_price = max(trail_price, pos.stop_price)

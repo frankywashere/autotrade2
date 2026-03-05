@@ -59,12 +59,17 @@ def _init_state():
     _state = DashboardState()
 
     _state.load_market_data()
-    logger.info("Market data loaded. TSLA=%.2f, scanners: CS=%s DW=%s ML=%s Intra=%s",
+    logger.info("Market data loaded. TSLA=%.2f, c16: CS=%s DW=%s ML=%s Intra=%s OE=%s, c14a: CS=%s DW=%s ML=%s Intra=%s",
                 _state.tsla_price,
                 "OK" if _state.scanner else "NONE",
                 "OK" if _state.scanner_dw else "NONE",
                 "OK" if _state.scanner_ml else "NONE",
-                "OK" if _state.scanner_intra else "NONE")
+                "OK" if _state.scanner_intra else "NONE",
+                "OK" if _state.scanner_oe else "NONE",
+                "OK" if _state.scanner_14a else "NONE",
+                "OK" if _state.scanner_14a_dw else "NONE",
+                "OK" if _state.scanner_14a_ml else "NONE",
+                "OK" if _state.scanner_14a_intra else "NONE")
 
     # Log ML model status
     gbt_ok = hasattr(_state, '_ml_model') and _state._ml_model is not None
@@ -101,11 +106,15 @@ def _init_state():
     # Send startup notification
     scanner_err = getattr(_state, '_scanner_init_error', '')
     gbt_err = getattr(_state, '_gbt_load_error', '')
+    c14a_ok = all([_state.scanner_14a, _state.scanner_14a_dw,
+                    _state.scanner_14a_ml, _state.scanner_14a_intra])
     startup_msg = (
-        f"Scanners: CS-5TF={'OK' if _state.scanner else 'FAIL'}, "
-        f"CS-DW={'OK' if _state.scanner_dw else 'FAIL'}, "
-        f"Surfer ML={'OK' if _state.scanner_ml else 'FAIL'}, "
-        f"Intraday={'OK' if _state.scanner_intra else 'FAIL'}\n"
+        f"c16: CS-5TF={'OK' if _state.scanner else 'FAIL'}, "
+        f"DW={'OK' if _state.scanner_dw else 'FAIL'}, "
+        f"ML={'OK' if _state.scanner_ml else 'FAIL'}, "
+        f"Intra={'OK' if _state.scanner_intra else 'FAIL'}, "
+        f"OE={'OK' if _state.scanner_oe else 'FAIL'}\n"
+        f"c14a: {'ALL OK' if c14a_ok else 'FAIL'} (4 scanners)\n"
         f"GBT model: {gbt_msg}{gbt_diag}\n"
         f"Intraday model: {intra_msg}{intra_diag}\n"
         f"TSLA price: ${_state.tsla_price:.2f}"
