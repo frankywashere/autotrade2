@@ -5,7 +5,6 @@ import panel as pn
 
 logger = logging.getLogger(__name__)
 
-# Order type mapping for IB
 ORDER_TYPE_MAP = {'Market': 'MKT', 'Limit': 'LMT', 'Stop': 'STP'}
 
 
@@ -69,54 +68,66 @@ def order_entry_panel(state) -> pn.Column:
 
     # ── Order Form ───────────────────────────────────────────────────
 
-    direction_toggle = pn.widgets.RadioButtonGroup(
-        name='Direction', options=['BUY', 'SELL'], value='BUY',
-        button_style='outline', button_type='success')
+    buy_btn = pn.widgets.Button(name='BUY', button_type='success', width=65)
+    sell_btn = pn.widgets.Button(name='SELL', button_type='default', width=65)
+    _direction = ['BUY']
+
+    def _click_buy(event):
+        _direction[0] = 'BUY'
+        buy_btn.button_type = 'success'
+        sell_btn.button_type = 'default'
+        submit_btn.name = 'SUBMIT BUY'
+        submit_btn.button_type = 'success'
+
+    def _click_sell(event):
+        _direction[0] = 'SELL'
+        buy_btn.button_type = 'default'
+        sell_btn.button_type = 'danger'
+        submit_btn.name = 'SUBMIT SELL'
+        submit_btn.button_type = 'danger'
+
+    buy_btn.on_click(_click_buy)
+    sell_btn.on_click(_click_sell)
 
     qty_input = pn.widgets.IntInput(
-        name='Shares', value=100, start=1, step=10, width=100)
+        name='Shares', value=100, start=1, step=10, width=90)
 
     order_type_select = pn.widgets.Select(
-        name='Order Type', options=['Market', 'Limit', 'Stop'],
-        value='Market', width=100)
+        name='Type', options=['Market', 'Limit', 'Stop'],
+        value='Market', width=90)
 
     session_select = pn.widgets.Select(
         name='Session', options=['RTH', 'Extended Hours', 'Overnight'],
         value='RTH', width=130)
 
     tif_select = pn.widgets.RadioButtonGroup(
-        name='TIF', options=['DAY', 'GTC'], value='DAY',
+        options=['DAY', 'GTC'], value='DAY',
         button_style='outline', button_type='default')
 
     submit_btn = pn.widgets.Button(
-        name='SUBMIT BUY', button_type='success', width=140, height=38)
+        name='SUBMIT BUY', button_type='success', width=130)
 
-    status_msg = pn.pane.HTML('', width=300)
+    status_msg = pn.pane.HTML('', width=250, margin=(8, 0, 0, 0))
 
     # ── Price Slider (Limit/Stop only) ───────────────────────────────
 
-    bid_label = pn.pane.HTML('<b style="color:#888">Bid</b> --', width=90,
-                             margin=(0, 0, 0, 0))
-    ask_label = pn.pane.HTML('<b style="color:#888">Ask</b> --', width=90,
-                             margin=(0, 0, 0, 0))
-    mid_label = pn.pane.HTML('<span style="color:#888">Mid</span> --', width=90,
-                             margin=(0, 0, 0, 0))
-
     price_slider = pn.widgets.FloatSlider(
         name='', start=0.0, end=1.0, step=0.01, value=0.0,
-        sizing_mode='stretch_width', show_value=False, margin=(0, 10))
+        width=400, show_value=False, margin=(5, 10, 0, 10))
 
     price_input = pn.widgets.FloatInput(
-        name='Price', value=0.0, step=0.01, width=100, format='0.00')
+        name='Price', value=0.0, step=0.01, width=90, format='0.00')
 
     lock_toggle = pn.widgets.Toggle(
-        name='Unlocked', button_type='default', width=80, height=38, value=False)
+        name='Unlocked', button_type='default', width=80, value=False)
+
+    price_info = pn.pane.HTML('', width=280, margin=(5, 0, 0, 0))
 
     slider_container = pn.Column(
-        pn.Row(bid_label, price_slider, ask_label, mid_label,
-               sizing_mode='stretch_width', margin=(0, 0)),
+        pn.Row(price_info, margin=(0, 0)),
+        pn.Row(price_slider, margin=(0, 0)),
         pn.Row(price_input, lock_toggle, margin=(2, 0, 0, 0)),
-        visible=False, margin=(4, 0, 0, 0),
+        visible=False, margin=(6, 0, 0, 0),
     )
 
     # Slider lock state
@@ -161,19 +172,6 @@ def order_entry_panel(state) -> pn.Column:
 
     order_type_select.param.watch(_on_order_type_change, 'value')
 
-    # Direction color styling
-    def _on_direction_change(event):
-        if event.new == 'BUY':
-            direction_toggle.button_type = 'success'
-            submit_btn.button_type = 'success'
-            submit_btn.name = 'SUBMIT BUY'
-        else:
-            direction_toggle.button_type = 'danger'
-            submit_btn.button_type = 'danger'
-            submit_btn.name = 'SUBMIT SELL'
-
-    direction_toggle.param.watch(_on_direction_change, 'value')
-
     # ── Submit Logic ─────────────────────────────────────────────────
 
     def _on_submit(event):
@@ -182,7 +180,7 @@ def order_entry_panel(state) -> pn.Column:
                                  'IB not connected</span>')
             return
 
-        action = direction_toggle.value
+        action = _direction[0]
         qty = qty_input.value
         otype = ORDER_TYPE_MAP[order_type_select.value]
         session = session_select.value
@@ -298,12 +296,10 @@ def order_entry_panel(state) -> pn.Column:
     _acct_counter = [0]
 
     def _periodic_update():
-        # Update account summary every ~2s (every 8th tick at 250ms)
         _acct_counter[0] += 1
         if _acct_counter[0] % 8 == 0:
             account_pane.object = _render_account()
 
-        # Update bid/ask/mid and slider
         if state.ib_client:
             data = state.ib_client.get_price_data('TSLA')
             bid = data.get('bid', 0.0)
@@ -313,12 +309,16 @@ def order_entry_panel(state) -> pn.Column:
                 spread = ask - bid
                 pad = max(0.50, spread * 2)
 
-                bid_label.object = (f'<b style="color:#888">Bid</b> '
-                                    f'<span style="color:#00e676">${bid:.2f}</span>')
-                ask_label.object = (f'<b style="color:#888">Ask</b> '
-                                    f'<span style="color:#ff5252">${ask:.2f}</span>')
-                mid_label.object = (f'<span style="color:#888">Mid</span> '
-                                    f'${mid:.2f}')
+                price_info.object = (
+                    f'<span style="font-size:13px">'
+                    f'<b style="color:#00e676">Bid ${bid:.2f}</b>'
+                    f'&nbsp;&nbsp;│&nbsp;&nbsp;'
+                    f'<b style="color:#ff5252">Ask ${ask:.2f}</b>'
+                    f'&nbsp;&nbsp;│&nbsp;&nbsp;'
+                    f'Mid ${mid:.2f}'
+                    f'&nbsp;&nbsp;│&nbsp;&nbsp;'
+                    f'<span style="color:#888">Spread ${spread:.2f}</span>'
+                    f'</span>')
 
                 if not _locked[0]:
                     _programmatic[0] = True
@@ -336,7 +336,6 @@ def order_entry_panel(state) -> pn.Column:
                     price_slider.end = new_end
                     _programmatic[0] = False
 
-            # Poll order log for status changes
             log = state.ib_client.get_order_log()
             log_snapshot = [(e['order_id'], e['status']) for e in log]
             if log_snapshot != _last_log_snapshot[0]:
@@ -348,10 +347,10 @@ def order_entry_panel(state) -> pn.Column:
     form = pn.Column(
         pn.pane.HTML('<h4 style="margin:0 0 4px 0">Manual Order Entry (TSLA)</h4>'),
         account_pane,
-        pn.Row(direction_toggle, qty_input, order_type_select,
-               session_select, tif_select),
+        pn.Row(buy_btn, sell_btn, qty_input, order_type_select,
+               session_select, tif_select, submit_btn, status_msg,
+               align='end'),
         slider_container,
-        pn.Row(submit_btn, status_msg),
         styles={'background': '#1a1a2e', 'padding': '10px',
                 'border-radius': '8px', 'border': '1px solid #333'},
         sizing_mode='stretch_width',
@@ -367,8 +366,5 @@ def order_entry_panel(state) -> pn.Column:
     )
 
     result = pn.Column(form, blotter, sizing_mode='stretch_width')
-
-    # Register periodic callback
     pn.state.add_periodic_callback(_periodic_update, period=250)
-
     return result
