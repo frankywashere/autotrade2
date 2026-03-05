@@ -79,8 +79,9 @@ def channel_surfer_tab(state) -> pn.Column:
         pn.bind(_tf_positions, state.param.analysis),
         # Collapsible detail cards
         pn.bind(_detail_cards, state.param.analysis),
-        # Audio alerts
-        pn.bind(_audio_alert, state.param.analysis),
+        # Audio alerts — fires only on actual trade open/close
+        pn.bind(_audio_alert, state.param.trades_version,
+                state.param.exit_alert_html),
         sizing_mode='stretch_width',
     )
 
@@ -982,48 +983,84 @@ def _energy_diagram(sorted_tfs):
 
 
 # ---------------------------------------------------------------------------
-# Audio Alerts
+# Audio Alerts — fires only on actual trade open/close
 # ---------------------------------------------------------------------------
 
-_PREV_ALERT_ACTION = [None]  # Mutable to track across calls
+_PREV_TRADES_VERSION = [0]
 
 
-def _audio_alert(analysis):
-    if analysis is None:
+def _audio_alert(trades_version, exit_alert_html):
+    if trades_version <= _PREV_TRADES_VERSION[0]:
         return pn.pane.HTML('')
+    _PREV_TRADES_VERSION[0] = trades_version
 
-    action = analysis.signal.action
-    if action == 'HOLD' or action == _PREV_ALERT_ACTION[0]:
-        _PREV_ALERT_ACTION[0] = action
-        return pn.pane.HTML('')
-
-    _PREV_ALERT_ACTION[0] = action
-
-    if action == 'BUY':
-        freq_start, freq_end = 400, 800
-    elif action == 'SELL':
-        freq_start, freq_end = 800, 400
+    # Exit alert present → exit sound, otherwise entry sound
+    is_exit = bool(exit_alert_html)
+    if is_exit:
+        # Exit: check for profit vs loss in the HTML
+        is_profit = 'take_profit' in exit_alert_html or 'trailing_stop' in exit_alert_html
+        if is_profit:
+            # Celebratory ascending chime: C5 → E5 → G5
+            js = """
+            <script>
+            (function() {
+                try {
+                    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                    [523, 659, 784].forEach(function(f, i) {
+                        const osc = ctx.createOscillator();
+                        const gain = ctx.createGain();
+                        osc.connect(gain); gain.connect(ctx.destination);
+                        osc.type = 'sine';
+                        osc.frequency.value = f;
+                        gain.gain.setValueAtTime(0.25, ctx.currentTime + i*0.15);
+                        gain.gain.linearRampToValueAtTime(0, ctx.currentTime + i*0.15 + 0.3);
+                        osc.start(ctx.currentTime + i*0.15);
+                        osc.stop(ctx.currentTime + i*0.15 + 0.3);
+                    });
+                } catch(e) {}
+            })();
+            </script>
+            """
+        else:
+            # Stop loss / other exit: descending tone
+            js = """
+            <script>
+            (function() {
+                try {
+                    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                    const osc = ctx.createOscillator();
+                    const gain = ctx.createGain();
+                    osc.connect(gain); gain.connect(ctx.destination);
+                    osc.type = 'square';
+                    osc.frequency.setValueAtTime(600, ctx.currentTime);
+                    osc.frequency.linearRampToValueAtTime(300, ctx.currentTime + 0.4);
+                    gain.gain.setValueAtTime(0.15, ctx.currentTime);
+                    gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.4);
+                    osc.start(ctx.currentTime);
+                    osc.stop(ctx.currentTime + 0.4);
+                } catch(e) {}
+            })();
+            </script>
+            """
     else:
-        return pn.pane.HTML('')
-
-    js = f"""
-    <script>
-    (function() {{
-        try {{
-            const ctx = new (window.AudioContext || window.webkitAudioContext)();
-            const osc = ctx.createOscillator();
-            const gain = ctx.createGain();
-            osc.connect(gain);
-            gain.connect(ctx.destination);
-            osc.type = 'sine';
-            osc.frequency.setValueAtTime({freq_start}, ctx.currentTime);
-            osc.frequency.linearRampToValueAtTime({freq_end}, ctx.currentTime + 0.3);
-            gain.gain.setValueAtTime(0.3, ctx.currentTime);
-            gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.5);
-            osc.start(ctx.currentTime);
-            osc.stop(ctx.currentTime + 0.5);
-        }} catch(e) {{}}
-    }})();
-    </script>
-    """
+        # Entry: ascending tone
+        js = """
+        <script>
+        (function() {
+            try {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain); gain.connect(ctx.destination);
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(400, ctx.currentTime);
+                osc.frequency.linearRampToValueAtTime(800, ctx.currentTime + 0.3);
+                gain.gain.setValueAtTime(0.3, ctx.currentTime);
+                gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.5);
+                osc.start(ctx.currentTime);
+                osc.stop(ctx.currentTime + 0.5);
+            } catch(e) {}
+        })();
+        </script>
+        """
     return pn.pane.HTML(js)
