@@ -209,7 +209,7 @@ class SurferLiveScanner:
     # Surfer ML: profit-tier trail from surfer_backtest.py
     # Intraday: 0.006*(1-conf)^6 from intraday_v14b
     CS_TRAIL_BASE = 0.025          # combo_backtest TRAILING_STOP_BASE
-    CS_TRAIL_POWER = 8             # DI v36 trail power (tp=8+)
+    CS_TRAIL_POWER = 12            # DI v36 dodecic trail (backtest: 10t, 100% WR, $21K)
     CS_MAX_HOLD_DAYS = 10          # combo_backtest MAX_HOLD_DAYS (trading days)
     TIMEOUT_MINUTES_BOUNCE = 300   # 5 hours for bounces (60 bars × 5 min) — Surfer ML only
     TIMEOUT_MINUTES_BREAK = 600    # 10 hours for breaks (120 bars × 5 min) — Surfer ML only
@@ -562,28 +562,13 @@ class SurferLiveScanner:
                 position_value = self.config.initial_capital
                 shares = max(1, int(position_value / current_price))
             elif signal_source in ('CS-5TF', 'CS-DW'):
-                # combo_backtest.py: confidence-scaled, $100K base
-                position_value = self.config.initial_capital * min(sig.confidence, 1.0)
+                # combo_backtest.py DI v36: flat $100K (backtest: 10t, 100% WR, $21K)
+                position_value = self.config.initial_capital
                 shares = max(1, int(position_value / current_price))
             else:
-                # surfer_backtest.py / default: risk-based sizing
-                risk_dollars = self.equity * self.config.risk_per_trade_pct
-                stop_distance = stop_pct * current_price
-                shares = int(risk_dollars / stop_distance) if stop_distance > 0 else 0
-                # Signal-type sizing boosts (matching backtest Arch 65+69)
-                size_mult = 1.0
-                if signal_type == 'bounce':
-                    if direction == 'short':
-                        size_mult = 2.5
-                    else:
-                        size_mult = 1.5
-                elif signal_type == 'break':
-                    ch_health = getattr(sig, 'channel_health', 0.5)
-                    if ch_health > 0.50:
-                        size_mult = 0.6
-                    elif ch_health < 0.30:
-                        size_mult = 1.4
-                shares = int(shares * size_mult)
+                # surfer_backtest.py: flat $100K (backtest: 4025t, 88% WR, $875K with ML)
+                position_value = self.config.initial_capital
+                shares = max(1, int(position_value / current_price))
 
             # Cap at max buying power
             buying_power = self.equity * self.config.max_leverage
@@ -660,10 +645,10 @@ class SurferLiveScanner:
         if not _is_market_open():
             return None
 
-        # Intraday window: 13:00-15:25 ET (PM session)
+        # Intraday window: 9:30-15:25 ET (full day, backtest config G/I: 3157t, 77% WR, $364K)
         from datetime import time as _time
         t = now.time()
-        if not (_time(13, 0) <= t <= _time(15, 25)):
+        if not (_time(9, 30) <= t <= _time(15, 25)):
             return None
 
         # Kill switch / daily loss limit
