@@ -97,8 +97,6 @@ def _price_banner(tsla_price, price_source, price_delta):
 
     if price_source == 'IB LIVE':
         source_color = '#00e676'
-    elif price_source == 'WS':
-        source_color = '#ff9800'
     elif price_source == 'NONE':
         source_color = '#ff5252'
     else:

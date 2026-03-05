@@ -24,7 +24,7 @@ class DashboardState(param.Parameterized):
     tsla_price = param.Number(0.0)
     spy_price = param.Number(0.0)
     price_delta = param.Number(0.0)
-    price_source = param.String('NONE')  # 'IB LIVE', 'WS', 'NONE'
+    price_source = param.String('NONE')  # 'IB LIVE' or 'NONE'
 
     # Market data (loaded on startup, refreshed every 5 min)
     current_tsla = param.Parameter(None)      # 5-min OHLCV DataFrame
@@ -63,7 +63,7 @@ class DashboardState(param.Parameterized):
     _intraday_trade_state = param.Parameter(None, precedence=-1)
     _el_model = param.Parameter(None, precedence=-1)   # ExtremeLoserDetector
     _er_model = param.Parameter(None, precedence=-1)   # ExtendedRunPredictor
-    _ws_client = param.Parameter(None, precedence=-1)
+    _ws_client = param.Parameter(None, precedence=-1)  # UNUSED — kept for param compat
     _price_updated_at = param.Number(0.0, precedence=-1)  # time.time() of last successful price fetch
 
     def load_market_data(self):
@@ -145,18 +145,7 @@ class DashboardState(param.Parameterized):
                 self.ib_connected = False
                 logger.error("IB DISCONNECTED — no price source available!")
 
-        # Try WebSocket if IB didn't provide price
-        if price == 0.0 and self._ws_client:
-            tick = self._ws_client.get_price('TSLA')
-            if tick and tick.is_fresh:
-                price = tick.price
-                source = 'WS'
-            spy_tick = self._ws_client.get_price('SPY')
-            if spy_tick and spy_tick.is_fresh and spy_tick.price > 0:
-                if spy_tick.price != self.spy_price:
-                    self.spy_price = spy_tick.price
-
-        # NO FALLBACKS — IB must be the source of truth.
+        # NO FALLBACKS — IB is the only price source.
         # yfinance REST and bar-close fallbacks removed: they mask stale/stuck prices.
         if price == 0.0:
             self._price_err_count += 1
