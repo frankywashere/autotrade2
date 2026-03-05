@@ -25,7 +25,8 @@ logger = logging.getLogger(__name__)
 
 
 def download_1min_bars(symbol: str, months: int, output: str,
-                       host: str, port: int):
+                       host: str, port: int, end: str = None,
+                       start: str = None):
     """Download 1-min bars day-by-day from IB and save in TSLAMin.txt format."""
     from v15.ib.client import IBClient
 
@@ -34,9 +35,12 @@ def download_1min_bars(symbol: str, months: int, output: str,
     client.connect()
     logger.info("Connected.")
 
-    # Calculate trading days to fetch
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=months * 31)  # overshoot slightly
+    # Calculate date range
+    end_date = datetime.strptime(end, '%Y-%m-%d') if end else datetime.now()
+    if start:
+        start_date = datetime.strptime(start, '%Y-%m-%d')
+    else:
+        start_date = end_date - timedelta(days=months * 31)
 
     all_records = []
     current = end_date
@@ -151,6 +155,10 @@ def main():
                         help='Output file path (default: data/{SYMBOL}Min_IB.txt)')
     parser.add_argument('--host', default='127.0.0.1', help='IB Gateway host')
     parser.add_argument('--port', type=int, default=4002, help='IB Gateway port')
+    parser.add_argument('--end', default=None,
+                        help='End date YYYY-MM-DD (default: now)')
+    parser.add_argument('--start', default=None,
+                        help='Start date YYYY-MM-DD (overrides --months)')
 
     args = parser.parse_args()
 
@@ -163,6 +171,8 @@ def main():
         output=args.output,
         host=args.host,
         port=args.port,
+        end=args.end,
+        start=args.start,
     )
 
 
