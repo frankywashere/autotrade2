@@ -1,4 +1,4 @@
-"""Model Comparisons tab — reads shared Gist to compare live performance across branches."""
+"""Model Comparisons tab — compares live performance across all scanner models."""
 
 import logging
 
@@ -12,7 +12,7 @@ def model_comparisons_tab(state) -> pn.Column:
     """Build the Model Comparisons tab, bound to state.model_data_version."""
     return pn.Column(
         pn.pane.Markdown("## Model Comparisons\n"
-                         "Reads the shared Gist to compare live performance across all branches. "
+                         "Compares live performance across all scanner models. "
                          "Refreshes every hour."),
         pn.bind(_model_content, state.param.model_data_version, model_data=state.model_data),
         sizing_mode='stretch_width',
@@ -63,7 +63,7 @@ def _model_content(version, model_data=None):
         )
 
     summary_html = f"""
-    <div style="font-size:12px;color:#888;margin-bottom:8px;">Gist last updated: {last_updated}</div>
+    <div style="font-size:12px;color:#888;margin-bottom:8px;">Last updated: {last_updated}</div>
     <div style="overflow-x:auto;">
         <table style="width:100%;font-size:13px;color:#ccc;border-collapse:collapse;">
             <thead><tr style="border-bottom:2px solid #444;color:#888;">

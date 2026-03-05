@@ -391,7 +391,7 @@ class DashboardState(param.Parameterized):
             self._analysis_running = False
 
     def _init_scanner(self):
-        """Create SurferLiveScanners with Gist credentials from env vars."""
+        """Create SurferLiveScanners with per-model local state files."""
         try:
             from v15.trading.surfer_live_scanner import SurferLiveScanner, ScannerConfig
             config = ScannerConfig(initial_capital=self.scanner_capital)
@@ -405,7 +405,10 @@ class DashboardState(param.Parameterized):
             self.scanner_ml = SurferLiveScanner(ml_config, model_tag='c14-ml')
             # Intraday scanner: separate tracking for intraday ML signals
             self.scanner_intra = SurferLiveScanner(config, model_tag='c14-intra')
-            logger.info("Scanners initialized (c14 + c14-dw + c14-ml + c14-intra, capital=$%,.0f)",
+            # Ensure state files exist for all scanners (so model_compare shows all 4)
+            for scnr in [self.scanner, self.scanner_dw, self.scanner_ml, self.scanner_intra]:
+                scnr._save_state()
+            logger.info("Scanners initialized (c14 + c14-dw + c14-ml + c14-intra, capital=$%.0f)",
                          self.scanner_capital)
         except Exception as e:
             self._scanner_init_error = f"{e}"
