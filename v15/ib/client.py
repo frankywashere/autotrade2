@@ -83,6 +83,9 @@ class IBClient:
                 for symbol in list(self._contracts.keys()):
                     await self._subscribe_async(symbol)
 
+                # Subscribe to account summary updates
+                await self._subscribe_account_async()
+
                 # Run until disconnected
                 while self.ib.isConnected():
                     await asyncio.sleep(0.1)
@@ -296,6 +299,29 @@ class IBClient:
     def get_bar_aggregator(self, symbol: str):
         """Get the bar aggregator for a symbol, or None."""
         return self._bar_aggregators.get(symbol)
+
+    # ── Account Data ──────────────────────────────────────────────────
+
+    async def _subscribe_account_async(self):
+        """Subscribe to account summary (runs in IB event loop)."""
+        self.ib.reqAccountSummary()
+        logger.info("Subscribed to account summary")
+
+    def get_account_summary(self) -> dict:
+        """Return account summary as {tag: value} dict.
+
+        Key tags: NetLiquidation, TotalCashValue, BuyingPower,
+        GrossPositionValue, UnrealizedPnL, RealizedPnL.
+        Reads from ib_async's cached accountSummary() list.
+        """
+        if not self.is_connected():
+            return {}
+        try:
+            items = self.ib.accountSummary()
+            return {item.tag: item.value for item in items
+                    if item.currency in ('USD', '')}
+        except Exception:
+            return {}
 
     # ── Order Placement ──────────────────────────────────────────────
 

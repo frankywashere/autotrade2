@@ -12,6 +12,57 @@ ORDER_TYPE_MAP = {'Market': 'MKT', 'Limit': 'LMT', 'Stop': 'STP'}
 def order_entry_panel(state) -> pn.Column:
     """Build the manual order entry panel with form, price slider, and blotter."""
 
+    # ── Account Summary ─────────────────────────────────────────────
+
+    account_pane = pn.pane.HTML('', sizing_mode='stretch_width')
+
+    def _render_account():
+        if not state.ib_client or not state.ib_client.is_connected():
+            return ''
+        acct = state.ib_client.get_account_summary()
+        if not acct:
+            return '<div style="color:#888;font-size:12px">Loading account...</div>'
+
+        def _fmt(tag, prefix='$'):
+            val = acct.get(tag, '')
+            if not val:
+                return '--'
+            try:
+                return f'{prefix}{float(val):,.0f}'
+            except (ValueError, TypeError):
+                return str(val)
+
+        nlv = _fmt('NetLiquidation')
+        cash = _fmt('TotalCashValue')
+        bp = _fmt('BuyingPower')
+        gross = _fmt('GrossPositionValue')
+        upnl_raw = acct.get('UnrealizedPnL', '')
+        rpnl_raw = acct.get('RealizedPnL', '')
+
+        def _pnl_fmt(raw):
+            if not raw:
+                return '--', '#aaa'
+            try:
+                v = float(raw)
+                color = '#00e676' if v >= 0 else '#ff5252'
+                return f'${v:,.0f}', color
+            except (ValueError, TypeError):
+                return str(raw), '#aaa'
+
+        upnl, upnl_c = _pnl_fmt(upnl_raw)
+        rpnl, rpnl_c = _pnl_fmt(rpnl_raw)
+
+        return (
+            '<div style="display:flex;gap:24px;font-size:13px;padding:4px 0">'
+            f'<span><b>Net Liq:</b> {nlv}</span>'
+            f'<span><b>Cash:</b> {cash}</span>'
+            f'<span><b>Buying Power:</b> {bp}</span>'
+            f'<span><b>Positions:</b> {gross}</span>'
+            f'<span><b>Unreal P&L:</b> <span style="color:{upnl_c}">{upnl}</span></span>'
+            f'<span><b>Real P&L:</b> <span style="color:{rpnl_c}">{rpnl}</span></span>'
+            '</div>'
+        )
+
     # ── A. Order Form ────────────────────────────────────────────────
 
     direction_toggle = pn.widgets.RadioButtonGroup(
@@ -241,7 +292,14 @@ def order_entry_panel(state) -> pn.Column:
 
     _last_log_snapshot = [None]
 
+    _acct_counter = [0]
+
     def _periodic_update():
+        # Update account summary every ~2s (every 8th tick at 250ms)
+        _acct_counter[0] += 1
+        if _acct_counter[0] % 8 == 0:
+            account_pane.object = _render_account()
+
         # Update bid/ask/mid slider
         if state.ib_client:
             data = state.ib_client.get_price_data('TSLA')
@@ -284,6 +342,7 @@ def order_entry_panel(state) -> pn.Column:
 
     form = pn.Column(
         pn.pane.HTML('<h4 style="margin:0 0 4px 0">Manual Order Entry (TSLA)</h4>'),
+        account_pane,
         pn.Row(direction_toggle, qty_input, order_type_select,
                session_select, tif_select),
         slider_container,
