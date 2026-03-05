@@ -6,6 +6,7 @@ Persistence via per-model JSON at ~/.x14/surfer_state_{model_tag}.json
 """
 
 import json
+import logging
 import os
 import threading
 import uuid
@@ -15,6 +16,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import pytz
+
+logger = logging.getLogger('v15.surfer_scanner')
 
 from v15.validation.ah_rules import AHStateTracker
 
@@ -90,11 +93,11 @@ def _send_notification(msg: str, model_tag: str = '', title: str = ''):
             timeout=10,
         )
         if resp.status_code == 200:
-            print(f"[SCANNER] Telegram sent OK: {msg[:60]}")
+            logger.info("Telegram sent OK: %s", msg[:60])
         else:
-            print(f"[SCANNER] Telegram HTTP {resp.status_code}: {resp.text[:100]}")
+            logger.warning("Telegram HTTP %d: %s", resp.status_code, resp.text[:100])
     except Exception as e:
-        print(f"[SCANNER] Telegram failed: {e}")
+        logger.warning("Telegram failed: %s", e)
 
 
 @dataclass
@@ -294,8 +297,8 @@ class SurferLiveScanner:
             pos = self.positions[pos_id]
             # Close at entry price (no price data available at startup)
             self._close_position(pos_id, pos, pos.entry_price, 'stale_recovery')
-            print(f"[SCANNER] Stale position closed on startup: {pos_id} "
-                  f"({pos.signal_source}, entered {pos.entry_time})")
+            logger.info("Stale position closed on startup: %s (%s, entered %s)",
+                        pos_id, pos.signal_source, pos.entry_time)
         for pos_id in stale_ids:
             del self.positions[pos_id]
         if stale_ids:
@@ -386,10 +389,11 @@ class SurferLiveScanner:
 
         n_trades_after = len(data['closed_trades'])
         n_pos_after = len(data['positions'])
-        print(f"[SCANNER] TZ migration: trades {n_trades_before}->{n_trades_after} "
-              f"(removed {n_trades_before - n_trades_after} after-hours), "
-              f"positions {n_pos_before}->{n_pos_after}, "
-              f"equity adjusted by ${-removed_pnl:+,.0f}")
+        logger.info("TZ migration: trades %d->%d (removed %d after-hours), "
+                    "positions %d->%d, equity adjusted by $%+,.0f",
+                    n_trades_before, n_trades_after,
+                    n_trades_before - n_trades_after,
+                    n_pos_before, n_pos_after, -removed_pnl)
 
         data['_migrated_tz_v1'] = True
         return data
@@ -400,9 +404,9 @@ class SurferLiveScanner:
         if self._state_path.exists():
             try:
                 data = json.loads(self._state_path.read_text())
-                print(f"[SCANNER] Loaded state from {self._state_path}")
+                logger.info("Loaded state from %s", self._state_path)
             except Exception as e:
-                print(f"[SCANNER] Failed to load state from {self._state_path}: {e}")
+                logger.warning("Failed to load state from %s: %s", self._state_path, e)
         if data:
             try:
                 data = self._migrate_utc_to_et(data)
@@ -410,7 +414,7 @@ class SurferLiveScanner:
                 if data.get('_migrated_tz_v1'):
                     self._save_state()
             except Exception as e:
-                print(f"[SCANNER] Failed to apply state: {e}")
+                logger.warning("Failed to apply state: %s", e)
 
     def _save_state(self):
         data = {
@@ -429,7 +433,7 @@ class SurferLiveScanner:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
             self._state_path.write_text(json.dumps(data, indent=2))
         except Exception as e:
-            print(f"[SCANNER] Local save failed ({self.model_tag}): {e}")
+            logger.error("Local save failed (%s): %s", self.model_tag, e)
 
     def _reset_daily_if_needed(self):
         today = _now_et().strftime('%Y-%m-%d')
@@ -910,8 +914,8 @@ class SurferLiveScanner:
             # --- AH loss limit: force-close if unrealized loss >= $250 during extended hours ---
             if ext_session and AHStateTracker.check_ah_loss_limit(unrealized_pnl):
                 exit_reason = 'ah_loss_limit'
-                print(f"[SCANNER] AH loss limit hit: {pos_id} ({pos.signal_source}) "
-                      f"unrealized ${unrealized_pnl:+,.0f}")
+                logger.info("AH loss limit hit: %s (%s) unrealized $%+,.0f",
+                            pos_id, pos.signal_source, unrealized_pnl)
 
             # Update best price (for trailing stop)
             if pos.direction == 'long':
