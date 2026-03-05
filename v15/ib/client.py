@@ -304,8 +304,11 @@ class IBClient:
 
     async def _subscribe_account_async(self):
         """Subscribe to account summary (runs in IB event loop)."""
-        await self.ib.reqAccountSummaryAsync()
-        logger.info("Subscribed to account summary")
+        try:
+            await asyncio.wait_for(self.ib.reqAccountSummaryAsync(), timeout=10)
+            logger.info("Subscribed to account summary")
+        except Exception as e:
+            logger.warning("Account summary subscription failed: %s", e)
 
     def get_account_summary(self) -> dict:
         """Return account summary as {tag: value} dict.
