@@ -121,9 +121,13 @@ class IBClient:
     async def _subscribe_async(self, symbol: str):
         """Subscribe to streaming ticks for symbol (runs in IB event loop)."""
         contract = self._make_contract(symbol)
+        # Qualify to resolve conId (required before hashing/subscribing)
+        qualified = await self.ib.qualifyContractsAsync(contract)
+        if qualified:
+            contract = qualified[0]
         self._contracts[symbol] = contract
         self.ib.reqMktData(contract, '', False, False)
-        logger.info("Subscribed to %s market data", symbol)
+        logger.info("Subscribed to %s market data (conId=%s)", symbol, contract.conId)
 
     def _on_pending_tickers(self, tickers):
         """Callback: update price cache from streaming ticks."""
@@ -174,6 +178,12 @@ class IBClient:
             raise ConnectionError("Not connected to IB")
 
         contract = self._make_contract(symbol)
+        # Qualify contract first
+        qual_future = asyncio.run_coroutine_threadsafe(
+            self.ib.qualifyContractsAsync(contract), self._loop)
+        qualified = qual_future.result(timeout=10)
+        if qualified:
+            contract = qualified[0]
         future = asyncio.run_coroutine_threadsafe(
             self._fetch_historical_async(contract, duration, bar_size, use_rth),
             self._loop)
