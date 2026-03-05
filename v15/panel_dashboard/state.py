@@ -409,8 +409,10 @@ class DashboardState(param.Parameterized):
     def _init_ib(self):
         """Connect to IB Gateway for real-time price streaming. Fails loudly."""
         try:
+            import random
             from v15.ib.client import IBClient
-            self.ib_client = IBClient(host='127.0.0.1', port=4002, client_id=1)
+            cid = random.randint(10, 99)  # Avoid stale client_id=1 conflicts
+            self.ib_client = IBClient(host='127.0.0.1', port=4002, client_id=cid)
             self.ib_client.connect()
             self.ib_client.subscribe('TSLA')
             self.ib_client.subscribe('SPY')
