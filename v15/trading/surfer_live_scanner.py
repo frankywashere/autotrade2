@@ -16,6 +16,8 @@ from typing import Dict, List, Optional
 
 import pytz
 
+from v15.validation.ah_rules import AHStateTracker
+
 _ET = pytz.timezone('US/Eastern')
 
 
@@ -919,6 +921,12 @@ class SurferLiveScanner:
                 unrealized_pnl = (current_price - pos.entry_price) * pos.shares
             else:
                 unrealized_pnl = (pos.entry_price - current_price) * pos.shares
+
+            # --- AH loss limit: force-close if unrealized loss >= $250 during extended hours ---
+            if ext_session and AHStateTracker.check_ah_loss_limit(unrealized_pnl):
+                exit_reason = 'ah_loss_limit'
+                print(f"[SCANNER] AH loss limit hit: {pos_id} ({pos.signal_source}) "
+                      f"unrealized ${unrealized_pnl:+,.0f}")
 
             # Update best price (for trailing stop)
             if pos.direction == 'long':
