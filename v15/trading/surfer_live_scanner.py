@@ -229,6 +229,7 @@ class SurferLiveScanner:
         self._daily_date: str = ''
         self._ext_opens_today: int = 0    # Extended-hours entries used today
         self._ext_closes_today: int = 0   # Extended-hours exits used today
+        self._ext_wins_today: int = 0     # Winning ext-hours closes (allows bonus opens)
         self._signal_lock = threading.Lock()  # Guards check-through-enter in evaluate_*
         self._load_state()
 
@@ -245,6 +246,7 @@ class SurferLiveScanner:
         self._daily_date = data.get('daily_date', '')
         self._ext_opens_today = data.get('ext_opens_today', 0)
         self._ext_closes_today = data.get('ext_closes_today', 0)
+        self._ext_wins_today = data.get('ext_wins_today', 0)
         self.positions = {
             k: HypotheticalPosition.from_dict(v)
             for k, v in data.get('positions', {}).items()
@@ -414,6 +416,7 @@ class SurferLiveScanner:
             'daily_date': self._daily_date,
             'ext_opens_today': self._ext_opens_today,
             'ext_closes_today': self._ext_closes_today,
+            'ext_wins_today': self._ext_wins_today,
             'positions': {k: v.to_dict() for k, v in self.positions.items()},
             'closed_trades': [t.to_dict() for t in self.closed_trades[-1000:]],
             'signal_history': self.signal_history[-MAX_SIGNAL_HISTORY:],
@@ -431,6 +434,7 @@ class SurferLiveScanner:
             self.daily_trade_count = 0
             self._ext_opens_today = 0
             self._ext_closes_today = 0
+            self._ext_wins_today = 0
             self._daily_date = today
 
     # ------------------------------------------------------------------
@@ -457,8 +461,10 @@ class SurferLiveScanner:
         sig = analysis.signal
 
         # Block entries outside regular + extended trading hours
+        # Extended hours: allow 1 open, +1 more for each winning ext close
         if not _is_market_open():
-            if not _is_extended_hours() or self._ext_opens_today >= 1:
+            ext_open_limit = 1 + self._ext_wins_today
+            if not _is_extended_hours() or self._ext_opens_today >= ext_open_limit:
                 return None
 
         # Record in history
@@ -992,13 +998,13 @@ class SurferLiveScanner:
                             exit_reason = 'timeout'
 
             if exit_reason:
-                if ext_session and self._ext_closes_today >= 1:
-                    continue  # Already used extended-hours close allowance
                 alert = self._close_position(pos_id, pos, exit_price, exit_reason)
                 alerts.append(alert)
                 to_close.append(pos_id)
                 if ext_session:
                     self._ext_closes_today += 1
+                    if alert.pnl > 0:
+                        self._ext_wins_today += 1
 
         for pos_id in to_close:
             del self.positions[pos_id]
