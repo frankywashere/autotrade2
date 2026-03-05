@@ -260,8 +260,23 @@ def create_app():
             for _ in range(30):
                 time.sleep(0.5)
                 if state.ib_client.is_connected():
-                    state.ib_connected = True
-                    ib_reconnect_status.object = '**Connected!**'
+                    # Wait for prices to actually flow
+                    for _ in range(20):
+                        time.sleep(0.5)
+                        ib_price = state.ib_client.get_last_price('TSLA')
+                        if ib_price > 0:
+                            state.ib_connected = True
+                            state._price_err_count = 0
+                            # Re-init bar aggregator for 5-min analysis triggers
+                            try:
+                                state._bar_aggregator = state.ib_client.create_bar_aggregator('TSLA', 5)
+                            except Exception as ex:
+                                logger.warning("Bar aggregator re-init failed: %s", ex)
+                            ib_reconnect_status.object = '**Connected!**'
+                            return
+                    # Socket up but no prices
+                    state.ib_connected = False
+                    ib_reconnect_status.object = '**Socket OK but no prices** — try again'
                     return
             state.ib_connected = False
             ib_reconnect_status.object = '**Failed** — check IB Gateway'

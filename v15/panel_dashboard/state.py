@@ -184,27 +184,31 @@ class DashboardState(param.Parameterized):
             if ib_price > 0:
                 price = ib_price
                 source = 'IB LIVE'
+                if not self.ib_connected:
+                    self.ib_connected = True
             ib_spy = self.ib_client.get_last_price('SPY')
             if ib_spy > 0 and ib_spy != self.spy_price:
                 self.spy_price = ib_spy
             ib_vix = self.ib_client.get_last_price('VIX')
             if ib_vix > 0:
                 self.vix_price = ib_vix
-            if not self.ib_connected:
-                self.ib_connected = True
         elif self.ib_client and not self.ib_client.is_connected():
             if self.ib_connected:
                 self.ib_connected = False
                 logger.error("IB DISCONNECTED — no price source available!")
 
         # NO FALLBACKS — IB is the only price source.
-        # yfinance REST and bar-close fallbacks removed: they mask stale/stuck prices.
         if price == 0.0:
             self._price_err_count += 1
             if self._price_err_count <= 5 or self._price_err_count % 10 == 0:
                 logger.error("NO LIVE PRICE — IB returned 0 (count=%d). "
                              "Check IB Gateway connection. No fallback.", self._price_err_count)
             source = 'NONE'
+            # Socket connected but no prices flowing — enable Reconnect button
+            if self._price_err_count >= 10 and self.ib_connected:
+                self.ib_connected = False
+                logger.warning("IB socket up but no prices for %d checks — marking disconnected",
+                               self._price_err_count)
 
         # Always update source label (so UI shows NONE when no price)
         if source != self.price_source:
