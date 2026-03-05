@@ -244,6 +244,118 @@ def precompute_all(features, f5m):
     print(f"  Done in {time.time()-t0:.1f}s"); _flush()
     return (dcp_arr,dslope_arr), arrays
 
+def _intraday_ml_predict(model, feat_map, n_feat, i, f5m, ctx, confidence, bar_time,
+                         bars_since_last, daily_trades, consec_wins, consec_losses):
+    """Build feature vector and run intraday ML model. Returns probability."""
+    feat = np.full(n_feat, np.nan)
+    def _s(name, val):
+        if name in feat_map: feat[feat_map[name]] = val
+
+    # 5-min features
+    _s('cp_5m', f5m['chan_pos'].iloc[i])
+    _s('rsi_5m', f5m['rsi'].iloc[i] if 'rsi' in f5m.columns else np.nan)
+    _s('bvc_5m', f5m['bvc'].iloc[i] if 'bvc' in f5m.columns else np.nan)
+    _s('vwap_dist', f5m['vwap_dist'].iloc[i] if 'vwap_dist' in f5m.columns else np.nan)
+    _s('vol_ratio', f5m['vol_ratio'].iloc[i] if 'vol_ratio' in f5m.columns else np.nan)
+    _s('vwap_slope', f5m['vwap_slope'].iloc[i] if 'vwap_slope' in f5m.columns else np.nan)
+    _s('spread_pct', f5m['spread_pct'].iloc[i] if 'spread_pct' in f5m.columns else np.nan)
+    _s('rsi_slope', f5m['rsi_slope'].iloc[i] if 'rsi_slope' in f5m.columns else np.nan)
+    _s('gap_pct', f5m['gap_pct'].iloc[i] if 'gap_pct' in f5m.columns else np.nan)
+
+    # Higher TF positions
+    _s('cp_15m', ctx.get('15m_cp', np.full(1, np.nan))[i] if isinstance(ctx.get('15m_cp'), np.ndarray) else np.nan)
+    _s('cp_30m', ctx.get('30m_cp', np.full(1, np.nan))[i] if isinstance(ctx.get('30m_cp'), np.ndarray) else np.nan)
+    _s('cp_1h', ctx.get('1h_cp', np.full(1, np.nan))[i] if isinstance(ctx.get('1h_cp'), np.ndarray) else np.nan)
+    _s('cp_4h', ctx.get('4h_cp', np.full(1, np.nan))[i] if isinstance(ctx.get('4h_cp'), np.ndarray) else np.nan)
+    _s('cp_daily', ctx.get('daily_cp', np.nan))
+
+    # Slopes
+    _s('slope_1h', ctx.get('1h_slope', np.full(1, np.nan))[i] if isinstance(ctx.get('1h_slope'), np.ndarray) else np.nan)
+    _s('slope_4h', ctx.get('4h_slope', np.full(1, np.nan))[i] if isinstance(ctx.get('4h_slope'), np.ndarray) else np.nan)
+    _s('slope_daily', ctx.get('daily_slope', np.nan))
+
+    # Cross-TF divergences
+    cp5 = f5m['chan_pos'].iloc[i]
+    dcp = ctx.get('daily_cp', np.nan)
+    h1 = ctx.get('1h_cp', np.full(1, np.nan))[i] if isinstance(ctx.get('1h_cp'), np.ndarray) else np.nan
+    h4 = ctx.get('4h_cp', np.full(1, np.nan))[i] if isinstance(ctx.get('4h_cp'), np.ndarray) else np.nan
+    if not np.isnan(dcp) and not np.isnan(cp5): _s('div_daily_5m', dcp - cp5)
+    if not np.isnan(h1) and not np.isnan(cp5): _s('div_1h_5m', h1 - cp5)
+    if not np.isnan(h4) and not np.isnan(cp5): _s('div_4h_5m', h4 - cp5)
+    vals = [v for v in [dcp, h4, h1] if not np.isnan(v)]
+    if vals and not np.isnan(cp5):
+        weights = [0.35, 0.35, 0.30][:len(vals)]
+        _s('div_weighted', sum(v * w for v, w in zip(vals, weights)) / sum(weights) - cp5)
+
+    # Time features
+    _s('hour', bar_time.hour)
+    _s('minute', bar_time.minute)
+    mkt_close_mins = (16 * 60) - (bar_time.hour * 60 + bar_time.minute)
+    _s('minutes_to_close', max(0, mkt_close_mins))
+    _s('day_of_week', bar_time.weekday())
+
+    # Volatility / range (approximate from 5-min data)
+    c_arr = f5m['close'].values
+    h_arr = f5m['high'].values; l_arr = f5m['low'].values
+    if i >= 14:
+        tr = np.maximum(h_arr[i-13:i+1] - l_arr[i-13:i+1],
+                        np.abs(h_arr[i-13:i+1] - np.roll(c_arr, 1)[i-13:i+1]))
+        _s('atr_5m_pct', tr.mean() / c_arr[i] if c_arr[i] > 0 else np.nan)
+
+    # Intraday range: today's high-low / open
+    dates = np.array([t.date() for t in f5m.index])
+    today = dates[i]
+    today_mask = dates[:i+1] == today
+    if today_mask.any():
+        day_h = h_arr[:i+1][today_mask].max(); day_l = l_arr[:i+1][today_mask].min()
+        day_o = f5m['open'].values[:i+1][today_mask][0]
+        if day_o > 0: _s('range_today_pct', (day_h - day_l) / day_o)
+
+    # Volume today ratio
+    v_arr = f5m['volume'].values
+    if today_mask.any() and i >= 20:
+        today_vol = v_arr[:i+1][today_mask].sum()
+        # 20-day average daily volume
+        unique_dates = sorted(set(dates[:i+1]))
+        if len(unique_dates) > 20:
+            recent_dates = unique_dates[-21:-1]
+            daily_vols = [v_arr[:i+1][dates[:i+1] == d].sum() for d in recent_dates]
+            avg_daily_vol = np.mean(daily_vols) if daily_vols else 1.0
+            _s('volume_today_ratio', today_vol / avg_daily_vol if avg_daily_vol > 0 else np.nan)
+
+    # Signal quality
+    _s('confidence', confidence)
+
+    # Momentum
+    if i >= 20:
+        _s('return_5bar', (c_arr[i] - c_arr[i-5]) / c_arr[i-5] if c_arr[i-5] > 0 else np.nan)
+        _s('return_20bar', (c_arr[i] - c_arr[i-20]) / c_arr[i-20] if c_arr[i-20] > 0 else np.nan)
+
+    # Cross-TF alignment
+    all_cps = [v for v in [cp5,
+               ctx.get('15m_cp', np.full(1, np.nan))[i] if isinstance(ctx.get('15m_cp'), np.ndarray) else np.nan,
+               ctx.get('30m_cp', np.full(1, np.nan))[i] if isinstance(ctx.get('30m_cp'), np.ndarray) else np.nan,
+               h1, h4, dcp] if not np.isnan(v)]
+    _s('bullish_tf_count', sum(1 for v in all_cps if v > 0.5))
+    _s('cp_dispersion', float(np.std(all_cps)) if len(all_cps) >= 2 else np.nan)
+    s1h = ctx.get('1h_slope', np.full(1, np.nan))[i] if isinstance(ctx.get('1h_slope'), np.ndarray) else np.nan
+    s4h = ctx.get('4h_slope', np.full(1, np.nan))[i] if isinstance(ctx.get('4h_slope'), np.ndarray) else np.nan
+    sdy = ctx.get('daily_slope', np.nan)
+    slope_vals = [v for v in [s1h, s4h, sdy] if not np.isnan(v)]
+    _s('slope_agreement', sum(1 for v in slope_vals if v > 0))
+
+    # Trade state
+    _s('bars_since_last_trade', bars_since_last)
+    _s('daily_trade_count', daily_trades)
+    _s('consecutive_wins', consec_wins)
+    _s('consecutive_losses', consec_losses)
+
+    try:
+        prob = model.predict(feat.reshape(1, -1))[0]
+        return float(prob)
+    except Exception:
+        return 1.0  # On error, accept
+
 # ---- SIGNALS ----
 
 def sig_vwap(i, f5m, ctx, params):
@@ -339,7 +451,8 @@ def simulate_fixed(f5m, signal_fn, name, params, precomp,
                    conf_size=True,
                    tod_start=dt.time(13,0), tod_end=dt.time(15,25),
                    f1m=None, eval_interval_1m=2,
-                   ah_rules=False, ah_loss_limit=250.0):
+                   ah_rules=False, ah_loss_limit=250.0,
+                   ml_model=None, ml_features=None, ml_threshold=0.5):
     """Confidence-scaled sizing capped at max_capital.
 
     New params:
@@ -361,6 +474,12 @@ def simulate_fixed(f5m, signal_fn, name, params, precomp,
     # AH state
     ah_tracker = AHStateTracker() if ah_rules else None
     ah_entry = False  # was this trade opened during AH?
+
+    # ML filter state
+    ml_accepted = 0; ml_rejected = 0
+    ml_consec_wins = 0; ml_consec_losses = 0
+    ml_daily_trades = 0; ml_bars_since_last = 999; ml_last_trade_date = None
+    ml_feat_map = {nm: idx for idx, nm in enumerate(ml_features)} if ml_features else {}
 
     # 1-min exit support: build mapping from 5-min bar index -> 1-min bar slice
     f1m_h = f1m_l = f1m_c = f1m_times = None
@@ -465,6 +584,9 @@ def simulate_fixed(f5m, signal_fn, name, params, precomp,
                 if ah_rules and ah_entry:
                     ah_tracker.record_ah_close(pnl)
                 in_trade=False; cr=cd; ah_entry=False
+                # ML trade state tracking
+                if pnl > 0: ml_consec_wins += 1; ml_consec_losses = 0
+                else: ml_consec_losses += 1; ml_consec_wins = 0
         if cr>0: cr-=1; continue
         if in_trade or tt>=mtd: continue
         if not ah_rules:
@@ -475,9 +597,25 @@ def simulate_fixed(f5m, signal_fn, name, params, precomp,
             if not (is_rth(btod) or is_extended_hours(btod)): continue
             if is_rth(btod) and (btod<tod_start or btod>tod_end): continue
         ctx['daily_cp']=dcp_arr[i]; ctx['daily_slope']=dslope_arr[i]
+        ml_bars_since_last += 1
+        if bd != ml_last_trade_date:
+            ml_daily_trades = 0; ml_last_trade_date = bd
         result=signal_fn(i,f5m,ctx,params)
         if result is not None:
+            # ML filter: reject low-quality signals
+            if ml_model is not None:
+                ml_prob = _intraday_ml_predict(
+                    ml_model, ml_feat_map, len(ml_features) if ml_features else 0,
+                    i, f5m, ctx, result[1], bt,
+                    ml_bars_since_last, ml_daily_trades, ml_consec_wins, ml_consec_losses)
+                if ml_prob < ml_threshold:
+                    ml_rejected += 1; continue
+                ml_accepted += 1
+                ml_daily_trades += 1; ml_bars_since_last = 0
             _,co,s,t=result; ps=(co,s,t)
+    if ml_model is not None:
+        total = ml_accepted + ml_rejected
+        print(f"    ML filter: {ml_accepted}/{total} accepted ({ml_accepted/total*100:.0f}%), {ml_rejected} rejected" if total > 0 else "    ML filter: no signals")
     return trades
 
 def simulate_compound(f5m, signal_fn, name, params, precomp,
@@ -541,16 +679,36 @@ def main():
                         help='Enable AH gated opens + unlimited closes')
     parser.add_argument('--ah-loss-limit', type=float, default=250.0,
                         help='Max loss per AH trade (default $250)')
+    parser.add_argument('--ml', type=str, default=None,
+                        help='Path to intraday ML model (.pkl or directory containing intraday_ml_model.pkl)')
     args = parser.parse_args()
 
     # Set eval_interval default based on --1min
     eval_interval_1m = args.eval_interval if args.eval_interval is not None else (2 if args.use_1min else 1)
+
+    # Load intraday ML model
+    ml_model = None; ml_features = None; ml_threshold = 0.5
+    if args.ml:
+        import pickle
+        ml_path = args.ml
+        if os.path.isdir(ml_path):
+            ml_path = os.path.join(ml_path, 'intraday_ml_model.pkl')
+        if os.path.exists(ml_path):
+            with open(ml_path, 'rb') as f:
+                data = pickle.load(f)
+            ml_model = data['model']
+            ml_features = data['feature_names']
+            ml_threshold = data.get('threshold', 0.5)
+            print(f"[ML] Intraday model loaded: {len(ml_features)} features, threshold={ml_threshold:.2f}")
+        else:
+            print(f"[ML] WARNING: Model not found at {ml_path}")
 
     print("="*70)
     print("V14b: ALL CONFIGS HEAD-TO-HEAD @ FLAT $100K PER TRADE")
     if args.use_1min: print("  >> 1-MIN EXIT CHECKING (eval_interval=%d)" % eval_interval_1m)
     if args.flat_sizing: print("  >> FLAT $100K SIZING")
     if args.ah_rules: print("  >> AH RULES (loss limit=$%.0f)" % args.ah_loss_limit)
+    if ml_model: print("  >> ML FILTER (%d features, threshold=%.2f)" % (len(ml_features), ml_threshold))
     print("="*70); _flush()
 
     # Load data: keep AH bars if ah_rules enabled
@@ -611,7 +769,8 @@ def main():
                                 base_capital=float(bc), max_capital=float(mc),
                                 conf_size=effective_cs, tod_start=ts, tod_end=te,
                                 f1m=f1m_for_exits, eval_interval_1m=eval_interval_1m,
-                                ah_rules=args.ah_rules, ah_loss_limit=args.ah_loss_limit)
+                                ah_rules=args.ah_rules, ah_loss_limit=args.ah_loss_limit,
+                                ml_model=ml_model, ml_features=ml_features, ml_threshold=ml_threshold)
         if not trades:
             print(f"   {name:<40} {'0':>7}"); _flush()
             continue
