@@ -357,12 +357,24 @@ class DashboardState(param.Parameterized):
         self._bg_started = True
 
         def _price_loop():
+            _min_interval = 0.1  # 100ms throttle (~10 updates/sec max)
+            _last_update = 0.0
             while True:
+                # Wait for IB tick (instant) or timeout at 2s (disconnected fallback)
+                if self.ib_client and hasattr(self.ib_client, 'tick_event'):
+                    self.ib_client.tick_event.wait(timeout=2.0)
+                    self.ib_client.tick_event.clear()
+                else:
+                    time.sleep(2)
+                # Throttle: skip if <100ms since last update
+                now = time.time()
+                if now - _last_update < _min_interval:
+                    continue
+                _last_update = now
                 try:
                     self.update_prices()
                 except Exception as e:
                     logger.error("Price loop error: %s", e)
-                time.sleep(2)
 
         def _analysis_loop():
             time.sleep(30)  # Initial delay — let prices stabilize

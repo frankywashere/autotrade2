@@ -31,6 +31,7 @@ class IBClient:
         self._thread = None
         self._contracts = {}       # {symbol: Contract}
         self._reconnect_delay = 2  # seconds, with exponential backoff
+        self.tick_event = threading.Event()  # Set on every tick for instant wakeup
 
     # ── Connection ───────────────────────────────────────────────────
 
@@ -150,6 +151,7 @@ class IBClient:
                     'ask': ticker.ask if ticker.ask == ticker.ask else 0.0,
                     'time': datetime.now(),
                 }
+        self.tick_event.set()  # Wake up price loop instantly
 
     def get_last_price(self, symbol: str, max_age_s: float = 30.0) -> float:
         """Read last price from cache. Returns 0.0 if unavailable or stale.
