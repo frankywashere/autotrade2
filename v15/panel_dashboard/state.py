@@ -37,6 +37,7 @@ class DashboardState(param.Parameterized):
     scanner_dw = param.Parameter(None)        # SurferLiveScanner (CS-DW)
     scanner_ml = param.Parameter(None)        # SurferLiveScanner (Surfer ML)
     scanner_intra = param.Parameter(None)     # SurferLiveScanner (Intraday ML)
+    scanner_oe = param.Parameter(None)        # SurferLiveScanner (OE Signals_5)
     positions_version = param.Integer(0)      # Bump to trigger position card re-render (price-sensitive)
     trades_version = param.Integer(0)        # Bump only on actual trade open/close (not price ticks)
     exit_alert_html = param.String('')        # Latest exit alert HTML
@@ -191,7 +192,7 @@ class DashboardState(param.Parameterized):
         # Check exits if positions are open (both scanners)
         html_parts = []
         all_exit_alerts = []
-        for scnr in [self.scanner, self.scanner_dw, self.scanner_ml, self.scanner_intra]:
+        for scnr in [self.scanner, self.scanner_dw, self.scanner_ml, self.scanner_intra, self.scanner_oe]:
             if scnr and scnr.positions and price > 0:
                 try:
                     exit_alerts = scnr.check_exits(price, price, price)
@@ -334,6 +335,9 @@ class DashboardState(param.Parameterized):
             # Evaluate intraday signal
             self._evaluate_intraday(analysis)
 
+            # Evaluate OE Signals_5 (daily bars)
+            self._evaluate_oe_signals5()
+
     def start_background_loops(self):
         """Start daemon threads for price/analysis/model — run without browser."""
         if getattr(self, '_bg_started', False):
@@ -405,10 +409,12 @@ class DashboardState(param.Parameterized):
             self.scanner_ml = SurferLiveScanner(ml_config, model_tag='c14-ml')
             # Intraday scanner: separate tracking for intraday ML signals
             self.scanner_intra = SurferLiveScanner(config, model_tag='c14-intra')
-            # Ensure state files exist for all scanners (so model_compare shows all 4)
-            for scnr in [self.scanner, self.scanner_dw, self.scanner_ml, self.scanner_intra]:
+            # OE Signals_5 scanner: daily evolved signal with combo trail
+            self.scanner_oe = SurferLiveScanner(config, model_tag='c14-oe')
+            # Ensure state files exist for all scanners (so model_compare shows all 5)
+            for scnr in [self.scanner, self.scanner_dw, self.scanner_ml, self.scanner_intra, self.scanner_oe]:
                 scnr._save_state()
-            logger.info("Scanners initialized (c14 + c14-dw + c14-ml + c14-intra, capital=$%.0f)",
+            logger.info("Scanners initialized (c14 + c14-dw + c14-ml + c14-intra + c14-oe, capital=$%.0f)",
                          self.scanner_capital)
         except Exception as e:
             self._scanner_init_error = f"{e}"
@@ -417,6 +423,7 @@ class DashboardState(param.Parameterized):
             self.scanner_dw = None
             self.scanner_ml = None
             self.scanner_intra = None
+            self.scanner_oe = None
 
         # Load ML model for Surfer ML path
         # NOTE: Cannot import surfer_ml directly — it pulls in torch which isn't on HF.
@@ -893,6 +900,29 @@ class DashboardState(param.Parameterized):
         except Exception as e:
             logger.warning("Intraday eval failed: %s", e)
 
+    def _evaluate_oe_signals5(self):
+        """Evaluate OE Signals_5 on latest daily bars."""
+        if not self.scanner_oe or not self.native_tf_data or self.tsla_price <= 0:
+            return
+        try:
+            from v15.core.oe_signals5 import check_oe_signal
+            if check_oe_signal(self.native_tf_data):
+                from types import SimpleNamespace
+                mock_signal = SimpleNamespace(
+                    action='BUY', confidence=0.7, primary_tf='daily',
+                    signal_type='bounce', reason='OE Signals_5',
+                    suggested_stop_pct=0.03, suggested_tp_pct=0.50,
+                    ou_half_life=5.0,
+                )
+                mock_analysis = SimpleNamespace(signal=mock_signal, atr=None)
+                alert = self.scanner_oe.evaluate_signal(
+                    mock_analysis, self.tsla_price, signal_source='oe_signals5')
+                if alert and alert.alert_type == 'ENTRY':
+                    self.positions_version += 1
+                    self.trades_version += 1
+        except Exception as e:
+            logger.warning("OE Signals_5 eval failed: %s", e)
+
     def _intraday_ml_filter(self, **kwargs) -> bool:
         """Run intraday ML model to filter signals. Returns True to accept, False to reject."""
         if self._intraday_ml_model is None:
@@ -1061,7 +1091,7 @@ class DashboardState(param.Parameterized):
         from v15.trading.surfer_live_scanner import _STATE_DIR
 
         combined = {}
-        for tag in ('c14', 'c14-dw', 'c14-ml', 'c14-intra'):
+        for tag in ('c14', 'c14-dw', 'c14-ml', 'c14-intra', 'c14-oe'):
             fpath = _STATE_DIR / f"surfer_state_{tag}.json"
             if fpath.exists():
                 try:
@@ -1078,7 +1108,7 @@ class DashboardState(param.Parameterized):
     def flush_scanner_state(self):
         """One-time: write each scanner's in-memory state to its per-model local file."""
         count = 0
-        for scnr in [self.scanner, self.scanner_dw, self.scanner_ml, self.scanner_intra]:
+        for scnr in [self.scanner, self.scanner_dw, self.scanner_ml, self.scanner_intra, self.scanner_oe]:
             if scnr:
                 scnr._save_state()
                 count += 1

@@ -23,6 +23,7 @@ SOURCE_DISPLAY = {
     'CS-DW': 'CS-DW',
     'surfer_ml': 'Surfer ML',
     'intraday': 'Intraday',
+    'oe_signals5': 'OE-Sig5',
 }
 
 
@@ -36,23 +37,27 @@ def channel_surfer_tab(state) -> pn.Column:
         # Active trades banner — only re-renders on actual trade open/close
         pn.bind(_active_trades_banner, state.param.trades_version,
                 scanner=state.scanner, scanner_dw=state.scanner_dw,
-                scanner_ml=state.scanner_ml, scanner_intra=state.scanner_intra),
+                scanner_ml=state.scanner_ml, scanner_intra=state.scanner_intra,
+                scanner_oe=state.scanner_oe),
         # Market insights
         pn.bind(_market_insights, state.param.analysis),
         # Scanner metrics + live P&L — re-renders on price change
         pn.bind(_scanner_metrics, state.param.positions_version, state.param.tsla_price,
                 scanner=state.scanner, scanner_dw=state.scanner_dw,
-                scanner_ml=state.scanner_ml, scanner_intra=state.scanner_intra),
+                scanner_ml=state.scanner_ml, scanner_intra=state.scanner_intra,
+                scanner_oe=state.scanner_oe),
         # Exit alerts — only re-renders when exit_alert_html changes
         pn.bind(_exit_alerts_pane, state.param.exit_alert_html),
         # Open positions with live P&L — re-renders on price change
         pn.bind(_open_positions_pane, state.param.positions_version, state.param.tsla_price,
                 scanner=state.scanner, scanner_dw=state.scanner_dw,
-                scanner_ml=state.scanner_ml, scanner_intra=state.scanner_intra),
+                scanner_ml=state.scanner_ml, scanner_intra=state.scanner_intra,
+                scanner_oe=state.scanner_oe),
         # Trade history — only re-renders on actual trade open/close (preserves <details> state)
         pn.bind(_trade_history_pane, state.param.trades_version,
                 scanner=state.scanner, scanner_dw=state.scanner_dw,
-                scanner_ml=state.scanner_ml, scanner_intra=state.scanner_intra),
+                scanner_ml=state.scanner_ml, scanner_intra=state.scanner_intra,
+                scanner_oe=state.scanner_oe),
         # Regime indicator
         pn.bind(_regime_indicator, state.param.analysis),
         # Break direction predictor
@@ -114,14 +119,14 @@ def _price_banner(tsla_price, price_source, price_delta):
 # Active Trades Banner — only renders when positions are open
 # ---------------------------------------------------------------------------
 
-def _active_trades_banner(trades_version, scanner=None, scanner_dw=None, scanner_ml=None, scanner_intra=None):
+def _active_trades_banner(trades_version, scanner=None, scanner_dw=None, scanner_ml=None, scanner_intra=None, scanner_oe=None):
     """Prominent banner showing active trades with entry/stop/TP and signal source.
 
     Bound to trades_version only — re-renders on actual trade open/close,
     not on every price tick or position P&L update.
     """
     all_positions = []
-    for scnr in [scanner, scanner_dw, scanner_ml, scanner_intra]:
+    for scnr in [scanner, scanner_dw, scanner_ml, scanner_intra, scanner_oe]:
         if scnr and scnr.positions:
             all_positions.extend(scnr.positions.values())
     if not all_positions:
@@ -152,6 +157,8 @@ def _active_trades_banner(trades_version, scanner=None, scanner_dw=None, scanner
             src_bg = '#7b1fa2'
         elif source == 'Intraday':
             src_bg = '#0288d1'
+        elif source == 'OE-Sig5':
+            src_bg = '#2e7d32'
         else:
             src_bg = '#e65100'
 
@@ -261,7 +268,7 @@ def _market_insights(analysis):
 # Scanner Panel
 # ---------------------------------------------------------------------------
 
-def _scanner_metrics(positions_version, tsla_price, scanner=None, scanner_dw=None, scanner_ml=None, scanner_intra=None):
+def _scanner_metrics(positions_version, tsla_price, scanner=None, scanner_dw=None, scanner_ml=None, scanner_intra=None, scanner_oe=None):
     """Scanner equity/P&L metrics. Bound to tsla_price for live unrealized updates."""
     if scanner is None:
         return pn.pane.HTML(
@@ -269,7 +276,7 @@ def _scanner_metrics(positions_version, tsla_price, scanner=None, scanner_dw=Non
             sizing_mode='stretch_width',
         )
 
-    all_scanners = [s for s in [scanner, scanner_dw, scanner_ml, scanner_intra] if s is not None]
+    all_scanners = [s for s in [scanner, scanner_dw, scanner_ml, scanner_intra, scanner_oe] if s is not None]
     total_equity = sum(s.equity for s in all_scanners)
     total_capital = sum(s.config.initial_capital for s in all_scanners)
     unrealized = sum(s.get_unrealized_pnl(tsla_price) for s in all_scanners) if tsla_price > 0 else 0.0
@@ -317,10 +324,10 @@ def _exit_alerts_pane(exit_alert_html):
     return pn.pane.HTML(exit_alert_html, sizing_mode='stretch_width')
 
 
-def _open_positions_pane(positions_version, tsla_price, scanner=None, scanner_dw=None, scanner_ml=None, scanner_intra=None):
+def _open_positions_pane(positions_version, tsla_price, scanner=None, scanner_dw=None, scanner_ml=None, scanner_intra=None, scanner_oe=None):
     """Open positions with live P&L. Bound to tsla_price for live updates."""
     all_positions = {}
-    for scnr in [scanner, scanner_dw, scanner_ml, scanner_intra]:
+    for scnr in [scanner, scanner_dw, scanner_ml, scanner_intra, scanner_oe]:
         if scnr and scnr.positions:
             all_positions.update(scnr.positions)
 
@@ -339,6 +346,8 @@ def _open_positions_pane(positions_version, tsla_price, scanner=None, scanner_dw
               if getattr(v, 'signal_source', '') == 'surfer_ml'}
     id_pos = {k: v for k, v in all_positions.items()
               if getattr(v, 'signal_source', '') == 'intraday'}
+    oe_pos = {k: v for k, v in all_positions.items()
+              if getattr(v, 'signal_source', '') == 'oe_signals5'}
 
     if cs5_pos:
         position_html += '<div style="font-weight:600;color:#ccc;margin:6px 0;">CS-5TF Positions</div>'
@@ -356,18 +365,22 @@ def _open_positions_pane(positions_version, tsla_price, scanner=None, scanner_dw
         position_html += '<div style="font-weight:600;color:#ccc;margin:6px 0;">Intraday Positions</div>'
         for pos in id_pos.values():
             position_html += _position_card_html(pos, tsla_price)
+    if oe_pos:
+        position_html += '<div style="font-weight:600;color:#ccc;margin:6px 0;">OE-Sig5 Positions</div>'
+        for pos in oe_pos.values():
+            position_html += _position_card_html(pos, tsla_price)
 
     return pn.pane.HTML(position_html, sizing_mode='stretch_width')
 
 
-def _trade_history_pane(trades_version, scanner=None, scanner_dw=None, scanner_ml=None, scanner_intra=None):
+def _trade_history_pane(trades_version, scanner=None, scanner_dw=None, scanner_ml=None, scanner_intra=None, scanner_oe=None):
     """Trade history. Bound to trades_version ONLY — not tsla_price or positions_version.
 
     Only re-renders when a trade actually opens or closes, so the <details>
     element preserves its open/closed state between price ticks.
     """
     all_closed = []
-    for scnr in [scanner, scanner_dw, scanner_ml, scanner_intra]:
+    for scnr in [scanner, scanner_dw, scanner_ml, scanner_intra, scanner_oe]:
         if scnr and scnr.closed_trades:
             all_closed.extend(scnr.closed_trades)
 
@@ -412,6 +425,8 @@ def _position_card_html(pos, current_price: float) -> str:
         tag_color = '#ce93d8'
     elif raw_source == 'intraday':
         tag_color = '#4fc3f7'
+    elif raw_source == 'oe_signals5':
+        tag_color = '#66bb6a'
     else:
         tag_color = '#ff9800'
 

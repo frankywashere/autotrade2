@@ -54,6 +54,7 @@ DISPLAY_NAMES = {
     'c14-dw': 'CS-DW',
     'c14-ml': 'Surfer ML',
     'c14-intra': 'Intraday',
+    'c14-oe': 'OE-Sig5',
 }
 
 # Slippage + commission (per-signal-source, matching each backtest engine)
@@ -62,6 +63,7 @@ SLIPPAGE_BY_SOURCE = {
     'CS-DW':  0.0001,   # 0.01% per side (combo_backtest.py)
     'intraday': 0.0002, # 0.02% per side (intraday_v14b_janfeb.py)
     'surfer_ml': 0.0003, # 0.03% per side (surfer_backtest.py)
+    'oe_signals5': 0.0001, # 0.01% per side (daily bars, same as combo)
 }
 SLIPPAGE_PCT = 0.0003     # fallback if source unknown
 COMMISSION_PER_SHARE = 0.005  # $0.005/share (IBKR tiered)
@@ -528,7 +530,7 @@ class SurferLiveScanner:
                 stop_pct = 0.02
             tp_pct = sig.suggested_tp_pct
 
-            if signal_source in ('CS-5TF', 'CS-DW'):
+            if signal_source in ('CS-5TF', 'CS-DW', 'oe_signals5'):
                 # combo_backtest.py: floor at 2%/4%, no ATR clipping
                 stop_pct = max(stop_pct, 0.02)
                 tp_pct = max(tp_pct, 0.04)
@@ -553,7 +555,11 @@ class SurferLiveScanner:
                     tp_pct *= 1.30
 
             # --- Position sizing (matches each backtest engine) ---
-            if signal_source in ('CS-5TF', 'CS-DW'):
+            if signal_source == 'oe_signals5':
+                # OE Signals_5: flat $100K (matching backtest, no confidence scaling)
+                position_value = self.config.initial_capital
+                shares = max(1, int(position_value / current_price))
+            elif signal_source in ('CS-5TF', 'CS-DW'):
                 # combo_backtest.py: confidence-scaled, $100K base
                 position_value = self.config.initial_capital * min(sig.confidence, 1.0)
                 shares = max(1, int(position_value / current_price))
@@ -922,7 +928,7 @@ class SurferLiveScanner:
                 if bar_low < pos.best_price:
                     pos.best_price = bar_low
 
-            is_cs = pos.signal_source in ('CS-5TF', 'CS-DW')
+            is_cs = pos.signal_source in ('CS-5TF', 'CS-DW', 'oe_signals5')
             is_intraday = pos.signal_type == 'intraday'
 
             # --- Intraday EOD close at 15:50 ET (matching backtest tfe) ---
