@@ -47,7 +47,7 @@ def download_1min_bars(symbol: str, months: int, output: str,
                 symbol, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
 
     while current > start_date:
-        end_dt_str = current.strftime('%Y%m%d %H:%M:%S')
+        end_dt_str = current.strftime('%Y%m%d-%H:%M:%S') + ' US/Eastern'
         try:
             df = _fetch_one_day(client, symbol, end_dt_str)
             if df is not None and len(df) > 0:
@@ -57,8 +57,8 @@ def download_1min_bars(symbol: str, months: int, output: str,
                 logger.info("  Day %d: %s — %d bars (earliest: %s)",
                              day_count, current.strftime('%Y-%m-%d'),
                              len(df), earliest)
-                # Move to previous day
-                current = pd.Timestamp(earliest).to_pydatetime() - timedelta(seconds=1)
+                # Move to previous day (strip tz to keep comparison naive)
+                current = pd.Timestamp(earliest).tz_localize(None).to_pydatetime() - timedelta(seconds=1)
             else:
                 # No data (weekend/holiday) — just step back 1 day
                 current -= timedelta(days=1)
