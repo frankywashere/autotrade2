@@ -239,16 +239,24 @@ def create_app():
         state.param.ib_connected,
     )
 
-    # IB Reconnect button
-    ib_reconnect_btn = pn.widgets.Button(name='Reconnect IB', button_type='warning', width=200)
+    # IB Reconnect button — disabled when connected
+    ib_reconnect_btn = pn.widgets.Button(
+        name='Reconnect IB', button_type='warning', width=200,
+        disabled=state.ib_connected,
+    )
     ib_reconnect_status = pn.pane.Markdown('', width=200)
+
+    def _sync_ib_btn(event):
+        ib_reconnect_btn.disabled = event.new
+        if event.new:
+            ib_reconnect_status.object = ''
+    state.param.watch(_sync_ib_btn, 'ib_connected')
 
     def _reconnect_ib(e):
         ib_reconnect_status.object = '*Reconnecting...*'
         if state.ib_client:
             state.ib_client.reconnect()
             import time
-            # Wait up to 15s for reconnect
             for _ in range(30):
                 time.sleep(0.5)
                 if state.ib_client.is_connected():
