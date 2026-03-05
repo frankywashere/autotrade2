@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import datetime as _dt
 import os as _os_mod
 import pickle as _pickle
 import sys
@@ -21,6 +22,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+from v15.validation.ah_rules import is_rth, is_extended_hours, AHStateTracker
 
 _SURFER_DATA_CACHE = Path('/tmp/surfer_backtest_data_cache.pkl')
 
@@ -375,6 +378,12 @@ def run_backtest(
     signal_filters=None,                # SignalFilterCascade for unified trade gating
     ml_hard_gate: bool = False,         # If True, skip signals where ML action disagrees with physics
     am_only: bool = False,              # Restrict entries to 9:30-10:30 ET
+    # 1-min exit checking + AH rules
+    use_1min: bool = False,             # Use 1-min bars for exit checking
+    df1m: 'pd.DataFrame | None' = None, # 1-min DataFrame for high-res exits
+    flat_sizing: bool = False,          # Flat $100K equity (no compounding)
+    ah_rules: bool = False,             # AH gated opens + unlimited closes
+    ah_loss_limit: float = 250.0,       # Max loss per AH trade
 ) -> tuple:
     """
     Run Channel Surfer backtest on historical 5-min TSLA data.
@@ -1092,8 +1101,13 @@ def run_backtest(
     position_features: list = []   # Feature vectors for each open position (capture_features)
     max_positions = 2
     pending_entries = []  # Deferred entries: list of (bar, direction, signal_type, confidence, stop_pct, tp_pct, primary_tf, ou_hl, max_hold, el_flagged, fast_rev, trade_size, signal_data)
-    equity = initial_capital if initial_capital > 0 else position_size * 10
-    initial_equity = equity
+    # Flat sizing: fix equity at $100K, no compounding
+    if flat_sizing:
+        equity = 100_000.0
+        initial_equity = equity
+    else:
+        equity = initial_capital if initial_capital > 0 else position_size * 10
+        initial_equity = equity
     peak_equity = equity
     max_dd = 0.0
     consecutive_losses = 0  # Track losing streak for position reduction
@@ -1106,6 +1120,31 @@ def run_backtest(
     daily_pnl = 0.0         # Running P&L for current trading day
     daily_breaker_active = False
     current_day = None
+
+    # 1-min exit checking setup
+    _1m_highs = _1m_lows = _1m_closes = _1m_times = None
+    _5m_to_1m = None  # mapping: 5min bar index -> list of 1min bar indices
+    if use_1min and df1m is not None:
+        _1m_highs = df1m['high'].values
+        _1m_lows = df1m['low'].values
+        _1m_closes = df1m['close'].values
+        _1m_times = df1m.index
+        # Build mapping from 5-min bar -> 1-min bar range
+        _5m_to_1m = {}
+        j1 = 0
+        for i5 in range(len(tsla)):
+            t5 = tsla.index[i5]
+            t5_end = tsla.index[i5 + 1] if i5 + 1 < len(tsla) else t5 + pd.Timedelta(minutes=5)
+            start_j = j1
+            while j1 < len(_1m_times) and _1m_times[j1] < t5_end:
+                j1 += 1
+            if j1 > start_j:
+                _5m_to_1m[i5] = (start_j, j1)
+        print(f"  1-min exit checking: {len(df1m):,} bars, mapped {len(_5m_to_1m):,} 5-min windows")
+
+    # AH state tracker
+    ah_tracker = AHStateTracker() if ah_rules else None
+
     # Walk forward from bar 100 (need lookback)
     start_bar = 100
     total_bars = len(tsla)
@@ -1130,12 +1169,35 @@ def run_backtest(
             current_day = bar_date
             daily_pnl = 0.0
             daily_breaker_active = False
+            if ah_tracker:
+                ah_tracker.reset_if_new_day(bar_date)
 
         # --- Check exits for all open positions ---
-        window_highs = highs[max(0, bar - eval_interval):bar + 1]
-        window_lows = lows[max(0, bar - eval_interval):bar + 1]
-        window_high = float(np.max(window_highs))
-        window_low = float(np.min(window_lows))
+        # Use 1-min bars for higher-resolution exit checking when available
+        if use_1min and _5m_to_1m is not None:
+            # Collect 1-min bars spanning the eval_interval of 5-min bars
+            _1m_start = None
+            _1m_end = None
+            for _bi in range(max(0, bar - eval_interval + 1), bar + 1):
+                if _bi in _5m_to_1m:
+                    s, e = _5m_to_1m[_bi]
+                    if _1m_start is None or s < _1m_start:
+                        _1m_start = s
+                    if _1m_end is None or e > _1m_end:
+                        _1m_end = e
+            if _1m_start is not None and _1m_end is not None:
+                window_high = float(_1m_highs[_1m_start:_1m_end].max())
+                window_low = float(_1m_lows[_1m_start:_1m_end].min())
+            else:
+                window_highs = highs[max(0, bar - eval_interval):bar + 1]
+                window_lows = lows[max(0, bar - eval_interval):bar + 1]
+                window_high = float(np.max(window_highs))
+                window_low = float(np.min(window_lows))
+        else:
+            window_highs = highs[max(0, bar - eval_interval):bar + 1]
+            window_lows = lows[max(0, bar - eval_interval):bar + 1]
+            window_high = float(np.max(window_highs))
+            window_low = float(np.min(window_lows))
 
         closed_indices = []
         for pi, position in enumerate(positions):
@@ -1198,7 +1260,21 @@ def run_backtest(
                 except Exception as _e:
                     _track_error("trail_optimizer_predict", _e)
 
-            result = _check_position_exit(
+            # AH loss limit check: force close if unrealized loss >= limit during extended hours
+            _ah_forced = None
+            if ah_rules and ah_tracker is not None:
+                _bar_ts = tsla.index[bar]
+                _bar_tod = _bar_ts.time() if hasattr(_bar_ts, 'time') else None
+                if _bar_tod and is_extended_hours(_bar_tod):
+                    if position.direction == 'BUY':
+                        _unrealized = (window_low - position.entry_price) * position.trade_size / position.entry_price
+                    else:
+                        _unrealized = (position.entry_price - window_high) * position.trade_size / position.entry_price
+                    if AHStateTracker.check_ah_loss_limit(_unrealized, ah_loss_limit):
+                        _exit_p = window_low if position.direction == 'BUY' else window_high
+                        _ah_forced = ('ah_loss_limit', _exit_p)
+
+            result = _ah_forced or _check_position_exit(
                 position, bar, current_price, window_high, window_low, eval_interval)
 
             if result is not None:
@@ -1246,11 +1322,23 @@ def run_backtest(
                     entry_time=str(tsla.index[position.entry_bar]) if position.entry_bar < len(tsla) else '',
                 )
                 trades.append(trade)
-                equity += pnl
+                if flat_sizing:
+                    # Flat sizing: equity stays fixed at initial_equity (no compounding)
+                    # Track P&L separately but don't grow/shrink equity
+                    equity = initial_equity
+                else:
+                    equity += pnl
                 equity_curve.append((bar, equity))
                 peak_equity = max(peak_equity, equity)
                 dd = (peak_equity - equity) / peak_equity
                 max_dd = max(max_dd, dd)
+
+                # AH close tracking
+                if ah_rules and ah_tracker is not None:
+                    _exit_ts = tsla.index[bar]
+                    _exit_tod = _exit_ts.time() if hasattr(_exit_ts, 'time') else None
+                    if _exit_tod and is_extended_hours(_exit_tod):
+                        ah_tracker.record_ah_close(pnl)
 
                 if pnl <= 0:
                     consecutive_losses += 1
@@ -1974,6 +2062,17 @@ def run_backtest(
                         ml_stats.setdefault('am_only_skip', 0)
                         ml_stats['am_only_skip'] += 1
                         continue
+
+                # AH entry gating: limit opens during extended hours
+                if ah_rules and ah_tracker is not None:
+                    _bar_ts = tsla.index[bar]
+                    _bar_tod = _bar_ts.time() if hasattr(_bar_ts, 'time') else None
+                    if _bar_tod and is_extended_hours(_bar_tod):
+                        if not ah_tracker.can_open_ah():
+                            ml_stats.setdefault('ah_gate_skip', 0)
+                            ml_stats['ah_gate_skip'] += 1
+                            continue
+                        ah_tracker.record_ah_open()
 
                 # Don't enter if we already have a position in the same direction
                 existing_dirs = {p.direction for p in positions}
@@ -6555,7 +6654,20 @@ def main():
                        help='End date YYYY-MM-DD')
     parser.add_argument('--am-only', action='store_true',
                        help='Restrict entries to 9:30-10:30 ET (AM session only)')
+    parser.add_argument('--1min', dest='use_1min', action='store_true',
+                       help='Use 1-min bars for exit checking (signals still on 5-min)')
+    parser.add_argument('--flat-sizing', action='store_true',
+                       help='Flat $100K equity per trade (no compounding)')
+    parser.add_argument('--ah-rules', action='store_true',
+                       help='Enable AH gated opens + unlimited closes')
+    parser.add_argument('--ah-loss-limit', type=float, default=250.0,
+                       help='Max loss per AH trade (default $250)')
     args = parser.parse_args()
+
+    # Auto-adjust eval_interval for --1min (default 2 instead of 3)
+    if args.use_1min and args.eval_interval == 3:
+        args.eval_interval = 2
+        print(f"[--1min] Auto-adjusted eval_interval to {args.eval_interval}")
 
     if args.refresh and _SURFER_DATA_CACHE.exists():
         _SURFER_DATA_CACHE.unlink()
@@ -6673,6 +6785,36 @@ def main():
             data_kwargs['spy_df_input'] = fetch_native_tf('SPY', 'daily', _start, _end)
             data_kwargs['vix_df_input'] = fetch_native_tf('^VIX', 'daily', _start, _end)
 
+        # Load 1-min data for exit checking
+        df1m_exits = None
+        if args.use_1min:
+            if args.tsla is None:
+                raise FileNotFoundError("--1min requires --tsla path to TSLAMin.txt")
+            print("\nLoading 1-min data for exit checking...")
+            _t0 = time.time()
+            _df1m_raw = pd.read_csv(args.tsla, sep=';',
+                                    names=['datetime', 'open', 'high', 'low', 'close', 'volume'],
+                                    parse_dates=['datetime'], date_format='%Y%m%d %H%M%S')
+            _df1m_raw = _df1m_raw.set_index('datetime').sort_index()
+            # Date filter
+            _s = pd.Timestamp(_start)
+            _e = pd.Timestamp(_end)
+            _df1m_raw = _df1m_raw[(_s <= _df1m_raw.index) & (_df1m_raw.index <= _e)]
+            if not args.ah_rules:
+                # RTH only
+                _times = _df1m_raw.index.time
+                _df1m_raw = _df1m_raw[(_times >= _dt.time(9, 30)) & (_times < _dt.time(16, 0))]
+            else:
+                # Keep extended hours (4:00-20:00)
+                _times = _df1m_raw.index.time
+                _df1m_raw = _df1m_raw[(_times >= _dt.time(4, 0)) & (_times < _dt.time(20, 0))]
+            df1m_exits = _df1m_raw
+            print(f"  Loaded {len(df1m_exits):,} 1-min bars in {time.time()-_t0:.1f}s")
+
+        if args.use_1min: print(f"  >> 1-MIN EXIT CHECKING (eval_interval={args.eval_interval})")
+        if args.flat_sizing: print("  >> FLAT $100K SIZING")
+        if args.ah_rules: print(f"  >> AH RULES (loss limit=${args.ah_loss_limit:.0f})")
+
         metrics, trades, eq = run_backtest(
             days=args.days,
             eval_interval=args.eval_interval,
@@ -6680,6 +6822,11 @@ def main():
             min_confidence=args.min_conf,
             ml_model=ml_model,
             am_only=args.am_only,
+            use_1min=args.use_1min,
+            df1m=df1m_exits,
+            flat_sizing=args.flat_sizing,
+            ah_rules=args.ah_rules,
+            ah_loss_limit=args.ah_loss_limit,
             **data_kwargs,
             **realistic_kwargs,
         )

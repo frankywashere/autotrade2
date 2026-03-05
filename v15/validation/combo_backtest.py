@@ -26,6 +26,7 @@ Usage:
 """
 
 import argparse
+import datetime as _dt
 import os
 import pickle
 import sys
@@ -38,6 +39,8 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from v15.validation.ah_rules import is_rth, is_extended_hours, AHStateTracker
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -357,7 +360,12 @@ def simulate_trades(signals: List[DaySignals],
                     combo_fn,
                     combo_name: str,
                     cooldown: int = COOLDOWN_DAYS,
-                    trail_power: int = 4) -> List[Trade]:
+                    trail_power: int = 4,
+                    df1m: Optional[pd.DataFrame] = None,
+                    eval_interval_1m: int = 2,
+                    flat_sizing: bool = False,
+                    ah_rules: bool = False,
+                    ah_loss_limit: float = 250.0) -> List[Trade]:
     """
     Run trade simulation over pre-computed signals.
 
@@ -369,6 +377,11 @@ def simulate_trades(signals: List[DaySignals],
         source: 'CS', 'V5', 'CS+V5'
     cooldown: days to wait after exit before next entry (default COOLDOWN_DAYS)
     trail_power: exponent for trail formula: trail = base * (1-conf)^power (default 4)
+    df1m: 1-min DataFrame for high-res exit checking (None = use daily bars)
+    eval_interval_1m: bars between exit checks on 1-min data (default 2)
+    flat_sizing: if True, position_value = CAPITAL (no confidence scaling)
+    ah_rules: enable AH gated opens + unlimited closes + loss limit
+    ah_loss_limit: max loss per AH trade before force close ($250 default)
     """
     trades: List[Trade] = []
     in_trade = False
@@ -389,47 +402,126 @@ def simulate_trades(signals: List[DaySignals],
     tp_pct = DEFAULT_TP_PCT
     trail_pct = TRAILING_STOP_BASE  # per-trade, set at entry
 
+    # AH state
+    ah_tracker = AHStateTracker() if ah_rules else None
+    ah_entry = False
+
+    # 1-min exit support: build date -> 1-min bar arrays
+    day_to_1m = {}
+    if df1m is not None:
+        f1m_h = df1m['high'].values
+        f1m_l = df1m['low'].values
+        f1m_c = df1m['close'].values
+        f1m_times = df1m.index
+        f1m_dates = np.array([t.date() for t in f1m_times])
+        for d in np.unique(f1m_dates):
+            mask = f1m_dates == d
+            idxs = np.where(mask)[0]
+            day_to_1m[d] = idxs  # array of 1-min bar indices for this date
+
     for day_idx, day in enumerate(signals):
+        if ah_tracker:
+            ah_tracker.reset_if_new_day(day.date)
+
         if in_trade:
             hold_days += 1
-            price_h = day.day_high
-            price_l = day.day_low
-            price_c = day.day_close
 
-            # Update best price for trailing stop (confidence-scaled)
-            if direction == 'LONG':
-                best_price = max(best_price, price_h)
-                trailing_stop = best_price * (1.0 - trail_pct)
-                # Only activate trailing once profitable
-                if best_price > entry_price:
-                    effective_stop = max(stop_price, trailing_stop)
+            if df1m is not None and day.date in day_to_1m:
+                # --- 1-min exit checking for this calendar day ---
+                bar_idxs = day_to_1m[day.date]
+                exit_reason = None
+                exit_price = 0.0
+                for step in range(0, len(bar_idxs), eval_interval_1m):
+                    end_step = min(step + eval_interval_1m, len(bar_idxs))
+                    window_idxs = bar_idxs[step:end_step]
+                    wh = f1m_h[window_idxs].max()
+                    wl = f1m_l[window_idxs].min()
+                    wc = f1m_c[window_idxs[-1]]
+                    wt = f1m_times[window_idxs[0]].time()
+
+                    if direction == 'LONG':
+                        best_price = max(best_price, wh)
+                        trailing_stop = best_price * (1.0 - trail_pct)
+                        if best_price > entry_price:
+                            effective_stop = max(stop_price, trailing_stop)
+                        else:
+                            effective_stop = stop_price
+
+                        # AH loss limit
+                        if ah_rules and ah_entry and is_extended_hours(wt):
+                            unrealized = (wl - entry_price) * shares
+                            if AHStateTracker.check_ah_loss_limit(unrealized, ah_loss_limit):
+                                exit_reason = 'ah_loss_limit'; exit_price = wl; break
+
+                        if wl <= effective_stop:
+                            is_trailing = best_price > entry_price and trailing_stop > stop_price
+                            exit_reason = 'trailing' if is_trailing else 'stop'
+                            exit_price = effective_stop; break
+                        elif wh >= tp_price:
+                            exit_reason = 'tp'; exit_price = tp_price; break
+                    else:  # SHORT
+                        best_price = min(best_price, wl)
+                        trailing_stop = best_price * (1.0 + trail_pct)
+                        if best_price < entry_price:
+                            effective_stop = min(stop_price, trailing_stop)
+                        else:
+                            effective_stop = stop_price
+
+                        # AH loss limit
+                        if ah_rules and ah_entry and is_extended_hours(wt):
+                            unrealized = (entry_price - wh) * shares
+                            if AHStateTracker.check_ah_loss_limit(unrealized, ah_loss_limit):
+                                exit_reason = 'ah_loss_limit'; exit_price = wh; break
+
+                        if wh >= effective_stop:
+                            is_trailing = best_price < entry_price and trailing_stop < stop_price
+                            exit_reason = 'trailing' if is_trailing else 'stop'
+                            exit_price = effective_stop; break
+                        elif wl <= tp_price:
+                            exit_reason = 'tp'; exit_price = tp_price; break
+
+                # Timeout and end-of-day (checked after full day scan)
+                if exit_reason is None and hold_days >= MAX_HOLD_DAYS:
+                    exit_reason = 'timeout'
+                    exit_price = day.day_close
+            else:
+                # --- Original daily exit checking ---
+                price_h = day.day_high
+                price_l = day.day_low
+                price_c = day.day_close
+
+                if direction == 'LONG':
+                    best_price = max(best_price, price_h)
+                    trailing_stop = best_price * (1.0 - trail_pct)
+                    if best_price > entry_price:
+                        effective_stop = max(stop_price, trailing_stop)
+                    else:
+                        effective_stop = stop_price
+                    hit_stop = price_l <= effective_stop
+                    hit_tp = price_h >= tp_price
                 else:
-                    effective_stop = stop_price
-                hit_stop = price_l <= effective_stop
-                hit_tp = price_h >= tp_price
-            else:  # SHORT
-                best_price = min(best_price, price_l)
-                trailing_stop = best_price * (1.0 + trail_pct)
-                if best_price < entry_price:
-                    effective_stop = min(stop_price, trailing_stop)
-                else:
-                    effective_stop = stop_price
-                hit_stop = price_h >= effective_stop
-                hit_tp = price_l <= tp_price
+                    best_price = min(best_price, price_l)
+                    trailing_stop = best_price * (1.0 + trail_pct)
+                    if best_price < entry_price:
+                        effective_stop = min(stop_price, trailing_stop)
+                    else:
+                        effective_stop = stop_price
+                    hit_stop = price_h >= effective_stop
+                    hit_tp = price_l <= tp_price
 
-            exit_reason = None
-            exit_price = 0.0
+                exit_reason = None
+                exit_price = 0.0
 
-            if hit_stop:
-                exit_reason = 'trailing' if (direction == 'LONG' and best_price > entry_price and trailing_stop > stop_price) or \
-                                            (direction == 'SHORT' and best_price < entry_price and trailing_stop < stop_price) else 'stop'
-                exit_price = effective_stop
-            elif hit_tp:
-                exit_reason = 'tp'
-                exit_price = tp_price
-            elif hold_days >= MAX_HOLD_DAYS:
-                exit_reason = 'timeout'
-                exit_price = price_c
+                if hit_stop:
+                    exit_reason = 'trailing' if (direction == 'LONG' and best_price > entry_price and trailing_stop > stop_price) or \
+                                                (direction == 'SHORT' and best_price < entry_price and trailing_stop < stop_price) else 'stop'
+                    exit_price = effective_stop
+                elif hit_tp:
+                    exit_reason = 'tp'
+                    exit_price = tp_price
+                elif hold_days >= MAX_HOLD_DAYS:
+                    exit_reason = 'timeout'
+                    exit_price = price_c
 
             if exit_reason:
                 pnl = _apply_costs(entry_price, exit_price, shares, direction)
@@ -446,7 +538,10 @@ def simulate_trades(signals: List[DaySignals],
                     exit_reason=exit_reason,
                     source=source,
                 ))
+                if ah_rules and ah_entry:
+                    ah_tracker.record_ah_close(pnl)
                 in_trade = False
+                ah_entry = False
                 cooldown_remaining = cooldown
                 continue
 
@@ -478,9 +573,16 @@ def simulate_trades(signals: List[DaySignals],
         tp_pct = t_pct
         trail_pct = TRAILING_STOP_BASE * (1.0 - conf) ** trail_power  # v6: ultra-tight for high-conf
 
-        # Position sizing: scale by confidence
-        position_value = CAPITAL * min(conf, 1.0)
+        # Position sizing
+        if flat_sizing:
+            position_value = CAPITAL  # Flat $100K, no confidence scaling
+        else:
+            position_value = CAPITAL * min(conf, 1.0)  # Original: scale by confidence
         shares = max(1, int(position_value / entry_price))
+
+        # Combo entries are at next-day open (always RTH 9:30), so AH entry gating
+        # has minimal effect. But track for consistency.
+        ah_entry = False
 
         if action == 'BUY':
             direction = 'LONG'
@@ -3296,7 +3398,12 @@ def phase2_run_combos(signals: List[DaySignals],
                       daily_df: pd.DataFrame,
                       spy_daily: pd.DataFrame,
                       vix_daily: Optional[pd.DataFrame],
-                      weekly_tsla: Optional[pd.DataFrame]):
+                      weekly_tsla: Optional[pd.DataFrame],
+                      df1m: Optional[pd.DataFrame] = None,
+                      eval_interval_1m: int = 2,
+                      flat_sizing: bool = False,
+                      ah_rules: bool = False,
+                      ah_loss_limit: float = 250.0):
     """Run all combo configurations and report results."""
 
     out_dir = Path(__file__).parent / 'combo_results'
@@ -3505,7 +3612,10 @@ def phase2_run_combos(signals: List[DaySignals],
     for name, fn in combos:
         print(f"\nRunning {name}...")
         t0 = time.time()
-        trades = simulate_trades(signals, fn, name)
+        trades = simulate_trades(signals, fn, name,
+                                 df1m=df1m, eval_interval_1m=eval_interval_1m,
+                                 flat_sizing=flat_sizing, ah_rules=ah_rules,
+                                 ah_loss_limit=ah_loss_limit)
         elapsed = time.time() - t0
         print(f"  {len(trades)} trades in {elapsed:.2f}s")
         report_combo(name, trades)
@@ -3516,7 +3626,10 @@ def phase2_run_combos(signals: List[DaySignals],
     for name, fn, cd, tp in custom_combos:
         print(f"\nRunning {name} (cd={cd}, trail^{tp})...")
         t0 = time.time()
-        trades = simulate_trades(signals, fn, name, cooldown=cd, trail_power=tp)
+        trades = simulate_trades(signals, fn, name, cooldown=cd, trail_power=tp,
+                                 df1m=df1m, eval_interval_1m=eval_interval_1m,
+                                 flat_sizing=flat_sizing, ah_rules=ah_rules,
+                                 ah_loss_limit=ah_loss_limit)
         elapsed = time.time() - t0
         print(f"  {len(trades)} trades in {elapsed:.2f}s")
         report_combo(name, trades)
@@ -3574,7 +3687,20 @@ def main():
                         help='Skip phase 1, load from cache')
     parser.add_argument('--am-only', action='store_true',
                         help='(No-op for combo: entries are always at daily open)')
+    parser.add_argument('--1min', dest='use_1min', action='store_true',
+                        help='Use 1-min bars for exit checking (signals still daily)')
+    parser.add_argument('--eval-interval', type=int, default=None,
+                        help='Bars between exit checks (default 2 with --1min)')
+    parser.add_argument('--flat-sizing', action='store_true',
+                        help='Flat $100K per trade (no confidence scaling)')
+    parser.add_argument('--ah-rules', action='store_true',
+                        help='Enable AH gated opens + unlimited closes')
+    parser.add_argument('--ah-loss-limit', type=float, default=250.0,
+                        help='Max loss per AH trade (default $250)')
     args = parser.parse_args()
+
+    # Set eval_interval default based on --1min
+    eval_interval_1m = args.eval_interval if args.eval_interval is not None else (2 if args.use_1min else 1)
 
     # Auto-detect TSLAMin.txt
     if args.tsla is None:
@@ -3585,11 +3711,17 @@ def main():
                 args.tsla = candidate
                 break
 
+    if args.use_1min and args.tsla is None:
+        raise FileNotFoundError("--1min requires --tsla or auto-detected TSLAMin.txt")
+
     if args.am_only:
         print("NOTE: --am-only is a no-op for combo backtest (entries are always at daily open)")
     print(f"Combo Backtest -- {args.start} to {args.end}")
     print(f"TSLAMin: {args.tsla or 'not found (yfinance fallback)'}")
     print(f"Cache: {CACHE_FILE}")
+    if args.use_1min: print(f"  >> 1-MIN EXIT CHECKING (eval_interval={eval_interval_1m})")
+    if args.flat_sizing: print("  >> FLAT $100K SIZING")
+    if args.ah_rules: print(f"  >> AH RULES (loss limit=${args.ah_loss_limit:.0f})")
 
     if args.phase2_only and CACHE_FILE.exists():
         print("\nLoading cached signals...")
@@ -3605,13 +3737,40 @@ def main():
         signals, daily_df, spy_daily, vix_daily, weekly_tsla = phase1_precompute(
             args.tsla, args.start, args.end)
 
+    # Load 1-min data for exit checking if requested
+    df1m_exits = None
+    if args.use_1min:
+        print("\nLoading 1-min data for exit checking...")
+        _t0 = time.time()
+        df1m_raw = pd.read_csv(args.tsla, sep=';',
+                               names=['datetime', 'open', 'high', 'low', 'close', 'volume'],
+                               parse_dates=['datetime'], date_format='%Y%m%d %H%M%S')
+        df1m_raw = df1m_raw.set_index('datetime').sort_index()
+        # Date filter
+        _start = pd.Timestamp(args.start)
+        _end = pd.Timestamp(args.end)
+        df1m_raw = df1m_raw[(_start <= df1m_raw.index) & (df1m_raw.index <= _end)]
+        if not args.ah_rules:
+            # RTH only
+            times = df1m_raw.index.time
+            df1m_raw = df1m_raw[(times >= _dt.time(9, 30)) & (times < _dt.time(16, 0))]
+        else:
+            # Keep extended hours (4:00-20:00)
+            times = df1m_raw.index.time
+            df1m_raw = df1m_raw[(times >= _dt.time(4, 0)) & (times < _dt.time(20, 0))]
+        df1m_exits = df1m_raw
+        print(f"  Loaded {len(df1m_exits):,} 1-min bars in {time.time()-_t0:.1f}s")
+
     # Quick sanity check
     cs_buy_days = sum(1 for s in signals if s.cs_action == 'BUY')
     cs_sell_days = sum(1 for s in signals if s.cs_action == 'SELL')
     v5_days = sum(1 for s in signals if s.v5_take_bounce)
     print(f"\nSignal summary: CS BUY={cs_buy_days}, CS SELL={cs_sell_days}, V5={v5_days}")
 
-    phase2_run_combos(signals, daily_df, spy_daily, vix_daily, weekly_tsla)
+    phase2_run_combos(signals, daily_df, spy_daily, vix_daily, weekly_tsla,
+                      df1m=df1m_exits, eval_interval_1m=eval_interval_1m,
+                      flat_sizing=args.flat_sizing, ah_rules=args.ah_rules,
+                      ah_loss_limit=args.ah_loss_limit)
 
 
 if __name__ == '__main__':

@@ -2,11 +2,14 @@
 """V14b: Jan-Feb breakdown per year + $100K compound year-by-year.
 Quick analysis requested by user to contextualize 2026 OOS (Jan-Feb only).
 """
+import argparse
 import os, sys, time
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
 import datetime as dt
+
+from v15.validation.ah_rules import is_rth, is_extended_hours, AHStateTracker
 
 def _flush(): sys.stdout.flush()
 
@@ -17,7 +20,7 @@ TEST_END  = pd.Timestamp('2026-03-04')
 MKT_OPEN  = dt.time(9, 30)
 MKT_CLOSE = dt.time(16, 0)
 
-def load_1min(path=None):
+def load_1min(path=None, rth_only=True):
     if path is None:
         for p in ['data/TSLAMin.txt', r'C:\AI\x14\data\TSLAMin.txt',
                    os.path.expanduser('~/Desktop/Coding/x14/data/TSLAMin.txt')]:
@@ -28,9 +31,14 @@ def load_1min(path=None):
     df = pd.read_csv(path, sep=';', names=['datetime','open','high','low','close','volume'],
                      parse_dates=['datetime'], date_format='%Y%m%d %H%M%S')
     df = df.set_index('datetime').sort_index()
-    times = df.index.time
-    df = df[(times >= MKT_OPEN) & (times < MKT_CLOSE)].copy()
-    print(f"  Loaded {len(df):,} bars in {time.time()-t0:.1f}s"); _flush()
+    if rth_only:
+        times = df.index.time
+        df = df[(times >= MKT_OPEN) & (times < MKT_CLOSE)].copy()
+    else:
+        # Keep extended hours (4:00-20:00) for AH rules
+        times = df.index.time
+        df = df[(times >= dt.time(4, 0)) & (times < dt.time(20, 0))].copy()
+    print(f"  Loaded {len(df):,} bars ({'RTH' if rth_only else 'RTH+AH'}) in {time.time()-t0:.1f}s"); _flush()
     return df
 
 def resample_ohlcv(df, rule):
@@ -329,8 +337,17 @@ def simulate_fixed(f5m, signal_fn, name, params, precomp,
                    tb=0.006, tp=6, cd=0, mtd=20,
                    base_capital=20_000.0, max_capital=100_000.0,
                    conf_size=True,
-                   tod_start=dt.time(13,0), tod_end=dt.time(15,25)):
-    """Confidence-scaled sizing capped at max_capital."""
+                   tod_start=dt.time(13,0), tod_end=dt.time(15,25),
+                   f1m=None, eval_interval_1m=2,
+                   ah_rules=False, ah_loss_limit=250.0):
+    """Confidence-scaled sizing capped at max_capital.
+
+    New params:
+      f1m:              1-min DataFrame for high-res exit checking (signals still on 5-min)
+      eval_interval_1m: bars between exit checks on 1-min data (default 2)
+      ah_rules:         enable AH gated opens + unlimited closes + loss limit
+      ah_loss_limit:    max loss per AH trade before force close ($250 default)
+    """
     (dcp_arr,dslope_arr), htf = precomp
     o_arr=f5m['open'].values; h_arr=f5m['high'].values
     l_arr=f5m['low'].values; c_arr=f5m['close'].values
@@ -339,22 +356,103 @@ def simulate_fixed(f5m, signal_fn, name, params, precomp,
     ctx={'daily_cp':0.0,'daily_slope':0.0,**htf}
     in_trade=False; ep=et=None; conf=sp=tpp=bp=0.0; hb=cr=tt=0; cd_=None; ps=None
     tes=dt.time(9,35); tee=dt.time(15,30); tfe=dt.time(15,50)
+    timeout_bars = 78  # 5-min bars
+
+    # AH state
+    ah_tracker = AHStateTracker() if ah_rules else None
+    ah_entry = False  # was this trade opened during AH?
+
+    # 1-min exit support: build mapping from 5-min bar index -> 1-min bar slice
+    f1m_h = f1m_l = f1m_c = f1m_times = None
+    bar_to_1m = None
+    if f1m is not None:
+        f1m_h = f1m['high'].values; f1m_l = f1m['low'].values
+        f1m_c = f1m['close'].values; f1m_times = f1m.index
+        # Map each 5-min bar to range of 1-min bar indices
+        bar_to_1m = {}
+        j = 0
+        for i in range(n):
+            t5 = times[i]
+            # Find all 1-min bars from this 5-min bar start to next 5-min bar start
+            t5_end = times[i+1] if i+1 < n else t5 + pd.Timedelta(minutes=5)
+            start_j = j
+            while j < len(f1m_times) and f1m_times[j] < t5_end:
+                j += 1
+            bar_to_1m[i] = (start_j, j)  # half-open range [start_j, j)
+        # Adjust timeout for 1-min resolution: 78 5-min bars = 390 1-min bars
+        timeout_bars = 78 * 5
+
+    if ah_rules:
+        # Expand entry/exit windows for AH
+        tes = dt.time(4, 0)    # pre-market open
+        tee = dt.time(19, 55)  # post-market near close
+        tfe = dt.time(19, 55)  # force EOD at AH end
+
     for i in range(n):
         bt=times[i]; bd=bt.date(); btod=tod_arr[i]; o,h,l,c=o_arr[i],h_arr[i],l_arr[i],c_arr[i]
-        if bd!=cd_: cd_=bd; tt=0
+        if bd!=cd_:
+            cd_=bd; tt=0
+            if ah_tracker: ah_tracker.reset_if_new_day(bd)
         if ps is not None and not in_trade:
             sc,ss,st=ps; ps=None
             if btod>=tes and btod<=tee:
+                # AH gating: check if we can open in extended hours
+                if ah_rules and is_extended_hours(btod):
+                    if not ah_tracker.can_open_ah():
+                        continue
+                    ah_tracker.record_ah_open()
+                    ah_entry = True
+                else:
+                    ah_entry = False
                 ep=o*(1+SLIPPAGE_PCT); et=bt; conf=sc; in_trade=True; hb=0; tt+=1
                 sp=ep*(1-ss); tpp=ep*(1+st); bp=ep
         if in_trade:
-            hb+=1; xp=xr=None; bp=max(bp,h)
-            trail=tb*(1.0-conf)**tp; ts_=bp*(1-trail)
-            if ts_>sp: sp=ts_
-            if l<=sp: xp=max(sp,l); xr='stop' if sp<ep else 'trail'
-            elif h>=tpp: xp=tpp; xr='tp'
-            elif hb>=78: xp=c; xr='timeout'
-            elif btod>=tfe: xp=c; xr='eod'
+            xp=xr=None
+
+            if f1m is not None and i in bar_to_1m:
+                # --- 1-min exit checking ---
+                s1, e1 = bar_to_1m[i]
+                for k in range(s1, e1, eval_interval_1m):
+                    hb += 1
+                    # Window high/low over eval interval
+                    wend = min(k + eval_interval_1m, e1)
+                    wh = f1m_h[k:wend].max(); wl = f1m_l[k:wend].min()
+                    wc = f1m_c[min(wend-1, len(f1m_c)-1)]
+                    bp = max(bp, wh)
+                    trail = tb*(1.0-conf)**tp; ts_ = bp*(1-trail)
+                    if ts_ > sp: sp = ts_
+
+                    # AH loss limit check
+                    if ah_rules and ah_entry and is_extended_hours(f1m_times[k].time()):
+                        unrealized = (wl - ep) * max(1, int(max_capital / ep))
+                        if AHStateTracker.check_ah_loss_limit(unrealized, ah_loss_limit):
+                            xp = wl; xr = 'ah_loss_limit'; break
+
+                    if wl <= sp: xp = max(sp, wl); xr = 'stop' if sp < ep else 'trail'; break
+                    elif wh >= tpp: xp = tpp; xr = 'tp'; break
+                    elif hb >= timeout_bars: xp = wc; xr = 'timeout'; break
+
+                    # EOD check on 1-min bar time
+                    bar_1m_tod = f1m_times[k].time()
+                    if bar_1m_tod >= tfe: xp = wc; xr = 'eod'; break
+            else:
+                # --- Original 5-min exit checking ---
+                hb += 1; bp = max(bp, h)
+                trail = tb*(1.0-conf)**tp; ts_ = bp*(1-trail)
+                if ts_ > sp: sp = ts_
+
+                # AH loss limit check
+                if ah_rules and ah_entry and is_extended_hours(btod):
+                    unrealized = (l - ep) * max(1, int(max_capital / ep))
+                    if AHStateTracker.check_ah_loss_limit(unrealized, ah_loss_limit):
+                        xp = l; xr = 'ah_loss_limit'
+
+                if xp is None:
+                    if l <= sp: xp = max(sp, l); xr = 'stop' if sp < ep else 'trail'
+                    elif h >= tpp: xp = tpp; xr = 'tp'
+                    elif hb >= 78: xp = c; xr = 'timeout'
+                    elif btod >= tfe: xp = c; xr = 'eod'
+
             if xp is not None:
                 xa=xp*(1-SLIPPAGE_PCT)
                 if conf_size:
@@ -364,10 +462,18 @@ def simulate_fixed(f5m, signal_fn, name, params, precomp,
                     sh = max(1, int(max_capital / ep))
                 pnl=(xa-ep)*sh-COMM_PER_SHARE*sh*2
                 trades.append((et,bt,ep,xa,conf,sh,pnl,hb,xr,name))
-                in_trade=False; cr=cd
+                if ah_rules and ah_entry:
+                    ah_tracker.record_ah_close(pnl)
+                in_trade=False; cr=cd; ah_entry=False
         if cr>0: cr-=1; continue
         if in_trade or tt>=mtd: continue
-        if btod<tod_start or btod>tod_end: continue
+        if not ah_rules:
+            # Original RTH-only entry window
+            if btod<tod_start or btod>tod_end: continue
+        else:
+            # With AH rules: allow entries in extended hours too
+            if not (is_rth(btod) or is_extended_hours(btod)): continue
+            if is_rth(btod) and (btod<tod_start or btod>tod_end): continue
         ctx['daily_cp']=dcp_arr[i]; ctx['daily_slope']=dslope_arr[i]
         result=signal_fn(i,f5m,ctx,params)
         if result is not None:
@@ -423,13 +529,46 @@ def simulate_compound(f5m, signal_fn, name, params, precomp,
     return trades, equity
 
 def main():
+    parser = argparse.ArgumentParser(description='V14b Intraday Backtest')
+    parser.add_argument('--tsla', type=str, default=None, help='Path to TSLAMin.txt')
+    parser.add_argument('--1min', dest='use_1min', action='store_true',
+                        help='Use 1-min bars for exit checking (signals still on 5-min)')
+    parser.add_argument('--eval-interval', type=int, default=None,
+                        help='Bars between exit checks (default 2 with --1min)')
+    parser.add_argument('--flat-sizing', action='store_true',
+                        help='Flat $100K per trade (conf_size=False)')
+    parser.add_argument('--ah-rules', action='store_true',
+                        help='Enable AH gated opens + unlimited closes')
+    parser.add_argument('--ah-loss-limit', type=float, default=250.0,
+                        help='Max loss per AH trade (default $250)')
+    args = parser.parse_args()
+
+    # Set eval_interval default based on --1min
+    eval_interval_1m = args.eval_interval if args.eval_interval is not None else (2 if args.use_1min else 1)
+
     print("="*70)
     print("V14b: ALL CONFIGS HEAD-TO-HEAD @ FLAT $100K PER TRADE")
+    if args.use_1min: print("  >> 1-MIN EXIT CHECKING (eval_interval=%d)" % eval_interval_1m)
+    if args.flat_sizing: print("  >> FLAT $100K SIZING")
+    if args.ah_rules: print("  >> AH RULES (loss limit=$%.0f)" % args.ah_loss_limit)
     print("="*70); _flush()
-    df1m = load_1min()
-    features = build_features(df1m)
+
+    # Load data: keep AH bars if ah_rules enabled
+    rth_only = not args.ah_rules
+    df1m = load_1min(path=args.tsla, rth_only=rth_only)
+
+    # Features are always built on RTH data for signal generation
+    df1m_rth = df1m
+    if not rth_only:
+        times = df1m.index.time
+        df1m_rth = df1m[(times >= MKT_OPEN) & (times < MKT_CLOSE)].copy()
+
+    features = build_features(df1m_rth)
     f5m = features['5m']
     precomp = precompute_all(features, f5m)
+
+    # Prepare 1-min data for exit checking (may include AH bars)
+    f1m_for_exits = df1m if args.use_1min else None
 
     # Wider params (used by most configs)
     pw = {'stop':0.008, 'tp':0.020, 'd_min':0.20, 'h1_min':0.15, 'f5_thresh':0.35,
@@ -466,9 +605,13 @@ def main():
 
     all_results = []
     for name, sig_fn, params, mtd, ts, te, bc, mc, cs in configs:
+        # Override conf_size if --flat-sizing
+        effective_cs = False if args.flat_sizing else cs
         trades = simulate_fixed(f5m, sig_fn, name, params, precomp, mtd=mtd,
                                 base_capital=float(bc), max_capital=float(mc),
-                                conf_size=cs, tod_start=ts, tod_end=te)
+                                conf_size=effective_cs, tod_start=ts, tod_end=te,
+                                f1m=f1m_for_exits, eval_interval_1m=eval_interval_1m,
+                                ah_rules=args.ah_rules, ah_loss_limit=args.ah_loss_limit)
         if not trades:
             print(f"   {name:<40} {'0':>7}"); _flush()
             continue
