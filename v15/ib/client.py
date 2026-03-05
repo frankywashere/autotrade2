@@ -309,8 +309,8 @@ class IBClient:
         """Subscribe to account summary (runs in IB event loop)."""
         try:
             await asyncio.wait_for(self.ib.reqAccountSummaryAsync(), timeout=10)
-            # Snapshot initial data into our thread-safe cache
-            self._cache_account_data()
+            # Snapshot initial data from wrapper cache into thread-safe dict
+            self._snapshot_account()
             # Wire up event for live updates
             self.ib.accountSummaryEvent += self._on_account_summary
             logger.info("Subscribed to account summary (%d tags cached)",
@@ -318,16 +318,16 @@ class IBClient:
         except Exception as e:
             logger.warning("Account summary subscription failed: %s", e)
 
-    def _cache_account_data(self):
-        """Snapshot ib.accountSummary() into thread-safe cache."""
+    def _snapshot_account(self):
+        """Read wrapper.acctSummary directly (no event loop needed)."""
         try:
-            items = self.ib.accountSummary()
+            items = self.ib.wrapper.acctSummary.values()
             with self._account_lock:
                 for item in items:
                     if item.currency in ('USD', ''):
                         self._account[item.tag] = item.value
         except Exception as e:
-            logger.error("_cache_account_data failed: %s", e)
+            logger.error("_snapshot_account failed: %s", e)
 
     def _on_account_summary(self, item):
         """Callback fired by ib_async on account summary update."""
