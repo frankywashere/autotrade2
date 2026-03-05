@@ -395,22 +395,22 @@ class DashboardState(param.Parameterized):
         try:
             from v15.trading.surfer_live_scanner import SurferLiveScanner, ScannerConfig
             config = ScannerConfig(initial_capital=self.scanner_capital)
-            self.scanner = SurferLiveScanner(config, model_tag='c14')
-            self.scanner_dw = SurferLiveScanner(config, model_tag='c14-dw')
+            self.scanner = SurferLiveScanner(config, model_tag='c16')
+            self.scanner_dw = SurferLiveScanner(config, model_tag='c16-dw')
             # Surfer ML scanner: low confidence gate (matching surfer_backtest)
             ml_config = ScannerConfig(
                 initial_capital=self.scanner_capital,
                 min_confidence=0.01,  # Very low gate — ML uses all signals
             )
-            self.scanner_ml = SurferLiveScanner(ml_config, model_tag='c14-ml')
+            self.scanner_ml = SurferLiveScanner(ml_config, model_tag='c16-ml')
             # Intraday scanner: separate tracking for intraday ML signals
-            self.scanner_intra = SurferLiveScanner(config, model_tag='c14-intra')
+            self.scanner_intra = SurferLiveScanner(config, model_tag='c16-intra')
             # OE Signals_5 scanner: daily evolved signal with combo trail
-            self.scanner_oe = SurferLiveScanner(config, model_tag='c14-oe')
+            self.scanner_oe = SurferLiveScanner(config, model_tag='c16-oe')
             # Ensure state files exist for all scanners (so model_compare shows all 5)
             for scnr in [self.scanner, self.scanner_dw, self.scanner_ml, self.scanner_intra, self.scanner_oe]:
                 scnr._save_state()
-            logger.info("Scanners initialized (c14 + c14-dw + c14-ml + c14-intra + c14-oe, capital=$%.0f)",
+            logger.info("Scanners initialized (c16 + c16-dw + c16-ml + c16-intra + c16-oe, capital=$%.0f)",
                          self.scanner_capital)
         except Exception as e:
             self._scanner_init_error = f"{e}"
@@ -1087,7 +1087,7 @@ class DashboardState(param.Parameterized):
         from v15.trading.surfer_live_scanner import _STATE_DIR
 
         combined = {}
-        for tag in ('c14', 'c14-dw', 'c14-ml', 'c14-intra', 'c14-oe'):
+        for tag in ('c16', 'c16-dw', 'c16-ml', 'c16-intra', 'c16-oe'):
             fpath = _STATE_DIR / f"surfer_state_{tag}.json"
             if fpath.exists():
                 try:

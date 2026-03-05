@@ -48,15 +48,15 @@ def _is_extended_hours() -> bool:
 
 _STATE_DIR = Path.home() / ".x14"
 MAX_SIGNAL_HISTORY = 200
-MODEL_TAG = 'c14'  # Default model tag
+MODEL_TAG = 'c16'  # Default model tag
 
 # Human-readable display names for each model_tag (used in UI + Telegram)
 DISPLAY_NAMES = {
-    'c14': 'CS-5TF',
-    'c14-dw': 'CS-DW',
-    'c14-ml': 'Surfer ML',
-    'c14-intra': 'Intraday',
-    'c14-oe': 'OE-Sig5',
+    'c16': 'CS-5TF',
+    'c16-dw': 'CS-DW',
+    'c16-ml': 'Surfer ML',
+    'c16-intra': 'Intraday',
+    'c16-oe': 'OE-Sig5',
 }
 
 # Slippage + commission (per-signal-source, matching each backtest engine)

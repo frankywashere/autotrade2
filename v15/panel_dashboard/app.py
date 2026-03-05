@@ -92,11 +92,11 @@ def _init_state():
     if gbt_ok:
         logger.info("ML model (GBT): %s", gbt_msg)
     else:
-        logger.warning("ML model (GBT): %s%s — c14-ml signals will be skipped", gbt_msg, gbt_diag)
+        logger.warning("ML model (GBT): %s%s — c16-ml signals will be skipped", gbt_msg, gbt_diag)
     if intra_ok:
         logger.info("ML model (Intraday): %s", intra_msg)
     else:
-        logger.warning("ML model (Intraday): %s%s — c14-intra ML filter disabled", intra_msg, intra_diag)
+        logger.warning("ML model (Intraday): %s%s — c16-intra ML filter disabled", intra_msg, intra_diag)
 
     # Send startup notification
     scanner_err = getattr(_state, '_scanner_init_error', '')
