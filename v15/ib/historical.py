@@ -47,7 +47,7 @@ def download_1min_bars(symbol: str, months: int, output: str,
                 symbol, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
 
     while current > start_date:
-        end_dt_str = current.strftime('%Y%m%d-%H:%M:%S') + ' US/Eastern'
+        end_dt_str = current.strftime('%Y%m%d %H:%M:%S') + ' US/Eastern'
         try:
             df = _fetch_one_day(client, symbol, end_dt_str)
             if df is not None and len(df) > 0:
