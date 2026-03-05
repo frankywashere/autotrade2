@@ -101,6 +101,16 @@ class IBClient:
         self._connected = False
         logger.info("IB disconnected (manual)")
 
+    def reconnect(self):
+        """Force reconnect with a new random client ID (clears stale sessions)."""
+        import random
+        old_id = self._client_id
+        self._client_id = random.randint(10, 99)
+        logger.info("IB reconnect: client_id %d -> %d", old_id, self._client_id)
+        if self.ib.isConnected():
+            self.ib.disconnect()
+        self._connected = False
+
     def is_connected(self) -> bool:
         return self._connected and self.ib.isConnected()
 

@@ -239,6 +239,29 @@ def create_app():
         state.param.ib_connected,
     )
 
+    # IB Reconnect button
+    ib_reconnect_btn = pn.widgets.Button(name='Reconnect IB', button_type='warning', width=200)
+    ib_reconnect_status = pn.pane.Markdown('', width=200)
+
+    def _reconnect_ib(e):
+        ib_reconnect_status.object = '*Reconnecting...*'
+        if state.ib_client:
+            state.ib_client.reconnect()
+            import time
+            # Wait up to 15s for reconnect
+            for _ in range(30):
+                time.sleep(0.5)
+                if state.ib_client.is_connected():
+                    state.ib_connected = True
+                    ib_reconnect_status.object = '**Connected!**'
+                    return
+            state.ib_connected = False
+            ib_reconnect_status.object = '**Failed** — check IB Gateway'
+        else:
+            ib_reconnect_status.object = '**No IB client**'
+
+    ib_reconnect_btn.on_click(_reconnect_ib)
+
     # Build template
     template = pn.template.FastListTemplate(
         title='c16 Trading Dashboard',
@@ -255,6 +278,8 @@ def create_app():
             last_analysis_display,
             pn.pane.Markdown("### Data Sources"),
             ib_status_display,
+            ib_reconnect_btn,
+            ib_reconnect_status,
             pn.pane.Markdown("### ML Models"),
             ml_status,
             pn.layout.Divider(),
