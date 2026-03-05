@@ -13,7 +13,7 @@ def _flush(): sys.stdout.flush()
 SLIPPAGE_PCT = 0.0002
 COMM_PER_SHARE = 0.005
 TRAIN_END = pd.Timestamp('2021-12-31')
-TEST_END  = pd.Timestamp('2025-12-31')
+TEST_END  = pd.Timestamp('2026-03-04')
 MKT_OPEN  = dt.time(9, 30)
 MKT_CLOSE = dt.time(16, 0)
 
