@@ -187,6 +187,7 @@ class DashboardState(param.Parameterized):
             self.exit_alert_html = '\n'.join(html_parts)
             self.positions_version += 1  # Re-render banner to clear exited positions
             self.trades_version += 1     # Update trade history
+            self.load_model_data()       # Sync model comparisons tab immediately
             # Update intraday ML trade state from intraday exits
             if self._intraday_trade_state:
                 for ea in all_exit_alerts:
@@ -293,6 +294,7 @@ class DashboardState(param.Parameterized):
                 if entry_alert and entry_alert.alert_type == 'ENTRY':
                     self.positions_version += 1
                     self.trades_version += 1
+                    self.load_model_data()
 
             # --- CS-DW: Daily+Weekly only signal (separate scanner/model) ---
             if self.scanner_dw and dw_analysis and self.tsla_price > 0:
@@ -304,6 +306,7 @@ class DashboardState(param.Parameterized):
                         if dw_alert and dw_alert.alert_type == 'ENTRY':
                             self.positions_version += 1
                             self.trades_version += 1
+                            self.load_model_data()
                     logger.info("DW analysis: %s %s (%.0f%%)",
                                 dw_sig.action, dw_sig.primary_tf,
                                 dw_sig.confidence * 100)
@@ -686,6 +689,7 @@ class DashboardState(param.Parameterized):
                              sig.action, self.tsla_price)
                 self.positions_version += 1
                 self.trades_version += 1
+                self.load_model_data()
             elif entry_alert:
                 logger.info("Surfer ML evaluate_signal returned: %s", entry_alert.alert_type)
             else:
@@ -891,6 +895,7 @@ class DashboardState(param.Parameterized):
                 ):
                     self.positions_version += 1
                     self.trades_version += 1
+                    self.load_model_data()
                 else:
                     logger.info("Intraday signal REJECTED by ML filter")
         except Exception as e:
@@ -916,6 +921,7 @@ class DashboardState(param.Parameterized):
                 if alert and alert.alert_type == 'ENTRY':
                     self.positions_version += 1
                     self.trades_version += 1
+                    self.load_model_data()
         except Exception as e:
             logger.warning("OE Signals_5 eval failed: %s", e)
 
