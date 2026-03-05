@@ -47,6 +47,7 @@ class DashboardState(param.Parameterized):
     scanner_14a_intra = param.Parameter(None) # SurferLiveScanner (Intraday [14a])
     positions_version = param.Integer(0)      # Bump to trigger position card re-render (price-sensitive)
     trades_version = param.Integer(0)        # Bump only on actual trade open/close (not price ticks)
+    order_version = param.Integer(0)         # Bump on manual order submit/fill/cancel
     exit_alert_html = param.String('')        # Latest exit alert HTML
 
     # Config (sidebar widgets bind to these)

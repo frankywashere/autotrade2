@@ -7,6 +7,8 @@ import param
 import numpy as np
 import pandas as pd
 
+from v15.panel_dashboard.order_entry import order_entry_panel
+
 logger = logging.getLogger(__name__)
 
 # Zone thresholds (match v15/core/channel_surfer.py)
@@ -41,6 +43,8 @@ def channel_surfer_tab(state) -> pn.Column:
                 scanner_oe=state.scanner_oe,
                 extra_scanners=[state.scanner_14a, state.scanner_14a_dw,
                                 state.scanner_14a_ml, state.scanner_14a_intra]),
+        # Manual order entry
+        order_entry_panel(state),
         # Market insights
         pn.bind(_market_insights, state.param.analysis),
         # Scanner metrics + live P&L — re-renders on price change
