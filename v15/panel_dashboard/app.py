@@ -59,7 +59,13 @@ def _init_state():
     _state = DashboardState()
 
     _state.load_market_data()
-    logger.info("Market data loaded. TSLA=%.2f, c16: CS=%s DW=%s ML=%s Intra=%s OE=%s, c14a: CS=%s DW=%s ML=%s Intra=%s",
+    yf_count = sum(1 for s in [
+        _state.scanner_yf, _state.scanner_yf_dw, _state.scanner_yf_ml,
+        _state.scanner_yf_intra, _state.scanner_yf_oe,
+        _state.scanner_yf_14a, _state.scanner_yf_14a_dw,
+        _state.scanner_yf_14a_ml, _state.scanner_yf_14a_intra,
+    ] if s is not None)
+    logger.info("Market data loaded. TSLA=%.2f, c16: CS=%s DW=%s ML=%s Intra=%s OE=%s, c14a: CS=%s DW=%s ML=%s Intra=%s, yf-AB: %d scanners",
                 _state.tsla_price,
                 "OK" if _state.scanner else "NONE",
                 "OK" if _state.scanner_dw else "NONE",
@@ -69,7 +75,8 @@ def _init_state():
                 "OK" if _state.scanner_14a else "NONE",
                 "OK" if _state.scanner_14a_dw else "NONE",
                 "OK" if _state.scanner_14a_ml else "NONE",
-                "OK" if _state.scanner_14a_intra else "NONE")
+                "OK" if _state.scanner_14a_intra else "NONE",
+                yf_count)
 
     # Log ML model status
     gbt_ok = hasattr(_state, '_ml_model') and _state._ml_model is not None
@@ -115,6 +122,7 @@ def _init_state():
         f"Intra={'OK' if _state.scanner_intra else 'FAIL'}, "
         f"OE={'OK' if _state.scanner_oe else 'FAIL'}\n"
         f"c14a: {'ALL OK' if c14a_ok else 'FAIL'} (4 scanners)\n"
+        f"yf-AB: {yf_count} scanners\n"
         f"GBT model: {gbt_msg}{gbt_diag}\n"
         f"Intraday model: {intra_msg}{intra_diag}\n"
         f"TSLA price: ${_state.tsla_price:.2f}"
@@ -260,8 +268,23 @@ def create_app():
             for _ in range(30):
                 time.sleep(0.5)
                 if state.ib_client.is_connected():
-                    state.ib_connected = True
-                    ib_reconnect_status.object = '**Connected!**'
+                    # Wait for prices to actually flow
+                    for _ in range(20):
+                        time.sleep(0.5)
+                        ib_price = state.ib_client.get_last_price('TSLA')
+                        if ib_price > 0:
+                            state.ib_connected = True
+                            state._price_err_count = 0
+                            # Re-init bar aggregator for 5-min analysis triggers
+                            try:
+                                state._bar_aggregator = state.ib_client.create_bar_aggregator('TSLA', 5)
+                            except Exception as ex:
+                                logger.warning("Bar aggregator re-init failed: %s", ex)
+                            ib_reconnect_status.object = '**Connected!**'
+                            return
+                    # Socket up but no prices
+                    state.ib_connected = False
+                    ib_reconnect_status.object = '**Socket OK but no prices** — try again'
                     return
             state.ib_connected = False
             ib_reconnect_status.object = '**Failed** — check IB Gateway'
@@ -303,6 +326,7 @@ def create_app():
             pn.Tabs(
                 ('Channel Surfer', channel_surfer_tab(state)),
                 ('Model Comparisons', model_comparisons_tab(state)),
+                ('yfinance A/B', model_comparisons_tab(state, prefix='yf-')),
                 dynamic=True,
             ),
         ],

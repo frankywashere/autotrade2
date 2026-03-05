@@ -8,18 +8,26 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-def model_comparisons_tab(state) -> pn.Column:
-    """Build the Model Comparisons tab, bound to state.model_data_version."""
+def model_comparisons_tab(state, prefix='') -> pn.Column:
+    """Build the Model Comparisons tab, bound to state.model_data_version.
+
+    prefix='': show IB scanners (keys not starting with 'yf-')
+    prefix='yf-': show yfinance A/B scanners only
+    """
+    title = "yfinance A/B Comparisons" if prefix == 'yf-' else "Model Comparisons"
+    subtitle = ("Compares yfinance-backed scanners against IB scanners. "
+                "Same configs, different data source." if prefix == 'yf-'
+                else "Compares live performance across all scanner models. "
+                     "Refreshes every hour.")
     return pn.Column(
-        pn.pane.Markdown("## Model Comparisons\n"
-                         "Compares live performance across all scanner models. "
-                         "Refreshes every hour."),
-        pn.bind(_model_content, state.param.model_data_version, model_data=state.model_data),
+        pn.pane.Markdown(f"## {title}\n{subtitle}"),
+        pn.bind(_model_content, state.param.model_data_version,
+                model_data=state.model_data, prefix=prefix),
         sizing_mode='stretch_width',
     )
 
 
-def _model_content(version, model_data=None):
+def _model_content(version, model_data=None, prefix=''):
     if not model_data:
         return pn.pane.HTML(
             '<div style="color:#888;padding:16px;">No model data loaded yet. '
@@ -27,8 +35,11 @@ def _model_content(version, model_data=None):
             sizing_mode='stretch_width',
         )
 
-    # Filter to model keys only
-    model_keys = [k for k in model_data if not k.startswith('_')]
+    # Filter to model keys by prefix
+    if prefix:
+        model_keys = [k for k in model_data if not k.startswith('_') and k.startswith(prefix)]
+    else:
+        model_keys = [k for k in model_data if not k.startswith('_') and not k.startswith('yf-')]
     if not model_keys:
         return pn.pane.HTML(
             '<div style="color:#888;padding:16px;">No model data found. '
