@@ -18,98 +18,105 @@ def order_entry_panel(state) -> pn.Column:
 
     def _render_account():
         if not state.ib_client or not state.ib_client.is_connected():
-            return ''
+            return ('<div style="color:#ff5252;font-size:12px;font-weight:bold">'
+                    'IB not connected — account data unavailable</div>')
         acct = state.ib_client.get_account_summary()
         if not acct:
-            return '<div style="color:#888;font-size:12px">Loading account...</div>'
+            return ('<div style="color:#ffab00;font-size:12px;font-weight:bold">'
+                    'Account summary empty — reqAccountSummary may have failed</div>')
 
-        def _fmt(tag, prefix='$'):
+        def _fmt(tag):
             val = acct.get(tag, '')
             if not val:
                 return '--'
             try:
-                return f'{prefix}{float(val):,.0f}'
+                return f'${float(val):,.0f}'
             except (ValueError, TypeError):
                 return str(val)
+
+        def _pnl_fmt(tag):
+            val = acct.get(tag, '')
+            if not val:
+                return '--', '#aaa'
+            try:
+                v = float(val)
+                color = '#00e676' if v >= 0 else '#ff5252'
+                sign = '+' if v > 0 else ''
+                return f'{sign}${v:,.0f}', color
+            except (ValueError, TypeError):
+                return str(val), '#aaa'
 
         nlv = _fmt('NetLiquidation')
         cash = _fmt('TotalCashValue')
         bp = _fmt('BuyingPower')
         gross = _fmt('GrossPositionValue')
-        upnl_raw = acct.get('UnrealizedPnL', '')
-        rpnl_raw = acct.get('RealizedPnL', '')
-
-        def _pnl_fmt(raw):
-            if not raw:
-                return '--', '#aaa'
-            try:
-                v = float(raw)
-                color = '#00e676' if v >= 0 else '#ff5252'
-                return f'${v:,.0f}', color
-            except (ValueError, TypeError):
-                return str(raw), '#aaa'
-
-        upnl, upnl_c = _pnl_fmt(upnl_raw)
-        rpnl, rpnl_c = _pnl_fmt(rpnl_raw)
+        upnl, upnl_c = _pnl_fmt('UnrealizedPnL')
+        rpnl, rpnl_c = _pnl_fmt('RealizedPnL')
 
         return (
-            '<div style="display:flex;gap:24px;font-size:13px;padding:4px 0">'
-            f'<span><b>Net Liq:</b> {nlv}</span>'
-            f'<span><b>Cash:</b> {cash}</span>'
-            f'<span><b>Buying Power:</b> {bp}</span>'
-            f'<span><b>Positions:</b> {gross}</span>'
-            f'<span><b>Unreal P&L:</b> <span style="color:{upnl_c}">{upnl}</span></span>'
-            f'<span><b>Real P&L:</b> <span style="color:{rpnl_c}">{rpnl}</span></span>'
+            '<div style="display:flex;gap:20px;flex-wrap:wrap;font-size:13px;'
+            'padding:6px 8px;background:#16213e;border-radius:6px;margin-bottom:4px">'
+            f'<span><span style="color:#888">Net Liq</span> <b>{nlv}</b></span>'
+            f'<span><span style="color:#888">Cash</span> <b>{cash}</b></span>'
+            f'<span><span style="color:#888">Buying Power</span> <b>{bp}</b></span>'
+            f'<span><span style="color:#888">Positions</span> <b>{gross}</b></span>'
+            f'<span><span style="color:#888">Unreal P&L</span> '
+            f'<b style="color:{upnl_c}">{upnl}</b></span>'
+            f'<span><span style="color:#888">Real P&L</span> '
+            f'<b style="color:{rpnl_c}">{rpnl}</b></span>'
             '</div>'
         )
 
-    # ── A. Order Form ────────────────────────────────────────────────
+    # ── Order Form ───────────────────────────────────────────────────
 
     direction_toggle = pn.widgets.RadioButtonGroup(
         name='Direction', options=['BUY', 'SELL'], value='BUY',
         button_style='outline', button_type='success')
 
     qty_input = pn.widgets.IntInput(
-        name='Shares', value=100, start=1, step=10, width=120)
+        name='Shares', value=100, start=1, step=10, width=100)
 
     order_type_select = pn.widgets.Select(
         name='Order Type', options=['Market', 'Limit', 'Stop'],
-        value='Market', width=120)
+        value='Market', width=100)
 
     session_select = pn.widgets.Select(
         name='Session', options=['RTH', 'Extended Hours', 'Overnight'],
-        value='RTH', width=140)
+        value='RTH', width=130)
 
     tif_select = pn.widgets.RadioButtonGroup(
         name='TIF', options=['DAY', 'GTC'], value='DAY',
         button_style='outline', button_type='default')
 
     submit_btn = pn.widgets.Button(
-        name='SUBMIT ORDER', button_type='success', width=160)
+        name='SUBMIT BUY', button_type='success', width=140, height=38)
 
-    status_msg = pn.pane.HTML('', height=30)
+    status_msg = pn.pane.HTML('', width=300)
 
-    # ── B. Price Slider (Limit/Stop only) ────────────────────────────
+    # ── Price Slider (Limit/Stop only) ───────────────────────────────
 
-    bid_label = pn.pane.HTML('<b>Bid:</b> --', width=100)
-    ask_label = pn.pane.HTML('<b>Ask:</b> --', width=100)
-    mid_label = pn.pane.HTML('Mid: --', styles={'text-align': 'center'})
+    bid_label = pn.pane.HTML('<b style="color:#888">Bid</b> --', width=90,
+                             margin=(0, 0, 0, 0))
+    ask_label = pn.pane.HTML('<b style="color:#888">Ask</b> --', width=90,
+                             margin=(0, 0, 0, 0))
+    mid_label = pn.pane.HTML('<span style="color:#888">Mid</span> --', width=90,
+                             margin=(0, 0, 0, 0))
 
     price_slider = pn.widgets.FloatSlider(
-        name='', start=0.0, end=1.0, step=0.01, value=0.0, width=300,
-        format='0.00')
+        name='', start=0.0, end=1.0, step=0.01, value=0.0,
+        sizing_mode='stretch_width', show_value=False, margin=(0, 10))
 
     price_input = pn.widgets.FloatInput(
-        name='Price', value=0.0, step=0.01, width=120, format='0.00')
+        name='Price', value=0.0, step=0.01, width=100, format='0.00')
 
     lock_toggle = pn.widgets.Toggle(
-        name='Unlocked', button_type='default', width=90, value=False)
+        name='Unlocked', button_type='default', width=80, height=38, value=False)
 
     slider_container = pn.Column(
-        pn.Row(bid_label, price_slider, ask_label),
-        pn.Row(pn.Spacer(width=100), mid_label, pn.Spacer(width=100)),
-        pn.Row(price_input, lock_toggle),
-        visible=False,
+        pn.Row(bid_label, price_slider, ask_label, mid_label,
+               sizing_mode='stretch_width', margin=(0, 0)),
+        pn.Row(price_input, lock_toggle, margin=(2, 0, 0, 0)),
+        visible=False, margin=(4, 0, 0, 0),
     )
 
     # Slider lock state
@@ -166,7 +173,6 @@ def order_entry_panel(state) -> pn.Column:
             submit_btn.name = 'SUBMIT SELL'
 
     direction_toggle.param.watch(_on_direction_change, 'value')
-    submit_btn.name = 'SUBMIT BUY'  # initial
 
     # ── Submit Logic ─────────────────────────────────────────────────
 
@@ -191,7 +197,7 @@ def order_entry_panel(state) -> pn.Column:
             price = price_input.value
             if price <= 0:
                 status_msg.object = ('<span style="color:#ff5252;font-weight:bold">'
-                                     'Price must be > 0 for Limit/Stop</span>')
+                                     'Price must be > 0</span>')
                 return
 
         result = state.ib_client.place_order(
@@ -209,10 +215,7 @@ def order_entry_panel(state) -> pn.Column:
 
     submit_btn.on_click(_on_submit)
 
-    # ── C. Order Blotter ─────────────────────────────────────────────
-
-    blotter_pane = pn.pane.HTML('', sizing_mode='stretch_width')
-    cancel_row = pn.Row()
+    # ── Order Blotter ────────────────────────────────────────────────
 
     def _render_blotter(order_version):
         if not state.ib_client:
@@ -240,7 +243,8 @@ def order_entry_panel(state) -> pn.Column:
             rows_html += (
                 f'<tr>'
                 f'<td style="padding:2px 6px">{entry["time"]}</td>'
-                f'<td style="padding:2px 6px;color:{action_color};font-weight:bold">{entry["action"]}</td>'
+                f'<td style="padding:2px 6px;color:{action_color};font-weight:bold">'
+                f'{entry["action"]}</td>'
                 f'<td style="padding:2px 6px">{entry["qty"]}</td>'
                 f'<td style="padding:2px 6px">{entry["order_type"]}</td>'
                 f'<td style="padding:2px 6px">{price_str}</td>'
@@ -291,7 +295,6 @@ def order_entry_panel(state) -> pn.Column:
     # ── Periodic Callback (250ms) — update slider + poll order status ─
 
     _last_log_snapshot = [None]
-
     _acct_counter = [0]
 
     def _periodic_update():
@@ -300,7 +303,7 @@ def order_entry_panel(state) -> pn.Column:
         if _acct_counter[0] % 8 == 0:
             account_pane.object = _render_account()
 
-        # Update bid/ask/mid slider
+        # Update bid/ask/mid and slider
         if state.ib_client:
             data = state.ib_client.get_price_data('TSLA')
             bid = data.get('bid', 0.0)
@@ -310,9 +313,12 @@ def order_entry_panel(state) -> pn.Column:
                 spread = ask - bid
                 pad = max(0.50, spread * 2)
 
-                bid_label.object = f'<b>Bid:</b> ${bid:.2f}'
-                ask_label.object = f'<b>Ask:</b> ${ask:.2f}'
-                mid_label.object = f'Mid: ${mid:.2f}'
+                bid_label.object = (f'<b style="color:#888">Bid</b> '
+                                    f'<span style="color:#00e676">${bid:.2f}</span>')
+                ask_label.object = (f'<b style="color:#888">Ask</b> '
+                                    f'<span style="color:#ff5252">${ask:.2f}</span>')
+                mid_label.object = (f'<span style="color:#888">Mid</span> '
+                                    f'${mid:.2f}')
 
                 if not _locked[0]:
                     _programmatic[0] = True
@@ -322,7 +328,6 @@ def order_entry_panel(state) -> pn.Column:
                     price_input.value = mid
                     _programmatic[0] = False
                 else:
-                    # Still update the range so slider doesn't clip
                     current_val = price_slider.value
                     new_start = round(min(bid - pad, current_val - 0.01), 2)
                     new_end = round(max(ask + pad, current_val + 0.01), 2)
@@ -349,6 +354,7 @@ def order_entry_panel(state) -> pn.Column:
         pn.Row(submit_btn, status_msg),
         styles={'background': '#1a1a2e', 'padding': '10px',
                 'border-radius': '8px', 'border': '1px solid #333'},
+        sizing_mode='stretch_width',
     )
 
     blotter = pn.Column(
@@ -357,11 +363,12 @@ def order_entry_panel(state) -> pn.Column:
         pn.bind(_render_cancel_buttons, state.param.order_version),
         styles={'background': '#1a1a2e', 'padding': '10px',
                 'border-radius': '8px', 'border': '1px solid #333'},
+        sizing_mode='stretch_width',
     )
 
-    panel = pn.Column(form, blotter, sizing_mode='stretch_width')
+    result = pn.Column(form, blotter, sizing_mode='stretch_width')
 
     # Register periodic callback
     pn.state.add_periodic_callback(_periodic_update, period=250)
 
-    return panel
+    return result

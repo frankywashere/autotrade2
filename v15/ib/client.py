@@ -321,9 +321,13 @@ class IBClient:
             return {}
         try:
             items = self.ib.accountSummary()
-            return {item.tag: item.value for item in items
-                    if item.currency in ('USD', '')}
-        except Exception:
+            if not items:
+                logger.warning("accountSummary() returned empty list")
+            result = {item.tag: item.value for item in items
+                      if item.currency in ('USD', '')}
+            return result
+        except Exception as e:
+            logger.error("get_account_summary failed: %s", e)
             return {}
 
     # ── Order Placement ──────────────────────────────────────────────
