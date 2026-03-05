@@ -141,11 +141,21 @@ class IBClient:
                     'time': datetime.now(),
                 }
 
-    def get_last_price(self, symbol: str) -> float:
-        """Read last price from cache. Returns 0.0 if unavailable."""
+    def get_last_price(self, symbol: str, max_age_s: float = 30.0) -> float:
+        """Read last price from cache. Returns 0.0 if unavailable or stale.
+
+        Args:
+            max_age_s: Max seconds since last tick before price is considered stale.
+                       Returns 0.0 if stale to force caller to handle missing data.
+        """
         with self._lock:
             data = self._prices.get(symbol)
             if not data:
+                return 0.0
+            # Staleness check: reject cached prices older than max_age_s
+            age = (datetime.now() - data['time']).total_seconds()
+            if age > max_age_s:
+                logger.warning("IB price STALE for %s: %.1fs old (limit %.0fs)", symbol, age, max_age_s)
                 return 0.0
             # Prefer last, fall back to mid of bid/ask
             if data['last'] > 0:

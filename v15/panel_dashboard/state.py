@@ -24,7 +24,7 @@ class DashboardState(param.Parameterized):
     tsla_price = param.Number(0.0)
     spy_price = param.Number(0.0)
     price_delta = param.Number(0.0)
-    price_source = param.String('bar close')  # 'LIVE', 'REST', 'bar close'
+    price_source = param.String('NONE')  # 'IB LIVE', 'WS', 'NONE'
 
     # Market data (loaded on startup, refreshed every 5 min)
     current_tsla = param.Parameter(None)      # 5-min OHLCV DataFrame
@@ -125,9 +125,9 @@ class DashboardState(param.Parameterized):
             logger.error("Initial analysis failed: %s\n%s", e, traceback.format_exc())
 
     def update_prices(self):
-        """2s periodic callback: fetch prices via IB, WebSocket, or yfinance REST."""
+        """2s periodic callback: fetch prices via IB (no fallback)."""
         price = 0.0
-        source = 'REST'
+        source = 'NONE'
 
         # Try IB first
         if self.ib_client and self.ib_client.is_connected():
@@ -143,7 +143,7 @@ class DashboardState(param.Parameterized):
         elif self.ib_client and not self.ib_client.is_connected():
             if self.ib_connected:
                 self.ib_connected = False
-                logger.warning("IB disconnected — falling back to REST")
+                logger.error("IB DISCONNECTED — no price source available!")
 
         # Try WebSocket if IB didn't provide price
         if price == 0.0 and self._ws_client:
@@ -156,47 +156,22 @@ class DashboardState(param.Parameterized):
                 if spy_tick.price != self.spy_price:
                     self.spy_price = spy_tick.price
 
-        # REST fallback if IB and WebSocket didn't provide fresh price
+        # NO FALLBACKS — IB must be the source of truth.
+        # yfinance REST and bar-close fallbacks removed: they mask stale/stuck prices.
         if price == 0.0:
-            try:
-                import yfinance as yf
-                tsla = yf.Ticker('TSLA')
-                info = tsla.info
-                price = float(
-                    info.get('preMarketPrice')
-                    or info.get('postMarketPrice')
-                    or info.get('regularMarketPrice')
-                    or 0
-                )
-                if price > 0:
-                    self._price_err_count = 0
-                    source = 'REST'
+            self._price_err_count += 1
+            if self._price_err_count <= 5 or self._price_err_count % 10 == 0:
+                logger.error("NO LIVE PRICE — IB returned 0 (count=%d). "
+                             "Check IB Gateway connection. No fallback.", self._price_err_count)
+            source = 'NONE'
 
-                # Only fetch SPY via REST if WebSocket didn't provide it
-                if not (self._ws_client and self._ws_client.get_price('SPY')
-                        and self._ws_client.get_price('SPY').is_fresh):
-                    spy = yf.Ticker('SPY')
-                    spy_info = spy.info
-                    spy_price = float(
-                        spy_info.get('preMarketPrice')
-                        or spy_info.get('postMarketPrice')
-                        or spy_info.get('regularMarketPrice')
-                        or 0
-                    )
-                    if spy_price > 0 and spy_price != self.spy_price:
-                        self.spy_price = spy_price
-            except Exception as e:
-                self._price_err_count += 1
-                if self._price_err_count <= 3 or self._price_err_count % 30 == 0:
-                    logger.warning("Price fetch failed (%d): %s", self._price_err_count, e)
-
-        # Fallback to last bar close if both WS and REST fail
-        if price == 0.0 and self.current_tsla is not None and len(self.current_tsla) > 0:
-            price = float(self.current_tsla['close'].iloc[-1])
-            source = 'bar close'
+        # Always update source label (so UI shows NONE when no price)
+        if source != self.price_source:
+            self.price_source = source
 
         if price > 0:
             self._price_updated_at = time.time()
+            self._price_err_count = 0
             price_changed = price != self.tsla_price
             if self._prev_price > 0:
                 new_delta = price - self._prev_price
@@ -205,8 +180,6 @@ class DashboardState(param.Parameterized):
             self._prev_price = self.tsla_price if self.tsla_price > 0 else price
             if price_changed:
                 self.tsla_price = price
-            if source != self.price_source:
-                self.price_source = source
 
         # Check exits if positions are open (both scanners)
         html_parts = []
@@ -414,7 +387,7 @@ class DashboardState(param.Parameterized):
             self._analysis_running = False
 
     def _init_ib(self):
-        """Try to connect to IB Gateway for real-time price streaming."""
+        """Connect to IB Gateway for real-time price streaming. Fails loudly."""
         try:
             from v15.ib.client import IBClient
             self.ib_client = IBClient(host='127.0.0.1', port=4002, client_id=1)
@@ -424,7 +397,7 @@ class DashboardState(param.Parameterized):
             self.ib_connected = True
             logger.info("IB connected — streaming TSLA + SPY")
         except Exception as e:
-            logger.warning("IB connection failed (falling back to yfinance): %s", e)
+            logger.error("IB CONNECTION FAILED — no live price source! %s", e)
             self.ib_client = None
             self.ib_connected = False
 

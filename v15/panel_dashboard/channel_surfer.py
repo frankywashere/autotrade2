@@ -92,10 +92,17 @@ def _price_banner(tsla_price, price_source, price_delta):
     delta_pct = price_delta / (tsla_price - price_delta) * 100 if (tsla_price - price_delta) != 0 else 0
 
     live_dot = ''
-    if price_source == 'LIVE':
+    if price_source == 'IB LIVE':
         live_dot = '<span style="color:#00e676;font-size:10px;">&#9679;</span> '
 
-    source_color = '#00e676' if price_source == 'LIVE' else '#ff9800' if 'REST' in price_source else '#888'
+    if price_source == 'IB LIVE':
+        source_color = '#00e676'
+    elif price_source == 'WS':
+        source_color = '#ff9800'
+    elif price_source == 'NONE':
+        source_color = '#ff5252'
+    else:
+        source_color = '#888'
 
     html = f"""
     <div style="display:flex;align-items:center;gap:16px;padding:8px 16px;

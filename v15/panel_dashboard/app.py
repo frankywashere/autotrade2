@@ -115,12 +115,15 @@ def _init_state():
     if gbt_err:
         startup_msg += f"\nGBT ERROR: {gbt_err[:200]}"
     ib_ok = getattr(_state, 'ib_connected', False)
-    startup_msg += f"\nIB Gateway: {'CONNECTED' if ib_ok else 'NOT CONNECTED (REST fallback)'}"
+    startup_msg += f"\nIB Gateway: {'CONNECTED' if ib_ok else 'NOT CONNECTED — NO LIVE PRICES!'}"
     _state.send_notification(startup_msg, title='c16 Startup')
 
     # Log IB status
     ib_ok = getattr(_state, 'ib_connected', False)
-    logger.info("IB Gateway: %s", "CONNECTED" if ib_ok else "NOT CONNECTED (using yfinance REST)")
+    if ib_ok:
+        logger.info("IB Gateway: CONNECTED")
+    else:
+        logger.error("IB Gateway: NOT CONNECTED — no live price source available!")
 
     _state.load_model_data()
     logger.info("Model data loaded. Keys=%d", len(_state.model_data))
