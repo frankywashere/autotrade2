@@ -316,8 +316,9 @@ def create_app():
         ],
         main=[
             pn.Tabs(
-                ('Channel Surfer', channel_surfer_tab(state)),
                 ('Model Comparisons', model_comparisons_tab(state)),
+                ('Channel Surfer', channel_surfer_tab(state)),
+                sizing_mode='stretch_width',
             ),
         ],
     )
