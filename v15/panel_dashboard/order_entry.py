@@ -54,7 +54,7 @@ def order_entry_panel(state) -> pn.Column:
 
         return (
             '<div style="display:flex;gap:20px;flex-wrap:wrap;font-size:13px;'
-            'padding:6px 8px;background:#16213e;border-radius:6px;margin-bottom:4px">'
+            'padding:6px 8px;background:#16213e;border-radius:6px">'
             f'<span><span style="color:#888">Net Liq</span> <b>{nlv}</b></span>'
             f'<span><span style="color:#888">Cash</span> <b>{cash}</b></span>'
             f'<span><span style="color:#888">Buying Power</span> <b>{bp}</b></span>'
@@ -67,10 +67,43 @@ def order_entry_panel(state) -> pn.Column:
         )
 
     # ── Order Form ───────────────────────────────────────────────────
+    # All widgets have no name/label — we use margin=(0,5) for tight spacing
 
-    buy_btn = pn.widgets.Button(name='BUY', button_type='success', width=65)
-    sell_btn = pn.widgets.Button(name='SELL', button_type='default', width=65)
+    buy_btn = pn.widgets.Button(
+        name='BUY', button_type='success', width=60, height=36, margin=(0, 2, 0, 0))
+    sell_btn = pn.widgets.Button(
+        name='SELL', button_type='default', width=60, height=36, margin=(0, 12, 0, 0))
     _direction = ['BUY']
+
+    qty_input = pn.widgets.IntInput(
+        value=100, start=1, step=10, width=80, height=36, margin=(0, 5, 0, 0))
+    qty_label = pn.pane.HTML(
+        '<span style="color:#888;font-size:11px">Shares</span>',
+        width=40, margin=(0, 2, 0, 0), align='center')
+
+    order_type_select = pn.widgets.Select(
+        options=['Market', 'Limit', 'Stop'], value='Market',
+        width=80, height=36, margin=(0, 5, 0, 0))
+    type_label = pn.pane.HTML(
+        '<span style="color:#888;font-size:11px">Type</span>',
+        width=30, margin=(0, 2, 0, 0), align='center')
+
+    session_select = pn.widgets.Select(
+        options=['RTH', 'Extended Hours', 'Overnight'], value='RTH',
+        width=120, height=36, margin=(0, 5, 0, 0))
+    session_label = pn.pane.HTML(
+        '<span style="color:#888;font-size:11px">Session</span>',
+        width=45, margin=(0, 2, 0, 0), align='center')
+
+    tif_select = pn.widgets.RadioButtonGroup(
+        options=['DAY', 'GTC'], value='DAY',
+        button_style='outline', button_type='default', margin=(0, 12, 0, 0))
+
+    submit_btn = pn.widgets.Button(
+        name='SUBMIT BUY', button_type='success', width=120, height=36,
+        margin=(0, 5, 0, 0))
+
+    status_msg = pn.pane.HTML('', width=200, margin=(0, 0, 0, 5), align='center')
 
     def _click_buy(event):
         _direction[0] = 'BUY'
@@ -89,48 +122,38 @@ def order_entry_panel(state) -> pn.Column:
     buy_btn.on_click(_click_buy)
     sell_btn.on_click(_click_sell)
 
-    qty_input = pn.widgets.IntInput(
-        name='Shares', value=100, start=1, step=10, width=90)
+    # ── Price Section (Limit/Stop only) ──────────────────────────────
 
-    order_type_select = pn.widgets.Select(
-        name='Type', options=['Market', 'Limit', 'Stop'],
-        value='Market', width=90)
-
-    session_select = pn.widgets.Select(
-        name='Session', options=['RTH', 'Extended Hours', 'Overnight'],
-        value='RTH', width=130)
-
-    tif_select = pn.widgets.RadioButtonGroup(
-        options=['DAY', 'GTC'], value='DAY',
-        button_style='outline', button_type='default')
-
-    submit_btn = pn.widgets.Button(
-        name='SUBMIT BUY', button_type='success', width=130)
-
-    status_msg = pn.pane.HTML('', width=250, margin=(8, 0, 0, 0))
-
-    # ── Price Slider (Limit/Stop only) ───────────────────────────────
+    price_info = pn.pane.HTML('', sizing_mode='stretch_width',
+                              margin=(0, 0, 0, 0))
 
     price_slider = pn.widgets.FloatSlider(
         name='', start=0.0, end=1.0, step=0.01, value=0.0,
-        width=400, show_value=False, margin=(5, 10, 0, 10))
+        sizing_mode='stretch_width', show_value=False,
+        margin=(0, 0, 0, 0))
 
     price_input = pn.widgets.FloatInput(
-        name='Price', value=0.0, step=0.01, width=90, format='0.00')
+        value=0.0, step=0.01, width=90, height=36, format='0.00',
+        margin=(0, 5, 0, 0))
+    price_label = pn.pane.HTML(
+        '<span style="color:#888;font-size:11px">Price $</span>',
+        width=42, margin=(0, 2, 0, 0), align='center')
 
     lock_toggle = pn.widgets.Toggle(
-        name='Unlocked', button_type='default', width=80, value=False)
-
-    price_info = pn.pane.HTML('', width=280, margin=(5, 0, 0, 0))
+        name='Unlocked', button_type='default', width=75, height=36,
+        value=False, margin=(0, 0, 0, 0))
 
     slider_container = pn.Column(
-        pn.Row(price_info, margin=(0, 0)),
-        pn.Row(price_slider, margin=(0, 0)),
-        pn.Row(price_input, lock_toggle, margin=(2, 0, 0, 0)),
-        visible=False, margin=(6, 0, 0, 0),
+        price_info,
+        price_slider,
+        pn.Row(price_label, price_input, lock_toggle, align='center',
+               margin=(2, 0, 0, 0)),
+        visible=False, margin=(8, 0, 0, 0),
+        styles={'background': '#16213e', 'padding': '8px',
+                'border-radius': '6px'},
+        sizing_mode='stretch_width',
     )
 
-    # Slider lock state
     _locked = [False]
     _programmatic = [False]
 
@@ -290,7 +313,7 @@ def order_entry_panel(state) -> pn.Column:
                 buttons.append(btn)
         return pn.Row(*buttons) if buttons else pn.Row()
 
-    # ── Periodic Callback (250ms) — update slider + poll order status ─
+    # ── Periodic Callback (250ms) ────────────────────────────────────
 
     _last_log_snapshot = [None]
     _acct_counter = [0]
@@ -310,15 +333,13 @@ def order_entry_panel(state) -> pn.Column:
                 pad = max(0.50, spread * 2)
 
                 price_info.object = (
-                    f'<span style="font-size:13px">'
-                    f'<b style="color:#00e676">Bid ${bid:.2f}</b>'
-                    f'&nbsp;&nbsp;│&nbsp;&nbsp;'
-                    f'<b style="color:#ff5252">Ask ${ask:.2f}</b>'
-                    f'&nbsp;&nbsp;│&nbsp;&nbsp;'
-                    f'Mid ${mid:.2f}'
-                    f'&nbsp;&nbsp;│&nbsp;&nbsp;'
-                    f'<span style="color:#888">Spread ${spread:.2f}</span>'
-                    f'</span>')
+                    f'<div style="display:flex;justify-content:space-between;'
+                    f'font-size:13px;padding:0 4px">'
+                    f'<span><b style="color:#00e676">Bid ${bid:.2f}</b></span>'
+                    f'<span>Mid <b>${mid:.2f}</b>'
+                    f'&nbsp;&nbsp;<span style="color:#888">Spd ${spread:.2f}</span></span>'
+                    f'<span><b style="color:#ff5252">Ask ${ask:.2f}</b></span>'
+                    f'</div>')
 
                 if not _locked[0]:
                     _programmatic[0] = True
@@ -344,27 +365,39 @@ def order_entry_panel(state) -> pn.Column:
 
     # ── Assemble ─────────────────────────────────────────────────────
 
+    controls_row = pn.Row(
+        buy_btn, sell_btn,
+        qty_label, qty_input,
+        type_label, order_type_select,
+        session_label, session_select,
+        tif_select,
+        submit_btn, status_msg,
+        align='center', margin=(8, 0, 4, 0),
+    )
+
     form = pn.Column(
-        pn.pane.HTML('<h4 style="margin:0 0 4px 0">Manual Order Entry (TSLA)</h4>'),
+        pn.pane.HTML(
+            '<b style="font-size:15px">Manual Order Entry (TSLA)</b>',
+            margin=(0, 0, 4, 0)),
         account_pane,
-        pn.Row(buy_btn, sell_btn, qty_input, order_type_select,
-               session_select, tif_select, submit_btn, status_msg,
-               align='end'),
+        controls_row,
         slider_container,
-        styles={'background': '#1a1a2e', 'padding': '10px',
+        styles={'background': '#1a1a2e', 'padding': '10px 12px',
                 'border-radius': '8px', 'border': '1px solid #333'},
         sizing_mode='stretch_width',
     )
 
     blotter = pn.Column(
-        pn.pane.HTML('<h4 style="margin:8px 0 4px 0">Order Blotter</h4>'),
+        pn.pane.HTML('<b style="font-size:13px">Order Blotter</b>',
+                     margin=(0, 0, 4, 0)),
         pn.bind(_render_blotter, state.param.order_version),
         pn.bind(_render_cancel_buttons, state.param.order_version),
-        styles={'background': '#1a1a2e', 'padding': '10px',
+        styles={'background': '#1a1a2e', 'padding': '10px 12px',
                 'border-radius': '8px', 'border': '1px solid #333'},
         sizing_mode='stretch_width',
     )
 
-    result = pn.Column(form, blotter, sizing_mode='stretch_width')
+    result = pn.Column(form, blotter, sizing_mode='stretch_width',
+                       margin=(0, 0, 5, 0))
     pn.state.add_periodic_callback(_periodic_update, period=250)
     return result
