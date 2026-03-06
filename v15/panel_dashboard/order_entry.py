@@ -358,14 +358,8 @@ def order_entry_panel(state) -> pn.Column:
                     price_slider.value = mid
                     price_input.value = mid
                     _programmatic[0] = False
-                else:
-                    current_val = price_slider.value
-                    new_start = round(min(bid - pad, current_val - 0.01), 2)
-                    new_end = round(max(ask + pad, current_val + 0.01), 2)
-                    _programmatic[0] = True
-                    price_slider.start = new_start
-                    price_slider.end = new_end
-                    _programmatic[0] = False
+                # Locked: don't touch slider at all — knob and range stay frozen
+                # Only bid/ask/mid labels above update (already done)
 
             log = state.ib_client.get_order_log()
             log_snapshot = [(e['order_id'], e['status']) for e in log]

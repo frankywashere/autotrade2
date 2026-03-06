@@ -86,6 +86,9 @@ class IBClient:
                 for symbol in list(self._contracts.keys()):
                     await self._subscribe_async(symbol)
 
+                # Wire up error handler for order rejections
+                self.ib.errorEvent += self._on_error
+
                 # Subscribe to account summary updates
                 await self._subscribe_account_async()
 
@@ -419,6 +422,16 @@ class IBClient:
                         entry['fill_time'] = datetime.now().strftime('%H:%M:%S')
                     break
         logger.info("Order %d status: %s", order_id, status)
+
+    def _on_error(self, reqId, errorCode, errorString, contract):
+        """Callback for IB errors — update order log if it's an order rejection."""
+        if reqId > 0:
+            with self._order_lock:
+                for entry in self._order_log:
+                    if entry['order_id'] == reqId and entry['status'] not in ('Filled', 'Cancelled'):
+                        entry['status'] = f'Rejected ({errorCode})'
+                        logger.warning("Order %d rejected: [%d] %s", reqId, errorCode, errorString)
+                        break
 
     def cancel_order(self, order_id: int) -> bool:
         """Cancel a pending order. Returns True if cancel request sent."""
