@@ -528,11 +528,11 @@ class DashboardState(param.Parameterized):
             time.sleep(30)  # Initial delay — let prices stabilize
             while True:
                 if self._bar_aggregator:
-                    # Wait for 5-min bar close (instant trigger) or timeout at 300s
-                    self._bar_aggregator.bar_close_event.wait(timeout=300)
+                    # Wait for 1-min interval or 5-min bar close (whichever first)
+                    self._bar_aggregator.bar_close_event.wait(timeout=60)
                     self._bar_aggregator.bar_close_event.clear()
                 else:
-                    time.sleep(150)  # fallback if no aggregator
+                    time.sleep(60)  # fallback if no aggregator
                 try:
                     self._run_analysis_bg()
                 except Exception as e:
