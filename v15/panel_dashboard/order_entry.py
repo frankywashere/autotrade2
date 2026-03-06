@@ -78,7 +78,7 @@ def order_entry_panel(state) -> pn.Column:
             return ('<div style="color:#888;font-size:12px;padding:4px 0">'
                     'No open positions</div>')
 
-        td = 'padding:2px 8px'
+        td = 'padding:2px 8px;color:#ccc'
         th = 'padding:2px 8px;text-align:left;color:#888'
         rows = ''
         for sym, p in sorted(positions.items()):
@@ -103,7 +103,7 @@ def order_entry_panel(state) -> pn.Column:
 
         return (
             f'<table style="width:100%;font-size:12px;border-collapse:collapse;'
-            f'margin:4px 0">'
+            f'color:#ccc;margin:4px 0">'
             f'<tr style="border-bottom:1px solid #333">'
             f'<th style="{th}">Symbol</th>'
             f'<th style="{th}">Side</th>'
