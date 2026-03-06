@@ -347,14 +347,19 @@ class IBClient:
 
     def place_order(self, symbol: str, action: str, qty: int,
                     order_type: str = 'MKT', price: float = 0.0,
-                    tif: str = 'DAY', outside_rth: bool = False) -> dict:
-        """Place an order via IB. Thread-safe (called from Panel UI thread)."""
+                    tif: str = 'DAY', outside_rth: bool = False,
+                    exchange: str = None) -> dict:
+        """Place an order via IB. Thread-safe (called from Panel UI thread).
+
+        Args:
+            exchange: Override exchange routing (e.g. 'OVERNIGHT' for overnight ATS).
+        """
         if not self.is_connected():
             return {'error': 'Not connected to IB'}
         try:
             future = asyncio.run_coroutine_threadsafe(
                 self._place_order_async(symbol, action, qty, order_type,
-                                        price, tif, outside_rth),
+                                        price, tif, outside_rth, exchange),
                 self._loop)
             return future.result(timeout=10)
         except Exception as e:
@@ -362,7 +367,7 @@ class IBClient:
             return {'error': str(e)}
 
     async def _place_order_async(self, symbol, action, qty, order_type,
-                                  price, tif, outside_rth):
+                                  price, tif, outside_rth, exchange=None):
         """Async order placement (runs in IB event loop)."""
         from ib_async import MarketOrder, LimitOrder, StopOrder
 
@@ -370,6 +375,10 @@ class IBClient:
         qualified = await self.ib.qualifyContractsAsync(contract)
         if qualified:
             contract = qualified[0]
+
+        # Override exchange for overnight routing
+        if exchange:
+            contract.exchange = exchange
 
         if order_type == 'MKT':
             order = MarketOrder(action, qty)
