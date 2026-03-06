@@ -37,6 +37,7 @@ class IBClient:
         self._trades = {}          # {order_id: ib_async.Trade} (this session only)
         self._order_log = []       # Unified blotter: open + completed from IB
         self._order_lock = threading.Lock()
+        self._order_time_cache = {}  # {perm_id: (order_time, sort_time)} for stable timestamps
         self._order_log_version = 0  # Bumped on any change
         # Account data (cached from IB event loop, read from Panel thread)
         self._account = {}         # {tag: value}
@@ -638,10 +639,15 @@ class IBClient:
                             order_time = completed_time[-8:] if len(completed_time) >= 8 else completed_time
                         break
 
-            # 4. Last resort: use order's lastFillPrice time or current time
-            if not sort_time and status in ('Filled', 'Cancelled'):
-                order_time = datetime.now().strftime('%H:%M:%S')
-                sort_time = datetime.now().isoformat()
+            # 4. Last resort: reuse previously cached time, or fall back to now
+            if not sort_time:
+                cached = self._order_time_cache.get(perm_id)
+                if cached:
+                    order_time, sort_time = cached
+                else:
+                    order_time = datetime.now().strftime('%H:%M:%S')
+                    sort_time = datetime.now().isoformat()
+                    self._order_time_cache[perm_id] = (order_time, sort_time)
 
             return {
                 'order_id': order_id,
