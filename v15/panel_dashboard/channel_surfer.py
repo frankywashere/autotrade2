@@ -463,18 +463,20 @@ def _position_card_html(pos, current_price: float) -> str:
 
 
 def _fmt_ts(iso_str: str) -> str:
-    """Format ISO timestamp to short HH:MM display."""
+    """Format ISO timestamp to short MM/DD HH:MM display."""
     try:
         from datetime import datetime
         dt = datetime.fromisoformat(iso_str)
-        return dt.strftime('%H:%M')
+        return dt.strftime('%m/%d %H:%M')
     except Exception:
         return ''
 
 
 def _trade_history_html(closed_trades) -> str:
+    # Sort by exit_time (full datetime) descending, then take last 50
+    sorted_trades = sorted(closed_trades, key=lambda t: getattr(t, 'exit_time', ''), reverse=True)[:50]
     rows = []
-    for t in reversed(closed_trades[-50:]):
+    for t in sorted_trades:
         pnl_color = '#00e676' if t.pnl >= 0 else '#ff5252'
         raw_source = getattr(t, 'signal_source', '')
         source = SOURCE_DISPLAY.get(raw_source, raw_source)
