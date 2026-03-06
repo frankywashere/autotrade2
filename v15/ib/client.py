@@ -74,6 +74,23 @@ class IBClient:
     async def _connect_and_run(self):
         """Connect and keep running. Auto-reconnect on disconnect."""
         delay = self._reconnect_delay
+        # Monkey-patch ib_async wrapper to preserve completedTime on Trade objects.
+        # ib_async discards OrderState (which has completedTime) when building Trade
+        # from completed orders — we patch to save it on OrderStatus as a custom attr.
+        _orig_completed = self.ib.wrapper.completedOrder
+
+        def _patched_completed(contract, order, orderState):
+            _orig_completed(contract, order, orderState)
+            # The Trade was just appended to results — attach completedTime
+            results = self.ib.wrapper._results.get("completedOrders", [])
+            if results:
+                trade = results[-1]
+                ct = getattr(orderState, 'completedTime', '')
+                if ct:
+                    trade.orderStatus.completedTime = ct
+
+        self.ib.wrapper.completedOrder = _patched_completed
+
         # Wire up events ONCE (before reconnect loop to avoid duplicates)
         self.ib.disconnectedEvent += self._on_disconnect
         self.ib.pendingTickersEvent += self._on_pending_tickers
@@ -623,21 +640,31 @@ class IBClient:
                             sort_time = ft.isoformat() if hasattr(ft, 'isoformat') else str(ft)
                             order_time = fill_time
 
-            # 3. Fallback: try completedTime on trade or orderStatus
+            # 3. Fallback: try completedTime on orderStatus (set by our monkey-patch)
             if not sort_time:
-                for attr_source in [trade, status_obj]:
-                    completed_time = getattr(attr_source, 'completedTime', '')
-                    if completed_time:
-                        sort_time = completed_time
-                        try:
-                            from datetime import datetime as dt
-                            ct = dt.fromisoformat(completed_time.replace('Z', '+00:00'))
-                            order_time = ct.strftime('%H:%M:%S')
-                            if not fill_time and status == 'Filled':
-                                fill_time = order_time
-                        except Exception:
+                completed_time = getattr(status_obj, 'completedTime', '')
+                if completed_time:
+                    sort_time = completed_time
+                    try:
+                        from datetime import datetime as dt
+                        # IB format: "YYYYMMDD-HH:MM:SS" or "YYYYMMDD HH:MM:SS"
+                        ct_clean = completed_time.replace('Z', '').strip()
+                        for fmt in ('%Y%m%d-%H:%M:%S', '%Y%m%d %H:%M:%S',
+                                    '%Y-%m-%dT%H:%M:%S', '%Y%m%d  %H:%M:%S'):
+                            try:
+                                ct = dt.strptime(ct_clean[:17], fmt)
+                                order_time = ct.strftime('%H:%M:%S')
+                                sort_time = ct.isoformat()
+                                if not fill_time and status == 'Filled':
+                                    fill_time = order_time
+                                break
+                            except ValueError:
+                                continue
+                        else:
+                            # Couldn't parse — use raw string
                             order_time = completed_time[-8:] if len(completed_time) >= 8 else completed_time
-                        break
+                    except Exception:
+                        order_time = completed_time[-8:] if len(completed_time) >= 8 else completed_time
 
             # 4. Last resort: reuse previously cached time, or fall back to now
             if not sort_time:
