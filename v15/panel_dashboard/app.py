@@ -316,8 +316,9 @@ def create_app():
         ],
         main=[
             pn.Tabs(
-                ('Model Comparisons', model_comparisons_tab(state)),
                 ('Channel Surfer', channel_surfer_tab(state)),
+                ('Model Comparisons', model_comparisons_tab(state)),
+                ('yfinance A/B', model_comparisons_tab(state, prefix='yf-')),
                 sizing_mode='stretch_width',
             ),
         ],
