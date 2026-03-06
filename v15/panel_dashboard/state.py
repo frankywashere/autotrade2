@@ -1462,6 +1462,29 @@ class DashboardState(param.Parameterized):
                 except Exception as e:
                     logger.warning("yf A/B OE eval failed: %s", e)
 
+        # Always check yf scanner exits using best available price
+        # (IB price loop may not be running if IB is disconnected)
+        exit_price = entry_price if entry_price > 0 else yf_price
+        if exit_price > 0:
+            for scnr in self._yf_scanners:
+                if scnr.positions:
+                    try:
+                        exit_alerts = scnr.check_exits(exit_price, exit_price, exit_price)
+                        if exit_alerts:
+                            self.load_model_data()
+                            if self._yf_intraday_trade_state:
+                                for ea in exit_alerts:
+                                    if getattr(ea, 'signal_source', '') == 'intraday':
+                                        ts = self._yf_intraday_trade_state
+                                        if getattr(ea, 'pnl', 0) > 0:
+                                            ts['consec_wins'] += 1
+                                            ts['consec_losses'] = 0
+                                        else:
+                                            ts['consec_losses'] += 1
+                                            ts['consec_wins'] = 0
+                    except Exception as e:
+                        logger.warning("yf exit check failed: %s", e)
+
     def _run_yf_analysis_bg(self):
         """Background-safe yfinance analysis: compute + apply."""
         if not self._yf_native_tf_data:
