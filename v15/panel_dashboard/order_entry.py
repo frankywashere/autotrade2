@@ -45,6 +45,7 @@ def order_entry_panel(state) -> pn.Column:
             except (ValueError, TypeError):
                 return str(val), '#aaa'
 
+        acct_id = acct.get('AccountCode', '')
         nlv = _fmt('NetLiquidation')
         cash = _fmt('TotalCashValue')
         bp = _fmt('BuyingPower')
@@ -52,9 +53,15 @@ def order_entry_panel(state) -> pn.Column:
         upnl, upnl_c = _pnl_fmt('UnrealizedPnL')
         rpnl, rpnl_c = _pnl_fmt('RealizedPnL')
 
+        # DU prefix = paper, U/F prefix = live
+        is_paper = acct_id.startswith('D')
+        acct_label = f'PAPER {acct_id}' if is_paper else f'LIVE {acct_id}'
+        acct_color = '#ffab00' if is_paper else '#ff5252'
+
         return (
             '<div style="display:flex;gap:20px;flex-wrap:wrap;font-size:13px;'
             'padding:6px 8px;background:#16213e;border-radius:6px">'
+            f'<span style="color:{acct_color};font-weight:bold">{acct_label}</span>'
             f'<span><span style="color:#888">Net Liq</span> <b>{nlv}</b></span>'
             f'<span><span style="color:#888">Cash</span> <b>{cash}</b></span>'
             f'<span><span style="color:#888">Buying Power</span> <b>{bp}</b></span>'
@@ -415,15 +422,14 @@ def order_entry_panel(state) -> pn.Column:
                     f'<span><b style="color:#ff5252">Ask ${ask:.2f}</b></span>'
                     f'</div>')
 
+                # Always update slider range to bid/ask
+                _programmatic[0] = True
+                price_slider.start = round(bid, 2)
+                price_slider.end = round(ask, 2)
                 if not _locked[0]:
-                    _programmatic[0] = True
-                    price_slider.start = round(bid - pad, 2)
-                    price_slider.end = round(ask + pad, 2)
                     price_slider.value = mid
                     price_input.value = mid
-                    _programmatic[0] = False
-                # Locked: don't touch slider at all — knob and range stay frozen
-                # Only bid/ask/mid labels above update (already done)
+                _programmatic[0] = False
 
             log = state.ib_client.get_order_log()
             log_snapshot = [(e['order_id'], e['status']) for e in log]

@@ -334,6 +334,8 @@ class IBClient:
                 for item in items:
                     if item.currency in ('USD', ''):
                         self._account[item.tag] = item.value
+                    if item.account and 'AccountCode' not in self._account:
+                        self._account['AccountCode'] = item.account
         except Exception as e:
             logger.error("_snapshot_account failed: %s", e)
 
