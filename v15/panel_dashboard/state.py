@@ -453,39 +453,41 @@ class DashboardState(param.Parameterized):
                                       scanner_14a_ml, scanner_14a_intra,
                                       label='',
                                       ml_history_buffer=None,
-                                      intraday_trade_state=None):
+                                      intraday_trade_state=None,
+                                      price_override=None):
         """Shared signal evaluation logic for both IB and yfinance paths."""
+        price = price_override if price_override and price_override > 0 else self.tsla_price
         sig = analysis.signal
         # --- CS-5TF ---
         if sig.action != 'HOLD':
             entry_alert = scanner_cs.evaluate_signal(
-                analysis, self.tsla_price, signal_source='CS-5TF')
+                analysis, price, signal_source='CS-5TF')
             if entry_alert and entry_alert.alert_type == 'ENTRY':
                 self.positions_version += 1
                 self.trades_version += 1
                 self.load_model_data()
             if scanner_14a:
                 a14 = scanner_14a.evaluate_signal(
-                    analysis, self.tsla_price, signal_source='CS-5TF')
+                    analysis, price, signal_source='CS-5TF')
                 if a14 and a14.alert_type == 'ENTRY':
                     self.positions_version += 1
                     self.trades_version += 1
                     self.load_model_data()
 
         # --- CS-DW ---
-        if scanner_dw and dw_analysis and self.tsla_price > 0:
+        if scanner_dw and dw_analysis and price > 0:
             try:
                 dw_sig = dw_analysis.signal
                 if dw_sig.action != 'HOLD':
                     dw_alert = scanner_dw.evaluate_signal(
-                        dw_analysis, self.tsla_price, signal_source='CS-DW')
+                        dw_analysis, price, signal_source='CS-DW')
                     if dw_alert and dw_alert.alert_type == 'ENTRY':
                         self.positions_version += 1
                         self.trades_version += 1
                         self.load_model_data()
                     if scanner_14a_dw:
                         a14dw = scanner_14a_dw.evaluate_signal(
-                            dw_analysis, self.tsla_price, signal_source='CS-DW')
+                            dw_analysis, price, signal_source='CS-DW')
                         if a14dw and a14dw.alert_type == 'ENTRY':
                             self.positions_version += 1
                             self.trades_version += 1
@@ -503,6 +505,7 @@ class DashboardState(param.Parameterized):
             scanner_ml=scanner_ml, scanner_14a_ml=scanner_14a_ml,
             label=label,
             history_buffer=ml_history_buffer,
+            price_override=price_override,
         )
 
         # --- Intraday ---
@@ -511,6 +514,7 @@ class DashboardState(param.Parameterized):
             scanner_intra=scanner_intra, scanner_14a_intra=scanner_14a_intra,
             label=label,
             intraday_trade_state=intraday_trade_state,
+            price_override=price_override,
         )
 
     def start_background_loops(self):
@@ -964,7 +968,7 @@ class DashboardState(param.Parameterized):
 
     def _evaluate_surfer_ml_with(self, *, analysis, current_tsla, native_tf_data,
                                   scanner_ml, scanner_14a_ml, label='',
-                                  history_buffer=None):
+                                  history_buffer=None, price_override=None):
         """Evaluate Surfer ML signal: physics signal + ML gate.
 
         ML model must agree with the signal direction to accept the trade.
@@ -972,7 +976,8 @@ class DashboardState(param.Parameterized):
         """
         if not scanner_ml or not self._ml_model or not analysis:
             return
-        if self.tsla_price <= 0:
+        _price = price_override if price_override and price_override > 0 else self.tsla_price
+        if _price <= 0:
             return
 
         sig = analysis.signal
@@ -1095,11 +1100,11 @@ class DashboardState(param.Parameterized):
         # Evaluate through scanner_ml (ML informs but doesn't gate)
         try:
             entry_alert = scanner_ml.evaluate_signal(
-                analysis, self.tsla_price, signal_source='surfer_ml',
+                analysis, _price, signal_source='surfer_ml',
                 el_flagged=el_flagged, trail_width_mult=trail_width)
             if entry_alert and entry_alert.alert_type == 'ENTRY':
                 logger.info("[%s] Surfer ML trade OPENED: %s @ $%.2f",
-                             label, sig.action, self.tsla_price)
+                             label, sig.action, _price)
                 self.positions_version += 1
                 self.trades_version += 1
                 self.load_model_data()
@@ -1114,7 +1119,7 @@ class DashboardState(param.Parameterized):
         if scanner_14a_ml:
             try:
                 a14ml = scanner_14a_ml.evaluate_signal(
-                    analysis, self.tsla_price, signal_source='surfer_ml')
+                    analysis, _price, signal_source='surfer_ml')
                 if a14ml and a14ml.alert_type == 'ENTRY':
                     self.positions_version += 1
                     self.trades_version += 1
@@ -1133,13 +1138,14 @@ class DashboardState(param.Parameterized):
 
     def _evaluate_intraday_with(self, *, analysis, current_tsla,
                                  scanner_intra, scanner_14a_intra, label='',
-                                 intraday_trade_state=None):
+                                 intraday_trade_state=None, price_override=None):
         """Extract 5-min features from analysis and evaluate intraday signal."""
         if analysis is None or not analysis.tf_states:
             return
         if current_tsla is None or len(current_tsla) == 0:
             return
-        if scanner_intra is None or self.tsla_price <= 0:
+        _price = price_override if price_override and price_override > 0 else self.tsla_price
+        if scanner_intra is None or _price <= 0:
             return
 
         tf_states = analysis.tf_states
@@ -1326,7 +1332,7 @@ class DashboardState(param.Parameterized):
                 logger.info("[%s] Intraday signal REJECTED by ML filter (pre-entry)", label)
             else:
                 alert = scanner_intra.evaluate_intraday_signal(
-                    current_price=self.tsla_price,
+                    current_price=_price,
                     cp5=cp5, vwap_dist=vwap_dist,
                     daily_cp=daily_cp, h1_cp=h1_cp, h4_cp=h4_cp,
                     daily_slope=daily_slope, h1_slope=h1_slope, h4_slope=h4_slope,
@@ -1344,7 +1350,7 @@ class DashboardState(param.Parameterized):
         if scanner_14a_intra:
             try:
                 a14i = scanner_14a_intra.evaluate_intraday_signal(
-                    current_price=self.tsla_price,
+                    current_price=_price,
                     cp5=cp5, vwap_dist=vwap_dist,
                     daily_cp=daily_cp, h1_cp=h1_cp, h4_cp=h4_cp,
                     daily_slope=daily_slope, h1_slope=h1_slope, h4_slope=h4_slope,
@@ -1403,11 +1409,19 @@ class DashboardState(param.Parameterized):
                      analysis.signal.primary_tf,
                      analysis.signal.confidence * 100)
 
-        # Use IB live price for entry decisions — with freshness guard (fix #6)
+        # Use IB live price for entry decisions; fall back to yfinance last close if IB stale
         price_age = time.time() - self._price_updated_at if self._price_updated_at > 0 else 999
-        if price_age > 5:
-            logger.warning("[yf] Skipping signal eval — IB price is %.1fs stale (limit 5s)", price_age)
-        elif self.scanner_yf and self.tsla_price > 0:
+        yf_price = 0.0
+        if tsla_df is not None and len(tsla_df) > 0:
+            yf_price = float(tsla_df['close'].iloc[-1])
+        if price_age > 5 and yf_price > 0:
+            entry_price = yf_price
+            logger.info("[yf] IB price stale (%.0fs) — using yfinance price $%.2f", price_age, yf_price)
+        elif self.tsla_price > 0:
+            entry_price = self.tsla_price
+        else:
+            entry_price = yf_price  # last resort
+        if self.scanner_yf and entry_price > 0:
             self._apply_analysis_results_with(
                 tsla_df=self._yf_current_tsla,
                 analysis=analysis,
@@ -1424,9 +1438,10 @@ class DashboardState(param.Parameterized):
                 label='yf',
                 ml_history_buffer=self._yf_ml_history_buffer,
                 intraday_trade_state=self._yf_intraday_trade_state,
+                price_override=entry_price,
             )
             # OE signals for yf path
-            if self.scanner_yf_oe and self._yf_native_tf_data and self.tsla_price > 0:
+            if self.scanner_yf_oe and self._yf_native_tf_data and entry_price > 0:
                 try:
                     from v15.core.oe_signals5 import check_oe_signal
                     if check_oe_signal(self._yf_native_tf_data):
@@ -1439,7 +1454,7 @@ class DashboardState(param.Parameterized):
                         )
                         mock_analysis = SimpleNamespace(signal=mock_signal, atr=None)
                         alert = self.scanner_yf_oe.evaluate_signal(
-                            mock_analysis, self.tsla_price, signal_source='oe_signals5')
+                            mock_analysis, entry_price, signal_source='oe_signals5')
                         if alert and alert.alert_type == 'ENTRY':
                             self.positions_version += 1
                             self.trades_version += 1
