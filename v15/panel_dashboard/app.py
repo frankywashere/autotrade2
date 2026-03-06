@@ -318,7 +318,6 @@ def create_app():
             pn.Tabs(
                 ('Channel Surfer', channel_surfer_tab(state)),
                 ('Model Comparisons', model_comparisons_tab(state)),
-                dynamic=True,
             ),
         ],
     )
