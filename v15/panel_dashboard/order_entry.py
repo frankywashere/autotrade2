@@ -259,6 +259,7 @@ def order_entry_panel(state) -> pn.Column:
 
         outside_rth = session != 'RTH'
         exchange = None
+        price = 0.0
         if session == 'Overnight':
             tif = 'GTC'
             exchange = 'OVERNIGHT'
@@ -275,16 +276,15 @@ def order_entry_panel(state) -> pn.Column:
                                          'No bid/ask for overnight market order</span>')
                     return
 
-        price_val = price
-        if otype in ('LMT', 'STP') and price_val == 0.0:
-            price_val = price_input.value
-            if price_val <= 0:
+        if otype in ('LMT', 'STP') and price == 0.0:
+            price = price_input.value
+            if price <= 0:
                 status_msg.object = ('<span style="color:#ff5252;font-weight:bold">'
                                      'Price must be > 0</span>')
                 return
 
         result = state.ib_client.place_order(
-            'TSLA', action, qty, order_type=otype, price=price_val,
+            'TSLA', action, qty, order_type=otype, price=price,
             tif=tif, outside_rth=outside_rth, exchange=exchange)
 
         if 'error' in result:
