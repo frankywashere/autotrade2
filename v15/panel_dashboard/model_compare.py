@@ -19,12 +19,120 @@ def model_comparisons_tab(state, prefix='') -> pn.Column:
                 "Same configs, different data source." if prefix == 'yf-'
                 else "Compares live performance across all scanner models. "
                      "Refreshes every hour.")
-    return pn.Column(
-        pn.pane.Markdown(f"## {title}\n{subtitle}"),
-        pn.bind(_model_content, state.param.model_data_version,
-                model_data=state.model_data, prefix=prefix),
-        sizing_mode='stretch_width',
-    )
+    parts = [pn.pane.Markdown(f"## {title}\n{subtitle}")]
+
+    # Live status panel for yfinance A/B tab
+    if prefix == 'yf-':
+        parts.append(pn.bind(_yf_live_status, state.param.yf_status_version,
+                             state=state))
+
+    parts.append(pn.bind(_model_content, state.param.model_data_version,
+                         model_data=state.model_data, prefix=prefix))
+
+    return pn.Column(*parts, sizing_mode='stretch_width')
+
+
+def _yf_live_status(version, state=None):
+    """Live status banner for yfinance A/B tab — shows current signal, price, scanner states."""
+    yf_status = state.yf_status if state else None
+    if not yf_status:
+        return pn.pane.HTML(
+            '<div style="background:#1a1a2e;border:1px solid #333;border-radius:8px;'
+            'padding:12px;margin-bottom:12px;color:#888;">'
+            'Waiting for first yfinance analysis cycle (runs every 150s)...</div>',
+            sizing_mode='stretch_width',
+        )
+
+    price = yf_status.get('price', 0)
+    sig_action = yf_status.get('signal', 'HOLD')
+    confidence = yf_status.get('confidence', 0)
+    primary_tf = yf_status.get('primary_tf', '?')
+    reason = yf_status.get('reason', '')
+    update_time = yf_status.get('time', '?')
+    data_bars = yf_status.get('data_bars', 0)
+    dw_sig = yf_status.get('dw_signal')
+
+    # Signal color
+    sig_colors = {'BUY': '#00e676', 'SELL': '#ff5252', 'HOLD': '#888'}
+    sig_color = sig_colors.get(sig_action, '#888')
+
+    # DW signal line
+    dw_html = ''
+    if dw_sig:
+        dw_color = sig_colors.get(dw_sig['action'], '#888')
+        dw_html = (f'<span style="margin-left:24px;">DW: '
+                   f'<b style="color:{dw_color}">{dw_sig["action"]}</b> '
+                   f'{dw_sig["confidence"]:.0%} ({dw_sig["primary_tf"]})</span>')
+
+    # Per-scanner status rows
+    scanner_cells = []
+    for s in yf_status.get('scanners', []):
+        tag = s['tag']
+        n_pos = s['positions']
+        n_closed = s['closed']
+        dpnl = s['daily_pnl']
+        dpnl_color = '#00e676' if dpnl >= 0 else '#ff5252'
+        last = s.get('last_signal')
+        if last:
+            ls_color = sig_colors.get(last['action'], '#888')
+            ls_text = (f'<span style="color:{ls_color}">{last["action"]}</span> '
+                       f'{last["confidence"]:.0%} ({last.get("signal_source", "?")})')
+        else:
+            ls_text = '<span style="color:#555">no signals yet</span>'
+        scanner_cells.append(
+            f'<tr style="border-bottom:1px solid #2a2a3e;">'
+            f'<td style="padding:3px 8px;font-weight:500;">{tag}</td>'
+            f'<td style="padding:3px 8px;">{ls_text}</td>'
+            f'<td style="padding:3px 8px;">{n_pos} open</td>'
+            f'<td style="padding:3px 8px;">{n_closed} closed</td>'
+            f'<td style="padding:3px 8px;color:{dpnl_color}">${dpnl:+,.0f}</td>'
+            f'</tr>'
+        )
+
+    scanner_table = ''
+    if scanner_cells:
+        scanner_table = (
+            '<table style="width:100%;font-size:12px;color:#aaa;border-collapse:collapse;'
+            'margin-top:8px;">'
+            '<thead><tr style="color:#666;border-bottom:1px solid #333;">'
+            '<th style="text-align:left;padding:2px 8px;">Scanner</th>'
+            '<th style="text-align:left;padding:2px 8px;">Last Signal</th>'
+            '<th style="text-align:left;padding:2px 8px;">Positions</th>'
+            '<th style="text-align:left;padding:2px 8px;">Trades</th>'
+            '<th style="text-align:left;padding:2px 8px;">Daily P&L</th>'
+            '</tr></thead>'
+            f'<tbody>{"".join(scanner_cells)}</tbody></table>'
+        )
+
+    html = f"""
+    <div style="background:#1a1a2e;border:1px solid #333;border-radius:8px;
+                padding:12px;margin-bottom:12px;">
+        <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+            <div>
+                <span style="color:#666;font-size:11px;">YF PRICE</span><br>
+                <span style="color:#fff;font-size:18px;font-weight:600;">
+                    ${price:,.2f}</span>
+            </div>
+            <div>
+                <span style="color:#666;font-size:11px;">CS-5TF SIGNAL</span><br>
+                <span style="color:{sig_color};font-size:18px;font-weight:600;">
+                    {sig_action}</span>
+                <span style="color:#aaa;font-size:13px;">
+                    {confidence:.0%} ({primary_tf})</span>
+            </div>
+            <div>
+                <span style="color:#666;font-size:11px;">LAST ANALYSIS</span><br>
+                <span style="color:#ccc;font-size:14px;">{update_time}</span>
+                <span style="color:#666;font-size:11px;margin-left:4px;">
+                    ({data_bars} bars)</span>
+            </div>
+            {f'<div><span style="color:#666;font-size:11px;">CS-DW</span><br>{dw_html}</div>' if dw_html else ''}
+        </div>
+        {f'<div style="color:#666;font-size:11px;margin-top:6px;">Reason: {reason}</div>' if reason else ''}
+        {scanner_table}
+    </div>
+    """
+    return pn.pane.HTML(html, sizing_mode='stretch_width')
 
 
 def _model_content(version, model_data=None, prefix=''):

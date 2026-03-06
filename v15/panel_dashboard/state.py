@@ -87,6 +87,10 @@ class DashboardState(param.Parameterized):
     _price_updated_at = param.Number(0.0, precedence=-1)  # time.time() of last successful price fetch
     _last_intraday_exit_check = param.Number(0.0, precedence=-1)  # throttle intraday exits to 5s
 
+    # yfinance A/B live status (for dashboard display)
+    yf_status = param.Dict({}, precedence=-1)
+    yf_status_version = param.Integer(0)  # Bump to trigger yf status re-render
+
     @property
     def _all_scanners(self):
         """All scanner instances (c16 + c14a + yf-*) for iteration."""
@@ -1381,15 +1385,46 @@ class DashboardState(param.Parameterized):
         if tsla_df is not None and len(tsla_df) > 0:
             self._yf_current_tsla = tsla_df
 
+        sig = analysis.signal
         logger.info("yf A/B analysis complete: %s %s (%.0f%%)",
-                     analysis.signal.action,
-                     analysis.signal.primary_tf,
-                     analysis.signal.confidence * 100)
+                     sig.action, sig.primary_tf, sig.confidence * 100)
 
         # yf scanners use yfinance price ONLY — fully independent of IB
         yf_price = 0.0
         if tsla_df is not None and len(tsla_df) > 0:
             yf_price = float(tsla_df['close'].iloc[-1])
+
+        # Update yf live status for dashboard display
+        now_str = datetime.now().strftime('%H:%M:%S')
+        scanner_statuses = []
+        for scnr in self._yf_scanners:
+            if scnr is None:
+                continue
+            last_sig = scnr.signal_history[-1] if scnr.signal_history else None
+            scanner_statuses.append({
+                'tag': scnr.model_tag,
+                'positions': len(scnr.positions),
+                'closed': len(scnr.closed_trades),
+                'daily_pnl': scnr.daily_pnl,
+                'last_signal': last_sig,
+            })
+        dw_sig_info = None
+        if dw_analysis:
+            dw_s = dw_analysis.signal
+            dw_sig_info = {'action': dw_s.action, 'confidence': dw_s.confidence,
+                           'primary_tf': dw_s.primary_tf}
+        self.yf_status = {
+            'price': yf_price,
+            'time': now_str,
+            'signal': sig.action,
+            'confidence': sig.confidence,
+            'primary_tf': sig.primary_tf,
+            'reason': getattr(sig, 'reason', ''),
+            'dw_signal': dw_sig_info,
+            'scanners': scanner_statuses,
+            'data_bars': len(tsla_df) if tsla_df is not None else 0,
+        }
+        self.yf_status_version += 1
         if self.scanner_yf and yf_price > 0:
             self._apply_analysis_results_with(
                 tsla_df=self._yf_current_tsla,
@@ -1468,6 +1503,13 @@ class DashboardState(param.Parameterized):
                     self._apply_yf_analysis_results(*results)
         except Exception as e:
             logger.error("yf A/B analysis failed: %s\n%s", e, traceback.format_exc())
+            self.yf_status = {
+                'price': 0, 'time': datetime.now().strftime('%H:%M:%S'),
+                'signal': 'ERROR', 'confidence': 0, 'primary_tf': '',
+                'reason': str(e)[:100], 'dw_signal': None,
+                'scanners': [], 'data_bars': 0,
+            }
+            self.yf_status_version += 1
         finally:
             self._yf_analysis_running = False
 
