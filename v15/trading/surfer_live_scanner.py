@@ -974,8 +974,8 @@ class SurferLiveScanner:
             # --- Trailing stop (branched by signal source) ---
             if exit_reason is None:
                 if is_intraday:
-                    # Intraday: trail = 0.006 * (1 - conf)^6
-                    trail_pct = 0.006 * (1.0 - pos.confidence) ** 6
+                    # Intraday: trail = 0.006 * (1 - conf)^6, floored at 0.2%
+                    trail_pct = max(0.002, 0.006 * (1.0 - pos.confidence) ** 6)
                     if pos.direction == 'long' and pos.best_price > pos.entry_price:
                         trail_price = pos.best_price * (1.0 - trail_pct)
                         trail_price = max(trail_price, pos.stop_price)

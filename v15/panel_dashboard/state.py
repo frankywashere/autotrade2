@@ -85,6 +85,7 @@ class DashboardState(param.Parameterized):
     _er_model = param.Parameter(None, precedence=-1)   # ExtendedRunPredictor
     _ws_client = param.Parameter(None, precedence=-1)  # UNUSED — kept for param compat
     _price_updated_at = param.Number(0.0, precedence=-1)  # time.time() of last successful price fetch
+    _last_intraday_exit_check = param.Number(0.0, precedence=-1)  # throttle intraday exits to 5s
 
     @property
     def _all_scanners(self):
@@ -270,11 +271,20 @@ class DashboardState(param.Parameterized):
                 self.tsla_price = price
 
         # Check exits — main scanners bump UI versions, yf scanners don't
+        # Intraday scanners throttled to every 5s (tick noise causes instant stopouts)
         html_parts = []
         main_exit_alerts = []
         yf_exit_alerts = []
+        now_ts = time.time()
+        intraday_due = (now_ts - self._last_intraday_exit_check) >= 5.0
+        intraday_scanners = {self.scanner_intra, self.scanner_14a_intra,
+                             self.scanner_yf_intra, self.scanner_yf_14a_intra}
+        if intraday_due:
+            self._last_intraday_exit_check = now_ts
         for scnr in self._main_scanners:
             if scnr.positions and price > 0:
+                if scnr in intraday_scanners and not intraday_due:
+                    continue
                 try:
                     exit_alerts = scnr.check_exits(price, price, price)
                     if exit_alerts:
@@ -285,6 +295,8 @@ class DashboardState(param.Parameterized):
                     logger.warning("Exit check failed: %s", e)
         for scnr in self._yf_scanners:
             if scnr.positions and price > 0:
+                if scnr in intraday_scanners and not intraday_due:
+                    continue
                 try:
                     exit_alerts = scnr.check_exits(price, price, price)
                     if exit_alerts:
