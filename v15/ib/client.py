@@ -72,6 +72,13 @@ class IBClient:
     async def _connect_and_run(self):
         """Connect and keep running. Auto-reconnect on disconnect."""
         delay = self._reconnect_delay
+        # Wire up events ONCE (before reconnect loop to avoid duplicates)
+        self.ib.disconnectedEvent += self._on_disconnect
+        self.ib.pendingTickersEvent += self._on_pending_tickers
+        self.ib.errorEvent += self._on_error
+        self.ib.updatePortfolioEvent += self._on_portfolio_update
+        self.ib.accountSummaryEvent += self._on_account_summary
+
         while True:
             try:
                 await self.ib.connectAsync(
@@ -79,23 +86,15 @@ class IBClient:
                 self._connected = True
                 delay = self._reconnect_delay  # reset backoff
 
-                # Wire up disconnect handler
-                self.ib.disconnectedEvent += self._on_disconnect
-                # Wire up tick handler
-                self.ib.pendingTickersEvent += self._on_pending_tickers
-
-                logger.info("IB event loop running")
+                logger.info("IB event loop running (server v%d)",
+                            self.ib.client.serverVersion())
                 # Re-subscribe any previously subscribed symbols
                 for symbol in list(self._contracts.keys()):
                     await self._subscribe_async(symbol)
 
-                # Wire up error handler for order rejections
-                self.ib.errorEvent += self._on_error
-
-                # Subscribe to account summary + portfolio updates
+                # Subscribe to account summary + snapshot positions
                 await self._subscribe_account_async()
                 self._snapshot_positions()
-                self.ib.updatePortfolioEvent += self._on_portfolio_update
 
                 # Run until disconnected
                 while self.ib.isConnected():
@@ -259,11 +258,7 @@ class IBClient:
 
     async def _fetch_historical_async(self, contract, duration, bar_size, use_rth):
         """Async wrapper for reqHistoricalData."""
-        # VIX is an index — use TRADES for stocks, TRADES for indices too
-        # (IB accepts TRADES for most; could also use MIDPOINT for indices)
         what_to_show = 'TRADES'
-        if hasattr(contract, 'secType') and contract.secType == 'IND':
-            what_to_show = 'TRADES'
         bars = await self.ib.reqHistoricalDataAsync(
             contract,
             endDateTime='',
@@ -319,8 +314,6 @@ class IBClient:
             await asyncio.wait_for(self.ib.reqAccountSummaryAsync(), timeout=10)
             # Snapshot initial data from wrapper cache into thread-safe dict
             self._snapshot_account()
-            # Wire up event for live updates
-            self.ib.accountSummaryEvent += self._on_account_summary
             logger.info("Subscribed to account summary (%d tags cached)",
                         len(self._account))
         except Exception as e:
@@ -480,15 +473,24 @@ class IBClient:
                     break
         logger.info("Order %d status: %s", order_id, status)
 
+    # IB warning codes that do NOT indicate order rejection
+    _IB_WARNING_CODES = {
+        105, 110, 161, 165, 321, 329, 399, 404, 434, 492,
+        2100, 2101, 2102, 2103, 2104, 2105, 2106, 2107, 2108, 2109,
+        2110, 2137, 2158, 2169, 10167, 10197,
+    }
+
     def _on_error(self, reqId, errorCode, errorString, contract):
-        """Callback for IB errors — update order log if it's an order rejection."""
-        if reqId > 0:
+        """Callback for IB errors — update order log only for real rejections."""
+        if reqId > 0 and errorCode not in self._IB_WARNING_CODES:
             with self._order_lock:
                 for entry in self._order_log:
                     if entry['order_id'] == reqId and entry['status'] not in ('Filled', 'Cancelled'):
                         entry['status'] = f'Rejected ({errorCode})'
                         logger.warning("Order %d rejected: [%d] %s", reqId, errorCode, errorString)
                         break
+        elif reqId > 0:
+            logger.info("Order %d warning: [%d] %s", reqId, errorCode, errorString)
 
     def cancel_order(self, order_id: int) -> bool:
         """Cancel a pending order. Returns True if cancel request sent."""

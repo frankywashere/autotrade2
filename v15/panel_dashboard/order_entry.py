@@ -229,8 +229,10 @@ def order_entry_panel(state) -> pn.Column:
         lock_toggle.name = 'Locked'
         lock_toggle.button_type = 'warning'
         _programmatic[0] = True
-        price_slider.value = event.new
-        _programmatic[0] = False
+        try:
+            price_slider.value = event.new
+        finally:
+            _programmatic[0] = False
 
     def _on_lock_toggle(event):
         _locked[0] = event.new
@@ -425,12 +427,14 @@ def order_entry_panel(state) -> pn.Column:
 
                 # Always update slider range to bid/ask
                 _programmatic[0] = True
-                price_slider.start = round(bid, 2)
-                price_slider.end = round(ask, 2)
-                if not _locked[0]:
-                    price_slider.value = mid
-                    price_input.value = mid
-                _programmatic[0] = False
+                try:
+                    price_slider.start = round(bid, 2)
+                    price_slider.end = round(ask, 2)
+                    if not _locked[0]:
+                        price_slider.value = mid
+                        price_input.value = mid
+                finally:
+                    _programmatic[0] = False
 
             log = state.ib_client.get_order_log()
             log_snapshot = [(e['order_id'], e['status']) for e in log]
