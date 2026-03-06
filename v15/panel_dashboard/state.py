@@ -274,11 +274,9 @@ class DashboardState(param.Parameterized):
         # Intraday scanners throttled to every 5s (tick noise causes instant stopouts)
         html_parts = []
         main_exit_alerts = []
-        yf_exit_alerts = []
         now_ts = time.time()
         intraday_due = (now_ts - self._last_intraday_exit_check) >= 5.0
-        intraday_scanners = {self.scanner_intra, self.scanner_14a_intra,
-                             self.scanner_yf_intra, self.scanner_yf_14a_intra}
+        intraday_scanners = {self.scanner_intra, self.scanner_14a_intra}
         if intraday_due:
             self._last_intraday_exit_check = now_ts
         for scnr in self._main_scanners:
@@ -293,16 +291,7 @@ class DashboardState(param.Parameterized):
                             main_exit_alerts.append(ea)
                 except Exception as e:
                     logger.warning("Exit check failed: %s", e)
-        for scnr in self._yf_scanners:
-            if scnr.positions and price > 0:
-                if scnr in intraday_scanners and not intraday_due:
-                    continue
-                try:
-                    exit_alerts = scnr.check_exits(price, price, price)
-                    if exit_alerts:
-                        yf_exit_alerts.extend(exit_alerts)
-                except Exception as e:
-                    logger.warning("yf exit check failed: %s", e)
+        # yf scanner exits are handled in _apply_yf_analysis_results (yfinance price only)
 
         if main_exit_alerts:
             self.exit_alert_html = '\n'.join(html_parts)
@@ -321,22 +310,10 @@ class DashboardState(param.Parameterized):
                             ts['consec_losses'] += 1
                             ts['consec_wins'] = 0
 
-        if yf_exit_alerts:
-            self.load_model_data()  # Update model comparisons tab only
-            # Update yf-specific intraday trade state
-            if self._yf_intraday_trade_state:
-                for ea in yf_exit_alerts:
-                    if getattr(ea, 'signal_source', '') == 'intraday':
-                        ts = self._yf_intraday_trade_state
-                        if getattr(ea, 'pnl', 0) > 0:
-                            ts['consec_wins'] += 1
-                            ts['consec_losses'] = 0
-                        else:
-                            ts['consec_losses'] += 1
-                            ts['consec_wins'] = 0
+        # yf exit alerts handled in _apply_yf_analysis_results
         # Bump version for live P&L updates only when price actually changed
-        elif not all_exit_alerts and (price_changed if price > 0 else False):
-            has_positions = any(s.positions for s in self._all_scanners)
+        elif not main_exit_alerts and (price_changed if price > 0 else False):
+            has_positions = any(s.positions for s in self._main_scanners)
             if has_positions:
                 self.positions_version += 1
 
@@ -1409,19 +1386,11 @@ class DashboardState(param.Parameterized):
                      analysis.signal.primary_tf,
                      analysis.signal.confidence * 100)
 
-        # Use IB live price for entry decisions; fall back to yfinance last close if IB stale
-        price_age = time.time() - self._price_updated_at if self._price_updated_at > 0 else 999
+        # yf scanners use yfinance price ONLY — fully independent of IB
         yf_price = 0.0
         if tsla_df is not None and len(tsla_df) > 0:
             yf_price = float(tsla_df['close'].iloc[-1])
-        if price_age > 5 and yf_price > 0:
-            entry_price = yf_price
-            logger.info("[yf] IB price stale (%.0fs) — using yfinance price $%.2f", price_age, yf_price)
-        elif self.tsla_price > 0:
-            entry_price = self.tsla_price
-        else:
-            entry_price = yf_price  # last resort
-        if self.scanner_yf and entry_price > 0:
+        if self.scanner_yf and yf_price > 0:
             self._apply_analysis_results_with(
                 tsla_df=self._yf_current_tsla,
                 analysis=analysis,
@@ -1438,10 +1407,10 @@ class DashboardState(param.Parameterized):
                 label='yf',
                 ml_history_buffer=self._yf_ml_history_buffer,
                 intraday_trade_state=self._yf_intraday_trade_state,
-                price_override=entry_price,
+                price_override=yf_price,
             )
             # OE signals for yf path
-            if self.scanner_yf_oe and self._yf_native_tf_data and entry_price > 0:
+            if self.scanner_yf_oe and self._yf_native_tf_data and yf_price > 0:
                 try:
                     from v15.core.oe_signals5 import check_oe_signal
                     if check_oe_signal(self._yf_native_tf_data):
@@ -1454,7 +1423,7 @@ class DashboardState(param.Parameterized):
                         )
                         mock_analysis = SimpleNamespace(signal=mock_signal, atr=None)
                         alert = self.scanner_yf_oe.evaluate_signal(
-                            mock_analysis, entry_price, signal_source='oe_signals5')
+                            mock_analysis, yf_price, signal_source='oe_signals5')
                         if alert and alert.alert_type == 'ENTRY':
                             self.positions_version += 1
                             self.trades_version += 1
@@ -1462,14 +1431,12 @@ class DashboardState(param.Parameterized):
                 except Exception as e:
                     logger.warning("yf A/B OE eval failed: %s", e)
 
-        # Always check yf scanner exits using best available price
-        # (IB price loop may not be running if IB is disconnected)
-        exit_price = entry_price if entry_price > 0 else yf_price
-        if exit_price > 0:
+        # Check yf scanner exits using yfinance price only
+        if yf_price > 0:
             for scnr in self._yf_scanners:
                 if scnr.positions:
                     try:
-                        exit_alerts = scnr.check_exits(exit_price, exit_price, exit_price)
+                        exit_alerts = scnr.check_exits(yf_price, yf_price, yf_price)
                         if exit_alerts:
                             self.load_model_data()
                             if self._yf_intraday_trade_state:
