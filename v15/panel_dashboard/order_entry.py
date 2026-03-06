@@ -234,24 +234,35 @@ def order_entry_panel(state) -> pn.Column:
                 f'Order #{result["order_id"]} {result["status"]}</span>')
             state.order_version += 1
 
+        # Clear status message after 3 seconds
+        def _clear_status():
+            status_msg.object = ''
+        pn.state.add_periodic_callback(_clear_status, period=3000, count=1)
+
     submit_btn.on_click(_on_submit)
 
     # ── Order Blotter ────────────────────────────────────────────────
 
     def _render_blotter(order_version):
         if not state.ib_client:
-            return '<div style="color:#888;font-size:12px">IB not connected</div>'
+            return pn.pane.HTML(
+                '<div style="color:#888;font-size:12px">IB not connected</div>')
         log = state.ib_client.get_order_log()
         if not log:
-            return '<div style="color:#888;font-size:12px">No orders yet</div>'
+            return pn.pane.HTML(
+                '<div style="color:#888;font-size:12px">No orders yet</div>')
 
+        # Build blotter as a Column: HTML table + cancel buttons per pending row
         rows_html = ''
+        pending_ids = []
+        td = 'padding:2px 6px'
         for entry in reversed(log):
             status = entry['status']
             if status == 'Filled':
                 color = '#00e676'
-            elif status in ('Submitted', 'PreSubmitted'):
+            elif status in ('Submitted', 'PreSubmitted', 'PendingSubmit'):
                 color = '#ffab00'
+                pending_ids.append(entry['order_id'])
             elif status == 'Cancelled':
                 color = '#ff5252'
             else:
@@ -260,48 +271,48 @@ def order_entry_panel(state) -> pn.Column:
             price_str = f"${entry['price']:.2f}" if entry['price'] > 0 else '--'
             fill_str = f"${entry['fill_price']:.2f}" if entry['fill_price'] > 0 else '--'
             action_color = '#00e676' if entry['action'] == 'BUY' else '#ff5252'
+            oid = entry['order_id']
 
             rows_html += (
                 f'<tr>'
-                f'<td style="padding:2px 6px">{entry["time"]}</td>'
-                f'<td style="padding:2px 6px;color:{action_color};font-weight:bold">'
+                f'<td style="{td};color:#888">#{oid}</td>'
+                f'<td style="{td}">{entry["time"]}</td>'
+                f'<td style="{td};color:{action_color};font-weight:bold">'
                 f'{entry["action"]}</td>'
-                f'<td style="padding:2px 6px">{entry["qty"]}</td>'
-                f'<td style="padding:2px 6px">{entry["order_type"]}</td>'
-                f'<td style="padding:2px 6px">{price_str}</td>'
-                f'<td style="padding:2px 6px;color:{color};font-weight:bold">{status}</td>'
-                f'<td style="padding:2px 6px">{fill_str}</td>'
-                f'<td style="padding:2px 6px">{entry["fill_time"]}</td>'
+                f'<td style="{td}">{entry["qty"]}</td>'
+                f'<td style="{td}">{entry["order_type"]}</td>'
+                f'<td style="{td}">{price_str}</td>'
+                f'<td style="{td};color:{color};font-weight:bold">{status}</td>'
+                f'<td style="{td}">{fill_str}</td>'
+                f'<td style="{td}">{entry["fill_time"]}</td>'
                 f'</tr>'
             )
 
-        return (
-            '<table style="width:100%;font-size:12px;border-collapse:collapse">'
-            '<tr style="border-bottom:1px solid #444">'
-            '<th style="padding:2px 6px;text-align:left">Time</th>'
-            '<th style="padding:2px 6px;text-align:left">Action</th>'
-            '<th style="padding:2px 6px;text-align:left">Qty</th>'
-            '<th style="padding:2px 6px;text-align:left">Type</th>'
-            '<th style="padding:2px 6px;text-align:left">Price</th>'
-            '<th style="padding:2px 6px;text-align:left">Status</th>'
-            '<th style="padding:2px 6px;text-align:left">Fill</th>'
-            '<th style="padding:2px 6px;text-align:left">Fill Time</th>'
-            '</tr>'
-            f'{rows_html}'
-            '</table>'
+        th = 'padding:2px 6px;text-align:left'
+        table_html = (
+            f'<table style="width:100%;font-size:12px;border-collapse:collapse">'
+            f'<tr style="border-bottom:1px solid #444">'
+            f'<th style="{th}">ID</th>'
+            f'<th style="{th}">Time</th>'
+            f'<th style="{th}">Action</th>'
+            f'<th style="{th}">Qty</th>'
+            f'<th style="{th}">Type</th>'
+            f'<th style="{th}">Price</th>'
+            f'<th style="{th}">Status</th>'
+            f'<th style="{th}">Fill</th>'
+            f'<th style="{th}">Fill Time</th>'
+            f'</tr>{rows_html}</table>'
         )
 
-    def _render_cancel_buttons(order_version):
-        if not state.ib_client:
-            return pn.Row()
-        log = state.ib_client.get_order_log()
-        buttons = []
-        for entry in reversed(log):
-            if entry['status'] in ('Submitted', 'PreSubmitted'):
-                oid = entry['order_id']
+        items = [pn.pane.HTML(table_html, sizing_mode='stretch_width')]
+
+        # Add cancel buttons for pending orders
+        if pending_ids:
+            cancel_btns = []
+            for oid in pending_ids:
                 btn = pn.widgets.Button(
                     name=f"Cancel #{oid}", button_type='danger',
-                    width=100, height=28)
+                    width=100, height=26)
 
                 def _make_cancel(order_id):
                     def _cancel(event):
@@ -310,8 +321,10 @@ def order_entry_panel(state) -> pn.Column:
                     return _cancel
 
                 btn.on_click(_make_cancel(oid))
-                buttons.append(btn)
-        return pn.Row(*buttons) if buttons else pn.Row()
+                cancel_btns.append(btn)
+            items.append(pn.Row(*cancel_btns, margin=(4, 0, 0, 0)))
+
+        return pn.Column(*items)
 
     # ── Periodic Callback (250ms) ────────────────────────────────────
 
@@ -391,7 +404,6 @@ def order_entry_panel(state) -> pn.Column:
         pn.pane.HTML('<b style="font-size:13px">Order Blotter</b>',
                      margin=(0, 0, 4, 0)),
         pn.bind(_render_blotter, state.param.order_version),
-        pn.bind(_render_cancel_buttons, state.param.order_version),
         styles={'background': '#1a1a2e', 'padding': '10px 12px',
                 'border-radius': '8px', 'border': '1px solid #333'},
         sizing_mode='stretch_width',
