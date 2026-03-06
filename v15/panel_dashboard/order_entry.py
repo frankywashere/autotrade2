@@ -66,6 +66,55 @@ def order_entry_panel(state) -> pn.Column:
             '</div>'
         )
 
+    # ── Open Positions ───────────────────────────────────────────────
+
+    positions_pane = pn.pane.HTML('', sizing_mode='stretch_width')
+
+    def _render_positions():
+        if not state.ib_client or not state.ib_client.is_connected():
+            return ''
+        positions = state.ib_client.get_positions()
+        if not positions:
+            return ('<div style="color:#888;font-size:12px;padding:4px 0">'
+                    'No open positions</div>')
+
+        td = 'padding:2px 8px'
+        th = 'padding:2px 8px;text-align:left;color:#888'
+        rows = ''
+        for sym, p in sorted(positions.items()):
+            qty = p['position']
+            direction = 'LONG' if qty > 0 else 'SHORT'
+            dir_color = '#00e676' if qty > 0 else '#ff5252'
+            upnl = p['unrealizedPNL']
+            pnl_color = '#00e676' if upnl >= 0 else '#ff5252'
+            pnl_sign = '+' if upnl > 0 else ''
+            rows += (
+                f'<tr>'
+                f'<td style="{td};font-weight:bold">{sym}</td>'
+                f'<td style="{td};color:{dir_color}">{direction}</td>'
+                f'<td style="{td}">{abs(qty):.0f}</td>'
+                f'<td style="{td}">${p["avgCost"]:.2f}</td>'
+                f'<td style="{td}">${p["marketPrice"]:.2f}</td>'
+                f'<td style="{td}">${p["marketValue"]:,.0f}</td>'
+                f'<td style="{td};color:{pnl_color};font-weight:bold">'
+                f'{pnl_sign}${upnl:,.0f}</td>'
+                f'</tr>'
+            )
+
+        return (
+            f'<table style="width:100%;font-size:12px;border-collapse:collapse;'
+            f'margin:4px 0">'
+            f'<tr style="border-bottom:1px solid #333">'
+            f'<th style="{th}">Symbol</th>'
+            f'<th style="{th}">Side</th>'
+            f'<th style="{th}">Qty</th>'
+            f'<th style="{th}">Avg Cost</th>'
+            f'<th style="{th}">Mkt Price</th>'
+            f'<th style="{th}">Mkt Value</th>'
+            f'<th style="{th}">Unreal P&L</th>'
+            f'</tr>{rows}</table>'
+        )
+
     # ── Order Form ───────────────────────────────────────────────────
 
     buy_btn = pn.widgets.Button(
@@ -346,6 +395,7 @@ def order_entry_panel(state) -> pn.Column:
         _acct_counter[0] += 1
         if _acct_counter[0] % 8 == 0:
             account_pane.object = _render_account()
+            positions_pane.object = _render_positions()
 
         if state.ib_client:
             data = state.ib_client.get_price_data('TSLA')
@@ -398,6 +448,7 @@ def order_entry_panel(state) -> pn.Column:
             '<b style="font-size:15px">Manual Order Entry (TSLA)</b>',
             margin=(0, 0, 4, 0)),
         account_pane,
+        positions_pane,
         controls_row,
         slider_container,
         styles={'background': '#1a1a2e', 'padding': '10px 12px',

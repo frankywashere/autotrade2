@@ -40,6 +40,9 @@ class IBClient:
         # Account data (cached from IB event loop, read from Panel thread)
         self._account = {}         # {tag: value}
         self._account_lock = threading.Lock()
+        # Portfolio positions (cached from IB event loop)
+        self._positions = {}       # {symbol: {position, avgCost, marketPrice, marketValue, unrealizedPNL, realizedPNL}}
+        self._positions_lock = threading.Lock()
 
     # ── Connection ───────────────────────────────────────────────────
 
@@ -89,8 +92,10 @@ class IBClient:
                 # Wire up error handler for order rejections
                 self.ib.errorEvent += self._on_error
 
-                # Subscribe to account summary updates
+                # Subscribe to account summary + portfolio updates
                 await self._subscribe_account_async()
+                self._snapshot_positions()
+                self.ib.updatePortfolioEvent += self._on_portfolio_update
 
                 # Run until disconnected
                 while self.ib.isConnected():
@@ -342,6 +347,47 @@ class IBClient:
         """Return account summary as {tag: value} dict (thread-safe)."""
         with self._account_lock:
             return dict(self._account)
+
+    # ── Portfolio Positions ───────────────────────────────────────────
+
+    def _snapshot_positions(self):
+        """Read initial positions from wrapper (called after connect)."""
+        try:
+            for item in self.ib.portfolio():
+                symbol = item.contract.symbol
+                with self._positions_lock:
+                    self._positions[symbol] = {
+                        'position': float(item.position),
+                        'avgCost': float(item.averageCost),
+                        'marketPrice': float(item.marketPrice),
+                        'marketValue': float(item.marketValue),
+                        'unrealizedPNL': float(item.unrealizedPNL),
+                        'realizedPNL': float(item.realizedPNL),
+                    }
+            logger.info("Portfolio snapshot: %d positions", len(self._positions))
+        except Exception as e:
+            logger.error("_snapshot_positions failed: %s", e)
+
+    def _on_portfolio_update(self, item):
+        """Callback fired by ib_async on portfolio update."""
+        symbol = item.contract.symbol
+        with self._positions_lock:
+            if item.position == 0:
+                self._positions.pop(symbol, None)
+            else:
+                self._positions[symbol] = {
+                    'position': float(item.position),
+                    'avgCost': float(item.averageCost),
+                    'marketPrice': float(item.marketPrice),
+                    'marketValue': float(item.marketValue),
+                    'unrealizedPNL': float(item.unrealizedPNL),
+                    'realizedPNL': float(item.realizedPNL),
+                }
+
+    def get_positions(self) -> dict:
+        """Return open positions as {symbol: {...}} dict (thread-safe)."""
+        with self._positions_lock:
+            return {k: dict(v) for k, v in self._positions.items()}
 
     # ── Order Placement ──────────────────────────────────────────────
 
