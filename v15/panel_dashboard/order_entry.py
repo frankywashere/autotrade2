@@ -270,7 +270,7 @@ def order_entry_panel(state) -> pn.Column:
         overnight = False
         price = 0.0
         if session == 'Overnight':
-            tif = 'GTC'
+            tif = 'DAY'
             overnight = True
             if otype == 'MKT':
                 otype = 'LMT'
