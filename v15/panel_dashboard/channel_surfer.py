@@ -462,6 +462,16 @@ def _position_card_html(pos, current_price: float) -> str:
     )
 
 
+def _fmt_ts(iso_str: str) -> str:
+    """Format ISO timestamp to short HH:MM display."""
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(iso_str)
+        return dt.strftime('%H:%M')
+    except Exception:
+        return ''
+
+
 def _trade_history_html(closed_trades) -> str:
     rows = []
     for t in reversed(closed_trades[-50:]):
@@ -471,13 +481,17 @@ def _trade_history_html(closed_trades) -> str:
         source_tag = (f'<span style="color:#64b5f6;font-size:10px;background:#1a237e;'
                       f'padding:1px 4px;border-radius:3px;margin-right:4px;">'
                       f'{source}</span>') if source else ''
+        entry_ts = _fmt_ts(getattr(t, 'entry_time', ''))
+        exit_ts = _fmt_ts(getattr(t, 'exit_time', ''))
+        time_str = f'{entry_ts}→{exit_ts}' if entry_ts and exit_ts else ''
         rows.append(
             f'<div style="font-size:12px;border-left:3px solid {pnl_color};'
             f'padding:3px 8px;margin:2px 0;">'
             f'{source_tag}'
             f'<b style="color:{pnl_color}">${t.pnl:+,.0f}</b> '
             f'<span style="color:#888">{t.direction.upper()} | {t.exit_reason} | '
-            f'{t.hold_minutes:.0f}m | Entry ${t.entry_price:.2f} Exit ${t.exit_price:.2f}</span>'
+            f'{t.hold_minutes:.0f}m | Entry ${t.entry_price:.2f} Exit ${t.exit_price:.2f}'
+            f'{" | " + time_str if time_str else ""}</span>'
             f'</div>'
         )
     return ''.join(rows)

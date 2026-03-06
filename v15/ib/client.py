@@ -33,10 +33,11 @@ class IBClient:
         self._bar_aggregators = {} # {symbol: LiveBarAggregator}
         self._reconnect_delay = 2  # seconds, with exponential backoff
         self.tick_event = threading.Event()  # Set on every tick for instant wakeup
-        # Order tracking
-        self._trades = {}          # {order_id: ib_async.Trade}
-        self._order_log = []       # List of dicts for blotter (max 50)
+        # Order tracking — IB is source of truth
+        self._trades = {}          # {order_id: ib_async.Trade} (this session only)
+        self._order_log = []       # Unified blotter: open + completed from IB
         self._order_lock = threading.Lock()
+        self._order_log_version = 0  # Bumped on any change
         # Account data (cached from IB event loop, read from Panel thread)
         self._account = {}         # {tag: value}
         self._account_lock = threading.Lock()
@@ -95,6 +96,9 @@ class IBClient:
                 # Subscribe to account summary + snapshot positions
                 await self._subscribe_account_async()
                 self._snapshot_positions()
+
+                # Fetch all open + completed orders from IB
+                await self._sync_orders_from_ib()
 
                 # Run until disconnected
                 while self.ib.isConnected():
@@ -440,40 +444,22 @@ class IBClient:
 
         with self._order_lock:
             self._trades[order_id] = trade
-            entry = {
-                'order_id': order_id,
-                'time': datetime.now().strftime('%H:%M:%S'),
-                'symbol': symbol,
-                'action': action,
-                'qty': qty,
-                'order_type': order_type,
-                'price': price,
-                'status': trade.orderStatus.status or 'Submitted',
-                'fill_price': 0.0,
-                'fill_time': '',
-            }
-            self._order_log.append(entry)
-            if len(self._order_log) > 50:
-                self._order_log = self._order_log[-50:]
 
         trade.statusEvent += self._on_order_status
         logger.info("Order placed: %s %d %s %s @ %.2f (id=%d)",
                      action, qty, symbol, order_type, price, order_id)
-        return {'order_id': order_id, 'status': entry['status'], 'message': 'OK'}
+
+        # Let _on_order_status handle the sync (avoid blocking the UI thread)
+        return {'order_id': order_id, 'status': trade.orderStatus.status or 'Submitted', 'message': 'OK'}
 
     def _on_order_status(self, trade):
-        """Callback fired by ib_async on order status change."""
+        """Callback fired by ib_async on order status change — re-sync from IB."""
         order_id = trade.order.orderId
         status = trade.orderStatus.status
-        with self._order_lock:
-            for entry in self._order_log:
-                if entry['order_id'] == order_id:
-                    entry['status'] = status
-                    if status == 'Filled':
-                        entry['fill_price'] = trade.orderStatus.avgFillPrice
-                        entry['fill_time'] = datetime.now().strftime('%H:%M:%S')
-                    break
         logger.info("Order %d status: %s", order_id, status)
+        # Schedule a re-sync to update the blotter from IB source of truth
+        if self._loop and self._connected:
+            asyncio.run_coroutine_threadsafe(self._sync_orders_from_ib(), self._loop)
 
     # IB warning codes that do NOT indicate order rejection
     _IB_WARNING_CODES = {
@@ -483,41 +469,213 @@ class IBClient:
     }
 
     def _on_error(self, reqId, errorCode, errorString, contract):
-        """Callback for IB errors — update order log only for real rejections."""
+        """Callback for IB errors — log warnings vs rejections."""
         if reqId > 0 and errorCode not in self._IB_WARNING_CODES:
-            with self._order_lock:
-                for entry in self._order_log:
-                    if entry['order_id'] == reqId and entry['status'] not in ('Filled', 'Cancelled'):
-                        entry['status'] = f'Rejected ({errorCode})'
-                        logger.warning("Order %d rejected: [%d] %s", reqId, errorCode, errorString)
-                        break
+            logger.warning("Order %d rejected: [%d] %s", reqId, errorCode, errorString)
+            # Re-sync to pick up the rejection status
+            if self._loop and self._connected:
+                asyncio.run_coroutine_threadsafe(self._sync_orders_from_ib(), self._loop)
         elif reqId > 0:
             logger.info("Order %d warning: [%d] %s", reqId, errorCode, errorString)
 
     def cancel_order(self, order_id: int) -> bool:
-        """Cancel a pending order. Returns True if cancel request sent."""
+        """Cancel a pending order by orderId or permId. Returns True if cancel request sent."""
         with self._order_lock:
             trade = self._trades.get(order_id)
-        if not trade:
-            logger.warning("cancel_order: order_id %d not found", order_id)
-            return False
+            # Also check by permId (cancel buttons use permId)
+            if not trade:
+                for t in self._trades.values():
+                    if t.order.permId == order_id:
+                        trade = t
+                        break
+        if trade:
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._cancel_order_async(trade), self._loop)
+                future.result(timeout=5)
+                return True
+            except Exception as e:
+                logger.error("cancel_order failed: %s", e)
+                return False
+        # Not in our session trades — try to find it in IB's open trades
         try:
             future = asyncio.run_coroutine_threadsafe(
-                self._cancel_order_async(trade), self._loop)
-            future.result(timeout=5)
-            return True
+                self._cancel_order_by_id_async(order_id), self._loop)
+            return future.result(timeout=5)
         except Exception as e:
-            logger.error("cancel_order failed: %s", e)
+            logger.error("cancel_order (by id) failed: %s", e)
             return False
 
     async def _cancel_order_async(self, trade):
         """Async cancel (runs in IB event loop)."""
         self.ib.cancelOrder(trade.order)
 
+    async def _cancel_order_by_id_async(self, order_id):
+        """Cancel an order by ID — searches IB's open trades."""
+        for trade in self.ib.openTrades():
+            if trade.order.orderId == order_id or trade.order.permId == order_id:
+                self.ib.cancelOrder(trade.order)
+                logger.info("Cancel sent for order %d (found in IB open trades)", order_id)
+                return True
+        logger.warning("cancel_order: order_id %d not found in IB open trades", order_id)
+        return False
+
+    # ── IB Order Sync (source of truth) ──────────────────────────────
+
+    async def _sync_orders_from_ib(self):
+        """Fetch open + completed orders from IB and rebuild _order_log."""
+        try:
+            # Request ALL open orders across all client IDs (populates ib.openTrades cache)
+            await self.ib.reqAllOpenOrdersAsync()
+            open_trades = self.ib.openTrades()
+            # Request completed orders (last 24h)
+            completed = await self.ib.reqCompletedOrdersAsync(apiOnly=False)
+
+            orders = {}  # keyed by permId to deduplicate
+
+            # Process open trades
+            for trade in open_trades:
+                entry = self._trade_to_entry(trade)
+                if entry:
+                    orders[entry['perm_id']] = entry
+                    # Also store Trade object for cancel support
+                    with self._order_lock:
+                        self._trades[trade.order.orderId] = trade
+
+            # Process completed orders
+            for trade in completed:
+                entry = self._trade_to_entry(trade)
+                if entry:
+                    # Don't overwrite open with completed (open is more current)
+                    if entry['perm_id'] not in orders:
+                        orders[entry['perm_id']] = entry
+
+            # Sort by time descending (newest first), limit to 50
+            sorted_orders = sorted(orders.values(),
+                                   key=lambda e: e.get('sort_time', ''),
+                                   reverse=True)[:50]
+
+            with self._order_lock:
+                # Only bump version if data actually changed (fix #8)
+                old_snapshot = [(e.get('perm_id'), e.get('status')) for e in self._order_log]
+                new_snapshot = [(e.get('perm_id'), e.get('status')) for e in sorted_orders]
+                self._order_log = sorted_orders
+                if new_snapshot != old_snapshot:
+                    self._order_log_version += 1
+
+        except Exception as e:
+            logger.error("_sync_orders_from_ib failed: %s", e)
+
+    def _trade_to_entry(self, trade) -> dict:
+        """Convert an ib_async Trade or CompletedOrder to a blotter entry."""
+        try:
+            order = trade.order
+            status_obj = trade.orderStatus
+            contract = trade.contract
+
+            # Determine order type string
+            otype = getattr(order, 'orderType', 'UNK')
+            if otype == 'MKT':
+                price = 0.0
+            elif otype == 'LMT':
+                price = getattr(order, 'lmtPrice', 0.0)
+            elif otype == 'STP':
+                price = getattr(order, 'auxPrice', 0.0)
+            else:
+                price = getattr(order, 'lmtPrice', 0.0) or getattr(order, 'auxPrice', 0.0)
+
+            status = getattr(status_obj, 'status', 'Unknown')
+            fill_price = getattr(status_obj, 'avgFillPrice', 0.0)
+            order_id = getattr(order, 'orderId', 0)
+            perm_id = getattr(order, 'permId', order_id)
+
+            # Extract time from trade log entries, fills, or order attributes
+            order_time = ''
+            sort_time = ''
+            fill_time = ''
+
+            # 1. Try trade.log (populated for live/open trades)
+            if hasattr(trade, 'log') and trade.log:
+                first_log = trade.log[0]
+                t = getattr(first_log, 'time', None)
+                if t:
+                    order_time = t.strftime('%H:%M:%S')
+                    sort_time = t.isoformat()
+                # Fill time from last Filled log entry
+                if status == 'Filled':
+                    for log_entry in reversed(trade.log):
+                        if getattr(log_entry, 'status', '') == 'Filled':
+                            t2 = getattr(log_entry, 'time', None)
+                            if t2:
+                                fill_time = t2.strftime('%H:%M:%S')
+                            break
+
+            # 2. Try fills list (has execution times)
+            if not fill_time and hasattr(trade, 'fills') and trade.fills:
+                last_fill = trade.fills[-1]
+                exec_obj = getattr(last_fill, 'execution', None)
+                if exec_obj:
+                    ft = getattr(exec_obj, 'time', None)
+                    if ft:
+                        fill_time = ft.strftime('%H:%M:%S') if hasattr(ft, 'strftime') else str(ft)[:8]
+                        if not sort_time:
+                            sort_time = ft.isoformat() if hasattr(ft, 'isoformat') else str(ft)
+                            order_time = fill_time
+
+            # 3. Fallback: try completedTime on trade or orderStatus
+            if not sort_time:
+                for attr_source in [trade, status_obj]:
+                    completed_time = getattr(attr_source, 'completedTime', '')
+                    if completed_time:
+                        sort_time = completed_time
+                        try:
+                            from datetime import datetime as dt
+                            ct = dt.fromisoformat(completed_time.replace('Z', '+00:00'))
+                            order_time = ct.strftime('%H:%M:%S')
+                            if not fill_time and status == 'Filled':
+                                fill_time = order_time
+                        except Exception:
+                            order_time = completed_time[-8:] if len(completed_time) >= 8 else completed_time
+                        break
+
+            # 4. Last resort: use order's lastFillPrice time or current time
+            if not sort_time and status in ('Filled', 'Cancelled'):
+                order_time = datetime.now().strftime('%H:%M:%S')
+                sort_time = datetime.now().isoformat()
+
+            return {
+                'order_id': order_id,
+                'perm_id': perm_id,
+                'time': order_time,
+                'sort_time': sort_time,
+                'symbol': getattr(contract, 'symbol', '?'),
+                'action': getattr(order, 'action', '?'),
+                'qty': int(getattr(order, 'totalQuantity', 0)),
+                'order_type': otype,
+                'price': price,
+                'status': status,
+                'fill_price': fill_price,
+                'fill_time': fill_time,
+                'exchange': getattr(contract, 'exchange', ''),
+            }
+        except Exception as e:
+            logger.error("_trade_to_entry failed: %s", e)
+            return None
+
     def get_order_log(self) -> list:
-        """Return a copy of the order log."""
+        """Return a copy of the order log (sourced from IB)."""
         with self._order_lock:
             return list(self._order_log)
+
+    def get_order_log_version(self) -> int:
+        """Return the current order log version (for change detection)."""
+        with self._order_lock:
+            return self._order_log_version
+
+    def sync_orders(self):
+        """Thread-safe trigger to re-sync orders from IB."""
+        if self._loop and self._connected:
+            asyncio.run_coroutine_threadsafe(self._sync_orders_from_ib(), self._loop)
 
 
 class LiveBarAggregator:

@@ -76,9 +76,11 @@ class DashboardState(param.Parameterized):
     _ml_model = param.Parameter(None, precedence=-1)
     _ml_feature_names = param.Parameter(None, precedence=-1)
     _ml_history_buffer = param.Parameter(None, precedence=-1)
+    _yf_ml_history_buffer = param.Parameter(None, precedence=-1)  # Separate buffer for yf A/B
     _intraday_ml_model = param.Parameter(None, precedence=-1)
     _intraday_ml_features = param.Parameter(None, precedence=-1)
     _intraday_trade_state = param.Parameter(None, precedence=-1)
+    _yf_intraday_trade_state = param.Parameter(None, precedence=-1)  # Separate for yf A/B
     _el_model = param.Parameter(None, precedence=-1)   # ExtremeLoserDetector
     _er_model = param.Parameter(None, precedence=-1)   # ExtendedRunPredictor
     _ws_client = param.Parameter(None, precedence=-1)  # UNUSED — kept for param compat
@@ -92,6 +94,26 @@ class DashboardState(param.Parameterized):
             self.scanner_intra, self.scanner_oe,
             self.scanner_14a, self.scanner_14a_dw,
             self.scanner_14a_ml, self.scanner_14a_intra,
+            self.scanner_yf, self.scanner_yf_dw, self.scanner_yf_ml,
+            self.scanner_yf_intra, self.scanner_yf_oe,
+            self.scanner_yf_14a, self.scanner_yf_14a_dw,
+            self.scanner_yf_14a_ml, self.scanner_yf_14a_intra,
+        ] if s is not None]
+
+    @property
+    def _main_scanners(self):
+        """Non-yf scanners (c16 + c14a) — used for main tab UI updates."""
+        return [s for s in [
+            self.scanner, self.scanner_dw, self.scanner_ml,
+            self.scanner_intra, self.scanner_oe,
+            self.scanner_14a, self.scanner_14a_dw,
+            self.scanner_14a_ml, self.scanner_14a_intra,
+        ] if s is not None]
+
+    @property
+    def _yf_scanners(self):
+        """yf-* scanners only — exits don't bump main tab versions."""
+        return [s for s in [
             self.scanner_yf, self.scanner_yf_dw, self.scanner_yf_ml,
             self.scanner_yf_intra, self.scanner_yf_oe,
             self.scanner_yf_14a, self.scanner_yf_14a_dw,
@@ -247,29 +269,53 @@ class DashboardState(param.Parameterized):
             if price_changed:
                 self.tsla_price = price
 
-        # Check exits if positions are open (both scanners)
+        # Check exits — main scanners bump UI versions, yf scanners don't
         html_parts = []
-        all_exit_alerts = []
-        for scnr in self._all_scanners:
+        main_exit_alerts = []
+        yf_exit_alerts = []
+        for scnr in self._main_scanners:
             if scnr.positions and price > 0:
                 try:
                     exit_alerts = scnr.check_exits(price, price, price)
                     if exit_alerts:
                         for ea in exit_alerts:
                             html_parts.append(_exit_alert_html(ea))
-                            all_exit_alerts.append(ea)
+                            main_exit_alerts.append(ea)
                 except Exception as e:
                     logger.warning("Exit check failed: %s", e)
-        if all_exit_alerts:
+        for scnr in self._yf_scanners:
+            if scnr.positions and price > 0:
+                try:
+                    exit_alerts = scnr.check_exits(price, price, price)
+                    if exit_alerts:
+                        yf_exit_alerts.extend(exit_alerts)
+                except Exception as e:
+                    logger.warning("yf exit check failed: %s", e)
+
+        if main_exit_alerts:
             self.exit_alert_html = '\n'.join(html_parts)
-            self.positions_version += 1  # Re-render banner to clear exited positions
-            self.trades_version += 1     # Update trade history
-            self.load_model_data()       # Sync model comparisons tab immediately
-            # Update intraday ML trade state from intraday exits
+            self.positions_version += 1
+            self.trades_version += 1
+            self.load_model_data()
+            # Update IB intraday ML trade state from intraday exits
             if self._intraday_trade_state:
-                for ea in all_exit_alerts:
+                for ea in main_exit_alerts:
                     if getattr(ea, 'signal_source', '') == 'intraday':
                         ts = self._intraday_trade_state
+                        if getattr(ea, 'pnl', 0) > 0:
+                            ts['consec_wins'] += 1
+                            ts['consec_losses'] = 0
+                        else:
+                            ts['consec_losses'] += 1
+                            ts['consec_wins'] = 0
+
+        if yf_exit_alerts:
+            self.load_model_data()  # Update model comparisons tab only
+            # Update yf-specific intraday trade state
+            if self._yf_intraday_trade_state:
+                for ea in yf_exit_alerts:
+                    if getattr(ea, 'signal_source', '') == 'intraday':
+                        ts = self._yf_intraday_trade_state
                         if getattr(ea, 'pnl', 0) > 0:
                             ts['consec_wins'] += 1
                             ts['consec_losses'] = 0
@@ -393,7 +439,9 @@ class DashboardState(param.Parameterized):
                                       scanner_ml, scanner_intra,
                                       scanner_14a, scanner_14a_dw,
                                       scanner_14a_ml, scanner_14a_intra,
-                                      label=''):
+                                      label='',
+                                      ml_history_buffer=None,
+                                      intraday_trade_state=None):
         """Shared signal evaluation logic for both IB and yfinance paths."""
         sig = analysis.signal
         # --- CS-5TF ---
@@ -442,6 +490,7 @@ class DashboardState(param.Parameterized):
             native_tf_data=native_tf_data,
             scanner_ml=scanner_ml, scanner_14a_ml=scanner_14a_ml,
             label=label,
+            history_buffer=ml_history_buffer,
         )
 
         # --- Intraday ---
@@ -449,6 +498,7 @@ class DashboardState(param.Parameterized):
             analysis=analysis, current_tsla=tsla_df,
             scanner_intra=scanner_intra, scanner_14a_intra=scanner_14a_intra,
             label=label,
+            intraday_trade_state=intraday_trade_state,
         )
 
     def start_background_loops(self):
@@ -738,6 +788,7 @@ class DashboardState(param.Parameterized):
                     self._ml_model = _GBTShim(data['models'], data['feature_names'])
                     self._ml_feature_names = data['feature_names']
                     self._ml_history_buffer = []
+                    self._yf_ml_history_buffer = []
                     # Verify with a test prediction
                     test_pred = self._ml_model.predict(
                         np.zeros((1, len(self._ml_feature_names)), dtype=np.float32))
@@ -814,6 +865,11 @@ class DashboardState(param.Parameterized):
                 self._intraday_ml_features = intra_data['feature_names']
                 self._intraday_ml_threshold = intra_data.get('threshold', 0.5)
                 self._intraday_trade_state = {
+                    'bars_since_last': 999, 'daily_trades': 0,
+                    'consec_wins': 0, 'consec_losses': 0,
+                    'last_trade_date': None,
+                }
+                self._yf_intraday_trade_state = {
                     'bars_since_last': 999, 'daily_trades': 0,
                     'consec_wins': 0, 'consec_losses': 0,
                     'last_trade_date': None,
@@ -895,7 +951,8 @@ class DashboardState(param.Parameterized):
         )
 
     def _evaluate_surfer_ml_with(self, *, analysis, current_tsla, native_tf_data,
-                                  scanner_ml, scanner_14a_ml, label=''):
+                                  scanner_ml, scanner_14a_ml, label='',
+                                  history_buffer=None):
         """Evaluate Surfer ML signal: physics signal + ML gate.
 
         ML model must agree with the signal direction to accept the trade.
@@ -947,7 +1004,7 @@ class DashboardState(param.Parameterized):
                 analysis, tsla_df, bar, closes,
                 spy_df=spy_df, vix_df=vix_df,
                 feature_names=self._ml_feature_names,
-                history_buffer=self._ml_history_buffer,
+                history_buffer=history_buffer if history_buffer is not None else self._ml_history_buffer,
                 eval_interval=3,
                 closed_trades=[t.to_dict() for t in closed[-50:]] if closed else [],
                 consecutive_wins=wins,
@@ -1063,7 +1120,8 @@ class DashboardState(param.Parameterized):
         )
 
     def _evaluate_intraday_with(self, *, analysis, current_tsla,
-                                 scanner_intra, scanner_14a_intra, label=''):
+                                 scanner_intra, scanner_14a_intra, label='',
+                                 intraday_trade_state=None):
         """Extract 5-min features from analysis and evaluate intraday signal."""
         if analysis is None or not analysis.tf_states:
             return
@@ -1236,36 +1294,39 @@ class DashboardState(param.Parameterized):
             pass
 
         try:
-            alert = scanner_intra.evaluate_intraday_signal(
-                current_price=self.tsla_price,
-                cp5=cp5, vwap_dist=vwap_dist,
+            # Run ML filter BEFORE opening the trade (fix #2: filter was no-op)
+            # Use a default confidence of 0.5 for pre-filter (scanner may adjust)
+            ml_pass = self._intraday_ml_filter(
+                cp5=cp5, vwap_dist=vwap_dist, vol_ratio=vol_ratio,
+                vwap_slope=vwap_slope, spread_pct=spread_pct, gap_pct=gap_pct,
                 daily_cp=daily_cp, h1_cp=h1_cp, h4_cp=h4_cp,
                 daily_slope=daily_slope, h1_slope=h1_slope, h4_slope=h4_slope,
-                vol_ratio=vol_ratio, vwap_slope=vwap_slope,
-                spread_pct=spread_pct, gap_pct=gap_pct,
+                confidence=0.5,
+                atr_5m_pct=atr_5m_pct, range_today_pct=range_today_pct,
+                volume_today_ratio=volume_today_ratio,
+                return_5bar=return_5bar, return_20bar=return_20bar,
+                rsi_5m=rsi_5m_val, bvc_5m=bvc_5m_val, rsi_slope=rsi_slope_val,
+                cp_15m=state_15m.position_pct if state_15m and state_15m.valid else float('nan'),
+                cp_30m=state_30m.position_pct if state_30m and state_30m.valid else float('nan'),
+                trade_state=intraday_trade_state,
             )
-            if alert and alert.alert_type == 'ENTRY':
-                # ML filter: check if intraday ML model rejects this signal
-                if self._intraday_ml_filter(
-                    cp5=cp5, vwap_dist=vwap_dist, vol_ratio=vol_ratio,
-                    vwap_slope=vwap_slope, spread_pct=spread_pct, gap_pct=gap_pct,
+            if not ml_pass:
+                logger.info("[%s] Intraday signal REJECTED by ML filter (pre-entry)", label)
+            else:
+                alert = scanner_intra.evaluate_intraday_signal(
+                    current_price=self.tsla_price,
+                    cp5=cp5, vwap_dist=vwap_dist,
                     daily_cp=daily_cp, h1_cp=h1_cp, h4_cp=h4_cp,
                     daily_slope=daily_slope, h1_slope=h1_slope, h4_slope=h4_slope,
-                    confidence=alert.confidence,
-                    atr_5m_pct=atr_5m_pct, range_today_pct=range_today_pct,
-                    volume_today_ratio=volume_today_ratio,
-                    return_5bar=return_5bar, return_20bar=return_20bar,
-                    rsi_5m=rsi_5m_val, bvc_5m=bvc_5m_val, rsi_slope=rsi_slope_val,
-                    cp_15m=state_15m.position_pct if state_15m and state_15m.valid else float('nan'),
-                    cp_30m=state_30m.position_pct if state_30m and state_30m.valid else float('nan'),
-                ):
+                    vol_ratio=vol_ratio, vwap_slope=vwap_slope,
+                    spread_pct=spread_pct, gap_pct=gap_pct,
+                )
+                if alert and alert.alert_type == 'ENTRY':
                     self.positions_version += 1
                     self.trades_version += 1
                     self.load_model_data()
-                else:
-                    logger.info("Intraday signal REJECTED by ML filter")
         except Exception as e:
-            logger.warning("Intraday eval failed: %s", e)
+            logger.warning("[%s] Intraday eval failed: %s", label, e)
 
         # c14a-intra: same signal, different config (PM-only window, confidence sizing)
         if scanner_14a_intra:
@@ -1330,8 +1391,11 @@ class DashboardState(param.Parameterized):
                      analysis.signal.primary_tf,
                      analysis.signal.confidence * 100)
 
-        # Use IB live price for entry decisions (shared with IB scanners)
-        if self.scanner_yf and self.tsla_price > 0:
+        # Use IB live price for entry decisions — with freshness guard (fix #6)
+        price_age = time.time() - self._price_updated_at if self._price_updated_at > 0 else 999
+        if price_age > 5:
+            logger.warning("[yf] Skipping signal eval — IB price is %.1fs stale (limit 5s)", price_age)
+        elif self.scanner_yf and self.tsla_price > 0:
             self._apply_analysis_results_with(
                 tsla_df=self._yf_current_tsla,
                 analysis=analysis,
@@ -1346,6 +1410,8 @@ class DashboardState(param.Parameterized):
                 scanner_14a_ml=self.scanner_yf_14a_ml,
                 scanner_14a_intra=self.scanner_yf_14a_intra,
                 label='yf',
+                ml_history_buffer=self._yf_ml_history_buffer,
+                intraday_trade_state=self._yf_intraday_trade_state,
             )
             # OE signals for yf path
             if self.scanner_yf_oe and self._yf_native_tf_data and self.tsla_price > 0:
@@ -1412,7 +1478,7 @@ class DashboardState(param.Parameterized):
         except Exception as e:
             logger.warning("OE Signals_5 eval failed: %s", e)
 
-    def _intraday_ml_filter(self, **kwargs) -> bool:
+    def _intraday_ml_filter(self, trade_state=None, **kwargs) -> bool:
         """Run intraday ML model to filter signals. Returns True to accept, False to reject."""
         if self._intraday_ml_model is None:
             return True  # No model = accept all
@@ -1426,8 +1492,8 @@ class DashboardState(param.Parameterized):
             market_close = now.replace(hour=16, minute=0, second=0)
             minutes_to_close = max(0, (market_close - now).total_seconds() / 60.0)
 
-            # Update trade state (daily reset only, counts updated AFTER accept/reject)
-            ts = self._intraday_trade_state
+            # Use passed trade_state (IB vs yf), fallback to default
+            ts = trade_state if trade_state is not None else self._intraday_trade_state
             today_str = now.strftime('%Y-%m-%d')
             if ts['last_trade_date'] != today_str:
                 ts['daily_trades'] = 0

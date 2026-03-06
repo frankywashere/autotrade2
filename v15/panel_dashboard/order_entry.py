@@ -327,35 +327,39 @@ def order_entry_panel(state) -> pn.Column:
         rows_html = ''
         pending_ids = []
         td = 'padding:2px 6px'
-        for entry in reversed(log):
+        for entry in log:  # Already sorted newest-first by IB sync
             status = entry['status']
             if status == 'Filled':
                 color = '#00e676'
             elif status in ('Submitted', 'PreSubmitted', 'PendingSubmit'):
                 color = '#ffab00'
-                pending_ids.append(entry['order_id'])
-            elif status == 'Cancelled':
+                pending_ids.append(entry.get('perm_id') or entry['order_id'])
+            elif 'Cancel' in status:
+                color = '#ff5252'
+            elif 'Reject' in status or 'Inactive' in status:
                 color = '#ff5252'
             else:
                 color = '#aaa'
 
-            price_str = f"${entry['price']:.2f}" if entry['price'] > 0 else '--'
-            fill_str = f"${entry['fill_price']:.2f}" if entry['fill_price'] > 0 else '--'
-            action_color = '#00e676' if entry['action'] == 'BUY' else '#ff5252'
-            oid = entry['order_id']
+            price_str = f"${entry['price']:.2f}" if entry.get('price', 0) > 0 else '--'
+            fill_str = f"${entry['fill_price']:.2f}" if entry.get('fill_price', 0) > 0 else '--'
+            action_color = '#00e676' if entry.get('action') == 'BUY' else '#ff5252'
+            oid = entry.get('order_id', '?')
+            exchange = entry.get('exchange', '')
+            exch_label = f' <span style="color:#888;font-size:10px">{exchange}</span>' if exchange else ''
 
             rows_html += (
                 f'<tr>'
                 f'<td style="{td};color:#888">#{oid}</td>'
-                f'<td style="{td}">{entry["time"]}</td>'
+                f'<td style="{td}">{entry.get("time", "")}</td>'
                 f'<td style="{td};color:{action_color};font-weight:bold">'
-                f'{entry["action"]}</td>'
-                f'<td style="{td}">{entry["qty"]}</td>'
-                f'<td style="{td}">{entry["order_type"]}</td>'
+                f'{entry.get("action", "?")}</td>'
+                f'<td style="{td}">{entry.get("qty", 0)}</td>'
+                f'<td style="{td}">{entry.get("order_type", "?")}{exch_label}</td>'
                 f'<td style="{td}">{price_str}</td>'
                 f'<td style="{td};color:{color};font-weight:bold">{status}</td>'
                 f'<td style="{td}">{fill_str}</td>'
-                f'<td style="{td}">{entry["fill_time"]}</td>'
+                f'<td style="{td}">{entry.get("fill_time", "")}</td>'
                 f'</tr>'
             )
 
@@ -379,18 +383,18 @@ def order_entry_panel(state) -> pn.Column:
 
         if pending_ids:
             cancel_btns = []
-            for oid in pending_ids:
+            for pid in pending_ids:
                 btn = pn.widgets.Button(
-                    name=f"Cancel #{oid}", button_type='danger',
-                    width=100, height=26)
+                    name=f"Cancel #{pid}", button_type='danger',
+                    width=120, height=26)
 
-                def _make_cancel(order_id):
+                def _make_cancel(perm_id):
                     def _cancel(event):
-                        state.ib_client.cancel_order(order_id)
+                        state.ib_client.cancel_order(perm_id)
                         state.order_version += 1
                     return _cancel
 
-                btn.on_click(_make_cancel(oid))
+                btn.on_click(_make_cancel(pid))
                 cancel_btns.append(btn)
             items.append(pn.Row(*cancel_btns, margin=(4, 0, 0, 0)))
 
@@ -398,14 +402,20 @@ def order_entry_panel(state) -> pn.Column:
 
     # ── Periodic Callback (250ms) ────────────────────────────────────
 
-    _last_log_snapshot = [None]
+    _last_log_version = [0]
     _acct_counter = [0]
+    _sync_counter = [0]
 
     def _periodic_update():
         _acct_counter[0] += 1
+        _sync_counter[0] += 1
         if _acct_counter[0] % 8 == 0:
             account_pane.object = _render_account()
             positions_pane.object = _render_positions()
+
+        # Periodically re-sync orders from IB (every 5s = 20 ticks at 250ms)
+        if _sync_counter[0] % 20 == 0 and state.ib_client:
+            state.ib_client.sync_orders()
 
         if state.ib_client:
             data = state.ib_client.get_price_data('TSLA')
@@ -414,7 +424,6 @@ def order_entry_panel(state) -> pn.Column:
             if bid > 0 and ask > 0:
                 mid = round((bid + ask) / 2, 2)
                 spread = ask - bid
-                pad = max(0.50, spread * 2)
 
                 price_info.object = (
                     f'<div style="display:flex;justify-content:space-between;'
@@ -425,21 +434,26 @@ def order_entry_panel(state) -> pn.Column:
                     f'<span><b style="color:#ff5252">Ask ${ask:.2f}</b></span>'
                     f'</div>')
 
-                # Always update slider range to bid/ask
+                # Always update slider range to bid/ask (guard against zero spread)
+                slider_start = round(bid, 2)
+                slider_end = round(ask, 2)
+                if slider_end <= slider_start:
+                    slider_start = round(bid - 0.25, 2)
+                    slider_end = round(ask + 0.25, 2)
                 _programmatic[0] = True
                 try:
-                    price_slider.start = round(bid, 2)
-                    price_slider.end = round(ask, 2)
+                    price_slider.start = slider_start
+                    price_slider.end = slider_end
                     if not _locked[0]:
                         price_slider.value = mid
                         price_input.value = mid
                 finally:
                     _programmatic[0] = False
 
-            log = state.ib_client.get_order_log()
-            log_snapshot = [(e['order_id'], e['status']) for e in log]
-            if log_snapshot != _last_log_snapshot[0]:
-                _last_log_snapshot[0] = log_snapshot
+            # Check if IB order log changed
+            v = state.ib_client.get_order_log_version()
+            if v != _last_log_version[0]:
+                _last_log_version[0] = v
                 state.order_version += 1
 
     # ── Assemble ─────────────────────────────────────────────────────
