@@ -265,11 +265,11 @@ def order_entry_panel(state) -> pn.Column:
         tif = tif_select.value
 
         outside_rth = session != 'RTH'
-        exchange = None
+        include_overnight = False
         price = 0.0
         if session == 'Overnight':
             tif = 'GTC'
-            exchange = 'OVERNIGHT'
+            include_overnight = True
             if otype == 'MKT':
                 otype = 'LMT'
                 # Use mid price for overnight market orders (no true MKT on ATS)
@@ -292,7 +292,8 @@ def order_entry_panel(state) -> pn.Column:
 
         result = state.ib_client.place_order(
             'TSLA', action, qty, order_type=otype, price=price,
-            tif=tif, outside_rth=outside_rth, exchange=exchange)
+            tif=tif, outside_rth=outside_rth,
+            include_overnight=include_overnight)
 
         if 'error' in result:
             status_msg.object = (f'<span style="color:#ff5252;font-weight:bold">'
