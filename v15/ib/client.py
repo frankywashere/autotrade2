@@ -389,11 +389,11 @@ class IBClient:
     def place_order(self, symbol: str, action: str, qty: int,
                     order_type: str = 'MKT', price: float = 0.0,
                     tif: str = 'DAY', outside_rth: bool = False,
-                    include_overnight: bool = False) -> dict:
+                    overnight: bool = False) -> dict:
         """Place an order via IB. Thread-safe (called from Panel UI thread).
 
         Args:
-            include_overnight: Enable overnight trading (Blue Ocean ATS, 8PM-3:50AM ET).
+            overnight: Route to OVERNIGHT exchange (Blue Ocean ATS, 8PM-3:50AM ET).
         """
         if not self.is_connected():
             return {'error': 'Not connected to IB'}
@@ -401,7 +401,7 @@ class IBClient:
             future = asyncio.run_coroutine_threadsafe(
                 self._place_order_async(symbol, action, qty, order_type,
                                         price, tif, outside_rth,
-                                        include_overnight),
+                                        overnight),
                 self._loop)
             return future.result(timeout=10)
         except Exception as e:
@@ -410,7 +410,7 @@ class IBClient:
 
     async def _place_order_async(self, symbol, action, qty, order_type,
                                   price, tif, outside_rth,
-                                  include_overnight=False):
+                                  overnight=False):
         """Async order placement (runs in IB event loop)."""
         from ib_async import MarketOrder, LimitOrder, StopOrder
 
@@ -418,6 +418,10 @@ class IBClient:
         qualified = await self.ib.qualifyContractsAsync(contract)
         if qualified:
             contract = qualified[0]
+
+        # Route to OVERNIGHT exchange for Blue Ocean ATS
+        if overnight:
+            contract.exchange = 'OVERNIGHT'
 
         if order_type == 'MKT':
             order = MarketOrder(action, qty)
@@ -430,8 +434,6 @@ class IBClient:
 
         order.tif = tif
         order.outsideRth = outside_rth
-        if include_overnight:
-            order.includeOvernight = True
 
         trade = self.ib.placeOrder(contract, order)
         order_id = trade.order.orderId
