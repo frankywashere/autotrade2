@@ -30,6 +30,19 @@ DEFAULT_PARAMS = {
     'tp': 0.020,
 }
 
+# Wider params matching backtest configs G/I (FD eUnion m30 FLAT $100K)
+WIDER_PARAMS = {
+    'vwap_thresh': -0.10,
+    'd_min': 0.20,
+    'h1_min': 0.15,
+    'f5_thresh': 0.35,
+    'div_thresh': 0.20,
+    'div_f5_thresh': 0.30,
+    'min_vol_ratio': 0.8,
+    'stop': 0.008,
+    'tp': 0.020,
+}
+
 
 def sig_vwap(
     cp5: float, vwap_dist: float,

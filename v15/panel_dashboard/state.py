@@ -1129,6 +1129,11 @@ class DashboardState(param.Parameterized):
         if scanner_intra is None or _price <= 0:
             return
 
+        # Increment bars_since_last on every eval cycle (matches backtest per-bar increment)
+        ts = intraday_trade_state if intraday_trade_state is not None else self._intraday_trade_state
+        if ts is not None:
+            ts['bars_since_last'] = ts.get('bars_since_last', 0) + 1
+
         tf_states = analysis.tf_states
         state_5m = tf_states.get('5min')
         state_1h = tf_states.get('1h')
@@ -1181,29 +1186,38 @@ class DashboardState(param.Parameterized):
                 if valid_v.any():
                     vwap_val = cum_tv[valid_v][-1] / cum_v[valid_v][-1]
                     vwap_dist = (close_arr[-1] - vwap_val) / vwap_val * 100.0
-                    # VWAP slope (last 5 bars)
+                    # VWAP slope: linear regression over last 5 vwap_dist values (matches backtest)
                     if valid_v.sum() >= 5:
-                        vwap_5 = cum_tv[valid_v][-5:] / cum_v[valid_v][-5:]
-                        vwap_slope = (vwap_5[-1] - vwap_5[0]) / max(vwap_5[0], 0.01) * 100.0
+                        today_close = close_arr[today_mask]
+                        today_vwap = cum_tv[today_mask] / np.maximum(cum_v[today_mask], 1e-10)
+                        today_vd = (today_close - today_vwap) / np.maximum(today_vwap, 1e-10) * 100.0
+                        if len(today_vd) >= 5:
+                            seg = today_vd[-5:]
+                            x = np.arange(5, dtype=np.float64)
+                            mx, my = x.mean(), seg.mean()
+                            denom = np.sum((x - mx) ** 2)
+                            if denom > 0:
+                                vwap_slope = float(np.sum((x - mx) * (seg - my)) / denom)
 
             # Spread
             if n > 0 and close_arr[-1] > 0:
                 spread_pct = (high_arr[-1] - low_arr[-1]) / close_arr[-1] * 100.0
 
-            # Volume ratio
+            # Volume ratio: current bar vol / rolling 20-bar mean (matches backtest)
             today_count = int(today_mask.sum())
-            if today_count > 0 and n >= 100:
-                today_vol_total = float(np.sum(vol_arr[today_mask]))
-                avg_daily_vol = float(np.mean(vol_arr[max(0, n - 100):n])) * 78
-                vol_ratio = today_vol_total / max(1.0, avg_daily_vol)
+            if n >= 21 and vol_arr[-1] > 0:
+                rolling_mean = float(np.mean(vol_arr[max(0, n - 20):n]))
+                if rolling_mean > 0:
+                    vol_ratio = float(vol_arr[-1]) / rolling_mean
 
-            # Gap %
-            if n >= 2 and close_arr[-2] > 0:
-                yesterday_mask = dates == dates[-1 - today_count] if today_count < n else np.zeros_like(dates, dtype=bool)
-                if yesterday_mask.any():
-                    prev_close = close_arr[yesterday_mask][-1]
-                    today_open = current_tsla['open'].values[today_mask][0] if today_mask.any() else close_arr[-1]
-                    gap_pct = (today_open - prev_close) / prev_close * 100.0
+            # Gap %: today's open vs prior day's last close (matches backtest forward-fill)
+            if today_count > 0 and today_count < n:
+                prev_day_mask = dates < today
+                if prev_day_mask.any():
+                    prev_close = close_arr[prev_day_mask][-1]
+                    if prev_close > 0:
+                        today_open = current_tsla['open'].values[today_mask][0]
+                        gap_pct = (today_open - prev_close) / prev_close * 100.0
 
             # ATR 5m %
             if n >= 21 and close_arr[-1] > 0:
@@ -1217,9 +1231,12 @@ class DashboardState(param.Parameterized):
             if today_mask.any() and close_arr[-1] > 0:
                 range_today_pct = (float(np.max(high_arr[today_mask])) - float(np.min(low_arr[today_mask]))) / close_arr[-1] * 100.0
 
-            # Volume today ratio
+            # Volume today ratio: total daily vol vs avg daily vol (ML feature)
             if today_count > 0 and n >= 100:
-                volume_today_ratio = vol_ratio  # same calculation
+                today_vol_total = float(np.sum(vol_arr[today_mask]))
+                avg_bar_vol = float(np.mean(vol_arr[max(0, n - 100):n]))
+                if avg_bar_vol > 0:
+                    volume_today_ratio = today_vol_total / (avg_bar_vol * 78)
 
             # Returns
             if n >= 6 and close_arr[-6] > 0:
@@ -1293,37 +1310,50 @@ class DashboardState(param.Parameterized):
             pass
 
         try:
-            # Run ML filter BEFORE opening the trade (fix #2: filter was no-op)
-            # Use a default confidence of 0.5 for pre-filter (scanner may adjust)
-            ml_pass = self._intraday_ml_filter(
-                cp5=cp5, vwap_dist=vwap_dist, vol_ratio=vol_ratio,
-                vwap_slope=vwap_slope, spread_pct=spread_pct, gap_pct=gap_pct,
+            # Check if signal fires first (matching backtest order: signal → ML filter)
+            from v15.trading.intraday_signals import sig_union_enhanced, WIDER_PARAMS as _pw
+            sig_result = sig_union_enhanced(
+                cp5=cp5, vwap_dist=vwap_dist,
                 daily_cp=daily_cp, h1_cp=h1_cp, h4_cp=h4_cp,
-                daily_slope=daily_slope, h1_slope=h1_slope, h4_slope=h4_slope,
-                confidence=0.5,
-                atr_5m_pct=atr_5m_pct, range_today_pct=range_today_pct,
-                volume_today_ratio=volume_today_ratio,
-                return_5bar=return_5bar, return_20bar=return_20bar,
-                rsi_5m=rsi_5m_val, bvc_5m=bvc_5m_val, rsi_slope=rsi_slope_val,
-                cp_15m=state_15m.position_pct if state_15m and state_15m.valid else float('nan'),
-                cp_30m=state_30m.position_pct if state_30m and state_30m.valid else float('nan'),
-                trade_state=intraday_trade_state,
+                vol_ratio=vol_ratio, vwap_slope=vwap_slope,
+                gap_pct=gap_pct, daily_slope=daily_slope,
+                h1_slope=h1_slope, h4_slope=h4_slope,
+                spread_pct=spread_pct, params=_pw,
             )
-            if not ml_pass:
-                logger.info("[%s] Intraday signal REJECTED by ML filter (pre-entry)", label)
+            if sig_result is None:
+                pass  # No signal — skip ML filter entirely (matches backtest)
             else:
-                alert = scanner_intra.evaluate_intraday_signal(
-                    current_price=_price,
-                    cp5=cp5, vwap_dist=vwap_dist,
+                _, sig_confidence, _, _ = sig_result
+                # ML filter AFTER signal confirmed, with actual confidence
+                ml_pass = self._intraday_ml_filter(
+                    cp5=cp5, vwap_dist=vwap_dist, vol_ratio=vol_ratio,
+                    vwap_slope=vwap_slope, spread_pct=spread_pct, gap_pct=gap_pct,
                     daily_cp=daily_cp, h1_cp=h1_cp, h4_cp=h4_cp,
                     daily_slope=daily_slope, h1_slope=h1_slope, h4_slope=h4_slope,
-                    vol_ratio=vol_ratio, vwap_slope=vwap_slope,
-                    spread_pct=spread_pct, gap_pct=gap_pct,
+                    confidence=sig_confidence,
+                    atr_5m_pct=atr_5m_pct, range_today_pct=range_today_pct,
+                    volume_today_ratio=volume_today_ratio,
+                    return_5bar=return_5bar, return_20bar=return_20bar,
+                    rsi_5m=rsi_5m_val, bvc_5m=bvc_5m_val, rsi_slope=rsi_slope_val,
+                    cp_15m=state_15m.position_pct if state_15m and state_15m.valid else float('nan'),
+                    cp_30m=state_30m.position_pct if state_30m and state_30m.valid else float('nan'),
+                    trade_state=intraday_trade_state,
                 )
-                if alert and alert.alert_type == 'ENTRY':
-                    self.positions_version += 1
-                    self.trades_version += 1
-                    self.load_model_data()
+                if not ml_pass:
+                    logger.info("[%s] Intraday signal REJECTED by ML filter", label)
+                else:
+                    alert = scanner_intra.evaluate_intraday_signal(
+                        current_price=_price,
+                        cp5=cp5, vwap_dist=vwap_dist,
+                        daily_cp=daily_cp, h1_cp=h1_cp, h4_cp=h4_cp,
+                        daily_slope=daily_slope, h1_slope=h1_slope, h4_slope=h4_slope,
+                        vol_ratio=vol_ratio, vwap_slope=vwap_slope,
+                        spread_pct=spread_pct, gap_pct=gap_pct,
+                    )
+                    if alert and alert.alert_type == 'ENTRY':
+                        self.positions_version += 1
+                        self.trades_version += 1
+                        self.load_model_data()
         except Exception as e:
             logger.warning("[%s] Intraday eval failed: %s", label, e)
 
@@ -1557,7 +1587,6 @@ class DashboardState(param.Parameterized):
             if ts['last_trade_date'] != today_str:
                 ts['daily_trades'] = 0
                 ts['last_trade_date'] = today_str
-            ts['bars_since_last'] += 1
 
             # Build feature vector matching FEATURE_NAMES order from training
             feat = np.full(len(self._intraday_ml_features), np.nan)

@@ -691,7 +691,7 @@ class SurferLiveScanner:
 
         # Evaluate signal (outside lock — pure computation, no state mutation)
         try:
-            from v15.trading.intraday_signals import sig_union_enhanced, compute_intraday_trail
+            from v15.trading.intraday_signals import sig_union_enhanced, compute_intraday_trail, WIDER_PARAMS as _WIDER_PARAMS
         except ImportError:
             return None
 
@@ -703,6 +703,7 @@ class SurferLiveScanner:
             rsi_slope=rsi_slope, daily_slope=daily_slope,
             h1_slope=h1_slope, h4_slope=h4_slope,
             spread_pct=spread_pct,
+            params=_WIDER_PARAMS,
         )
 
         if result is None:
