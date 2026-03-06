@@ -327,7 +327,7 @@ def create_app():
                 ('Channel Surfer', channel_surfer_tab(state)),
                 ('Model Comparisons', model_comparisons_tab(state)),
                 ('yfinance A/B', model_comparisons_tab(state, prefix='yf-')),
-                dynamic=True,
+                sizing_mode='stretch_width',
             ),
         ],
     )

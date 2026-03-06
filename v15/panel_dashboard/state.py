@@ -66,6 +66,7 @@ class DashboardState(param.Parameterized):
     # Model comparisons (1-hour cache)
     model_data = param.Dict({})
     model_data_version = param.Integer(0)
+    order_version = param.Integer(0)       # Bump on order submit/fill/cancel
 
     # IB connection
     ib_connected = param.Boolean(False)

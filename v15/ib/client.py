@@ -33,6 +33,13 @@ class IBClient:
         self._bar_aggregators = {} # {symbol: LiveBarAggregator}
         self._reconnect_delay = 2  # seconds, with exponential backoff
         self.tick_event = threading.Event()  # Set on every tick for instant wakeup
+        # Order tracking
+        self._trades = {}          # {order_id: ib_async.Trade}
+        self._order_log = []       # List of dicts for blotter (max 50)
+        self._order_lock = threading.Lock()
+        # Account data (cached from IB event loop, read from Panel thread)
+        self._account = {}         # {tag: value}
+        self._account_lock = threading.Lock()
 
     # ── Connection ───────────────────────────────────────────────────
 
@@ -78,6 +85,9 @@ class IBClient:
                 # Re-subscribe any previously subscribed symbols
                 for symbol in list(self._contracts.keys()):
                     await self._subscribe_async(symbol)
+
+                # Subscribe to account summary updates
+                await self._subscribe_account_async()
 
                 # Run until disconnected
                 while self.ib.isConnected():
@@ -292,6 +302,148 @@ class IBClient:
     def get_bar_aggregator(self, symbol: str):
         """Get the bar aggregator for a symbol, or None."""
         return self._bar_aggregators.get(symbol)
+
+    # ── Account Data ──────────────────────────────────────────────────
+
+    async def _subscribe_account_async(self):
+        """Subscribe to account summary (runs in IB event loop)."""
+        try:
+            await asyncio.wait_for(self.ib.reqAccountSummaryAsync(), timeout=10)
+            # Snapshot initial data from wrapper cache into thread-safe dict
+            self._snapshot_account()
+            # Wire up event for live updates
+            self.ib.accountSummaryEvent += self._on_account_summary
+            logger.info("Subscribed to account summary (%d tags cached)",
+                        len(self._account))
+        except Exception as e:
+            logger.warning("Account summary subscription failed: %s", e)
+
+    def _snapshot_account(self):
+        """Read wrapper.acctSummary directly (no event loop needed)."""
+        try:
+            items = self.ib.wrapper.acctSummary.values()
+            with self._account_lock:
+                for item in items:
+                    if item.currency in ('USD', ''):
+                        self._account[item.tag] = item.value
+        except Exception as e:
+            logger.error("_snapshot_account failed: %s", e)
+
+    def _on_account_summary(self, item):
+        """Callback fired by ib_async on account summary update."""
+        if item.currency in ('USD', ''):
+            with self._account_lock:
+                self._account[item.tag] = item.value
+
+    def get_account_summary(self) -> dict:
+        """Return account summary as {tag: value} dict (thread-safe)."""
+        with self._account_lock:
+            return dict(self._account)
+
+    # ── Order Placement ──────────────────────────────────────────────
+
+    def place_order(self, symbol: str, action: str, qty: int,
+                    order_type: str = 'MKT', price: float = 0.0,
+                    tif: str = 'DAY', outside_rth: bool = False) -> dict:
+        """Place an order via IB. Thread-safe (called from Panel UI thread)."""
+        if not self.is_connected():
+            return {'error': 'Not connected to IB'}
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._place_order_async(symbol, action, qty, order_type,
+                                        price, tif, outside_rth),
+                self._loop)
+            return future.result(timeout=10)
+        except Exception as e:
+            logger.error("place_order failed: %s", e)
+            return {'error': str(e)}
+
+    async def _place_order_async(self, symbol, action, qty, order_type,
+                                  price, tif, outside_rth):
+        """Async order placement (runs in IB event loop)."""
+        from ib_async import MarketOrder, LimitOrder, StopOrder
+
+        contract = self._make_contract(symbol)
+        qualified = await self.ib.qualifyContractsAsync(contract)
+        if qualified:
+            contract = qualified[0]
+
+        if order_type == 'MKT':
+            order = MarketOrder(action, qty)
+        elif order_type == 'LMT':
+            order = LimitOrder(action, qty, price)
+        elif order_type == 'STP':
+            order = StopOrder(action, qty, price)
+        else:
+            return {'error': f'Unknown order type: {order_type}'}
+
+        order.tif = tif
+        order.outsideRth = outside_rth
+
+        trade = self.ib.placeOrder(contract, order)
+        order_id = trade.order.orderId
+
+        with self._order_lock:
+            self._trades[order_id] = trade
+            entry = {
+                'order_id': order_id,
+                'time': datetime.now().strftime('%H:%M:%S'),
+                'symbol': symbol,
+                'action': action,
+                'qty': qty,
+                'order_type': order_type,
+                'price': price,
+                'status': trade.orderStatus.status or 'Submitted',
+                'fill_price': 0.0,
+                'fill_time': '',
+            }
+            self._order_log.append(entry)
+            if len(self._order_log) > 50:
+                self._order_log = self._order_log[-50:]
+
+        trade.statusEvent += self._on_order_status
+        logger.info("Order placed: %s %d %s %s @ %.2f (id=%d)",
+                     action, qty, symbol, order_type, price, order_id)
+        return {'order_id': order_id, 'status': entry['status'], 'message': 'OK'}
+
+    def _on_order_status(self, trade):
+        """Callback fired by ib_async on order status change."""
+        order_id = trade.order.orderId
+        status = trade.orderStatus.status
+        with self._order_lock:
+            for entry in self._order_log:
+                if entry['order_id'] == order_id:
+                    entry['status'] = status
+                    if status == 'Filled':
+                        entry['fill_price'] = trade.orderStatus.avgFillPrice
+                        entry['fill_time'] = datetime.now().strftime('%H:%M:%S')
+                    break
+        logger.info("Order %d status: %s", order_id, status)
+
+    def cancel_order(self, order_id: int) -> bool:
+        """Cancel a pending order. Returns True if cancel request sent."""
+        with self._order_lock:
+            trade = self._trades.get(order_id)
+        if not trade:
+            logger.warning("cancel_order: order_id %d not found", order_id)
+            return False
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._cancel_order_async(trade), self._loop)
+            future.result(timeout=5)
+            return True
+        except Exception as e:
+            logger.error("cancel_order failed: %s", e)
+            return False
+
+    async def _cancel_order_async(self, trade):
+        """Async cancel (runs in IB event loop)."""
+        self.ib.cancelOrder(trade.order)
+
+    def get_order_log(self) -> list:
+        """Return a copy of the order log."""
+        with self._order_lock:
+            return list(self._order_log)
 
 
 class LiveBarAggregator:
