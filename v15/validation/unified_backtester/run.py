@@ -170,38 +170,59 @@ def main():
                         help='Algo spec: type[:key=val:key=val] (repeatable)')
     parser.add_argument('--extended-hours', action='store_true',
                         help='Include extended hours (4:00-20:00 ET)')
+    parser.add_argument('--tick-data', type=str, default=None,
+                        help='Path to tick data directory (e.g., data/ticks/TSLA)')
     parser.add_argument('--csv', type=str, default=None,
                         help='Export trades to CSV file')
     parser.add_argument('--quiet', action='store_true',
                         help='Suppress progress output')
     args = parser.parse_args()
 
-    # Auto-detect data file
-    if args.data is None:
-        for candidate in ['data/TSLAMin.txt', '../data/TSLAMin.txt',
-                          'C:/AI/x14/data/TSLAMin.txt']:
-            if os.path.isfile(candidate):
-                args.data = candidate
-                break
-    if args.data is None:
-        print("ERROR: Could not find TSLAMin.txt. Use --data to specify path.")
-        sys.exit(1)
-
     if not args.algo:
         args.algo = ['intraday']
         print("No --algo specified, defaulting to intraday")
 
     # Load data
-    print(f"Loading data from {args.data}...")
     t0 = time.time()
-    data = DataProvider(
-        tsla_1min_path=args.data,
-        start=args.start,
-        end=args.end,
-        spy_path=args.spy,
-        rth_only=not args.extended_hours,
-    )
-    print(f"  Loaded {len(data._df1m):,} 1-min bars in {time.time()-t0:.1f}s")
+    rth_only = not args.extended_hours
+
+    if args.tick_data:
+        # Tick-sourced data path
+        print(f"Loading tick data from {args.tick_data}...")
+        data = DataProvider.from_ticks(
+            tick_dir=args.tick_data,
+            symbol='TSLA',
+            start=args.start,
+            end=args.end,
+            spy_path=args.spy,
+            rth_only=rth_only,
+        )
+        tick_count = getattr(data, '_tick_count', 0)
+        days = len(data.trading_days)
+        print(f"  Using tick-sourced data ({tick_count:,} ticks -> "
+              f"{len(data._df1m):,} 1-min bars, {days} trading days) "
+              f"in {time.time()-t0:.1f}s")
+    else:
+        # CSV data path (original)
+        if args.data is None:
+            for candidate in ['data/TSLAMin.txt', '../data/TSLAMin.txt',
+                              'C:/AI/x14/data/TSLAMin.txt']:
+                if os.path.isfile(candidate):
+                    args.data = candidate
+                    break
+        if args.data is None:
+            print("ERROR: Could not find TSLAMin.txt. Use --data to specify path.")
+            sys.exit(1)
+
+        print(f"Loading data from {args.data}...")
+        data = DataProvider(
+            tsla_1min_path=args.data,
+            start=args.start,
+            end=args.end,
+            spy_path=args.spy,
+            rth_only=rth_only,
+        )
+        print(f"  Loaded {len(data._df1m):,} 1-min bars in {time.time()-t0:.1f}s")
 
     # Create algorithms
     algo_specs = [_parse_algo_spec(s) for s in args.algo]

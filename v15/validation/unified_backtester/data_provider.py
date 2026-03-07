@@ -122,6 +122,27 @@ class DataProvider:
         if len(self._df1m) == 0:
             raise ValueError(f"No data loaded from {tsla_1min_path} for {start} to {end}")
 
+        self._init_from_df1m(spy_path, start, end, rth_only)
+
+    @classmethod
+    def from_ticks(cls, tick_dir: str, symbol: str, start: str, end: str,
+                   spy_path: str = None, rth_only: bool = True) -> 'DataProvider':
+        """Build DataProvider with 1-min bars aggregated from tick data."""
+        from .tick_provider import TickDataProvider
+
+        tick_prov = TickDataProvider(tick_dir, symbol, start, end, rth_only)
+        df1m = tick_prov.aggregate_to_1min()
+
+        instance = cls.__new__(cls)
+        instance._rth_only = rth_only
+        instance._df1m = df1m
+        instance._tick_count = tick_prov.tick_count
+        instance._init_from_df1m(spy_path, start, end, rth_only)
+        return instance
+
+    def _init_from_df1m(self, spy_path: str = None, start: str = None,
+                        end: str = None, rth_only: bool = True):
+        """Shared init: resample all TFs, build _tf_bar_end, load SPY."""
         # Load SPY if provided
         self._spy1m = None
         if spy_path and Path(spy_path).exists():
