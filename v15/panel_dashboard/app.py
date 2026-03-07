@@ -59,13 +59,7 @@ def _init_state():
     _state = DashboardState()
 
     _state.load_market_data()
-    yf_count = sum(1 for s in [
-        _state.scanner_yf, _state.scanner_yf_dw, _state.scanner_yf_ml,
-        _state.scanner_yf_intra, _state.scanner_yf_oe,
-        _state.scanner_yf_14a, _state.scanner_yf_14a_dw,
-        _state.scanner_yf_14a_ml, _state.scanner_yf_14a_intra,
-    ] if s is not None)
-    logger.info("Market data loaded. TSLA=%.2f, c16: CS=%s DW=%s ML=%s Intra=%s OE=%s, c14a: CS=%s DW=%s ML=%s Intra=%s, yf-AB: %d scanners",
+    logger.info("Market data loaded. TSLA=%.2f, c16: CS=%s DW=%s ML=%s Intra=%s OE=%s, c14a: CS=%s DW=%s ML=%s Intra=%s",
                 _state.tsla_price,
                 "OK" if _state.scanner else "NONE",
                 "OK" if _state.scanner_dw else "NONE",
@@ -75,8 +69,7 @@ def _init_state():
                 "OK" if _state.scanner_14a else "NONE",
                 "OK" if _state.scanner_14a_dw else "NONE",
                 "OK" if _state.scanner_14a_ml else "NONE",
-                "OK" if _state.scanner_14a_intra else "NONE",
-                yf_count)
+                "OK" if _state.scanner_14a_intra else "NONE")
 
     # Log ML model status
     gbt_ok = hasattr(_state, '_ml_model') and _state._ml_model is not None
@@ -122,7 +115,6 @@ def _init_state():
         f"Intra={'OK' if _state.scanner_intra else 'FAIL'}, "
         f"OE={'OK' if _state.scanner_oe else 'FAIL'}\n"
         f"c14a: {'ALL OK' if c14a_ok else 'FAIL'} (4 scanners)\n"
-        f"yf-AB: {yf_count} scanners\n"
         f"GBT model: {gbt_msg}{gbt_diag}\n"
         f"Intraday model: {intra_msg}{intra_diag}\n"
         f"TSLA price: ${_state.tsla_price:.2f}"
@@ -141,9 +133,6 @@ def _init_state():
         logger.info("IB Gateway: CONNECTED")
     else:
         logger.error("IB Gateway: NOT CONNECTED — no live price source available!")
-
-    _state.load_model_data()
-    logger.info("Model data loaded. Keys=%d", len(_state.model_data))
 
     logger.info("Starting background loops...")
     _state.start_background_loops()
@@ -197,22 +186,12 @@ def _init_new_infra(state):
 def create_app():
     logger.info("create_app() called (session factory)")
     try:
-        from v15.panel_dashboard.channel_surfer import channel_surfer_tab
-        from v15.panel_dashboard.model_compare import model_comparisons_tab
+        from v15.panel_dashboard.tabs.ib_live import ib_live_tab
+        from v15.panel_dashboard.tabs.yf_sim import yf_sim_tab
+        from v15.panel_dashboard.tabs.comparison import comparison_tab
     except Exception:
-        logger.error("Import failed:\n%s", traceback.format_exc())
+        logger.error("Tab import failed:\n%s", traceback.format_exc())
         raise
-
-    # Import new tabs (optional — don't break if missing)
-    ib_live_tab_fn = None
-    yf_sim_tab_fn = None
-    comparison_tab_fn = None
-    try:
-        from v15.panel_dashboard.tabs.ib_live import ib_live_tab as ib_live_tab_fn
-        from v15.panel_dashboard.tabs.yf_sim import yf_sim_tab as yf_sim_tab_fn
-        from v15.panel_dashboard.tabs.comparison import comparison_tab as comparison_tab_fn
-    except Exception as e:
-        logger.warning("New tabs import failed (non-fatal): %s", e)
 
     state = _init_state()
 
@@ -378,12 +357,9 @@ def create_app():
         ],
         main=[
             pn.Tabs(
-                ('Channel Surfer', channel_surfer_tab(state)),
-                ('Model Comparisons', model_comparisons_tab(state)),
-                ('yfinance A/B', model_comparisons_tab(state, prefix='yf-')),
-                *([('IB Live', ib_live_tab_fn(state))] if ib_live_tab_fn else []),
-                *([('yf Sim', yf_sim_tab_fn(state))] if yf_sim_tab_fn else []),
-                *([('IB vs yf', comparison_tab_fn(state))] if comparison_tab_fn else []),
+                ('IB Live', ib_live_tab(state)),
+                ('yf Sim', yf_sim_tab(state)),
+                ('IB vs yf', comparison_tab(state)),
                 sizing_mode='stretch_width',
             ),
         ],

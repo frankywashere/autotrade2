@@ -45,16 +45,6 @@ class DashboardState(param.Parameterized):
     scanner_14a_dw = param.Parameter(None)    # SurferLiveScanner (CS-DW [14a])
     scanner_14a_ml = param.Parameter(None)    # SurferLiveScanner (Surfer ML [14a])
     scanner_14a_intra = param.Parameter(None) # SurferLiveScanner (Intraday [14a])
-    # Scanners — yfinance A/B (parallel yf-backed copies of c16 + c14a)
-    scanner_yf = param.Parameter(None)
-    scanner_yf_dw = param.Parameter(None)
-    scanner_yf_ml = param.Parameter(None)
-    scanner_yf_intra = param.Parameter(None)
-    scanner_yf_oe = param.Parameter(None)
-    scanner_yf_14a = param.Parameter(None)
-    scanner_yf_14a_dw = param.Parameter(None)
-    scanner_yf_14a_ml = param.Parameter(None)
-    scanner_yf_14a_intra = param.Parameter(None)
     positions_version = param.Integer(0)      # Bump to trigger position card re-render (price-sensitive)
     trades_version = param.Integer(0)        # Bump only on actual trade open/close (not price ticks)
     exit_alert_html = param.String('')        # Latest exit alert HTML
@@ -63,9 +53,6 @@ class DashboardState(param.Parameterized):
     scanner_capital = param.Number(100_000, bounds=(10_000, 1_000_000))
     kill_switch = param.Boolean(False)
 
-    # Model comparisons (1-hour cache)
-    model_data = param.Dict({})
-    model_data_version = param.Integer(0)
     order_version = param.Integer(0)       # Bump on order submit/fill/cancel
 
     # IB connection
@@ -87,53 +74,23 @@ class DashboardState(param.Parameterized):
     _ml_model = param.Parameter(None, precedence=-1)
     _ml_feature_names = param.Parameter(None, precedence=-1)
     _ml_history_buffer = param.Parameter(None, precedence=-1)
-    _yf_ml_history_buffer = param.Parameter(None, precedence=-1)  # Separate buffer for yf A/B
     _intraday_ml_model = param.Parameter(None, precedence=-1)
     _intraday_ml_features = param.Parameter(None, precedence=-1)
     _intraday_trade_state = param.Parameter(None, precedence=-1)
-    _yf_intraday_trade_state = param.Parameter(None, precedence=-1)  # Separate for yf A/B
     _el_model = param.Parameter(None, precedence=-1)   # ExtremeLoserDetector
     _er_model = param.Parameter(None, precedence=-1)   # ExtendedRunPredictor
     _ws_client = param.Parameter(None, precedence=-1)  # UNUSED — kept for param compat
     _price_updated_at = param.Number(0.0, precedence=-1)  # time.time() of last successful price fetch
     _last_intraday_exit_check = param.Number(0.0, precedence=-1)  # throttle intraday exits to 5s
 
-    # yfinance A/B live status (for dashboard display)
-    yf_status = param.Dict({}, precedence=-1)
-    yf_status_version = param.Integer(0)  # Bump to trigger yf status re-render
-
     @property
     def _all_scanners(self):
-        """All scanner instances (c16 + c14a + yf-*) for iteration."""
+        """All scanner instances (c16 + c14a) for iteration."""
         return [s for s in [
             self.scanner, self.scanner_dw, self.scanner_ml,
             self.scanner_intra, self.scanner_oe,
             self.scanner_14a, self.scanner_14a_dw,
             self.scanner_14a_ml, self.scanner_14a_intra,
-            self.scanner_yf, self.scanner_yf_dw, self.scanner_yf_ml,
-            self.scanner_yf_intra, self.scanner_yf_oe,
-            self.scanner_yf_14a, self.scanner_yf_14a_dw,
-            self.scanner_yf_14a_ml, self.scanner_yf_14a_intra,
-        ] if s is not None]
-
-    @property
-    def _main_scanners(self):
-        """Non-yf scanners (c16 + c14a) — used for main tab UI updates."""
-        return [s for s in [
-            self.scanner, self.scanner_dw, self.scanner_ml,
-            self.scanner_intra, self.scanner_oe,
-            self.scanner_14a, self.scanner_14a_dw,
-            self.scanner_14a_ml, self.scanner_14a_intra,
-        ] if s is not None]
-
-    @property
-    def _yf_scanners(self):
-        """yf-* scanners only — exits don't bump main tab versions."""
-        return [s for s in [
-            self.scanner_yf, self.scanner_yf_dw, self.scanner_yf_ml,
-            self.scanner_yf_intra, self.scanner_yf_oe,
-            self.scanner_yf_14a, self.scanner_yf_14a_dw,
-            self.scanner_yf_14a_ml, self.scanner_yf_14a_intra,
         ] if s is not None]
 
     def load_market_data(self):
@@ -214,15 +171,9 @@ class DashboardState(param.Parameterized):
             else:
                 self._prev_price = self.tsla_price
 
-        # Load yfinance data for A/B comparison (always, even when IB is primary)
-        self._yf_native_tf_data = {}
-        self._yf_current_tsla = None
-        self._load_yf_data()
-
         # Initialize scanner
         self._init_scanner()
         self._analysis_running = False
-        self._yf_analysis_running = False
 
         # Run initial analysis (synchronous at startup — no UI to block yet)
         try:
@@ -297,7 +248,7 @@ class DashboardState(param.Parameterized):
         intraday_scanners = {self.scanner_intra, self.scanner_14a_intra}
         if intraday_due:
             self._last_intraday_exit_check = now_ts
-        for scnr in self._main_scanners:
+        for scnr in self._all_scanners:
             if scnr.positions and price > 0:
                 if scnr in intraday_scanners and not intraday_due:
                     continue
@@ -309,13 +260,11 @@ class DashboardState(param.Parameterized):
                             main_exit_alerts.append(ea)
                 except Exception as e:
                     logger.warning("Exit check failed: %s", e)
-        # yf scanner exits are handled in _apply_yf_analysis_results (yfinance price only)
 
         if main_exit_alerts:
             self.exit_alert_html = '\n'.join(html_parts)
             self.positions_version += 1
             self.trades_version += 1
-            self.load_model_data()
             # Update IB intraday ML trade state from intraday exits
             if self._intraday_trade_state:
                 for ea in main_exit_alerts:
@@ -328,10 +277,9 @@ class DashboardState(param.Parameterized):
                             ts['consec_losses'] += 1
                             ts['consec_wins'] = 0
 
-        # yf exit alerts handled in _apply_yf_analysis_results
         # Bump version for live P&L updates only when price actually changed
         elif not main_exit_alerts and (price_changed if price > 0 else False):
-            has_positions = any(s.positions for s in self._main_scanners)
+            has_positions = any(s.positions for s in self._all_scanners)
             if has_positions:
                 self.positions_version += 1
 
@@ -460,14 +408,14 @@ class DashboardState(param.Parameterized):
             if entry_alert and entry_alert.alert_type == 'ENTRY':
                 self.positions_version += 1
                 self.trades_version += 1
-                self.load_model_data()
+
             if scanner_14a:
                 a14 = scanner_14a.evaluate_signal(
                     analysis, price, signal_source='CS-5TF')
                 if a14 and a14.alert_type == 'ENTRY':
                     self.positions_version += 1
                     self.trades_version += 1
-                    self.load_model_data()
+    
 
         # --- CS-DW ---
         if scanner_dw and dw_analysis and price > 0:
@@ -479,14 +427,14 @@ class DashboardState(param.Parameterized):
                     if dw_alert and dw_alert.alert_type == 'ENTRY':
                         self.positions_version += 1
                         self.trades_version += 1
-                        self.load_model_data()
+        
                     if scanner_14a_dw:
                         a14dw = scanner_14a_dw.evaluate_signal(
                             dw_analysis, price, signal_source='CS-DW')
                         if a14dw and a14dw.alert_type == 'ENTRY':
                             self.positions_version += 1
                             self.trades_version += 1
-                            self.load_model_data()
+            
                 logger.info("[%s] DW analysis: %s %s (%.0f%%)",
                             label, dw_sig.action, dw_sig.primary_tf,
                             dw_sig.confidence * 100)
@@ -552,14 +500,6 @@ class DashboardState(param.Parameterized):
                 except Exception as e:
                     logger.error("Analysis loop error: %s", e)
 
-        def _model_loop():
-            while True:
-                time.sleep(3600)
-                try:
-                    self.load_model_data()
-                except Exception as e:
-                    logger.error("Model reload error: %s", e)
-
         def _tf_refresh_loop():
             """Refresh higher TF bars from IB every 30 min."""
             while True:
@@ -573,33 +513,12 @@ class DashboardState(param.Parameterized):
                     except Exception as e:
                         logger.warning("Higher TF refresh failed: %s", e)
 
-        def _yf_analysis_loop():
-            """yfinance A/B: 150s timer, staggered 45s from IB loop."""
-            time.sleep(75)  # Initial delay (staggered from IB's 30s)
-            while True:
-                time.sleep(150)
-                try:
-                    self._run_yf_analysis_bg()
-                except Exception as e:
-                    logger.error("yf A/B analysis loop error: %s", e)
-
-        def _yf_tf_refresh_loop():
-            """Refresh yfinance higher TF data every 30 min."""
-            while True:
-                time.sleep(1800)
-                try:
-                    self._load_yf_data()
-                except Exception as e:
-                    logger.warning("yf A/B TF refresh failed: %s", e)
-
         loops = [(_price_loop, 'price'), (_analysis_loop, 'analysis'),
-                 (_model_loop, 'model'), (_tf_refresh_loop, 'tf-refresh'),
-                 (_yf_analysis_loop, 'yf-analysis'),
-                 (_yf_tf_refresh_loop, 'yf-tf-refresh')]
+                 (_tf_refresh_loop, 'tf-refresh')]
         for fn, name in loops:
             t = threading.Thread(target=fn, daemon=True, name=f'x14-{name}')
             t.start()
-        logger.info("Background loops started (price/analysis/model/tf-refresh/yf-analysis/yf-tf-refresh)")
+        logger.info("Background loops started (price/analysis/tf-refresh)")
 
     def _run_analysis_bg(self):
         """Background-safe analysis: compute + apply without requiring Panel session."""
@@ -642,32 +561,6 @@ class DashboardState(param.Parameterized):
             tf_summary = ", ".join(f"{tf}={len(df)}" for tf, df in tfs.items() if len(df) > 0)
             logger.info("IB historical %s: %s", sym, tf_summary)
         return data
-
-    def _load_yf_data(self):
-        """Load native TF data + 5-min bars from yfinance for A/B comparison."""
-        try:
-            from v15.data.native_tf import load_native_tf_data
-            from pathlib import Path
-            cache_dir = Path('/tmp/.x14_native_tf_cache') if os.environ.get('SPACE_ID') else None
-            self._yf_native_tf_data = load_native_tf_data(
-                symbols=['TSLA', 'SPY', '^VIX'],
-                timeframes=['daily', 'weekly', 'monthly', '1h', '2h', '3h', '4h'],
-                verbose=False,
-                cache_dir=cache_dir,
-            )
-            logger.info("yfinance A/B: TF data loaded: %s", list(self._yf_native_tf_data.keys()))
-        except Exception as e:
-            logger.warning("yfinance A/B: TF data load failed: %s", e)
-            self._yf_native_tf_data = {}
-
-        try:
-            from v15.live_data import fetch_live_data
-            tsla_df, spy_df, vix_df = fetch_live_data(period='5d', interval='5m')
-            self._yf_current_tsla = tsla_df
-            logger.info("yfinance A/B: 5-min data loaded: %d bars",
-                        len(tsla_df) if tsla_df is not None else 0)
-        except Exception as e:
-            logger.warning("yfinance A/B: 5-min data load failed: %s", e)
 
     @staticmethod
     def _resample_ohlcv(df, rule):
@@ -759,8 +652,6 @@ class DashboardState(param.Parameterized):
             self.scanner_14a_ml = None
             self.scanner_14a_intra = None
 
-        # Initialize yfinance A/B scanners (identical configs, yf- prefixed tags)
-        self._init_yf_scanners()
 
         # Load ML model for Surfer ML path
         # NOTE: Cannot import surfer_ml directly — it pulls in torch which isn't on HF.
@@ -799,7 +690,6 @@ class DashboardState(param.Parameterized):
                     self._ml_model = _GBTShim(data['models'], data['feature_names'])
                     self._ml_feature_names = data['feature_names']
                     self._ml_history_buffer = []
-                    self._yf_ml_history_buffer = []
                     # Verify with a test prediction
                     test_pred = self._ml_model.predict(
                         np.zeros((1, len(self._ml_feature_names)), dtype=np.float32))
@@ -880,77 +770,11 @@ class DashboardState(param.Parameterized):
                     'consec_wins': 0, 'consec_losses': 0,
                     'last_trade_date': None,
                 }
-                self._yf_intraday_trade_state = {
-                    'bars_since_last': 999, 'daily_trades': 0,
-                    'consec_wins': 0, 'consec_losses': 0,
-                    'last_trade_date': None,
-                }
                 logger.info("Intraday ML model ready: %d features, threshold=%.2f",
                             len(self._intraday_ml_features), self._intraday_ml_threshold)
         except Exception as e:
             logger.warning("Intraday ML model load failed: %s — %s", e, traceback.format_exc())
             self._intraday_ml_model = None
-
-    def _init_yf_scanners(self):
-        """Create yf-* prefixed scanners with identical configs to IB counterparts."""
-        try:
-            from v15.trading.surfer_live_scanner import SurferLiveScanner, ScannerConfig
-
-            # c16 generation (yf- prefixed)
-            config = ScannerConfig(initial_capital=self.scanner_capital)
-            self.scanner_yf = SurferLiveScanner(config, model_tag='yf-c16')
-            self.scanner_yf_dw = SurferLiveScanner(config, model_tag='yf-c16-dw')
-            ml_config = ScannerConfig(
-                initial_capital=self.scanner_capital,
-                min_confidence=0.01,
-            )
-            self.scanner_yf_ml = SurferLiveScanner(ml_config, model_tag='yf-c16-ml')
-            self.scanner_yf_intra = SurferLiveScanner(config, model_tag='yf-c16-intra')
-            self.scanner_yf_oe = SurferLiveScanner(config, model_tag='yf-c16-oe')
-
-            # c14a generation (yf- prefixed)
-            c14a_config = ScannerConfig(
-                initial_capital=self.scanner_capital,
-                trail_power=8,
-                flat_sizing=False,
-                am_block_hour=10,
-                intraday_start_hour=13,
-                intraday_start_minute=0,
-            )
-            self.scanner_yf_14a = SurferLiveScanner(c14a_config, model_tag='yf-c14a')
-            self.scanner_yf_14a_dw = SurferLiveScanner(c14a_config, model_tag='yf-c14a-dw')
-            c14a_ml_config = ScannerConfig(
-                initial_capital=self.scanner_capital,
-                min_confidence=0.01,
-                trail_power=8,
-                flat_sizing=False,
-                am_block_hour=10,
-                intraday_start_hour=13,
-                intraday_start_minute=0,
-            )
-            self.scanner_yf_14a_ml = SurferLiveScanner(c14a_ml_config, model_tag='yf-c14a-ml')
-            self.scanner_yf_14a_intra = SurferLiveScanner(c14a_config, model_tag='yf-c14a-intra')
-
-            yf_scanners = [
-                self.scanner_yf, self.scanner_yf_dw, self.scanner_yf_ml,
-                self.scanner_yf_intra, self.scanner_yf_oe,
-                self.scanner_yf_14a, self.scanner_yf_14a_dw,
-                self.scanner_yf_14a_ml, self.scanner_yf_14a_intra,
-            ]
-            for scnr in yf_scanners:
-                scnr._save_state()
-            logger.info("yfinance A/B scanners initialized: 5x yf-c16 + 4x yf-c14a")
-        except Exception as e:
-            logger.error("yfinance A/B scanner init failed: %s", e)
-            self.scanner_yf = None
-            self.scanner_yf_dw = None
-            self.scanner_yf_ml = None
-            self.scanner_yf_intra = None
-            self.scanner_yf_oe = None
-            self.scanner_yf_14a = None
-            self.scanner_yf_14a_dw = None
-            self.scanner_yf_14a_ml = None
-            self.scanner_yf_14a_intra = None
 
     def _evaluate_surfer_ml(self, analysis):
         """Evaluate Surfer ML signal (IB path — thin wrapper)."""
@@ -1102,7 +926,7 @@ class DashboardState(param.Parameterized):
                              label, sig.action, _price)
                 self.positions_version += 1
                 self.trades_version += 1
-                self.load_model_data()
+
             elif entry_alert:
                 logger.info("[%s] Surfer ML evaluate_signal returned: %s", label, entry_alert.alert_type)
             else:
@@ -1118,7 +942,7 @@ class DashboardState(param.Parameterized):
                 if a14ml and a14ml.alert_type == 'ENTRY':
                     self.positions_version += 1
                     self.trades_version += 1
-                    self.load_model_data()
+    
             except Exception as e:
                 logger.warning("[%s] c14a ML eval failed: %s", label, e)
 
@@ -1367,7 +1191,7 @@ class DashboardState(param.Parameterized):
                     if alert and alert.alert_type == 'ENTRY':
                         self.positions_version += 1
                         self.trades_version += 1
-                        self.load_model_data()
+        
         except Exception as e:
             logger.warning("[%s] Intraday eval failed: %s", label, e)
 
@@ -1385,177 +1209,9 @@ class DashboardState(param.Parameterized):
                 if a14i and a14i.alert_type == 'ENTRY':
                     self.positions_version += 1
                     self.trades_version += 1
-                    self.load_model_data()
+    
             except Exception as e:
                 logger.warning("c14a intraday eval failed: %s", e)
-
-    def _run_yf_analysis_core(self):
-        """Compute analysis from yfinance data. Returns (tsla_df, analysis, dw_analysis) or None."""
-        from v15.core.channel_surfer import prepare_multi_tf_analysis
-
-        # Refresh yfinance 5-min bars
-        tsla_df = None
-        try:
-            from v15.live_data import fetch_live_data
-            tsla_df, spy_df, vix_df = fetch_live_data(period='5d', interval='5m')
-        except Exception as e:
-            logger.warning("yf A/B: failed to refresh 5-min data: %s", e)
-
-        effective_tsla = tsla_df if tsla_df is not None and len(tsla_df) > 0 else self._yf_current_tsla
-
-        if not self._yf_native_tf_data or effective_tsla is None:
-            return None
-
-        analysis = prepare_multi_tf_analysis(
-            native_data=self._yf_native_tf_data,
-            live_5min_tsla=effective_tsla,
-            target_tfs=['5min', '1h', '4h', 'daily', 'weekly'],
-        )
-
-        dw_analysis = None
-        if self.scanner_yf_dw:
-            dw_analysis = prepare_multi_tf_analysis(
-                native_data=self._yf_native_tf_data,
-                live_5min_tsla=effective_tsla,
-                target_tfs=['daily', 'weekly'],
-            )
-
-        return tsla_df, analysis, dw_analysis
-
-    def _apply_yf_analysis_results(self, tsla_df, analysis, dw_analysis):
-        """Apply yfinance analysis results — route to yf-* scanners."""
-        self._yf_analysis_running = False
-
-        if tsla_df is not None and len(tsla_df) > 0:
-            self._yf_current_tsla = tsla_df
-
-        sig = analysis.signal
-        logger.info("yf A/B analysis complete: %s %s (%.0f%%)",
-                     sig.action, sig.primary_tf, sig.confidence * 100)
-
-        # yf scanners use yfinance price ONLY — fully independent of IB
-        yf_price = 0.0
-        if tsla_df is not None and len(tsla_df) > 0:
-            yf_price = float(tsla_df['close'].iloc[-1])
-
-        # Update yf live status for dashboard display
-        now_str = datetime.now().strftime('%H:%M:%S')
-        scanner_statuses = []
-        for scnr in self._yf_scanners:
-            if scnr is None:
-                continue
-            last_sig = scnr.signal_history[-1] if scnr.signal_history else None
-            scanner_statuses.append({
-                'tag': scnr.model_tag,
-                'positions': len(scnr.positions),
-                'closed': len(scnr.closed_trades),
-                'daily_pnl': scnr.daily_pnl,
-                'last_signal': last_sig,
-            })
-        dw_sig_info = None
-        if dw_analysis:
-            dw_s = dw_analysis.signal
-            dw_sig_info = {'action': dw_s.action, 'confidence': dw_s.confidence,
-                           'primary_tf': dw_s.primary_tf}
-        self.yf_status = {
-            'price': yf_price,
-            'time': now_str,
-            'signal': sig.action,
-            'confidence': sig.confidence,
-            'primary_tf': sig.primary_tf,
-            'reason': getattr(sig, 'reason', ''),
-            'dw_signal': dw_sig_info,
-            'scanners': scanner_statuses,
-            'data_bars': len(tsla_df) if tsla_df is not None else 0,
-        }
-        self.yf_status_version += 1
-        if self.scanner_yf and yf_price > 0:
-            self._apply_analysis_results_with(
-                tsla_df=self._yf_current_tsla,
-                analysis=analysis,
-                dw_analysis=dw_analysis,
-                native_tf_data=self._yf_native_tf_data,
-                scanner_cs=self.scanner_yf,
-                scanner_dw=self.scanner_yf_dw,
-                scanner_ml=self.scanner_yf_ml,
-                scanner_intra=self.scanner_yf_intra,
-                scanner_14a=self.scanner_yf_14a,
-                scanner_14a_dw=self.scanner_yf_14a_dw,
-                scanner_14a_ml=self.scanner_yf_14a_ml,
-                scanner_14a_intra=self.scanner_yf_14a_intra,
-                label='yf',
-                ml_history_buffer=self._yf_ml_history_buffer,
-                intraday_trade_state=self._yf_intraday_trade_state,
-                price_override=yf_price,
-            )
-            # OE signals for yf path
-            if self.scanner_yf_oe and self._yf_native_tf_data and yf_price > 0:
-                try:
-                    from v15.core.oe_signals5 import check_oe_signal
-                    if check_oe_signal(self._yf_native_tf_data):
-                        from types import SimpleNamespace
-                        mock_signal = SimpleNamespace(
-                            action='BUY', confidence=0.7, primary_tf='daily',
-                            signal_type='bounce', reason='OE Signals_5',
-                            suggested_stop_pct=0.03, suggested_tp_pct=0.50,
-                            ou_half_life=5.0,
-                        )
-                        mock_analysis = SimpleNamespace(signal=mock_signal, atr=None)
-                        alert = self.scanner_yf_oe.evaluate_signal(
-                            mock_analysis, yf_price, signal_source='oe_signals5')
-                        if alert and alert.alert_type == 'ENTRY':
-                            self.positions_version += 1
-                            self.trades_version += 1
-                            self.load_model_data()
-                except Exception as e:
-                    logger.warning("yf A/B OE eval failed: %s", e)
-
-        # Check yf scanner exits using yfinance price only
-        if yf_price > 0:
-            for scnr in self._yf_scanners:
-                if scnr.positions:
-                    try:
-                        exit_alerts = scnr.check_exits(yf_price, yf_price, yf_price)
-                        if exit_alerts:
-                            self.load_model_data()
-                            if self._yf_intraday_trade_state:
-                                for ea in exit_alerts:
-                                    if getattr(ea, 'signal_source', '') == 'intraday':
-                                        ts = self._yf_intraday_trade_state
-                                        if getattr(ea, 'pnl', 0) > 0:
-                                            ts['consec_wins'] += 1
-                                            ts['consec_losses'] = 0
-                                        else:
-                                            ts['consec_losses'] += 1
-                                            ts['consec_wins'] = 0
-                    except Exception as e:
-                        logger.warning("yf exit check failed: %s", e)
-
-    def _run_yf_analysis_bg(self):
-        """Background-safe yfinance analysis: compute + apply."""
-        if not self._yf_native_tf_data:
-            return
-        if self._yf_analysis_running:
-            return
-        self._yf_analysis_running = True
-        try:
-            results = self._run_yf_analysis_core()
-            if results:
-                try:
-                    pn.state.execute(lambda r=results: self._apply_yf_analysis_results(*r))
-                except Exception:
-                    self._apply_yf_analysis_results(*results)
-        except Exception as e:
-            logger.error("yf A/B analysis failed: %s\n%s", e, traceback.format_exc())
-            self.yf_status = {
-                'price': 0, 'time': datetime.now().strftime('%H:%M:%S'),
-                'signal': 'ERROR', 'confidence': 0, 'primary_tf': '',
-                'reason': str(e)[:100], 'dw_signal': None,
-                'scanners': [], 'data_bars': 0,
-            }
-            self.yf_status_version += 1
-        finally:
-            self._yf_analysis_running = False
 
     def _evaluate_oe_signals5(self):
         """Evaluate OE Signals_5 on latest daily bars."""
@@ -1577,7 +1233,7 @@ class DashboardState(param.Parameterized):
                 if alert and alert.alert_type == 'ENTRY':
                     self.positions_version += 1
                     self.trades_version += 1
-                    self.load_model_data()
+    
         except Exception as e:
             logger.warning("OE Signals_5 eval failed: %s", e)
 
@@ -1742,29 +1398,6 @@ class DashboardState(param.Parameterized):
         )
         return self.send_notification(msg, title='Test Notification')
 
-    def load_model_data(self):
-        """Load multi-model state from per-model local JSON files."""
-        import json
-        from v15.trading.surfer_live_scanner import _STATE_DIR
-
-        combined = {}
-        for tag in ('c16', 'c16-dw', 'c16-ml', 'c16-intra', 'c16-oe',
-                    'c14a', 'c14a-dw', 'c14a-ml', 'c14a-intra',
-                    'yf-c16', 'yf-c16-dw', 'yf-c16-ml', 'yf-c16-intra', 'yf-c16-oe',
-                    'yf-c14a', 'yf-c14a-dw', 'yf-c14a-ml', 'yf-c14a-intra'):
-            fpath = _STATE_DIR / f"surfer_state_{tag}.json"
-            if fpath.exists():
-                try:
-                    combined[tag] = json.loads(fpath.read_text())
-                except Exception as e:
-                    logger.warning("Failed to load %s: %s", fpath, e)
-        if combined:
-            combined['_last_updated'] = datetime.now().isoformat()
-            self.model_data = combined
-            self.model_data_version += 1
-            logger.info("Model data loaded: %d models (local files)",
-                        len([k for k in combined if not k.startswith('_')]))
-
     def flush_scanner_state(self):
         """One-time: write each scanner's in-memory state to its per-model local file."""
         count = 0
@@ -1773,7 +1406,6 @@ class DashboardState(param.Parameterized):
             count += 1
             logger.info("Flushed state for %s: %d trades, equity=$%.2f",
                         scnr.model_tag, len(scnr.closed_trades), scnr.equity)
-        self.load_model_data()
         return count
 
 

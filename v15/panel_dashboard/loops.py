@@ -195,37 +195,6 @@ def tf_refresh_loop(state):
                 logger.warning("Higher TF refresh failed: %s", e)
 
 
-def yf_analysis_loop(state):
-    """yfinance analysis cycle — 150s timer, staggered from IB."""
-    time.sleep(75)
-    while True:
-        time.sleep(150)
-        try:
-            _run_yf_analysis(state)
-        except Exception as e:
-            logger.error("yf analysis loop error: %s", e)
-
-
-def yf_tf_refresh_loop(state):
-    """Refresh yfinance higher TF data every 30 min."""
-    while True:
-        time.sleep(1800)
-        try:
-            state._load_yf_data()
-        except Exception as e:
-            logger.warning("yf TF refresh failed: %s", e)
-
-
-def model_refresh_loop(state):
-    """Refresh model data every hour."""
-    while True:
-        time.sleep(3600)
-        try:
-            state.load_model_data()
-        except Exception as e:
-            logger.error("Model reload error: %s", e)
-
-
 def _handle_exits(state, exit_signals, source='ib'):
     """Process exit signals — close trades in DB (yf) or place IB orders (ib).
 
@@ -280,14 +249,6 @@ def _run_analysis(state):
         state._run_analysis_bg()
 
 
-def _run_yf_analysis(state):
-    """Run yfinance-based analysis."""
-    if getattr(state, '_yf_analysis_running', False):
-        return
-    if hasattr(state, '_run_yf_analysis_bg'):
-        state._run_yf_analysis_bg()
-
-
 def start_all_loops(state):
     """Start all background loops as daemon threads."""
     import threading
@@ -297,9 +258,6 @@ def start_all_loops(state):
         (yf_price_loop, 'yf-price'),
         (analysis_loop, 'analysis'),
         (tf_refresh_loop, 'tf-refresh'),
-        (yf_analysis_loop, 'yf-analysis'),
-        (yf_tf_refresh_loop, 'yf-tf-refresh'),
-        (model_refresh_loop, 'model'),
     ]
 
     for fn, name in loops:
