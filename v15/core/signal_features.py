@@ -54,6 +54,7 @@ def build_feature_vector(
     history_buffer=None,
     eval_interval=3,
     context=None,
+    bars_df=None,
 ):
     """Build the full ML feature vector from channel analysis + market context.
 
@@ -108,14 +109,14 @@ def build_feature_vector(
     offset += len(CROSS_TF_FEATURES)
 
     # Context features (RSI, volume, ATR, bar structure)
-    # bar_data can be a dict (live) or DataFrame row reference
-    if isinstance(bar_data, dict):
-        # Build a minimal DataFrame row for extract_context_features
-        # which expects (tsla_df, bar_index)
+    if bars_df is not None and len(bars_df) > 0:
+        ctx_feats = extract_context_features(bars_df, len(bars_df) - 1)
+    elif isinstance(bar_data, dict):
+        import logging
+        logging.getLogger(__name__).warning(
+            "build_feature_vector: no bars_df, context features degraded")
         ctx_feats = np.zeros(len(CONTEXT_FEATURES), dtype=np.float32)
-        # Fill what we can from the bar dict
         if closes is not None and len(closes) >= 14:
-            # RSI-14 from closes
             ctx_feats[0] = _compute_rsi_from_closes(closes, 14)
     else:
         ctx_feats = extract_context_features(bar_data, bar_data)

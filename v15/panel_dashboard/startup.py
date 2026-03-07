@@ -376,20 +376,26 @@ def run_ib_recovery(state):
     try:
         scan_unlinked_orders(state)
     except Exception as e:
-        logger.error("scan_unlinked_orders failed: %s", e)
+        logger.error("CRITICAL: scan_unlinked_orders failed: %s — setting ib_degraded", e)
+        state.ib_degraded = True
+        state.trade_db.set_metadata('ib_degraded', '1')
 
     # 6d. Recover in-flight orders
     try:
         recover_inflight_orders(state)
     except Exception as e:
-        logger.error("recover_inflight_orders failed: %s", e)
+        logger.error("CRITICAL: recover_inflight_orders failed: %s — setting ib_degraded", e)
+        state.ib_degraded = True
+        state.trade_db.set_metadata('ib_degraded', '1')
 
     # 6e. Seed seen_exec_ids + wire callbacks
     try:
         seed_seen_exec_ids(state)
         wire_exec_details_callbacks(state)
     except Exception as e:
-        logger.error("Seed/wire failed: %s", e)
+        logger.error("CRITICAL: Seed/wire failed: %s — setting ib_degraded", e)
+        state.ib_degraded = True
+        state.trade_db.set_metadata('ib_degraded', '1')
 
 
 def run_reconciliation(state):
@@ -405,7 +411,9 @@ def run_reconciliation(state):
     try:
         reconcile_ib_db(state)
     except Exception as e:
-        logger.error("Reconciliation failed: %s", e)
+        logger.error("CRITICAL: Reconciliation failed: %s — setting ib_degraded", e)
+        state.ib_degraded = True
+        state.trade_db.set_metadata('ib_degraded', '1')
 
 
 def start_loops(state):

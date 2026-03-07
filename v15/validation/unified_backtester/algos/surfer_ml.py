@@ -273,6 +273,7 @@ class SurferMLAlgo(AlgoBase):
                     history_buffer=self._history_buffer,
                     eval_interval=self.config.eval_interval,
                     context=context,
+                    bars_df=df5,
                 )
             except Exception:
                 feature_vec = None
@@ -373,7 +374,11 @@ class SurferMLAlgo(AlgoBase):
                 np.abs(lows[1:] - closes[:-1])
             )
         )
-        return float(np.mean(tr))
+        # Wilder EMA (matching surfer_backtest.py line 1092)
+        atr = float(np.mean(tr[:period])) if len(tr) >= period else float(np.mean(tr))
+        for i in range(period, len(tr)):
+            atr = (atr * (period - 1) + tr[i]) / period
+        return float(atr)
 
     def on_position_opened(self, position: 'Position'):
         """Initialize profit-tier trail state for new position.

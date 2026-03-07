@@ -237,6 +237,7 @@ def seed_seen_exec_ids(state):
         logger.info("Seeded seen_exec_ids: %d executions", len(handler.seen_exec_ids))
     except Exception as e:
         logger.error("Failed to seed seen_exec_ids: %s", e)
+        raise
 
 
 def wire_exec_details_callbacks(state):
@@ -278,7 +279,12 @@ def reconcile_ib_db(state):
             state.ib_client.ib.reqPositionsAsync(), state.ib_client._loop)
         broker_positions = future.result(timeout=15)
     except Exception as e:
-        logger.error("Reconciliation failed: could not get broker positions: %s", e)
+        logger.error("Reconciliation failed: could not get broker positions: %s — setting ib_degraded", e)
+        state.ib_degraded = True
+        try:
+            state.trade_db.set_metadata('ib_degraded', '1')
+        except Exception:
+            pass
         return
 
     # Sum broker TSLA position
