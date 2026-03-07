@@ -148,7 +148,50 @@ def _init_state():
     logger.info("Starting background loops...")
     _state.start_background_loops()
 
+    # Initialize new infrastructure (TradeDB, adapters, order handler, recovery)
+    # This runs alongside the existing scanner system — both coexist
+    _init_new_infra(_state)
+
     return _state
+
+
+def _init_new_infra(state):
+    """Initialize the new DB-backed infrastructure alongside existing scanners.
+
+    This adds TradeDB, ScannerManagers, IBOrderHandler, and recovery
+    without disrupting the existing SurferLiveScanner-based system.
+    """
+    try:
+        from v15.panel_dashboard.startup import (
+            init_trade_db, run_migration, create_adapters,
+            create_order_handler, reload_degraded_state,
+            run_ib_recovery, run_reconciliation,
+        )
+
+        # 1. Create DB + migrate (IB and ML already initialized by load_market_data)
+        init_trade_db(state)
+        run_migration(state)
+
+        # 2. Create adapters + order handler (IB client already connected)
+        if not state.migration_failed:
+            create_adapters(state)
+            create_order_handler(state)
+            reload_degraded_state(state)
+
+            # 3. Recovery + reconciliation (if IB connected)
+            if state.ib_connected:
+                run_ib_recovery(state)
+                run_reconciliation(state)
+
+        logger.info("New infrastructure initialized (trade_db=%s, ib_handler=%s, "
+                     "migration_failed=%s, ib_degraded=%s)",
+                     'OK' if state.trade_db else 'NONE',
+                     'OK' if getattr(state, 'ib_order_handler', None) else 'NONE',
+                     state.migration_failed,
+                     state.ib_degraded)
+    except Exception as e:
+        logger.error("New infrastructure init failed (non-fatal): %s\n%s",
+                     e, traceback.format_exc())
 
 
 def create_app():
@@ -159,6 +202,17 @@ def create_app():
     except Exception:
         logger.error("Import failed:\n%s", traceback.format_exc())
         raise
+
+    # Import new tabs (optional — don't break if missing)
+    ib_live_tab_fn = None
+    yf_sim_tab_fn = None
+    comparison_tab_fn = None
+    try:
+        from v15.panel_dashboard.tabs.ib_live import ib_live_tab as ib_live_tab_fn
+        from v15.panel_dashboard.tabs.yf_sim import yf_sim_tab as yf_sim_tab_fn
+        from v15.panel_dashboard.tabs.comparison import comparison_tab as comparison_tab_fn
+    except Exception as e:
+        logger.warning("New tabs import failed (non-fatal): %s", e)
 
     state = _init_state()
 
@@ -327,6 +381,9 @@ def create_app():
                 ('Channel Surfer', channel_surfer_tab(state)),
                 ('Model Comparisons', model_comparisons_tab(state)),
                 ('yfinance A/B', model_comparisons_tab(state, prefix='yf-')),
+                *([('IB Live', ib_live_tab_fn(state))] if ib_live_tab_fn else []),
+                *([('yf Sim', yf_sim_tab_fn(state))] if yf_sim_tab_fn else []),
+                *([('IB vs yf', comparison_tab_fn(state))] if comparison_tab_fn else []),
                 sizing_mode='stretch_width',
             ),
         ],
