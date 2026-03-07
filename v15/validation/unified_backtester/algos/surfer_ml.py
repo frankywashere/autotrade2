@@ -316,8 +316,6 @@ class SurferMLAlgo(AlgoBase):
         exits = []
         max_hold = self.config.params.get('max_hold_bars', 60)  # In 5-min bars
         eval_interval = self.config.eval_interval  # 3
-        # hold_bars counts 1-min bars; convert to 5-min equivalent
-        _1m_to_5m = 5
 
         for pos in open_positions:
             state = self._pos_state.get(pos.pos_id, {})
@@ -357,10 +355,7 @@ class SurferMLAlgo(AlgoBase):
             trailing = state.get('trailing_stop', entry)
 
             if pos.direction == 'long':
-                # Update trailing stop (best price)
-                if high > trailing:
-                    trailing = high
-                    state['trailing_stop'] = trailing
+                # Causal: use trailing from PRIOR eval window. Ratchet AFTER exit check.
 
                 if is_breakout:
                     profit_from_best = (trailing - entry) / entry
@@ -410,15 +405,16 @@ class SurferMLAlgo(AlgoBase):
                 if high >= pos.tp_price:
                     exits.append(ExitSignal(pos_id=pos.pos_id, price=pos.tp_price, reason='tp'))
                     continue
-                hold_5m = pos.hold_bars // _1m_to_5m
+                hold_5m = pos.hold_bars  # hold_bars now counts in exit_check_tf units
                 if not is_breakout and hold_5m >= max(6, int(ou_hl * 3)):
                     exits.append(ExitSignal(pos_id=pos.pos_id, price=close, reason='ou_timeout'))
                     continue
+                # Ratchet trailing stop AFTER exit check (causal: effective next eval)
+                if high > trailing:
+                    state['trailing_stop'] = high
 
             else:  # short
-                if trailing == 0 or low < trailing:
-                    trailing = low
-                    state['trailing_stop'] = trailing
+                # Causal: use trailing from PRIOR eval window
 
                 if is_breakout:
                     profit_from_best = (entry - trailing) / entry
@@ -466,13 +462,16 @@ class SurferMLAlgo(AlgoBase):
                 if low <= pos.tp_price:
                     exits.append(ExitSignal(pos_id=pos.pos_id, price=pos.tp_price, reason='tp'))
                     continue
-                hold_5m = pos.hold_bars // _1m_to_5m
+                hold_5m = pos.hold_bars  # hold_bars now counts in exit_check_tf units
                 if not is_breakout and hold_5m >= max(6, int(ou_hl * 3)):
                     exits.append(ExitSignal(pos_id=pos.pos_id, price=close, reason='ou_timeout'))
                     continue
+                # Ratchet trailing stop AFTER exit check (causal: effective next eval)
+                if trailing == 0 or low < trailing:
+                    state['trailing_stop'] = low
 
             # Hard timeout (max_hold is in 5-min bars)
-            hold_5m = pos.hold_bars // _1m_to_5m
+            hold_5m = pos.hold_bars  # hold_bars now counts in exit_check_tf units
             if hold_5m >= max_hold:
                 exits.append(ExitSignal(pos_id=pos.pos_id, price=close, reason='timeout'))
 

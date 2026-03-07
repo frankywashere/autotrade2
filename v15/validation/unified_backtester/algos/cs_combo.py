@@ -167,7 +167,7 @@ class CSComboAlgo(AlgoBase):
             for tf, df in full_data.items():
                 # For daily+ TFs, include up to this date
                 if tf in ('daily', 'weekly', 'monthly'):
-                    mask = df.index <= day_ts + pd.Timedelta(days=1)
+                    mask = df.index < day_ts + pd.Timedelta(days=1)
                 else:
                     mask = df.index <= day_ts + pd.Timedelta(hours=16)
                 sliced = df.loc[mask]
@@ -263,7 +263,8 @@ class CSComboAlgo(AlgoBase):
             trail_pct = trail_base * (1.0 - pos.confidence) ** trail_power
 
             if pos.direction == 'long':
-                best = max(pos.best_price, high)
+                # Causal: use best_price from PRIOR bars only (engine updates after exits)
+                best = pos.best_price
 
                 # Trailing stop (only activates when in profit — matching combo_backtest)
                 trailing_stop = best * (1.0 - trail_pct)
@@ -287,7 +288,8 @@ class CSComboAlgo(AlgoBase):
                     continue
 
             else:  # short
-                best = min(pos.best_price, low)
+                # Causal: use best_price from PRIOR bars only
+                best = pos.best_price
 
                 trailing_stop = best * (1.0 + trail_pct)
                 if best < pos.entry_price:
@@ -307,8 +309,8 @@ class CSComboAlgo(AlgoBase):
                         pos_id=pos.pos_id, price=pos.tp_price, reason='tp'))
                     continue
 
-            # Check timeout (hold_bars counts 1-min bars, convert to days: ~390 bars/day)
-            hold_days = pos.hold_bars / 390.0
+            # hold_bars counts in exit_check_tf units (daily bars)
+            hold_days = pos.hold_bars
             if hold_days >= max_hold:
                 exits.append(ExitSignal(
                     pos_id=pos.pos_id, price=close, reason='timeout'))

@@ -152,6 +152,28 @@ class DataProvider:
         for tf, df in self._tf_data.items():
             self._tf_times[tf] = df.index.values
 
+        # Precompute bar-end (completion) timestamps for start-indexed intraday TFs
+        # A 5-min bar starting at 09:30 completes at 09:34 (last 1-min bar before 09:35)
+        self._tf_bar_end: Dict[str, np.ndarray] = {}
+        idx_1m = self._df1m.index
+        for tf in _START_INDEXED_INTRADAY_TFS:
+            if tf not in self._tf_data:
+                continue
+            df = self._tf_data[tf]
+            ends = np.empty(len(df), dtype='datetime64[ns]')
+            for i in range(len(df)):
+                if i + 1 < len(df):
+                    next_start = df.index[i + 1]
+                    end_pos = idx_1m.searchsorted(next_start, side='left') - 1
+                    ends[i] = idx_1m[end_pos] if end_pos >= 0 else df.index[i]
+                else:
+                    day_mask = idx_1m.date == df.index[i].date()
+                    if day_mask.any():
+                        ends[i] = idx_1m[np.flatnonzero(day_mask)[-1]]
+                    else:
+                        ends[i] = df.index[i]
+            self._tf_bar_end[tf] = ends
+
     @property
     def start_time(self) -> pd.Timestamp:
         return self._df1m.index[0]
@@ -187,6 +209,14 @@ class DataProvider:
 
         df = source[tf]
         up_to_ts = pd.Timestamp(up_to)
+
+        # For start-indexed intraday TFs, only return bars that have completed
+        # (a 5-min bar starting at 09:30 is only available after 09:34)
+        if tf in self._tf_bar_end and symbol == 'TSLA':
+            ends = self._tf_bar_end[tf]
+            mask = ends <= np.datetime64(up_to_ts)
+            return df[mask]
+
         return df[df.index <= up_to_ts]
 
     def get_current_bar(self, tf: str, bar_time: 'pd.Timestamp | dt.datetime',

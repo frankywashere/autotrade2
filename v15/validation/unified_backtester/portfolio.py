@@ -224,12 +224,20 @@ class PortfolioManager:
                 return trade
         return None
 
-    def update_position(self, pos_id: str, high: float, low: float):
-        """Update best/worst prices and increment hold bars for a position."""
+    def update_position(self, pos_id: str, high: float, low: float,
+                        increment_hold: bool = False):
+        """Update best/worst prices for a position.
+
+        Args:
+            increment_hold: If True, also increment hold_bars. Engine sets
+                this only at exit-check TF boundaries so hold_bars counts
+                in the algo's natural units (5-min bars, daily bars, etc.).
+        """
         for ae in self._algos.values():
             if pos_id in ae.positions:
                 pos = ae.positions[pos_id]
-                pos.hold_bars += 1
+                if increment_hold:
+                    pos.hold_bars += 1
                 if pos.direction == 'long':
                     pos.best_price = max(pos.best_price, high)
                     pos.worst_price = min(pos.worst_price, low)

@@ -328,7 +328,8 @@ class OESig5Algo(AlgoBase):
             trail_pct = trail_base * (1.0 - pos.confidence) ** trail_power
 
             if pos.direction == 'long':
-                best = max(pos.best_price, high)
+                # Causal: use best_price from PRIOR bars only (engine updates after exits)
+                best = pos.best_price
                 trailing_stop = best * (1.0 - trail_pct)
                 if best > pos.entry_price:
                     effective_stop = max(pos.stop_price, trailing_stop)

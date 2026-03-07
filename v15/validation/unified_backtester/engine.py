@@ -4,10 +4,10 @@ BacktestEngine — Main simulation loop.
 Walks forward through 1-min bars, dispatches to algorithms at their
 primary TF, and manages position fills and exits.
 
-Loop order per bar (matching legacy engines):
+Loop order per bar (causal — no intrabar lookahead):
 1. Fill pending entries (at this bar's open)
-2. Update best/worst prices for open positions
-3. Process exits (stops, trails, TPs, timeouts)
+2. Process exits using stop/trail known at bar open (before ratcheting)
+3. Update best/worst prices (ratchet trail — effective next bar)
 4. Generate new signals → queue as pending entries for next bar
 """
 
@@ -155,14 +155,10 @@ class BacktestEngine:
                 # ---- STEP 1: Fill pending entries at this bar's open ----
                 self._fill_pending(algo, ts, bar_1m)
 
-                # ---- STEP 2: Update best/worst prices for open positions ----
+                # ---- STEP 2: Process exits BEFORE updating best/worst (causal) ----
+                # Stop/trail level is whatever was known at bar open.
+                # High/low ratcheting happens AFTER exit checks (Step 3).
                 positions = self.portfolio.get_open_positions(algo_id)
-                for pos in positions:
-                    self.portfolio.update_position(
-                        pos.pos_id, bar_1m['high'], bar_1m['low'])
-
-                # ---- STEP 3: Process exits ----
-                # Only check exits on exit_check_tf bar boundaries
                 if positions and ts in self._algo_exit_bar_times.get(algo_id, set()):
                     # Get the exit-resolution bar (may be 1min, 5min, or daily)
                     exit_bar = self.data.get_current_bar(algo.config.exit_check_tf, ts)
@@ -175,6 +171,16 @@ class BacktestEngine:
                             ex.pos_id, ex.price, ts, ex.reason)
                         if trade:
                             algo.on_fill(trade)
+
+                # ---- STEP 3: Update best/worst prices AFTER exits (causal) ----
+                # This ensures trail ratcheting only affects NEXT bar's stop level.
+                # hold_bars only increments at exit-check TF boundaries so algos
+                # count in their natural units (5-min bars, daily bars, etc.).
+                is_exit_boundary = ts in self._algo_exit_bar_times.get(algo_id, set())
+                for pos in self.portfolio.get_open_positions(algo_id):
+                    self.portfolio.update_position(
+                        pos.pos_id, bar_1m['high'], bar_1m['low'],
+                        increment_hold=is_exit_boundary)
 
                 # ---- STEP 4: Generate new signals → queue as pending ----
                 if ts in self._algo_bar_times.get(algo_id, set()):
@@ -266,11 +272,9 @@ class BacktestEngine:
                 else:
                     remaining.append(pe)
             else:
-                # next_primary_open: fill at the next primary TF bar
-                if time in self._algo_bar_times.get(algo_id, set()):
-                    to_fill.append(pe)
-                else:
-                    remaining.append(pe)
+                # next_primary_open: fill at the next 1-min bar's open
+                # (signal fires at bar-end, so next 1-min bar = next TF bar's open)
+                to_fill.append(pe)
 
         self._pending[algo_id] = remaining
 

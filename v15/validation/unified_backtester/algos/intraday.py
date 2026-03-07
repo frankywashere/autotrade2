@@ -267,9 +267,37 @@ class IntradayAlgo(AlgoBase):
         self._spread_pct = _compute_spread_pct(h, l, c)
         self._gap_pct = _compute_gap_pct(c, dates)
 
+        # RSI(14) on 5-min closes + 5-bar slope
+        delta = pd.Series(c).diff()
+        gain = delta.clip(lower=0).rolling(14).mean().values
+        loss = (-delta.clip(upper=0)).rolling(14).mean().values
+        with np.errstate(divide='ignore', invalid='ignore'):
+            rs = gain / np.where(loss == 0, np.nan, loss)
+        rsi_arr = 100.0 - (100.0 / (1.0 + rs))
+        self._rsi_slope = np.full(n, np.nan)
+        for i in range(18, n):  # 14 warmup + 5 slope
+            seg = rsi_arr[i - 4:i + 1]
+            if not np.any(np.isnan(seg)):
+                x = np.arange(5, dtype=np.float64)
+                mx = x.mean()
+                my = seg.mean()
+                self._rsi_slope[i] = np.sum((x - mx) * (seg - my)) / np.sum((x - mx) ** 2)
+
+        # Bullish 1-min candle count (last 5 1-min bars at each 5-min boundary)
+        df1m = self.data._tf_data['1min']
+        df1m_c = df1m['close'].values
+        df1m_o = df1m['open'].values
+        self._bullish_1m = np.full(n, np.nan)
+        for i, ts in enumerate(f5m.index):
+            pos = df1m.index.searchsorted(ts, side='right')
+            start = max(0, pos - 5)
+            if pos > start:
+                seg_c = df1m_c[start:pos]
+                seg_o = df1m_o[start:pos]
+                self._bullish_1m[i] = float(np.sum(seg_c > seg_o))
+
         # Higher TF features (precomputed and mapped to 5-min bars)
         # Resample from 1-min data
-        df1m = self.data._tf_data['1min']
         tfs = {}
         for rule, name in [('1h', '1h'), ('4h', '4h'), ('15min', '15m'), ('30min', '30m')]:
             tfs[name] = _resample_ohlcv(df1m, rule)
@@ -316,20 +344,37 @@ class IntradayAlgo(AlgoBase):
                 self._daily_cp[i] = daily_cp[k]
                 self._daily_slope[i] = daily_slope[k]
 
-        # Intraday TFs: map using point-in-time lookup
+        # Intraday TFs: map using completion-aware lookup
+        # A 1h bar starting at 10:00 only becomes visible after 10:59 (its last 1-min bar)
         configs = [
             (tfs['1h'], {'1h_cp': 'chan_pos', '1h_slope': 'chan_slope'}),
             (tfs['4h'], {'4h_cp': 'chan_pos', '4h_slope': 'chan_slope'}),
         ]
+        df1m_idx = df1m.index
         for tf_feat, col_map in configs:
-            ti = tf_feat.index.values
+            ti = tf_feat.index
+            # Compute bar completion: last 1-min bar before next TF bar start
+            completion = np.empty(len(ti), dtype='datetime64[ns]')
+            for k in range(len(ti)):
+                if k + 1 < len(ti):
+                    pos = df1m_idx.searchsorted(ti[k + 1], side='left') - 1
+                    completion[k] = df1m_idx[pos] if pos >= 0 else ti[k]
+                else:
+                    day = ti[k].date()
+                    day_mask = df1m_idx.date == day
+                    if day_mask.any():
+                        completion[k] = df1m_idx[np.flatnonzero(day_mask)[-1]]
+                    else:
+                        completion[k] = ti[k]
+
             ca = {k: tf_feat[v].values for k, v in col_map.items()}
-            j = 0
+            j = -1
             for i in range(n):
                 t = f5m.index[i]
-                while j < len(ti) - 1 and ti[j + 1] <= t:
+                # Advance j to latest bar whose completion <= current 5-min start
+                while j + 1 < len(ti) and completion[j + 1] <= t:
                     j += 1
-                if j < len(ti) and ti[j] <= t:
+                if j >= 0:
                     for k in col_map:
                         if k == '1h_cp':
                             self._h1_cp[i] = ca[k][j]
@@ -387,6 +432,8 @@ class IntradayAlgo(AlgoBase):
         daily_slope = self._daily_slope[idx]
         h1_slope = self._h1_slope[idx]
         h4_slope = self._h4_slope[idx]
+        rsi_slope = self._rsi_slope[idx]
+        bullish_1m = self._bullish_1m[idx]
 
         # Run signal function
         try:
@@ -398,7 +445,9 @@ class IntradayAlgo(AlgoBase):
             cp5=cp5, vwap_dist=vwap_dist,
             daily_cp=daily_cp, h1_cp=h1_cp, h4_cp=h4_cp,
             vol_ratio=vol_ratio, vwap_slope=vwap_slope,
-            gap_pct=gap_pct, daily_slope=daily_slope,
+            bullish_1m=bullish_1m,
+            gap_pct=gap_pct, rsi_slope=rsi_slope,
+            daily_slope=daily_slope,
             h1_slope=h1_slope, h4_slope=h4_slope,
             spread_pct=spread_pct,
             params=sig_params or None,
@@ -435,8 +484,8 @@ class IntradayAlgo(AlgoBase):
             close = bar['close']
 
             if pos.direction == 'long':
-                # Update best price
-                best = max(pos.best_price, high)
+                # Causal: use best_price from PRIOR bars only (engine updates after exits)
+                best = pos.best_price
 
                 # Trailing stop — ratchets from bar 1 (matching original backtest)
                 trail_pct = trail_base * (1.0 - pos.confidence) ** trail_power
