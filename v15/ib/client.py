@@ -411,11 +411,14 @@ class IBClient:
     def place_order(self, symbol: str, action: str, qty: int,
                     order_type: str = 'MKT', price: float = 0.0,
                     tif: str = 'DAY', outside_rth: bool = False,
-                    overnight: bool = False) -> dict:
+                    overnight: bool = False,
+                    order_ref: str = '', model_code: str = None) -> dict:
         """Place an order via IB. Thread-safe (called from Panel UI thread).
 
         Args:
             overnight: Route to OVERNIGHT exchange (Blue Ocean ATS, 8PM-3:50AM ET).
+            order_ref: Durable orderRef for crash recovery matching (max 80 chars).
+            model_code: IB modelCode for FA accounts (algo_id). None = don't set.
         """
         if not self.is_connected():
             return {'error': 'Not connected to IB'}
@@ -423,7 +426,7 @@ class IBClient:
             future = asyncio.run_coroutine_threadsafe(
                 self._place_order_async(symbol, action, qty, order_type,
                                         price, tif, outside_rth,
-                                        overnight),
+                                        overnight, order_ref, model_code),
                 self._loop)
             return future.result(timeout=10)
         except Exception as e:
@@ -432,7 +435,8 @@ class IBClient:
 
     async def _place_order_async(self, symbol, action, qty, order_type,
                                   price, tif, outside_rth,
-                                  overnight=False):
+                                  overnight=False, order_ref='',
+                                  model_code=None):
         """Async order placement (runs in IB event loop)."""
         from ib_async import MarketOrder, LimitOrder, StopOrder
 
@@ -457,18 +461,28 @@ class IBClient:
         order.tif = tif
         order.outsideRth = outside_rth
 
+        # Durable orderRef for crash recovery matching
+        if order_ref:
+            order.orderRef = order_ref[:80]  # IB limit
+
+        # FA modelCode for per-algo position tracking
+        if model_code:
+            order.modelCode = model_code
+
         trade = self.ib.placeOrder(contract, order)
         order_id = trade.order.orderId
+        perm_id = trade.order.permId
 
         with self._order_lock:
             self._trades[order_id] = trade
 
         trade.statusEvent += self._on_order_status
-        logger.info("Order placed: %s %d %s %s @ %.2f (id=%d)",
-                     action, qty, symbol, order_type, price, order_id)
+        logger.info("Order placed: %s %d %s %s @ %.2f (id=%d, perm=%d, ref=%s)",
+                     action, qty, symbol, order_type, price, order_id,
+                     perm_id, order_ref[:30] if order_ref else '')
 
-        # Let _on_order_status handle the sync (avoid blocking the UI thread)
-        return {'order_id': order_id, 'status': trade.orderStatus.status or 'Submitted', 'message': 'OK'}
+        return {'order_id': order_id, 'perm_id': perm_id,
+                'status': trade.orderStatus.status or 'Submitted', 'message': 'OK'}
 
     def _on_order_status(self, trade):
         """Callback fired by ib_async on order status change — re-sync from IB."""

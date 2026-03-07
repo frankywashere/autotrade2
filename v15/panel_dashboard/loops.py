@@ -117,6 +117,12 @@ def _update_ib_prices(state):
                 updates = state.ib_scanner_manager.update_all_trailing(price)
                 for trade_id, changes in updates:
                     state.trade_db.update_trade_state(trade_id, **changes)
+                    # If stop_price changed, modify the resting IB stop
+                    if ('stop_price' in changes
+                            and hasattr(state, 'ib_order_handler')
+                            and state.ib_order_handler):
+                        state.ib_order_handler.modify_trailing_stop(
+                            trade_id, changes['stop_price'])
             except Exception as e:
                 logger.warning("IB trailing update failed: %s", e)
 
@@ -249,11 +255,17 @@ def _handle_exits(state, exit_signals, source='ib'):
             except Exception as e:
                 logger.error("Failed to close yf trade %d: %s", trade_id, e)
         else:
-            # IB exit: two-phase commit
-            # TODO: Implement IB two-phase exit (place order, handle fill callback)
-            # For now, log the signal for manual follow-up
-            logger.info("IB exit signal: trade %d, reason=%s, price=$%.2f",
+            # IB exit: two-phase commit via IBOrderHandler
+            if hasattr(state, 'ib_order_handler') and state.ib_order_handler:
+                try:
+                    state.ib_order_handler.place_exit(
                         trade_id, exit_reason, exit_price)
+                except Exception as e:
+                    logger.error("IB exit failed for trade %d: %s",
+                                 trade_id, e)
+            else:
+                logger.warning("No IB order handler — exit signal for trade %d "
+                               "not placed", trade_id)
 
 
 def _run_analysis(state):

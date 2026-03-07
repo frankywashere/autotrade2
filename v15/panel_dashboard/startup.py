@@ -179,38 +179,70 @@ def reload_degraded_state(state):
         logger.error("Failed to reload ib_degraded: %s", e)
 
 
-def run_ib_recovery(state):
-    """Steps 6b-6e: Open-order cache, unlinked scan, recovery, seed+wire.
+def create_order_handler(state):
+    """Step 5b: Create the IBOrderHandler (shared between scanners and manual)."""
+    from v15.panel_dashboard.ib_order_handler import IBOrderHandler
+    state.ib_order_handler = IBOrderHandler(state)
+    logger.info("IBOrderHandler created")
 
-    TODO: Implement full IB recovery sequence:
-      6b. reqAllOpenOrdersAsync() to populate open-order cache
-      6c. scan_unlinked_orders (open + completed)
-      6d. recover_inflight_orders (pending/partial entries + exits + stops)
-      6e. seed seen_exec_ids + wire execDetailsEvent
-    """
+
+def run_ib_recovery(state):
+    """Steps 6b-6e: Open-order cache, unlinked scan, recovery, seed+wire."""
     if getattr(state, 'migration_failed', False):
         return
     if not state.ib_client or not state.ib_connected:
         logger.info("IB not connected — skipping recovery")
         return
+    if not hasattr(state, 'ib_order_handler') or not state.ib_order_handler:
+        logger.warning("No order handler — skipping recovery")
+        return
 
-    # TODO: Implement when IB two-phase commit is built
-    logger.info("IB recovery: not yet implemented (stub)")
+    from v15.panel_dashboard.ib_recovery import (
+        scan_unlinked_orders, recover_inflight_orders,
+        seed_seen_exec_ids, wire_exec_details_callbacks,
+    )
+
+    # 6b. Populate open-order cache
+    try:
+        state.ib_client.sync_orders()
+        logger.info("Open-order cache populated")
+    except Exception as e:
+        logger.error("Failed to populate open-order cache: %s", e)
+
+    # 6c. Scan unlinked orders
+    try:
+        scan_unlinked_orders(state)
+    except Exception as e:
+        logger.error("scan_unlinked_orders failed: %s", e)
+
+    # 6d. Recover in-flight orders
+    try:
+        recover_inflight_orders(state)
+    except Exception as e:
+        logger.error("recover_inflight_orders failed: %s", e)
+
+    # 6e. Seed seen_exec_ids + wire callbacks
+    try:
+        seed_seen_exec_ids(state)
+        wire_exec_details_callbacks(state)
+    except Exception as e:
+        logger.error("Seed/wire failed: %s", e)
 
 
 def run_reconciliation(state):
-    """Step 7: IB/DB reconciliation.
-
-    TODO: Implement quantity-based reconciliation per modelCode/orderRef.
-    """
+    """Step 7: IB/DB reconciliation."""
     if getattr(state, 'migration_failed', False):
         return
     if not state.ib_client or not state.ib_connected:
         logger.info("IB not connected — skipping reconciliation")
         return
 
-    # TODO: Implement when IB two-phase commit is built
-    logger.info("IB reconciliation: not yet implemented (stub)")
+    from v15.panel_dashboard.ib_recovery import reconcile_ib_db
+
+    try:
+        reconcile_ib_db(state)
+    except Exception as e:
+        logger.error("Reconciliation failed: %s", e)
 
 
 def start_loops(state):
@@ -233,6 +265,7 @@ def full_init(state):
     connect_ib(state)           # 3
     load_models(state)          # 4
     create_adapters(state)      # 5
+    create_order_handler(state) # 5b
     reload_degraded_state(state)  # 6
     run_ib_recovery(state)      # 6b-6e
     run_reconciliation(state)   # 7

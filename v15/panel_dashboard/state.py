@@ -79,6 +79,7 @@ class DashboardState(param.Parameterized):
     price_manager = param.Parameter(None, precedence=-1)        # PriceManager instance
     ib_scanner_manager = param.Parameter(None, precedence=-1)   # ScannerManager (source='ib')
     yf_scanner_manager = param.Parameter(None, precedence=-1)   # ScannerManager (source='yf')
+    ib_order_handler = param.Parameter(None, precedence=-1)     # IBOrderHandler instance
     fa_supported = param.Boolean(False, precedence=-1)          # IB FA account support
 
     # Internal
