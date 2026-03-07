@@ -264,9 +264,12 @@ class DashboardState(param.Parameterized):
                              "Check IB Gateway connection. No fallback.", self._price_err_count)
             source = 'NONE'
             # Socket connected but no prices flowing — enable Reconnect button
-            if self._price_err_count >= 10 and self.ib_connected:
+            # Only mark disconnected if the socket is actually down;
+            # during off-hours there are no ticks but the connection is fine.
+            if (self._price_err_count >= 10 and self.ib_connected
+                    and self.ib_client and not self.ib_client.is_connected()):
                 self.ib_connected = False
-                logger.warning("IB socket up but no prices for %d checks — marking disconnected",
+                logger.warning("IB socket down after %d price failures — marking disconnected",
                                self._price_err_count)
 
         # Always update source label (so UI shows NONE when no price)
