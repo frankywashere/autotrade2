@@ -11,6 +11,7 @@ Threading: all algo evaluation is serialized through _eval_lock.
 import datetime as dt
 import json
 import logging
+import queue
 import threading
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -52,16 +53,66 @@ class LiveEngine:
         self._eval_counters: Dict[str, int] = {}
         self._algo_enabled: Dict[str, bool] = {a.algo_id: True for a in algos}
 
-    def on_bar_close(self, tf: str, time: pd.Timestamp, bar: dict):
-        """Called when a TF bar closes. Single entry point, serialized."""
-        with self._eval_lock:
-            self._process_bar(tf, time, bar)
+        # Wire fill callback from IBOrderHandler
+        if self._orders and hasattr(self._orders, 'register_live_engine_callback'):
+            self._orders.register_live_engine_callback(self.on_fill)
 
-    def _process_bar(self, tf, time, bar):
-        """Process a bar close. Follows backtester causal loop order."""
+        # Start bar dispatch thread
+        if self._data and hasattr(self._data, '_bar_queue'):
+            self._dispatch_thread = threading.Thread(
+                target=self._bar_dispatch_loop, daemon=True,
+                name='LiveEngine-dispatch')
+            self._dispatch_thread.start()
+
+    def _bar_dispatch_loop(self):
+        """Drain bar-close events from LiveDataProvider queue.
+
+        Crash-safe: exceptions in on_bar_close are caught and logged,
+        the loop continues. The thread never dies.
+        """
+        while True:
+            try:
+                info = self._data._bar_queue.get(timeout=60)
+            except queue.Empty:
+                continue
+            except Exception:
+                continue
+
+            try:
+                self.on_bar_close(info['tf'], info['time'], info['bar'])
+            except Exception as e:
+                logger.error("LiveEngine dispatch failed for %s bar at %s: %s",
+                             info.get('tf'), info.get('time'), e, exc_info=True)
+
+    def on_bar_close(self, tf: str, time: pd.Timestamp, bar: dict):
+        """Called when a TF bar closes. Serialized, deadlock-safe.
+
+        Collects IB operations in a list during _process_bar(), then
+        executes them AFTER releasing _eval_lock to prevent deadlock
+        (IB fill callbacks need to acquire _eval_lock).
+        """
+        deferred_ib_ops = []
+        with self._eval_lock:
+            self._process_bar(tf, time, bar, deferred_ib_ops)
+
+        # Execute IB operations AFTER releasing eval_lock
+        for op in deferred_ib_ops:
+            try:
+                op()
+            except Exception as e:
+                logger.error("Deferred IB op failed: %s", e)
+
+    def _process_bar(self, tf, time, bar, deferred_ib_ops=None):
+        """Process a bar close. Follows backtester causal loop order.
+
+        IB operations are appended to deferred_ib_ops (if provided) instead
+        of being executed directly, to prevent deadlock with IB fill callbacks.
+        """
+        if deferred_ib_ops is None:
+            deferred_ib_ops = []
 
         # 1. Fill pending delayed entries at this bar's open (1-min bars only)
-        self._fill_pending_entries(tf, time, bar)
+        self._fill_pending_entries(tf, time, bar, deferred_ib_ops)
 
         for algo in self._algos:
             if not self._algo_enabled.get(algo.algo_id, True):
@@ -85,14 +136,14 @@ class LiveEngine:
             if tf == algo.config.exit_check_tf and positions:
                 exits = algo.check_exits(time, bar, positions)
                 for exit_sig in exits:
-                    self._execute_exit(algo, exit_sig)
+                    self._execute_exit(algo, exit_sig, deferred_ib_ops)
 
                 # 3. Re-fetch positions after exits, then ratchet
                 positions = self._get_positions(algo)
                 self._ratchet_positions(algo, positions, bar)
 
-                # 4. Sync broker-side trailing stops
-                self._sync_trailing_stops(algo, positions)
+                # 4. Sync broker-side trailing stops (deferred)
+                self._sync_trailing_stops(algo, positions, deferred_ib_ops)
 
             # 5. Active window gate — only applies to ENTRY generation
             if algo.config.active_start and algo.config.active_end:
@@ -115,7 +166,8 @@ class LiveEngine:
                             signal=sig, algo=algo, queued_time=time,
                             fill_at=fill_at))
                     else:
-                        self._execute_entry(algo, sig, bar['close'])
+                        self._execute_entry(algo, sig, bar['close'],
+                                            deferred_ib_ops)
 
     def _get_positions(self, algo):
         """Get open positions for an algo from DB, convert to Position objects."""
@@ -179,7 +231,7 @@ class LiveEngine:
             except Exception as e:
                 logger.error("Ratchet failed for trade %d: %s", trade_id, e)
 
-    def _sync_trailing_stops(self, algo, positions):
+    def _sync_trailing_stops(self, algo, positions, deferred_ib_ops=None):
         """Sync effective stop from algo state to IB resting stop orders."""
         for pos in positions:
             effective_stop = algo.get_effective_stop(pos)
@@ -192,14 +244,20 @@ class LiveEngine:
                     logger.error("Stop sync DB failed for trade %d: %s",
                                  trade_id, e)
                 if self._orders:
-                    try:
-                        self._orders.modify_trailing_stop(trade_id,
-                                                           effective_stop)
-                    except Exception as e:
-                        logger.error("Stop sync IB failed for trade %d: %s",
-                                     trade_id, e)
+                    # Defer IB call to prevent deadlock
+                    if deferred_ib_ops is not None:
+                        deferred_ib_ops.append(
+                            lambda tid=trade_id, s=effective_stop:
+                                self._orders.modify_trailing_stop(tid, s))
+                    else:
+                        try:
+                            self._orders.modify_trailing_stop(trade_id,
+                                                               effective_stop)
+                        except Exception as e:
+                            logger.error("Stop sync IB failed for trade %d: %s",
+                                         trade_id, e)
 
-    def _fill_pending_entries(self, tf, time, bar):
+    def _fill_pending_entries(self, tf, time, bar, deferred_ib_ops=None):
         """Fill delayed entries. Only on 1-min bars for precise timing."""
         if tf != '1min':
             return
@@ -208,7 +266,7 @@ class LiveEngine:
             if pending.fill_at == 'next_rth_open':
                 if time.time() == dt.time(9, 30):
                     self._execute_entry(pending.algo, pending.signal,
-                                        bar['open'])
+                                        bar['open'], deferred_ib_ops)
                 else:
                     remaining.append(pending)
             elif pending.fill_at == 'next_1min_open':
@@ -217,18 +275,17 @@ class LiveEngine:
                     remaining.append(pending)
                 else:
                     self._execute_entry(pending.algo, pending.signal,
-                                        bar['open'])
+                                        bar['open'], deferred_ib_ops)
             else:
                 remaining.append(pending)
         self._pending_entries = remaining
 
-    def _execute_entry(self, algo, signal, fill_price):
+    def _execute_entry(self, algo, signal, fill_price, deferred_ib_ops=None):
         """Place entry order or record sim trade."""
         if not algo.config.live_orders:
-            # Sim mode: instant DB write
+            # Sim mode: instant DB write (no IB calls, safe inside lock)
             if self._db:
                 try:
-                    # Convert pct to absolute prices
                     if signal.direction == 'long':
                         stop_price = fill_price * (1 - signal.stop_pct)
                         tp_price = fill_price * (1 + signal.tp_pct)
@@ -263,7 +320,6 @@ class LiveEngine:
                         trail_width_mult=signal.metadata.get('trail_width_mult', 1.0),
                         metadata=signal.metadata,
                     )
-                    # Call algo.on_position_opened
                     trade = self._db.get_trade(trade_id)
                     if trade:
                         pos = self._get_positions(algo)
@@ -276,44 +332,50 @@ class LiveEngine:
                                  algo.algo_id, e)
             return
 
-        # IB mode: two-phase commit via IBOrderHandler
+        # IB mode: defer order placement to prevent deadlock
         if self._orders:
-            try:
-                if signal.direction == 'long':
-                    stop_price = fill_price * (1 - signal.stop_pct)
-                    tp_price = fill_price * (1 + signal.tp_pct)
-                else:
-                    stop_price = fill_price * (1 + signal.stop_pct)
-                    tp_price = fill_price * (1 - signal.tp_pct)
+            if signal.direction == 'long':
+                stop_price = fill_price * (1 - signal.stop_pct)
+                tp_price = fill_price * (1 + signal.tp_pct)
+            else:
+                stop_price = fill_price * (1 + signal.stop_pct)
+                tp_price = fill_price * (1 - signal.tp_pct)
 
-                shares = signal.shares
-                if shares == 0:
-                    equity = algo.config.max_equity_per_trade
-                    shares = max(1, int(equity / fill_price))
+            shares = signal.shares
+            if shares == 0:
+                equity = algo.config.max_equity_per_trade
+                shares = max(1, int(equity / fill_price))
 
-                self._orders.place_entry(
-                    algo_id=algo.algo_id,
-                    direction=signal.direction,
-                    shares=shares,
-                    stop_price=stop_price,
-                    tp_price=tp_price,
-                    confidence=signal.confidence,
-                    signal_type=signal.signal_type,
-                    trail_width=signal.metadata.get('trail_width', 0.01),
-                    ou_half_life=signal.metadata.get('ou_half_life', 5.0),
-                    el_flagged=signal.metadata.get('el_flagged', False),
-                    trail_width_mult=signal.metadata.get('trail_width_mult', 1.0),
-                    entry_price=fill_price,
-                )
-            except Exception as e:
-                logger.error("IB entry failed for %s: %s", algo.algo_id, e)
+            entry_kwargs = dict(
+                algo_id=algo.algo_id,
+                direction=signal.direction,
+                shares=shares,
+                stop_price=stop_price,
+                tp_price=tp_price,
+                confidence=signal.confidence,
+                signal_type=signal.signal_type,
+                trail_width=signal.metadata.get('trail_width', 0.01),
+                ou_half_life=signal.metadata.get('ou_half_life', 5.0),
+                el_flagged=signal.metadata.get('el_flagged', False),
+                trail_width_mult=signal.metadata.get('trail_width_mult', 1.0),
+                entry_price=fill_price,
+            )
+            if deferred_ib_ops is not None:
+                deferred_ib_ops.append(
+                    lambda kw=entry_kwargs: self._orders.place_entry(**kw))
+            else:
+                try:
+                    self._orders.place_entry(**entry_kwargs)
+                except Exception as e:
+                    logger.error("IB entry failed for %s: %s",
+                                 algo.algo_id, e)
 
-    def _execute_exit(self, algo, exit_signal):
+    def _execute_exit(self, algo, exit_signal, deferred_ib_ops=None):
         """Place closing order."""
         trade_id = int(exit_signal.pos_id)
 
         if not algo.config.live_orders:
-            # Sim mode: instant close
+            # Sim mode: instant close (no IB calls, safe inside lock)
             if self._db:
                 try:
                     from datetime import datetime
@@ -328,13 +390,20 @@ class LiveEngine:
                                  trade_id, e)
             return
 
-        # IB mode: two-phase exit
+        # IB mode: defer order placement to prevent deadlock
         if self._orders:
-            try:
-                self._orders.place_exit(
-                    trade_id, exit_signal.reason, exit_signal.price)
-            except Exception as e:
-                logger.error("IB exit failed for trade %d: %s", trade_id, e)
+            if deferred_ib_ops is not None:
+                deferred_ib_ops.append(
+                    lambda tid=trade_id, reason=exit_signal.reason,
+                           price=exit_signal.price:
+                        self._orders.place_exit(tid, reason, price))
+            else:
+                try:
+                    self._orders.place_exit(
+                        trade_id, exit_signal.reason, exit_signal.price)
+                except Exception as e:
+                    logger.error("IB exit failed for trade %d: %s",
+                                 trade_id, e)
 
     def on_fill(self, trade_id: int, fill_price: float, fill_qty: int,
                 is_entry: bool):

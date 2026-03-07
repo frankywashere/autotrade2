@@ -131,6 +131,9 @@ class IBOrderHandler:
         self._exit_orders: dict[int, dict] = {}   # order_id -> {trade_id, exit_reason}
         self._stop_orders: dict[int, dict] = {}   # order_id -> {trade_id}
 
+        # LiveEngine fill callback (set via register_live_engine_callback)
+        self._live_engine_callback = None
+
     @property
     def db(self):
         return self._state.trade_db
@@ -138,6 +141,25 @@ class IBOrderHandler:
     @property
     def ib(self):
         return self._state.ib_client
+
+    def register_live_engine_callback(self, callback):
+        """Register LiveEngine fill callback.
+
+        callback(trade_id: int, fill_price: float, fill_qty: int, is_entry: bool)
+        Called from IB event loop thread. Callback should acquire its own lock.
+        """
+        self._live_engine_callback = callback
+
+    def _notify_live_engine(self, trade_id, fill_price, fill_qty, is_entry):
+        """Notify LiveEngine of a fill (if callback registered)."""
+        if self._live_engine_callback:
+            try:
+                self._live_engine_callback(
+                    trade_id=trade_id, fill_price=fill_price,
+                    fill_qty=fill_qty, is_entry=is_entry)
+            except Exception as e:
+                logger.error("LiveEngine %s callback failed: %s",
+                             'entry' if is_entry else 'exit', e)
 
     def _set_degraded(self, reason: str):
         """Set ib_degraded=True and persist to DB metadata."""
@@ -638,6 +660,7 @@ class IBOrderHandler:
         self.place_or_resize_stop(trade_id, stop_price, new_filled, direction)
 
         self._state.positions_version += 1
+        self._notify_live_engine(trade_id, fill.price, fill.shares, is_entry=True)
 
     def _on_exit_fill(self, order_id: int, fill: FillData):
         """Handle a fill on an exit order."""
@@ -705,6 +728,7 @@ class IBOrderHandler:
                 logger.error("close_trade failed for trade %d: %s", trade_id, e)
 
         self._state.positions_version += 1
+        self._notify_live_engine(trade_id, fill.price, fill.shares, is_entry=False)
 
     def _on_stop_fill(self, order_id: int, fill: FillData):
         """Handle a fill on a protective stop (stop fill = exit)."""

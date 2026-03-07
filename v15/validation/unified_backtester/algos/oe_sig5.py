@@ -9,6 +9,7 @@ Exit logic: same as CS-combo (exponential trail, 10-day hold, 3% stop).
 Entry: next-day RTH open (delayed_entry=True).
 """
 
+import logging
 import time as _time_mod
 from typing import Dict, List
 
@@ -18,6 +19,8 @@ import pandas as pd
 from ..algo_base import AlgoBase, AlgoConfig, Signal, ExitSignal, CostModel
 from ..data_provider import DataProvider
 from ..portfolio import Position
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_OE_SIG5_CONFIG = AlgoConfig(
@@ -224,10 +227,15 @@ class OESig5Algo(AlgoBase):
         self._cooldown_remaining = 0
         self._current_day = None
 
-        print("  Loading OE-Sig5 signals...")
-        t0 = _time_mod.time()
-        self._day_signals = self._precompute_signals()
-        print(f"  Done: {len(self._day_signals)} signal days in {_time_mod.time() - t0:.1f}s")
+        if data is not None and not getattr(data, 'is_live', False):
+            # Backtest: precompute from native_tf files
+            print("  Loading OE-Sig5 signals...")
+            t0 = _time_mod.time()
+            self._day_signals = self._precompute_signals()
+            print(f"  Done: {len(self._day_signals)} signal days in {_time_mod.time() - t0:.1f}s")
+        else:
+            # Live: compute incrementally from DataProvider
+            self._day_signals = {}
 
     def _precompute_signals(self) -> Dict:
         """Precompute OE-Sig5 signals for all trading days."""
@@ -279,6 +287,74 @@ class OESig5Algo(AlgoBase):
     def warmup_bars(self) -> int:
         return 0
 
+    def _compute_today_signal(self, time, day):
+        """Compute OE-Sig5 signal for today using live data.
+
+        Critical: align TSLA/SPY/VIX DataFrames by date before calling
+        _evolved_signal, which uses positional iloc indexing.
+        """
+        try:
+            tsla_d = self.data.get_bars('daily', time, symbol='TSLA')
+            spy_d = self.data.get_bars('daily', time, symbol='SPY')
+            vix_d = self.data.get_bars('daily', time, symbol='VIX')
+        except Exception as e:
+            logger.error("OE-Sig5: failed to get daily bars: %s", e)
+            return
+
+        if len(tsla_d) < 36 or len(spy_d) < 36 or len(vix_d) < 36:
+            logger.debug("OE-Sig5: insufficient daily bars (TSLA=%d, SPY=%d, VIX=%d)",
+                          len(tsla_d), len(spy_d), len(vix_d))
+            return
+
+        # Ensure lowercase columns
+        for df in [tsla_d, spy_d, vix_d]:
+            df.columns = [c.lower() for c in df.columns]
+
+        # DATE ALIGNMENT: inner-join on DatetimeIndex so iloc[i] on all three
+        # DataFrames refers to the same calendar date. Without this,
+        # different-length DataFrames produce wrong cross-symbol comparisons.
+        common_dates = tsla_d.index.intersection(spy_d.index).intersection(vix_d.index)
+        if len(common_dates) < 36:
+            logger.debug("OE-Sig5: insufficient aligned dates (%d)", len(common_dates))
+            return
+        tsla_d = tsla_d.loc[common_dates]
+        spy_d = spy_d.loc[common_dates]
+        vix_d = vix_d.loc[common_dates]
+
+        # Get weekly bars (native from IB seeding, not resampled)
+        try:
+            tsla_w = self.data.get_bars('weekly', time, symbol='TSLA')
+        except Exception:
+            tsla_w = None
+
+        # Fallback: resample from daily if no native weekly
+        if tsla_w is None or len(tsla_w) < 51:
+            tsla_w = tsla_d.resample('W-FRI').agg({
+                'open': 'first', 'high': 'max', 'low': 'min',
+                'close': 'last', 'volume': 'sum',
+            }).dropna()
+
+        if len(tsla_w) < 51:
+            logger.debug("OE-Sig5: insufficient weekly bars (%d)", len(tsla_w))
+            return
+
+        tsla_rsi = _compute_rsi(tsla_d['close'], 14)
+
+        # Evaluate signal at last aligned daily bar
+        idx = len(tsla_d) - 1
+        sig = _evolved_signal(idx, tsla_d, spy_d, vix_d, tsla_w, tsla_rsi)
+
+        if sig == 1:
+            default_conf = self.config.params.get('default_confidence', 0.7)
+            stop_pct = self.config.params.get('stop_pct', 0.03)
+            self._day_signals[day] = {
+                'action': 'BUY',
+                'confidence': default_conf,
+                'stop_pct': stop_pct,
+                'signal_type': 'oe_sig5',
+            }
+            logger.info("OE-Sig5 signal for %s: BUY conf=%.2f", day, default_conf)
+
     def on_bar(self, time: pd.Timestamp, bar: dict,
                open_positions: list,
                context=None) -> List[Signal]:
@@ -286,6 +362,11 @@ class OESig5Algo(AlgoBase):
         params = self.config.params
 
         day = time.date()
+
+        # Live mode: compute today's signal from available data
+        if getattr(self.data, 'is_live', False) and day != self._current_day:
+            self._compute_today_signal(time, day)
+
         if day != self._current_day:
             self._current_day = day
             if self._cooldown_remaining > 0:

@@ -196,6 +196,10 @@ class DataProvider:
             self._tf_bar_end[tf] = ends
 
     @property
+    def is_live(self) -> bool:
+        return False
+
+    @property
     def start_time(self) -> pd.Timestamp:
         return self._df1m.index[0]
 

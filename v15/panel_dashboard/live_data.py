@@ -10,6 +10,7 @@ Only completed bars are visible — no incomplete/in-progress bars.
 """
 
 import logging
+import queue
 import threading
 from typing import Dict, Optional
 
@@ -36,9 +37,9 @@ class LiveDataProvider:
         # Per-symbol bar storage: {symbol: {tf: pd.DataFrame}}
         self._bars: Dict[str, Dict[str, pd.DataFrame]] = {}
 
-        # Bar-close event for LiveEngine dispatch
-        self.bar_close_event = threading.Event()
-        self._last_bar_info: Optional[dict] = None  # {tf, time, bar, symbol}
+        # Bar-close queue for LiveEngine dispatch (replaces Event + dict
+        # to prevent event drops when multiple TFs close simultaneously)
+        self._bar_queue: queue.Queue = queue.Queue()
 
         # Seed historical data at startup
         self._seed_historical()
@@ -146,9 +147,8 @@ class LiveDataProvider:
         # Order: 1min first, then higher TFs ascending
         if symbol == 'TSLA':
             for tf, time, bar_data in emit_events:
-                self._last_bar_info = {'tf': tf, 'time': time, 'bar': bar_data,
-                                        'symbol': symbol}
-                self.bar_close_event.set()
+                self._bar_queue.put({'tf': tf, 'time': time, 'bar': bar_data,
+                                      'symbol': symbol})
 
     def _check_and_resample(self, storage, tf, period_mins, bar_time):
         """Check if a higher-TF bar just completed, resample if so."""
@@ -317,9 +317,10 @@ class LiveDataProvider:
         """Seed with IB historical bars at startup.
 
         Provides lookback for channel/feature computation:
-        - TSLA: 5 days of 1-min bars (for intraday features)
-        - TSLA/SPY/VIX: 400 daily bars (for channels + OE-Sig5 weekly)
-        - TSLA weekly/monthly: derived from daily resample
+        - TSLA: 5 days of 1-min bars (for intraday features + 5min/1h resample)
+        - TSLA/SPY/VIX: 500 daily bars (for channels + OE-Sig5)
+        - TSLA/SPY/VIX: 104 weekly bars (for weekly channels)
+        - TSLA monthly: derived from daily resample
         """
         if not self._ib or not self._ib.is_connected():
             logger.warning("IB not connected, skipping historical seeding")
@@ -332,50 +333,95 @@ class LiveDataProvider:
 
         for symbol in ('TSLA', 'SPY', 'VIX'):
             try:
-                self._seed_daily_bars(symbol, bars=400)
+                self._seed_daily_bars(symbol, bars=500)
             except Exception as e:
                 logger.error("Failed to seed %s daily bars: %s", symbol, e)
+            try:
+                self._seed_weekly_bars(symbol)
+            except Exception as e:
+                logger.error("Failed to seed %s weekly bars: %s", symbol, e)
 
-        # Derive weekly/monthly from daily
+        # Monthly: resample from daily (IB monthly bars limited anyway)
         with self._lock:
-            tsla_storage = self._bars.get('TSLA', {})
-            if 'daily' in tsla_storage:
-                for tf in ('weekly', 'monthly'):
-                    self._resample_from_daily(tsla_storage, tf)
+            storage = self._bars.get('TSLA', {})
+            if 'daily' in storage:
+                self._resample_from_daily(storage, 'monthly')
+
+        # Validate seeded data meets algo minimum requirements
+        self._validate_seeded_bars()
 
         logger.info("Historical seeding complete: %s",
                      {s: list(tfs.keys()) for s, tfs in self._bars.items()})
 
+    def _validate_seeded_bars(self):
+        """Check seeded bar counts against algo minimum requirements."""
+        # Minimum bars needed per symbol/TF across all algos:
+        # CS-Combo: daily=60, weekly=50, monthly=24, 5min=78, 1h=60, 4h=30
+        # OE-Sig5: daily=36 (TSLA/SPY/VIX), weekly=51 (TSLA)
+        # Surfer-ML: daily=20 (SPY/VIX for correlation)
+        # Intraday: daily=40, 1h=24, 4h=20
+        minimums = {
+            'TSLA': {'1min': 390, '5min': 78, '1h': 60, '4h': 30,
+                     'daily': 60, 'weekly': 51, 'monthly': 24},
+            'SPY':  {'daily': 36},
+            'VIX':  {'daily': 36},
+        }
+        with self._lock:
+            for symbol, tf_mins in minimums.items():
+                storage = self._bars.get(symbol, {})
+                for tf, min_bars in tf_mins.items():
+                    actual = len(storage.get(tf, pd.DataFrame()))
+                    if actual < min_bars:
+                        logger.warning(
+                            "INSUFFICIENT DATA: %s %s has %d bars, need %d",
+                            symbol, tf, actual, min_bars)
+
     def _seed_1min_bars(self, symbol, days=5):
         """Seed 1-min bars from IB historical API."""
-        if not hasattr(self._ib, 'get_historical_bars'):
+        bars_df = self._ib.fetch_historical(symbol, f'{days} D', '1 min',
+                                             use_rth=False)
+        if bars_df is None or len(bars_df) == 0:
+            logger.warning("No 1-min bars returned for %s", symbol)
             return
-        bars = self._ib.get_historical_bars(
-            symbol, duration=f'{days} D', bar_size='1 min')
-        if bars is not None and len(bars) > 0:
-            with self._lock:
-                self._bars.setdefault(symbol, {})['1min'] = bars
-                # Resample to 5min, 1h from 1min
-                for tf, rule in [('5min', '5min'), ('15min', '15min'),
-                                  ('1h', '1h')]:
-                    resampled = bars.resample(rule).agg({
-                        'open': 'first', 'high': 'max', 'low': 'min',
-                        'close': 'last', 'volume': 'sum',
-                    }).dropna()
-                    self._bars[symbol][tf] = resampled
-            logger.info("Seeded %s 1-min bars: %d", symbol, len(bars))
+        bars_df['date'] = pd.to_datetime(bars_df['date'])
+        bars_df = bars_df.set_index('date')
+        with self._lock:
+            self._bars.setdefault(symbol, {})['1min'] = bars_df
+            for tf, rule in [('5min', '5min'), ('15min', '15min'),
+                              ('1h', '1h')]:
+                resampled = bars_df.resample(rule).agg({
+                    'open': 'first', 'high': 'max', 'low': 'min',
+                    'close': 'last', 'volume': 'sum',
+                }).dropna()
+                self._bars[symbol][tf] = resampled
+        logger.info("Seeded %s 1-min bars: %d", symbol, len(bars_df))
 
-    def _seed_daily_bars(self, symbol, bars=400):
+    def _seed_daily_bars(self, symbol, bars=500):
         """Seed daily bars from IB historical API."""
-        if not hasattr(self._ib, 'get_historical_bars'):
+        daily_df = self._ib.fetch_historical(symbol, '2 Y', '1 day',
+                                              use_rth=True)
+        if daily_df is None or len(daily_df) == 0:
+            logger.warning("No daily bars returned for %s", symbol)
             return
-        daily = self._ib.get_historical_bars(
-            symbol, duration='2 Y', bar_size='1 day')
-        if daily is not None and len(daily) > 0:
-            with self._lock:
-                self._bars.setdefault(symbol, {})['daily'] = daily.tail(bars)
-            logger.info("Seeded %s daily bars: %d", symbol,
-                         min(len(daily), bars))
+        daily_df['date'] = pd.to_datetime(daily_df['date'])
+        daily_df = daily_df.set_index('date')
+        with self._lock:
+            self._bars.setdefault(symbol, {})['daily'] = daily_df.tail(bars)
+        logger.info("Seeded %s daily bars: %d", symbol,
+                     min(len(daily_df), bars))
+
+    def _seed_weekly_bars(self, symbol):
+        """Seed weekly bars from IB historical API (native, not resampled)."""
+        weekly_df = self._ib.fetch_historical(symbol, '2 Y', '1 W',
+                                               use_rth=True)
+        if weekly_df is None or len(weekly_df) == 0:
+            logger.warning("No weekly bars returned for %s", symbol)
+            return
+        weekly_df['date'] = pd.to_datetime(weekly_df['date'])
+        weekly_df = weekly_df.set_index('date')
+        with self._lock:
+            self._bars.setdefault(symbol, {})['weekly'] = weekly_df
+        logger.info("Seeded %s weekly bars: %d", symbol, len(weekly_df))
 
     def backfill_gap(self, symbol: str, since: pd.Timestamp):
         """Backfill bars after IB disconnect/reconnect."""
@@ -386,16 +432,19 @@ class LiveDataProvider:
             gap_mins = int((now - since).total_seconds() / 60)
             if gap_mins < 1:
                 return
-            bars = self._ib.get_historical_bars(
-                symbol, duration=f'{gap_mins * 60} S', bar_size='1 min')
-            if bars is not None and len(bars) > 0:
+            duration_secs = gap_mins * 60
+            bars_df = self._ib.fetch_historical(
+                symbol, f'{duration_secs} S', '1 min', use_rth=False)
+            if bars_df is not None and len(bars_df) > 0:
+                bars_df['date'] = pd.to_datetime(bars_df['date'])
+                bars_df = bars_df.set_index('date')
                 with self._lock:
                     existing = self._bars.get(symbol, {}).get('1min',
                                                                pd.DataFrame())
-                    combined = pd.concat([existing, bars])
+                    combined = pd.concat([existing, bars_df])
                     combined = combined[~combined.index.duplicated(keep='last')]
                     self._bars.setdefault(symbol, {})['1min'] = combined.sort_index()
-                logger.info("Backfilled %d 1-min bars for %s", len(bars),
+                logger.info("Backfilled %d 1-min bars for %s", len(bars_df),
                              symbol)
         except Exception as e:
             logger.error("Backfill failed for %s: %s", symbol, e)

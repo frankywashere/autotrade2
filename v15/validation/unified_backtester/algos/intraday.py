@@ -11,6 +11,7 @@ Max trades per day: 30
 """
 
 import datetime as dt
+import logging
 import time as _time_mod
 from typing import Dict, List, Optional
 
@@ -20,6 +21,8 @@ import pandas as pd
 from ..algo_base import AlgoBase, AlgoConfig, Signal, ExitSignal, CostModel
 from ..data_provider import DataProvider
 from ..portfolio import Position
+
+logger = logging.getLogger(__name__)
 
 
 # Default config matching backtest config I
@@ -65,10 +68,16 @@ DEFAULT_INTRADAY_CONFIG = AlgoConfig(
 
 
 def _channel_position(close_arr, window=60):
-    """Compute channel position using linear regression (matching backtest)."""
+    """Compute channel position using linear regression (matching backtest).
+
+    Adapts window down to fit available data (min 10 bars for meaningful
+    regression). Matches detect_channel() behavior in channel.py.
+    """
     n = len(close_arr)
+    if n < 10:
+        return np.full(n, np.nan)
     close = close_arr.astype(np.float64)
-    w = window
+    w = min(window, n)
     sx = w * (w - 1) / 2.0
     sx2 = (w - 1) * w * (2 * w - 1) / 6.0
     denom = w * sx2 - sx ** 2
@@ -106,10 +115,15 @@ def _channel_position(close_arr, window=60):
 
 
 def _channel_slope(close_arr, window=60):
-    """Compute channel slope (matching backtest)."""
+    """Compute channel slope (matching backtest).
+
+    Adapts window down to fit available data (min 10 bars).
+    """
     n = len(close_arr)
+    if n < 10:
+        return np.full(n, np.nan)
     close = close_arr.astype(np.float64)
-    w = window
+    w = min(window, n)
     sx = w * (w - 1) / 2.0
     sx2 = (w - 1) * w * (2 * w - 1) / 6.0
     denom = w * sx2 - sx ** 2
@@ -221,11 +235,17 @@ class IntradayAlgo(AlgoBase):
         self._trades_today = 0
         self._current_day = None
 
-        # Precompute features (matching backtest build_features + precompute_all)
-        print("  Precomputing intraday features...")
-        t0 = _time_mod.time()
-        self._precompute_features()
-        print(f"  Done in {_time_mod.time() - t0:.1f}s")
+        if data is not None and not getattr(data, 'is_live', False):
+            # Backtest mode: precompute all features for speed
+            print("  Precomputing intraday features...")
+            t0 = _time_mod.time()
+            self._precompute_features()
+            print(f"  Done in {_time_mod.time() - t0:.1f}s")
+        else:
+            # Live mode: compute features incrementally in on_bar()
+            logger.info("Intraday algo: live mode, features computed per-bar")
+            self._bar_index = {}
+            self._live_mode = True
 
     def _precompute_features(self):
         """Precompute all features from 5-min data (matching backtest exactly)."""
@@ -388,6 +408,111 @@ class IntradayAlgo(AlgoBase):
     def warmup_bars(self) -> int:
         return 100
 
+    def _compute_live_features(self, time: pd.Timestamp) -> Optional[dict]:
+        """Compute all features from live bar data for current 5-min bar.
+
+        Returns dict of feature values, or None if insufficient data.
+        """
+        wins = {'5m': 60, '1h': 24, '4h': 20, 'daily': 40}
+
+        # 5-min bars up to current time
+        f5m = self.data.get_bars('5min', time)
+        if len(f5m) < 60:
+            return None
+
+        c = f5m['close'].values.astype(np.float64)
+        h = f5m['high'].values.astype(np.float64)
+        l = f5m['low'].values.astype(np.float64)
+        o = f5m['open'].values.astype(np.float64)
+        v = f5m['volume'].values.astype(np.float64)
+        dates = np.array([t.date() for t in f5m.index])
+
+        # 5-min channel position (last value)
+        cp5_arr = _channel_position(c, wins['5m'])
+        cp5 = cp5_arr[-1]
+
+        # VWAP features (last values)
+        _, vwap_dist_arr = _compute_vwap(o, h, l, c, v, dates)
+        vwap_dist = vwap_dist_arr[-1]
+        vol_ratio_arr = _compute_volume_ratio(v)
+        vol_ratio = vol_ratio_arr[-1]
+        vwap_slope_arr = _compute_vwap_slope(vwap_dist_arr)
+        vwap_slope = vwap_slope_arr[-1]
+        spread_pct_arr = _compute_spread_pct(h, l, c)
+        spread_pct = spread_pct_arr[-1]
+        gap_pct_arr = _compute_gap_pct(c, dates)
+        gap_pct = gap_pct_arr[-1]
+
+        # RSI(14) slope (last value)
+        delta = pd.Series(c).diff()
+        gain = delta.clip(lower=0).rolling(14).mean().values
+        loss = (-delta.clip(upper=0)).rolling(14).mean().values
+        with np.errstate(divide='ignore', invalid='ignore'):
+            rs = gain / np.where(loss == 0, np.nan, loss)
+        rsi_arr = 100.0 - (100.0 / (1.0 + rs))
+        rsi_slope = np.nan
+        n = len(c)
+        if n >= 19:  # 14 warmup + 5 slope
+            seg = rsi_arr[-5:]
+            if not np.any(np.isnan(seg)):
+                x = np.arange(5, dtype=np.float64)
+                mx = x.mean()
+                my = seg.mean()
+                rsi_slope = float(np.sum((x - mx) * (seg - my)) / np.sum((x - mx) ** 2))
+
+        # Bullish 1-min candle count (last 5 1-min bars)
+        df1m = self.data.get_bars('1min', time)
+        bullish_1m = np.nan
+        if len(df1m) >= 5:
+            last5 = df1m.iloc[-5:]
+            bullish_1m = float((last5['close'] > last5['open']).sum())
+
+        # Daily channel (prior day — no lookahead)
+        daily = self.data.get_bars('daily', time)
+        daily_cp = np.nan
+        daily_slope = np.nan
+        if len(daily) >= 2:
+            # Use all days except today (prior day's value)
+            today = time.date()
+            prior = daily[daily.index.date < today] if hasattr(daily.index, 'date') else daily.iloc[:-1]
+            if len(prior) >= 10:
+                dc = prior['close'].values.astype(np.float64)
+                cp_arr = _channel_position(dc, wins['daily'])
+                sl_arr = _channel_slope(dc, wins['daily'])
+                daily_cp = cp_arr[-1]
+                daily_slope = sl_arr[-1]
+
+        # 1h channel (last completed bar)
+        h1 = self.data.get_bars('1h', time)
+        h1_cp = np.nan
+        h1_slope = np.nan
+        if len(h1) >= 10:
+            hc = h1['close'].values.astype(np.float64)
+            cp_arr = _channel_position(hc, wins['1h'])
+            sl_arr = _channel_slope(hc, wins['1h'])
+            h1_cp = cp_arr[-1]
+            h1_slope = sl_arr[-1]
+
+        # 4h channel (last completed bar)
+        h4 = self.data.get_bars('4h', time)
+        h4_cp = np.nan
+        h4_slope = np.nan
+        if len(h4) >= 10:
+            hc = h4['close'].values.astype(np.float64)
+            cp_arr = _channel_position(hc, wins['4h'])
+            sl_arr = _channel_slope(hc, wins['4h'])
+            h4_cp = cp_arr[-1]
+            h4_slope = sl_arr[-1]
+
+        return {
+            'cp5': cp5, 'vwap_dist': vwap_dist, 'daily_cp': daily_cp,
+            'h1_cp': h1_cp, 'h4_cp': h4_cp, 'vol_ratio': vol_ratio,
+            'vwap_slope': vwap_slope, 'gap_pct': gap_pct,
+            'spread_pct': spread_pct, 'daily_slope': daily_slope,
+            'h1_slope': h1_slope, 'h4_slope': h4_slope,
+            'rsi_slope': rsi_slope, 'bullish_1m': bullish_1m,
+        }
+
     def on_bar(self, time: pd.Timestamp, bar: dict,
                open_positions: list,
                context=None) -> List[Signal]:
@@ -415,26 +540,44 @@ class IntradayAlgo(AlgoBase):
         if not (params['intraday_start'] <= t <= params['intraday_end']):
             return []
 
-        # Look up bar index
-        idx = self._bar_index.get(time)
-        if idx is None or idx < 60:
-            return []
-
-        # Get precomputed features
-        cp5 = self._cp5[idx]
-        vwap_dist = self._vwap_dist[idx]
-        daily_cp = self._daily_cp[idx]
-        h1_cp = self._h1_cp[idx]
-        h4_cp = self._h4_cp[idx]
-        vol_ratio = self._vol_ratio[idx]
-        vwap_slope = self._vwap_slope[idx]
-        gap_pct = self._gap_pct[idx]
-        spread_pct = self._spread_pct[idx]
-        daily_slope = self._daily_slope[idx]
-        h1_slope = self._h1_slope[idx]
-        h4_slope = self._h4_slope[idx]
-        rsi_slope = self._rsi_slope[idx]
-        bullish_1m = self._bullish_1m[idx]
+        # Get features — live or precomputed
+        if getattr(self, '_live_mode', False):
+            feats = self._compute_live_features(time)
+            if feats is None:
+                return []
+            cp5 = feats['cp5']
+            vwap_dist = feats['vwap_dist']
+            daily_cp = feats['daily_cp']
+            h1_cp = feats['h1_cp']
+            h4_cp = feats['h4_cp']
+            vol_ratio = feats['vol_ratio']
+            vwap_slope = feats['vwap_slope']
+            gap_pct = feats['gap_pct']
+            spread_pct = feats['spread_pct']
+            daily_slope = feats['daily_slope']
+            h1_slope = feats['h1_slope']
+            h4_slope = feats['h4_slope']
+            rsi_slope = feats['rsi_slope']
+            bullish_1m = feats['bullish_1m']
+        else:
+            # Backtest: look up precomputed index
+            idx = self._bar_index.get(time)
+            if idx is None or idx < 60:
+                return []
+            cp5 = self._cp5[idx]
+            vwap_dist = self._vwap_dist[idx]
+            daily_cp = self._daily_cp[idx]
+            h1_cp = self._h1_cp[idx]
+            h4_cp = self._h4_cp[idx]
+            vol_ratio = self._vol_ratio[idx]
+            vwap_slope = self._vwap_slope[idx]
+            gap_pct = self._gap_pct[idx]
+            spread_pct = self._spread_pct[idx]
+            daily_slope = self._daily_slope[idx]
+            h1_slope = self._h1_slope[idx]
+            h4_slope = self._h4_slope[idx]
+            rsi_slope = self._rsi_slope[idx]
+            bullish_1m = self._bullish_1m[idx]
 
         # Run signal function
         try:

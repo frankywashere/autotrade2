@@ -177,6 +177,8 @@ def create_live_engine(state):
     from v15.validation.unified_backtester.algo_base import AlgoConfig, CostModel
     from v15.validation.unified_backtester.algos.surfer_ml import SurferMLAlgo
     from v15.validation.unified_backtester.algos.intraday import IntradayAlgo
+    from v15.validation.unified_backtester.algos.cs_combo import CSComboAlgo
+    from v15.validation.unified_backtester.algos.oe_sig5 import OESig5Algo
     import datetime as dt
 
     try:
@@ -211,6 +213,47 @@ def create_live_engine(state):
                     'max_trades_per_day': 30,
                 },
             ), data=data),
+            CSComboAlgo(config=AlgoConfig(
+                algo_id='c16', live_orders=True,
+                initial_equity=100_000.0, max_equity_per_trade=100_000.0,
+                max_positions=1, primary_tf='daily', eval_interval=1,
+                exit_check_tf='5min', cost_model=cost,
+                params={
+                    'signal_source': 'CS-5TF', 'flat_sizing': True,
+                    'stop_pct': 0.02, 'tp_pct': 0.04,
+                    'target_tfs': ['5min', '1h', '4h', 'daily', 'weekly', 'monthly'],
+                    'trail_power': 12, 'trail_base': 0.025,
+                    'max_hold_days': 10, 'cooldown_days': 2,
+                    'min_confidence': 0.45,
+                },
+            ), data=data),
+            CSComboAlgo(config=AlgoConfig(
+                algo_id='c16-dw', live_orders=True,
+                initial_equity=100_000.0, max_equity_per_trade=100_000.0,
+                max_positions=1, primary_tf='daily', eval_interval=1,
+                exit_check_tf='5min', cost_model=cost,
+                params={
+                    'signal_source': 'CS-DW', 'flat_sizing': True,
+                    'stop_pct': 0.02, 'tp_pct': 0.04,
+                    'target_tfs': ['daily', 'weekly'],
+                    'trail_power': 12, 'trail_base': 0.025,
+                    'max_hold_days': 10, 'cooldown_days': 0,
+                    'min_confidence': 0.45,
+                },
+            ), data=data),
+            OESig5Algo(config=AlgoConfig(
+                algo_id='c16-oe', live_orders=True,
+                initial_equity=100_000.0, max_equity_per_trade=100_000.0,
+                max_positions=1, primary_tf='daily', eval_interval=1,
+                exit_check_tf='5min', cost_model=cost,
+                params={
+                    'flat_sizing': True,
+                    'stop_pct': 0.03, 'tp_pct': 0.04,
+                    'default_confidence': 0.7,
+                    'trail_power': 12, 'trail_base': 0.025,
+                    'max_hold_days': 10, 'cooldown_days': 0,
+                },
+            ), data=data),
         ]
 
         engine = LiveEngine(
@@ -224,12 +267,66 @@ def create_live_engine(state):
         engine.recover_after_restart()
 
         state.live_engine = engine
+
+        # Create 1-min bar aggregators for all symbols and wire to LiveDataProvider
+        if state.ib_client:
+            _wire_tick_to_bar_feed(state, data)
+
         logger.info("LiveEngine created with %d algos: %s",
                      len(ib_algos),
                      [a.algo_id for a in ib_algos])
     except Exception as e:
         logger.error("Failed to create LiveEngine: %s", e, exc_info=True)
         state.live_engine = None
+
+
+def _wire_tick_to_bar_feed(state, data):
+    """Create 1-min bar aggregators for TSLA/SPY/VIX and feed to LiveDataProvider.
+
+    Each symbol gets a 1-min LiveBarAggregator (via add_bar_aggregator to avoid
+    overwriting the existing 5-min TSLA aggregator used by the old scanner system).
+    A daemon thread watches for completed bars and routes them to
+    LiveDataProvider.on_1min_close().
+    """
+    import threading
+    import time as _time
+
+    symbols = ['TSLA', 'SPY', 'VIX']
+    aggregators = {}
+    for symbol in symbols:
+        agg = state.ib_client.add_bar_aggregator(symbol, 1)
+        aggregators[symbol] = agg
+
+    state._1min_aggregators = aggregators
+
+    def _feed_loop():
+        """Watch all 1-min aggregators, feed completed bars to LiveDataProvider."""
+        consumed = {s: 0 for s in symbols}
+        while True:
+            any_new = False
+            for symbol in symbols:
+                agg = aggregators[symbol]
+                with agg._lock:
+                    n = len(agg._completed_bars)
+                if n > consumed[symbol]:
+                    with agg._lock:
+                        new_bars = list(agg._completed_bars[consumed[symbol]:])
+                    for bar in new_bars:
+                        # bar['time'] is bar start; end-index = start + 1 min
+                        bar_time = pd.Timestamp(bar['time']) + pd.Timedelta(minutes=1)
+                        try:
+                            data.on_1min_close(symbol, bar_time, bar)
+                        except Exception as e:
+                            logger.error("Feed %s 1-min bar failed: %s",
+                                         symbol, e)
+                    consumed[symbol] = n
+                    any_new = True
+            if not any_new:
+                _time.sleep(0.5)
+
+    t = threading.Thread(target=_feed_loop, daemon=True, name='TickToBarFeed')
+    t.start()
+    logger.info("Tick-to-bar feed started for %s", symbols)
 
 
 def reload_degraded_state(state):

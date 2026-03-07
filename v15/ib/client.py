@@ -30,7 +30,8 @@ class IBClient:
         self._loop = None
         self._thread = None
         self._contracts = {}       # {symbol: Contract}
-        self._bar_aggregators = {} # {symbol: LiveBarAggregator}
+        self._bar_aggregators = {} # {symbol: LiveBarAggregator} (legacy, single per symbol)
+        self._extra_aggregators = {}  # {symbol: [LiveBarAggregator, ...]} (additional)
         self._reconnect_delay = 2  # seconds, with exponential backoff
         self.tick_event = threading.Event()  # Set on every tick for instant wakeup
         # Order tracking — IB is source of truth
@@ -199,10 +200,13 @@ class IBClient:
                 # Feed tick into bar aggregator if present
                 effective_price = price if price > 0 else (
                     (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0)
-                if effective_price > 0 and symbol in self._bar_aggregators:
+                if effective_price > 0:
                     vol = ticker.volume if (hasattr(ticker, 'volume')
                            and ticker.volume == ticker.volume) else 0
-                    self._bar_aggregators[symbol].on_tick(effective_price, vol)
+                    if symbol in self._bar_aggregators:
+                        self._bar_aggregators[symbol].on_tick(effective_price, vol)
+                    for agg in self._extra_aggregators.get(symbol, []):
+                        agg.on_tick(effective_price, vol)
         self.tick_event.set()  # Wake up price loop instantly
 
     def get_last_price(self, symbol: str, max_age_s: float = 30.0) -> float:
@@ -280,7 +284,11 @@ class IBClient:
 
     async def _fetch_historical_async(self, contract, duration, bar_size, use_rth):
         """Async wrapper for reqHistoricalData."""
-        what_to_show = 'TRADES'
+        # IB requires MIDPOINT for index contracts (VIX), TRADES for stocks
+        if contract.secType == 'IND':
+            what_to_show = 'MIDPOINT'
+        else:
+            what_to_show = 'TRADES'
         bars = await self.ib.reqHistoricalDataAsync(
             contract,
             endDateTime='',
@@ -318,10 +326,21 @@ class IBClient:
         return result
 
     def create_bar_aggregator(self, symbol: str, bar_size_minutes: int = 5):
-        """Create and register a LiveBarAggregator for a symbol."""
+        """Create and register a LiveBarAggregator for a symbol.
+
+        Note: only one primary aggregator per symbol (overwrites previous).
+        Use add_bar_aggregator() for additional aggregators.
+        """
         agg = LiveBarAggregator(bar_size_minutes)
         self._bar_aggregators[symbol] = agg
         logger.info("Bar aggregator created for %s (%d-min bars)", symbol, bar_size_minutes)
+        return agg
+
+    def add_bar_aggregator(self, symbol: str, bar_size_minutes: int = 1):
+        """Add an additional bar aggregator for a symbol (doesn't overwrite primary)."""
+        agg = LiveBarAggregator(bar_size_minutes)
+        self._extra_aggregators.setdefault(symbol, []).append(agg)
+        logger.info("Extra bar aggregator added for %s (%d-min bars)", symbol, bar_size_minutes)
         return agg
 
     def get_bar_aggregator(self, symbol: str):

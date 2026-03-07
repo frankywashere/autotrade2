@@ -12,6 +12,7 @@ Two variants:
 """
 
 import datetime as dt
+import logging
 import time as _time_mod
 from typing import Dict, List, Optional
 
@@ -21,6 +22,8 @@ import pandas as pd
 from ..algo_base import AlgoBase, AlgoConfig, Signal, ExitSignal, CostModel
 from ..data_provider import DataProvider
 from ..portfolio import Position
+
+logger = logging.getLogger(__name__)
 
 
 # Default config matching combo_backtest.py with c16 settings
@@ -90,15 +93,19 @@ class CSComboAlgo(AlgoBase):
         self._cooldown_remaining = 0
         self._current_day = None
 
-        # Load signals: from cache (preferred) or live computation
-        print("  Loading CS signals...")
-        t0 = _time_mod.time()
-        cache_path = self.config.params.get('signal_cache')
-        if cache_path:
-            self._day_signals = self._load_from_cache(cache_path)
+        if data is not None and not getattr(data, 'is_live', False):
+            # Backtest mode: precompute all signals for speed
+            print("  Loading CS signals...")
+            t0 = _time_mod.time()
+            cache_path = self.config.params.get('signal_cache')
+            if cache_path:
+                self._day_signals = self._load_from_cache(cache_path)
+            else:
+                self._day_signals = self._precompute_signals()
+            print(f"  Done: {len(self._day_signals)} days with signals in {_time_mod.time() - t0:.1f}s")
         else:
-            self._day_signals = self._precompute_signals()
-        print(f"  Done: {len(self._day_signals)} days with signals in {_time_mod.time() - t0:.1f}s")
+            # Live mode: compute fresh each day in on_bar()
+            self._day_signals = {}
 
     def _load_from_cache(self, cache_path: str) -> Dict:
         """Load precomputed signals from combo_backtest pickle cache."""
@@ -203,6 +210,53 @@ class CSComboAlgo(AlgoBase):
     def warmup_bars(self) -> int:
         return 0  # Signals precomputed
 
+    def _compute_today_signal(self, time, day):
+        """Compute CS signal for today using live data."""
+        try:
+            from v15.core.channel_surfer import prepare_multi_tf_analysis
+        except ImportError:
+            logger.error("Cannot import channel_surfer — CS signals disabled")
+            return
+
+        target_tfs = self.config.params.get('target_tfs')
+        if target_tfs:
+            tfs_needed = list(target_tfs)
+        else:
+            tfs_needed = ['5min', '1h', '4h', 'daily', 'weekly', 'monthly']
+
+        native_slice = {}
+        for tf in tfs_needed:
+            try:
+                df = self.data.get_bars(tf, time)
+                if len(df) >= 15:
+                    native_slice[tf] = df
+            except Exception:
+                continue
+
+        if not native_slice:
+            logger.debug("CS %s: no data for signal computation on %s",
+                         self.algo_id, day)
+            return
+
+        try:
+            analysis = prepare_multi_tf_analysis(
+                native_data={'TSLA': native_slice})
+            sig = analysis.signal
+            if sig.action in ('BUY', 'SELL') and sig.confidence >= 0.01:
+                self._day_signals[day] = {
+                    'action': sig.action,
+                    'confidence': sig.confidence,
+                    'stop_pct': sig.suggested_stop_pct or self.config.params['stop_pct'],
+                    'tp_pct': sig.suggested_tp_pct or self.config.params['tp_pct'],
+                    'signal_type': sig.signal_type,
+                    'primary_tf': getattr(sig, 'primary_tf', ''),
+                }
+                logger.info("CS %s signal for %s: %s conf=%.2f",
+                             self.algo_id, day, sig.action, sig.confidence)
+        except Exception as e:
+            logger.error("CS %s signal computation failed for %s: %s",
+                          self.algo_id, day, e)
+
     def on_bar(self, time: pd.Timestamp, bar: dict,
                open_positions: list,
                context=None) -> List[Signal]:
@@ -210,6 +264,11 @@ class CSComboAlgo(AlgoBase):
         params = self.config.params
 
         day = time.date()
+
+        # Live mode: compute today's signal on first bar of day
+        if getattr(self.data, 'is_live', False) and day != self._current_day:
+            self._compute_today_signal(time, day)
+
         if day != self._current_day:
             self._current_day = day
             # Cooldown: skip this day, then decrement
