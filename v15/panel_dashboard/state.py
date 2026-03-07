@@ -70,6 +70,16 @@ class DashboardState(param.Parameterized):
 
     # IB connection
     ib_connected = param.Boolean(False)
+    ib_degraded = param.Boolean(False)      # IB/DB mismatch — block new entries
+    migration_failed = param.Boolean(False) # Migration failed — block all loops
+
+    # New infrastructure (rebuild plan Parts 1-8)
+    # These are set during startup.full_init() and used by new tabs/loops
+    trade_db = param.Parameter(None, precedence=-1)             # TradeDB instance
+    price_manager = param.Parameter(None, precedence=-1)        # PriceManager instance
+    ib_scanner_manager = param.Parameter(None, precedence=-1)   # ScannerManager (source='ib')
+    yf_scanner_manager = param.Parameter(None, precedence=-1)   # ScannerManager (source='yf')
+    fa_supported = param.Boolean(False, precedence=-1)          # IB FA account support
 
     # Internal
     _prev_price = param.Number(0.0, precedence=-1)
