@@ -18,7 +18,7 @@ from typing import Dict, List, Set
 import numpy as np
 import pandas as pd
 
-from .algo_base import AlgoBase, AlgoConfig, Signal, ExitSignal
+from .algo_base import AlgoBase, AlgoConfig, Signal, ExitSignal, TradeContext
 from .data_provider import DataProvider
 from .portfolio import PortfolioManager, Position
 
@@ -84,6 +84,40 @@ class BacktestEngine:
 
         # Pending entries per algo (filled at next bar's open)
         self._pending: Dict[str, List[PendingEntry]] = {a.algo_id: [] for a in algos}
+
+    def _build_trade_context(self, algo_id: str) -> TradeContext:
+        """Build TradeContext from PortfolioManager state for ML features."""
+        trades = self.portfolio.get_trades(algo_id)
+        recent = trades[-10:] if trades else []
+        # Convert to dicts for TradeContext
+        recent_dicts = []
+        for t in recent:
+            recent_dicts.append({
+                'pnl': t.net_pnl,
+                'pnl_pct': t.pnl_pct,
+            })
+        # Win/loss streaks
+        win_streak = 0
+        loss_streak = 0
+        for t in reversed(trades):
+            if t.net_pnl > 0:
+                if loss_streak > 0:
+                    break
+                win_streak += 1
+            elif t.net_pnl < 0:
+                if win_streak > 0:
+                    break
+                loss_streak += 1
+        # Daily P&L (approximate: sum of recent closed trades)
+        daily_pnl = sum(t.net_pnl for t in trades[-5:]) if trades else 0.0
+        equity = self.portfolio.get_equity(algo_id)
+        return TradeContext(
+            recent_trades=recent_dicts,
+            daily_pnl=daily_pnl,
+            win_streak=win_streak,
+            loss_streak=loss_streak,
+            equity=equity,
+        )
 
     @staticmethod
     def _remap_tf_times(tf: str, tf_df: 'pd.DataFrame',
@@ -201,7 +235,9 @@ class BacktestEngine:
                             continue
 
                         positions = self.portfolio.get_open_positions(algo_id)
-                        signals = algo.on_bar(ts, primary_bar, positions)
+                        context = self._build_trade_context(algo_id)
+                        signals = algo.on_bar(ts, primary_bar, positions,
+                                              context=context)
 
                         for sig in signals:
                             fill_at = 'next_rth_open' if sig.delayed_entry else 'next_primary_open'

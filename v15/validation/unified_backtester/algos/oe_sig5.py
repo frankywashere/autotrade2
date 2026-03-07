@@ -280,7 +280,8 @@ class OESig5Algo(AlgoBase):
         return 0
 
     def on_bar(self, time: pd.Timestamp, bar: dict,
-               open_positions: list) -> List[Signal]:
+               open_positions: list,
+               context=None) -> List[Signal]:
         """At end of trading day: look up precomputed OE signal."""
         params = self.config.params
 

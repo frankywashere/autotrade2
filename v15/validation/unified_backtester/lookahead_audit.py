@@ -466,7 +466,7 @@ class AuditedSurferMLAlgo(SurferMLAlgo):
             stop_pct = float(np.clip(stop_pct, atr_floor, atr_cap))
 
         if signal_type == "break":
-            stop_pct *= self.config.params.get("breakout_stop_mult", 0.05)
+            stop_pct *= self.config.params.get("breakout_stop_mult", 1.00)
         if signal_type == "bounce" and conf > 0.65:
             tp_pct *= 1.30
 

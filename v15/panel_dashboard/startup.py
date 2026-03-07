@@ -166,6 +166,72 @@ def create_adapters(state):
                 len(ib_manager.adapters), len(yf_manager.adapters))
 
 
+def create_live_engine(state):
+    """Step 5c: Create LiveEngine with unified backtester algos.
+
+    Instantiates the same algo classes used by the backtester,
+    configured for live execution. IB algos get live_orders=True.
+    """
+    from v15.panel_dashboard.live_data import LiveDataProvider
+    from v15.panel_dashboard.live_engine import LiveEngine
+    from v15.validation.unified_backtester.algo_base import AlgoConfig, CostModel
+    from v15.validation.unified_backtester.algos.surfer_ml import SurferMLAlgo
+    from v15.validation.unified_backtester.algos.intraday import IntradayAlgo
+    import datetime as dt
+
+    try:
+        # Create LiveDataProvider
+        data = LiveDataProvider(ib_client=state.ib_client)
+        state.live_data_provider = data
+
+        # Create algo instances for IB execution
+        cost = CostModel(slippage_pct=0.0, commission_per_share=0.0)
+
+        ib_algos = [
+            SurferMLAlgo(config=AlgoConfig(
+                algo_id='c16-ml', live_orders=True,
+                initial_equity=100_000.0, max_equity_per_trade=100_000.0,
+                max_positions=2, primary_tf='5min', eval_interval=3,
+                exit_check_tf='5min', cost_model=cost,
+                params={
+                    'flat_sizing': True, 'min_confidence': 0.01,
+                    'max_hold_bars': 60, 'ou_half_life': 5.0,
+                    'stop_pct': 0.015, 'tp_pct': 0.012,
+                    'breakout_stop_mult': 1.00,
+                },
+            ), data=data),
+            IntradayAlgo(config=AlgoConfig(
+                algo_id='c16-intra', live_orders=True,
+                initial_equity=100_000.0, max_equity_per_trade=100_000.0,
+                max_positions=1, primary_tf='5min', eval_interval=1,
+                exit_check_tf='5min', cost_model=cost,
+                active_start=dt.time(9, 30), active_end=dt.time(15, 25),
+                params={
+                    'flat_sizing': True,
+                    'max_trades_per_day': 30,
+                },
+            ), data=data),
+        ]
+
+        engine = LiveEngine(
+            algos=ib_algos,
+            data=data,
+            trade_db=state.trade_db,
+            ib_order_handler=getattr(state, 'ib_order_handler', None),
+        )
+
+        # Recover state from DB
+        engine.recover_after_restart()
+
+        state.live_engine = engine
+        logger.info("LiveEngine created with %d algos: %s",
+                     len(ib_algos),
+                     [a.algo_id for a in ib_algos])
+    except Exception as e:
+        logger.error("Failed to create LiveEngine: %s", e, exc_info=True)
+        state.live_engine = None
+
+
 def reload_degraded_state(state):
     """Step 6: Reload persisted ib_degraded flag from DB metadata."""
     if getattr(state, 'migration_failed', False):
@@ -266,6 +332,7 @@ def full_init(state):
     load_models(state)          # 4
     create_adapters(state)      # 5
     create_order_handler(state) # 5b
+    create_live_engine(state)   # 5c
     reload_degraded_state(state)  # 6
     run_ib_recovery(state)      # 6b-6e
     run_reconciliation(state)   # 7

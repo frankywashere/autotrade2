@@ -16,7 +16,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from ..algo_base import AlgoBase, AlgoConfig, Signal, ExitSignal, CostModel
+from ..algo_base import AlgoBase, AlgoConfig, Signal, ExitSignal, CostModel, TradeContext
 from ..data_provider import DataProvider
 from ..portfolio import Position
 
@@ -42,7 +42,7 @@ DEFAULT_SURFER_ML_CONFIG = AlgoConfig(
         'tp_pct': 0.012,         # Default TP (overridden by signal)
         'ml_model_dir': None,    # Path to surfer_models/ directory
         'atr_period': 14,        # ATR lookback period (5-min bars)
-        'breakout_stop_mult': 0.05,  # Ultra-tight breakout stop (5% of suggested)
+        'breakout_stop_mult': 1.00,  # No tightening (grid search: 0.05 was overfit)
     },
 )
 
@@ -66,6 +66,10 @@ class SurferMLAlgo(AlgoBase):
 
         # Track positions' internal state (for profit-tier trail)
         self._pos_state: Dict[str, dict] = {}  # pos_id -> trail state
+
+        # ML feature history buffer (for temporal features)
+        self._history_buffer: list = []
+        self._feature_names: Optional[list] = None
 
     def _load_models(self):
         """Load GBT + sub-models if model directory provided."""
@@ -108,7 +112,8 @@ class SurferMLAlgo(AlgoBase):
         return 300  # Need enough history for channel detection
 
     def on_bar(self, time: pd.Timestamp, bar: dict,
-               open_positions: list) -> List[Signal]:
+               open_positions: list,
+               context: TradeContext = None) -> List[Signal]:
         """Run Channel Surfer analysis, optionally gate with GBT model.
 
         Replicates the original surfer_backtest signal generation path:
@@ -225,7 +230,7 @@ class SurferMLAlgo(AlgoBase):
 
         # Ultra-tight breakout stops (surfer_backtest line 2227)
         if signal_type == 'break':
-            stop_pct *= self.config.params.get('breakout_stop_mult', 0.05)
+            stop_pct *= self.config.params.get('breakout_stop_mult', 1.00)
 
         # TP widening for high-confidence bounces (surfer_backtest line 2244)
         if signal_type == 'bounce' and conf > 0.65:
@@ -236,15 +241,100 @@ class SurferMLAlgo(AlgoBase):
         twm = 1.0
         fast_rev = False
 
+        # Build ML feature vector if any model is loaded
+        feature_vec = None
+        if any(m is not None for m in [self._gbt_model, self._el_model,
+                                        self._er_model, self._fast_rev_model]):
+            try:
+                from v15.core.signal_features import build_feature_vector
+                closes_arr = df_slice['close'].values
+                # Get SPY/VIX data for correlation features
+                spy_df = None
+                vix_df = None
+                try:
+                    spy_daily = self.data.get_bars('daily', time, symbol='SPY')
+                    if len(spy_daily) > 0:
+                        spy_df = spy_daily
+                except Exception:
+                    pass
+                try:
+                    vix_daily = self.data.get_bars('daily', time, symbol='VIX')
+                    if len(vix_daily) > 0:
+                        vix_df = vix_daily
+                except Exception:
+                    pass
+                feature_vec, _ = build_feature_vector(
+                    analysis=analysis,
+                    bar_data=bar,
+                    closes=closes_arr,
+                    spy_df=spy_df,
+                    vix_df=vix_df,
+                    tsla_index=df5.index,
+                    history_buffer=self._history_buffer,
+                    eval_interval=self.config.eval_interval,
+                    context=context,
+                )
+            except Exception:
+                feature_vec = None
+
+        # GBT soft gate: scale confidence, don't hard-skip
+        if self._gbt_model is not None and feature_vec is not None:
+            try:
+                ml_pred = self._gbt_model.predict(feature_vec.reshape(1, -1))
+                ml_action = int(ml_pred.get('action', [0])[0])
+                # 0=HOLD, 1=BUY, 2=SELL
+                physics_action = 1 if direction == 'long' else 2
+                if ml_action == 0:
+                    # ML says HOLD — penalize confidence 20%
+                    conf *= 0.80
+                elif ml_action != physics_action:
+                    # ML disagrees with direction — penalize 20%
+                    conf *= 0.80
+                # Lifetime prediction: cap max_hold if model predicts short life
+                if 'lifetime' in ml_pred:
+                    predicted_life = float(ml_pred['lifetime'][0])
+                    if predicted_life > 0:
+                        pass  # Informational only for now
+            except Exception:
+                pass
+
         # Extended Run predictor
-        if self._er_model is not None:
-            # TODO: extract features for ER prediction
-            pass
+        if self._er_model is not None and feature_vec is not None:
+            try:
+                er_pred = self._er_model.predict(feature_vec.reshape(1, -1))
+                er_prob = float(er_pred.get('run_prob', [0.5])[0])
+                if er_prob > 0.70:
+                    twm = 2.0  # Let winners run — wider trail
+                elif er_prob > 0.55:
+                    twm = 1.5
+            except Exception:
+                pass
 
         # Extreme Loser detector
-        if self._el_model is not None:
-            # TODO: extract features for EL prediction
-            pass
+        if self._el_model is not None and feature_vec is not None:
+            try:
+                el_pred = self._el_model.predict(feature_vec.reshape(1, -1))
+                el_loser_prob = float(el_pred.get('loser_prob', [0.0])[0])
+                if el_loser_prob > 0.18:
+                    el_flagged = True
+                    if signal_type == 'bounce':
+                        conf *= 0.80  # Penalize EL bounces
+            except Exception:
+                pass
+
+        # Fast Reversion (Momentum Reversal) detector
+        if self._fast_rev_model is not None and feature_vec is not None:
+            try:
+                rev_pred = self._fast_rev_model.predict(feature_vec.reshape(1, -1))
+                fast_rev_prob = float(rev_pred.get('fast_reversion_prob', [0.0])[0])
+                if fast_rev_prob > 0.55:
+                    fast_rev = True
+            except Exception:
+                pass
+
+        # Re-check confidence after ML gating
+        if conf < self.config.params.get('min_confidence', 0.01):
+            return []
 
         return [Signal(
             algo_id=self.config.algo_id,
@@ -480,3 +570,16 @@ class SurferMLAlgo(AlgoBase):
     def on_fill(self, trade):
         """Clean up position state."""
         self._pos_state.pop(trade.pos_id, None)
+
+    def get_effective_stop(self, position) -> Optional[float]:
+        """Return current trailing stop for broker-side sync."""
+        state = self._pos_state.get(position.pos_id, {})
+        return state.get('trailing_stop', position.stop_price)
+
+    def serialize_state(self, pos_id: str) -> dict:
+        """Persist trail state for crash recovery."""
+        return dict(self._pos_state.get(pos_id, {}))
+
+    def restore_state(self, pos_id: str, state: dict):
+        """Restore trail state after restart."""
+        self._pos_state[pos_id] = state
