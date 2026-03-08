@@ -58,7 +58,6 @@ class DashboardState(param.Parameterized):
     # IB connection
     ib_connected = param.Boolean(False)
     ib_degraded = param.Boolean(False)      # IB/DB mismatch — block new entries
-    migration_failed = param.Boolean(False) # Migration failed — block all loops
 
     # New infrastructure (rebuild plan Parts 1-8)
     # These are set during startup.full_init() and used by new tabs/loops

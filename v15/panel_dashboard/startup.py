@@ -1,12 +1,13 @@
 """
-Startup sequence — initializes TradeDB, migration, IB, adapters, scanners.
+Startup sequence — initializes TradeDB, IB, adapters, LiveEngine, scanners.
 
-Follows the exact startup order from REBUILD_PLAN.md Part 8:
+Follows the startup order from REBUILD_PLAN.md Part 8:
   1. Create DB
-  2. Migrate JSON -> DB
   3. Connect IB
   4. Load ML models
   5. Create adapters, register with ScannerManagers
+  5b. Create IBOrderHandler
+  5c. Create LiveEngine (unified backtester algos + tick-to-bar feed)
   6. Reload ib_degraded, populate open-order cache, scan unlinked, recover, seed+wire
   7. Reconcile IB/DB
   8. Start background loops
@@ -24,23 +25,6 @@ def init_trade_db(state):
     state.trade_db = TradeDB()
     logger.info("TradeDB created at %s", state.trade_db._db_path)
 
-
-def run_migration(state):
-    """Step 2: Migrate JSON state files to SQLite.
-
-    MUST run before anything else touches DB.
-    """
-    from v15.panel_dashboard.db.migration import run_migration as _migrate
-
-    try:
-        migrated = _migrate(state.trade_db)
-        if migrated:
-            logger.info("Migration complete")
-        else:
-            logger.info("Migration already done")
-    except Exception as e:
-        logger.error("Migration FAILED: %s", e, exc_info=True)
-        state.migration_failed = True
 
 
 def connect_ib(state):
@@ -331,9 +315,6 @@ def _wire_tick_to_bar_feed(state, data):
 
 def reload_degraded_state(state):
     """Step 6: Reload persisted ib_degraded flag from DB metadata."""
-    if getattr(state, 'migration_failed', False):
-        return
-
     try:
         if state.trade_db.get_metadata('ib_degraded') == '1':
             state.ib_degraded = True
@@ -351,8 +332,6 @@ def create_order_handler(state):
 
 def run_ib_recovery(state):
     """Steps 6b-6e: Open-order cache, unlinked scan, recovery, seed+wire."""
-    if getattr(state, 'migration_failed', False):
-        return
     if not state.ib_client or not state.ib_connected:
         logger.info("IB not connected — skipping recovery")
         return
@@ -400,8 +379,6 @@ def run_ib_recovery(state):
 
 def run_reconciliation(state):
     """Step 7: IB/DB reconciliation."""
-    if getattr(state, 'migration_failed', False):
-        return
     if not state.ib_client or not state.ib_connected:
         logger.info("IB not connected — skipping reconciliation")
         return
@@ -418,10 +395,6 @@ def run_reconciliation(state):
 
 def start_loops(state):
     """Step 8: Start background loops."""
-    if getattr(state, 'migration_failed', False):
-        logger.error("Migration failed — NOT starting background loops")
-        return
-
     from v15.panel_dashboard.loops import start_all_loops
     start_all_loops(state)
 
@@ -432,7 +405,6 @@ def full_init(state):
     Call this from app.py or state.load_market_data().
     """
     init_trade_db(state)        # 1
-    run_migration(state)        # 2
     connect_ib(state)           # 3
     load_models(state)          # 4
     create_adapters(state)      # 5
@@ -443,7 +415,6 @@ def full_init(state):
     run_reconciliation(state)   # 7
     start_loops(state)          # 8
 
-    logger.info("Startup complete (migration_failed=%s, ib_degraded=%s, ib_connected=%s)",
-                getattr(state, 'migration_failed', False),
+    logger.info("Startup complete (ib_degraded=%s, ib_connected=%s)",
                 getattr(state, 'ib_degraded', False),
                 state.ib_connected)

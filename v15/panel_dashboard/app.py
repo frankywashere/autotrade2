@@ -152,31 +152,31 @@ def _init_new_infra(state):
     """
     try:
         from v15.panel_dashboard.startup import (
-            init_trade_db, run_migration, create_adapters,
-            create_order_handler, reload_degraded_state,
+            init_trade_db, create_adapters,
+            create_order_handler, create_live_engine,
+            reload_degraded_state,
             run_ib_recovery, run_reconciliation,
         )
 
-        # 1. Create DB + migrate (IB and ML already initialized by load_market_data)
+        # 1. Create DB (IB and ML already initialized by load_market_data)
         init_trade_db(state)
-        run_migration(state)
 
-        # 2. Create adapters + order handler (IB client already connected)
-        if not state.migration_failed:
-            create_adapters(state)
-            create_order_handler(state)
-            reload_degraded_state(state)
+        # 2. Create adapters + order handler + live engine (IB client already connected)
+        create_adapters(state)
+        create_order_handler(state)
+        create_live_engine(state)
+        reload_degraded_state(state)
 
-            # 3. Recovery + reconciliation (if IB connected)
-            if state.ib_connected:
-                run_ib_recovery(state)
-                run_reconciliation(state)
+        # 3. Recovery + reconciliation (if IB connected)
+        if state.ib_connected:
+            run_ib_recovery(state)
+            run_reconciliation(state)
 
         logger.info("New infrastructure initialized (trade_db=%s, ib_handler=%s, "
-                     "migration_failed=%s, ib_degraded=%s)",
+                     "live_engine=%s, ib_degraded=%s)",
                      'OK' if state.trade_db else 'NONE',
                      'OK' if getattr(state, 'ib_order_handler', None) else 'NONE',
-                     state.migration_failed,
+                     'OK' if getattr(state, 'live_engine', None) else 'NONE',
                      state.ib_degraded)
     except Exception as e:
         logger.error("New infrastructure init failed (non-fatal): %s\n%s",
@@ -186,7 +186,7 @@ def _init_new_infra(state):
 def create_app():
     logger.info("create_app() called (session factory)")
     try:
-        from v15.panel_dashboard.tabs.ib_live import ib_live_tab
+        from v15.panel_dashboard.tabs.ib_live import ib_live_tab, _kill_switch_panel
         from v15.panel_dashboard.tabs.yf_sim import yf_sim_tab
         from v15.panel_dashboard.tabs.comparison import comparison_tab
     except Exception:
@@ -338,6 +338,7 @@ def create_app():
             pn.layout.Divider(),
             capital_input,
             kill_switch,
+            _kill_switch_panel(state),
             pn.layout.Divider(),
             last_analysis_display,
             pn.pane.Markdown("### Data Sources"),

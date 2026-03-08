@@ -293,15 +293,9 @@ def _trade_history(state):
 
 
 def _degraded_banner(state):
-    """Warning banner for ib_degraded or migration_failed states."""
+    """Warning banner for ib_degraded state."""
     def _render(ib_connected):
         parts = []
-        if hasattr(state, 'migration_failed') and state.migration_failed:
-            parts.append("""
-            <div style="background:#ff5252; color:white; padding:12px; border-radius:8px;
-                        margin-bottom:8px; font-weight:bold;">
-                MIGRATION FAILED — Scanner loops blocked. Fix the issue and restart.
-            </div>""")
         if hasattr(state, 'ib_degraded') and state.ib_degraded:
             parts.append("""
             <div style="background:#ff9800; color:black; padding:12px; border-radius:8px;
@@ -728,7 +722,6 @@ def ib_live_tab(state):
     components = [
         _degraded_banner(state),
         _price_banner(state),
-        _kill_switch_panel(state),
         _algo_pnl_summary(state),
         _open_positions(state),
     ]

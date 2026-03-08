@@ -99,8 +99,7 @@ def _update_ib_prices(state):
             state.tsla_price = price
 
         # Check exits for IB trades
-        if (hasattr(state, 'ib_scanner_manager') and state.ib_scanner_manager
-                and not getattr(state, 'migration_failed', False)):
+        if hasattr(state, 'ib_scanner_manager') and state.ib_scanner_manager:
             try:
                 bid = state.price_manager.get('TSLA', 'ib').bid if state.price_manager else price
                 ask = state.price_manager.get('TSLA', 'ib').ask if state.price_manager else price
@@ -111,8 +110,7 @@ def _update_ib_prices(state):
                 logger.warning("IB exit check failed: %s", e)
 
         # Update trailing stops for IB trades
-        if (hasattr(state, 'ib_scanner_manager') and state.ib_scanner_manager
-                and not getattr(state, 'migration_failed', False)):
+        if hasattr(state, 'ib_scanner_manager') and state.ib_scanner_manager:
             try:
                 updates = state.ib_scanner_manager.update_all_trailing(price)
                 for trade_id, changes in updates:
@@ -150,8 +148,7 @@ def yf_price_loop(state):
                     state.price_manager.update_yf('TSLA', price)
 
                 # Check exits for yf trades
-                if (hasattr(state, 'yf_scanner_manager') and state.yf_scanner_manager
-                        and not getattr(state, 'migration_failed', False)):
+                if hasattr(state, 'yf_scanner_manager') and state.yf_scanner_manager:
                     exits = state.yf_scanner_manager.check_all_exits(price)
                     if exits:
                         _handle_exits(state, exits, source='yf')

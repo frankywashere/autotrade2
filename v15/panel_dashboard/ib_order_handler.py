@@ -185,9 +185,6 @@ class IBOrderHandler:
         if self._state.ib_degraded:
             logger.warning("Entry blocked: ib_degraded=True")
             return None
-        if self._state.migration_failed:
-            logger.warning("Entry blocked: migration_failed=True")
-            return None
         if not self.ib or not self.ib.is_connected():
             logger.warning("Entry blocked: IB not connected")
             return None
