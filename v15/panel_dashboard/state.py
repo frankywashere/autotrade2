@@ -41,6 +41,7 @@ class DashboardState(param.Parameterized):
 
     # Config (sidebar widgets bind to these)
     kill_switch = param.Boolean(False)
+    algo_control_version = param.Integer(0)  # Bump on algo enable/disable/equity change
 
     order_version = param.Integer(0)       # Bump on order submit/fill/cancel
 

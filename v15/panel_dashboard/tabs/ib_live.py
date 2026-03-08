@@ -67,8 +67,8 @@ def _price_banner(state):
 
 
 def _algo_pnl_summary(state):
-    """Per-algo P&L summary with on/off toggles. Bound to positions_version."""
-    def _render(positions_version):
+    """Per-algo P&L summary with on/off toggles. Bound to positions_version + algo_control_version."""
+    def _render(positions_version, algo_control_version):
         if not hasattr(state, 'trade_db') or state.trade_db is None:
             return pn.pane.HTML(
                 '<div style="color:#888; padding:8px;">No trade database</div>')
@@ -76,8 +76,12 @@ def _algo_pnl_summary(state):
         db = state.trade_db
         rows_html = []
 
-        # Get algo summaries for IB source
-        algos = ['c16', 'c16-dw', 'c16-ml', 'c16-intra', 'c16-oe', 'manual']
+        # Dynamic algo list from LiveEngine + manual
+        engine = getattr(state, 'live_engine', None)
+        if engine:
+            algos = [a.algo_id for a in engine._algos] + ['manual']
+        else:
+            algos = ['c16', 'c16-dw', 'c16-ml', 'c16-intra', 'c16-oe', 'manual']
         for algo_id in algos:
             open_trades = db.get_open_trades(source='ib', algo_id=algo_id)
             closed = db.get_closed_trades(source='ib', algo_id=algo_id)
@@ -162,7 +166,9 @@ def _algo_pnl_summary(state):
         """
         return pn.pane.HTML(html, sizing_mode='stretch_width')
 
-    return pn.bind(_render, positions_version=state.param.positions_version)
+    return pn.bind(_render,
+                   positions_version=state.param.positions_version,
+                   algo_control_version=state.param.algo_control_version)
 
 
 def _open_positions(state):
@@ -335,7 +341,7 @@ def _degraded_banner(state):
 
 
 def _kill_switch_panel(state):
-    """Kill All button with confirmation."""
+    """Kill All button with confirmation. Uses unkill() to restore pre-kill state."""
     kill_btn = pn.widgets.Button(
         name='KILL ALL', button_type='danger', width=120)
     status = pn.pane.HTML('', width=200)
@@ -344,15 +350,16 @@ def _kill_switch_panel(state):
         engine = getattr(state, 'live_engine', None)
         if engine:
             if state.kill_switch:
-                for algo_id in engine._algo_enabled:
-                    engine.set_algo_enabled(algo_id, True)
+                engine.unkill()
                 state.kill_switch = False
+                state.algo_control_version += 1
                 kill_btn.name = 'KILL ALL'
                 kill_btn.button_type = 'danger'
-                status.object = '<span style="color:#00e676;">Algos re-enabled</span>'
+                status.object = '<span style="color:#00e676;">Algos restored</span>'
             else:
                 engine.kill_all()
                 state.kill_switch = True
+                state.algo_control_version += 1
                 kill_btn.name = 'UNKILL'
                 kill_btn.button_type = 'warning'
                 status.object = '<span style="color:#ff5252;">All algos KILLED</span>'

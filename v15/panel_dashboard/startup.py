@@ -166,6 +166,25 @@ def create_live_engine(state):
             ib_order_handler=getattr(state, 'ib_order_handler', None),
         )
 
+        # Load persisted enabled/equity state from DB metadata
+        if state.trade_db:
+            for algo in ib_algos:
+                # Enabled state
+                val = state.trade_db.get_metadata(f'enabled_{algo.algo_id}')
+                if val is not None:
+                    engine._algo_enabled[algo.algo_id] = (val == '1')
+                    if val == '0':
+                        logger.info("Loaded %s as DISABLED from DB", algo.algo_id)
+                # Equity allocation
+                eq_val = state.trade_db.get_metadata(f'equity_{algo.algo_id}')
+                if eq_val is not None:
+                    try:
+                        algo.config.max_equity_per_trade = float(eq_val)
+                        logger.info("Loaded %s equity=$%.0f from DB",
+                                    algo.algo_id, float(eq_val))
+                    except ValueError:
+                        pass
+
         # Recover state from DB
         engine.recover_after_restart()
 

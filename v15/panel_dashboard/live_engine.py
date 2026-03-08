@@ -53,6 +53,8 @@ class LiveEngine:
         self._pending_entries: List[PendingEntry] = []
         self._eval_counters: Dict[str, int] = {}
         self._algo_enabled: Dict[str, bool] = {a.algo_id: True for a in algos}
+        self._kill_epoch: int = 0
+        self._pre_kill_snapshot: Dict[str, bool] = {}  # saved enabled state for unkill
 
         # Wire fill callback from IBOrderHandler
         if self._orders and hasattr(self._orders, 'register_live_engine_callback'):
@@ -116,12 +118,11 @@ class LiveEngine:
         self._fill_pending_entries(tf, time, bar, deferred_ib_ops)
 
         for algo in self._algos:
-            if not self._algo_enabled.get(algo.algo_id, True):
-                continue
-
             # Skip if wrong TF for this algo
             if tf != algo.config.primary_tf and tf != algo.config.exit_check_tf:
                 continue
+
+            algo_enabled = self._algo_enabled.get(algo.algo_id, True)
 
             # Respect eval_interval
             should_eval = False
@@ -133,7 +134,7 @@ class LiveEngine:
             # Get open positions for this algo from DB
             positions = self._get_positions(algo)
 
-            # 2. Check exits (ALWAYS — active window does NOT apply to exits)
+            # 2. Check exits (ALWAYS — regardless of enabled state)
             if tf == algo.config.exit_check_tf and positions:
                 exits = algo.check_exits(time, bar, positions)
                 for exit_sig in exits:
@@ -154,11 +155,15 @@ class LiveEngine:
                             <= algo.config.active_end):
                         continue
 
-            # 6. Generate new entry signals
+            # 6. Generate new entry signals (signals always run for visibility)
             if should_eval:
                 context = self._build_trade_context(algo)
                 signals = algo.on_bar(time, bar, positions, context=context)
                 for sig in signals:
+                    if not algo_enabled:
+                        logger.info("BLOCKED: %s signal %s (algo disabled)",
+                                    algo.algo_id, sig.direction)
+                        continue
                     if sig.delayed_entry:
                         fill_at = ('next_rth_open'
                                    if algo.config.primary_tf == 'daily'
@@ -264,6 +269,12 @@ class LiveEngine:
             return
         remaining = []
         for pending in self._pending_entries:
+            # Check enabled gate at fill time (algo may have been disabled since queued)
+            if not self._algo_enabled.get(pending.algo.algo_id, True):
+                logger.info("BLOCKED: %s pending entry (algo disabled)",
+                            pending.algo.algo_id)
+                continue  # Drop the pending entry
+
             if pending.fill_at == 'next_rth_open':
                 if time.time() == dt.time(9, 30):
                     self._execute_entry(pending.algo, pending.signal,
@@ -283,6 +294,12 @@ class LiveEngine:
 
     def _execute_entry(self, algo, signal, fill_price, deferred_ib_ops=None):
         """Place entry order or record sim trade."""
+        # Final enabled check (belt-and-suspenders — catches race with kill_all)
+        if not self._algo_enabled.get(algo.algo_id, True):
+            logger.info("BLOCKED: %s entry in _execute_entry (algo disabled)",
+                        algo.algo_id)
+            return
+
         if not algo.config.live_orders:
             # Sim mode: instant DB write (no IB calls, safe inside lock)
             if self._db:
@@ -362,8 +379,14 @@ class LiveEngine:
                 entry_price=fill_price,
             )
             if deferred_ib_ops is not None:
+                epoch_at_signal = self._kill_epoch
                 deferred_ib_ops.append(
-                    lambda kw=entry_kwargs: self._orders.place_entry(**kw))
+                    lambda kw=entry_kwargs, ep=epoch_at_signal: (
+                        self._orders.place_entry(**kw)
+                        if self._kill_epoch == ep
+                        else logger.info("STALE: entry for %s dropped (kill epoch %d→%d)",
+                                         kw['algo_id'], ep, self._kill_epoch)
+                    ))
             else:
                 try:
                     self._orders.place_entry(**entry_kwargs)
@@ -474,18 +497,96 @@ class LiveEngine:
     # ── UI Mutation Methods (all acquire _eval_lock) ──
 
     def kill_all(self):
-        """Close all positions, disable all algos."""
+        """Disable all algos, purge pending entries, cancel IB pending orders."""
+        deferred_cancels = []
         with self._eval_lock:
+            # Save pre-kill state for unkill restore
+            self._pre_kill_snapshot = dict(self._algo_enabled)
+            self._kill_epoch += 1
             for algo_id in self._algo_enabled:
                 self._algo_enabled[algo_id] = False
-            logger.warning("LiveEngine: kill_all — all algos disabled")
+            # Purge pending entries
+            n_purged = len(self._pending_entries)
+            self._pending_entries.clear()
+            # Collect IB cancels (deferred outside lock)
+            if self._orders:
+                for order_id in list(self._orders._entry_orders):
+                    ctx = self._orders._entry_orders[order_id]
+                    if not ctx.get('trade_id'):
+                        # Still pending DB write — cancel IB order
+                        deferred_cancels.append(order_id)
+            logger.warning("LiveEngine: kill_all — epoch=%d, purged=%d pending entries",
+                           self._kill_epoch, n_purged)
+
+        # Cancel IB orders outside lock
+        for oid in deferred_cancels:
+            try:
+                self._orders.ib.cancel_order(oid)
+                logger.info("kill_all: cancelled IB entry order %d", oid)
+            except Exception as e:
+                logger.error("kill_all: failed to cancel order %d: %s", oid, e)
+
+    def unkill(self):
+        """Restore pre-kill enabled state (or enable all if no snapshot)."""
+        with self._eval_lock:
+            if self._pre_kill_snapshot:
+                for algo_id, was_enabled in self._pre_kill_snapshot.items():
+                    if algo_id in self._algo_enabled:
+                        self._algo_enabled[algo_id] = was_enabled
+                logger.info("LiveEngine: unkill — restored pre-kill state: %s",
+                            self._pre_kill_snapshot)
+                self._pre_kill_snapshot.clear()
+            else:
+                for algo_id in self._algo_enabled:
+                    self._algo_enabled[algo_id] = True
+                logger.info("LiveEngine: unkill — all algos enabled (no snapshot)")
 
     def set_algo_enabled(self, algo_id: str, enabled: bool):
-        """Enable/disable a specific algo."""
+        """Enable/disable a specific algo. Persists to DB metadata."""
         with self._eval_lock:
             self._algo_enabled[algo_id] = enabled
+            if not enabled:
+                # Purge pending entries for this algo
+                before = len(self._pending_entries)
+                self._pending_entries = [
+                    p for p in self._pending_entries
+                    if p.algo.algo_id != algo_id
+                ]
+                purged = before - len(self._pending_entries)
+                if purged:
+                    logger.info("Purged %d pending entries for disabled %s",
+                                purged, algo_id)
             logger.info("LiveEngine: %s %s",
                          algo_id, 'enabled' if enabled else 'disabled')
+        # Persist outside lock
+        if self._db:
+            try:
+                self._db.set_metadata(f'enabled_{algo_id}',
+                                       '1' if enabled else '0')
+            except Exception as e:
+                logger.error("Failed to persist enabled state for %s: %s",
+                             algo_id, e)
+
+    def set_algo_equity(self, algo_id: str, equity: float):
+        """Set per-algo max equity. Thread-safe (mutates config under _eval_lock)."""
+        with self._eval_lock:
+            algo = self._algo_map.get(algo_id)
+            if algo:
+                algo.config.max_equity_per_trade = equity
+                logger.info("LiveEngine: %s equity set to $%.0f", algo_id, equity)
+        # Persist outside lock
+        if self._db:
+            try:
+                self._db.set_metadata(f'equity_{algo_id}', str(int(equity)))
+            except Exception as e:
+                logger.error("Failed to persist equity for %s: %s", algo_id, e)
+
+    def get_algo_equity(self, algo_id: str) -> float:
+        """Get current max equity for an algo."""
+        algo = self._algo_map.get(algo_id)
+        if algo:
+            return algo.config.max_equity_per_trade
+        return 0.0
 
     def reset_algo(self, algo_id: str):
         """Reset an algo's counters and pending entries."""
