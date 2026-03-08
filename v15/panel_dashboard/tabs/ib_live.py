@@ -14,6 +14,7 @@ Layout (top to bottom):
 import logging
 from datetime import datetime
 
+import pandas as pd
 import panel as pn
 import param
 
@@ -82,7 +83,24 @@ def _algo_pnl_summary(state):
             closed = db.get_closed_trades(source='ib', algo_id=algo_id)
 
             total_pnl = sum(t.get('pnl', 0) for t in closed)
-            day_pnl = 0  # TODO: filter by today's date
+            # Today's realized P&L (trades closed today ET)
+            today_et = pd.Timestamp.now(tz='US/Eastern').date()
+            day_pnl = 0
+            day_trades = 0
+            for t in closed:
+                exit_ts = t.get('exit_time') or t.get('closed_at', '')
+                if exit_ts:
+                    try:
+                        ts = pd.Timestamp(exit_ts)
+                        if ts.tzinfo is None:
+                            ts = ts.tz_localize('US/Eastern')
+                        else:
+                            ts = ts.tz_convert('US/Eastern')
+                        if ts.date() == today_et:
+                            day_pnl += t.get('pnl', 0)
+                            day_trades += 1
+                    except Exception:
+                        pass
             n_trades = len(closed)
             n_open = len(open_trades)
             wins = sum(1 for t in closed if t.get('pnl', 0) > 0)
@@ -100,6 +118,7 @@ def _algo_pnl_summary(state):
                         unrealized += (entry - state.tsla_price) * shares
 
             pnl_color = '#00e676' if total_pnl >= 0 else '#ff5252'
+            day_color = '#00e676' if day_pnl >= 0 else '#ff5252'
             unr_color = '#00e676' if unrealized >= 0 else '#ff5252'
 
             # Enabled toggle state
@@ -114,6 +133,7 @@ def _algo_pnl_summary(state):
             <tr style="border-bottom:1px solid #333;">
                 <td style="padding:6px 12px; color:{dot_color};">{dot} {algo_id}</td>
                 <td style="padding:6px 12px; color:{pnl_color};">${total_pnl:,.0f}</td>
+                <td style="padding:6px 12px; color:{day_color};">${day_pnl:,.0f}</td>
                 <td style="padding:6px 12px; color:{unr_color};">${unrealized:,.0f}</td>
                 <td style="padding:6px 12px; color:#aaa;">{n_trades}</td>
                 <td style="padding:6px 12px; color:#aaa;">{n_open}</td>
@@ -130,6 +150,7 @@ def _algo_pnl_summary(state):
                 <tr style="border-bottom:2px solid #555; color:#888;">
                     <th style="text-align:left; padding:4px 12px;">Algo</th>
                     <th style="text-align:left; padding:4px 12px;">Total P&L</th>
+                    <th style="text-align:left; padding:4px 12px;">Today</th>
                     <th style="text-align:left; padding:4px 12px;">Unrealized</th>
                     <th style="text-align:left; padding:4px 12px;">Trades</th>
                     <th style="text-align:left; padding:4px 12px;">Open</th>
