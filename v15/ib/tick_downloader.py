@@ -127,9 +127,16 @@ class RateLimiter:
 
 def _fetch_ticks_page(client, contract, start_dt_str: str,
                       num_ticks: int = 1000) -> list:
-    """Fetch one page of historical trade ticks from IB."""
-    async def _req():
-        return await client.ib.reqHistoricalTicksAsync(
+    """Fetch one page of historical trade ticks from IB.
+
+    reqHistoricalTicksAsync returns an ib_async Future (not a coroutine),
+    so we schedule it on the event loop and bridge to a concurrent.futures.Future.
+    """
+    import concurrent.futures
+    result_future = concurrent.futures.Future()
+
+    def _schedule():
+        awaitable = client.ib.reqHistoricalTicksAsync(
             contract,
             startDateTime=start_dt_str,
             endDateTime='',
@@ -138,9 +145,19 @@ def _fetch_ticks_page(client, contract, start_dt_str: str,
             useRth=False,
             ignoreSize=False,
         )
+        task = asyncio.ensure_future(awaitable, loop=client._loop)
 
-    future = asyncio.run_coroutine_threadsafe(_req(), client._loop)
-    return future.result(timeout=60)
+        def _on_done(t):
+            exc = t.exception()
+            if exc:
+                result_future.set_exception(exc)
+            else:
+                result_future.set_result(t.result())
+
+        task.add_done_callback(_on_done)
+
+    client._loop.call_soon_threadsafe(_schedule)
+    return result_future.result(timeout=60)
 
 
 def download_ticks_for_day(client, contract, day: date, output_dir: Path,
@@ -403,6 +420,11 @@ def download_ticks(symbol: str, start: date, end: date, output_dir: str,
     logger.info("Connected.")
 
     contract = Stock(symbol, 'SMART', 'USD')
+    # Qualify contract (required for historical data requests)
+    qf = asyncio.run_coroutine_threadsafe(
+        client.ib.qualifyContractsAsync(contract), client._loop)
+    qf.result(timeout=15)
+    logger.info("Contract qualified: %s (conId=%d)", symbol, contract.conId)
     rate_limiter = RateLimiter()
 
     # If redownloading specific day, remove its file first
