@@ -218,39 +218,45 @@ def create_app():
     ib_reconnect_btn.on_click(_reconnect_ib)
 
     # ── Dynamic per-algo controls ──
-    algo_controls_col = pn.Column()
+    algo_controls_col = pn.Column(margin=(0, 0))
     engine = getattr(state, 'live_engine', None)
     if engine:
         for algo in engine._algos:
             aid = algo.algo_id
             enabled = engine._algo_enabled.get(aid, True)
-            equity = int(algo.config.max_equity_per_trade)
+            equity = int(algo.config.max_equity_per_trade // 1000)  # display in $K
 
-            sw = pn.widgets.Switch(value=enabled, name=aid, width=40)
+            sw = pn.widgets.Switch(value=enabled, name='', width=40,
+                                   margin=(8, 5, 0, 0))
             eq_input = pn.widgets.IntInput(
-                value=equity, start=1000, end=1_000_000, step=5000,
-                width=90, name=f'{aid}_eq')
+                value=equity, start=1, end=1000, step=5,
+                width=65, name='', margin=(0, 0, 0, 0))
             label = pn.pane.HTML(
                 f'<span style="color:{"#ccc" if enabled else "#666"}; '
-                f'font-size:12px;">{aid}</span>', width=80)
+                f'font-size:12px; white-space:nowrap;">{aid}</span>',
+                width=65, margin=(8, 0, 0, 0))
+            k_label = pn.pane.HTML(
+                '<span style="color:#888; font-size:11px;">$K</span>',
+                width=20, margin=(8, 0, 0, 2))
 
             def _on_toggle(event, _aid=aid, _label=label):
                 engine.set_algo_enabled(_aid, event.new)
                 state.algo_control_version += 1
                 _label.object = (
                     f'<span style="color:{"#ccc" if event.new else "#666"}; '
-                    f'font-size:12px;">{_aid}</span>')
+                    f'font-size:12px; white-space:nowrap;">{_aid}</span>')
 
             def _on_equity(event, _aid=aid):
                 if event.new and event.new > 0:
-                    engine.set_algo_equity(_aid, float(event.new))
+                    engine.set_algo_equity(_aid, float(event.new) * 1000)
                     state.algo_control_version += 1
 
             sw.param.watch(_on_toggle, 'value')
             eq_input.param.watch(_on_equity, 'value')
 
             algo_controls_col.append(
-                pn.Row(sw, label, eq_input, height=35))
+                pn.Row(sw, label, eq_input, k_label,
+                       margin=(0, 0), height=32))
 
     # Build template
     template = pn.template.FastListTemplate(
