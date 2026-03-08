@@ -184,6 +184,7 @@ def download_ticks_for_day(client, contract, day: date, output_dir: Path,
     while True:
         rate_limiter.wait()
         page_count += 1
+        logger.info("  Fetching %s page %d (start=%s)...", day, page_count, start_dt)
 
         try:
             ticks = _fetch_ticks_page(client, contract, start_dt)
