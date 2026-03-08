@@ -114,6 +114,22 @@ def create_live_engine(state):
                 params={
                     'flat_sizing': True,
                     'max_trades_per_day': 30,
+                    'trail_base': 0.006,
+                    'trail_power': 6,
+                    'trail_floor': 0.0,
+                    'stop_pct': 0.008,
+                    'tp_pct': 0.020,
+                    'signal_params': {
+                        'vwap_thresh': -0.10,
+                        'd_min': 0.20,
+                        'h1_min': 0.15,
+                        'f5_thresh': 0.35,
+                        'div_thresh': 0.20,
+                        'div_f5_thresh': 0.35,
+                        'min_vol_ratio': 0.8,
+                        'stop': 0.008,
+                        'tp': 0.020,
+                    },
                 },
             ), data=data),
             CSComboAlgo(config=AlgoConfig(

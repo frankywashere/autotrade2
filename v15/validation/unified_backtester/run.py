@@ -182,6 +182,14 @@ def main():
         args.algo = ['intraday']
         print("No --algo specified, defaulting to intraday")
 
+    # Parse algos early to check data requirements
+    algo_specs = [_parse_algo_spec(s) for s in args.algo]
+    needs_context = any(s['algo_type'] in ('surfer-ml', 'surfer_ml', 'surfer',
+                                            'oe-sig5', 'oe_sig5', 'oe')
+                        for s in algo_specs)
+    if needs_context:
+        print("  SPY/VIX daily context will be auto-loaded from native_tf (yfinance cache)")
+
     # Load data
     t0 = time.time()
     rth_only = not args.extended_hours

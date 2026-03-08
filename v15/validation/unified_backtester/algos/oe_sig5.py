@@ -30,7 +30,7 @@ DEFAULT_OE_SIG5_CONFIG = AlgoConfig(
     max_positions=1,
     primary_tf='daily',
     eval_interval=1,
-    exit_check_tf='daily',
+    exit_check_tf='5min',            # Check exits intraday (matching live)
     cost_model=CostModel(
         slippage_pct=0.0001,
         commission_per_share=0.005,
@@ -252,6 +252,17 @@ class OESig5Algo(AlgoBase):
 
         for df in [tsla_d, spy_d, vix_d, tsla_w]:
             df.columns = [c.lower() for c in df.columns]
+
+        # Strip timezone if present (match backtest tz-naive convention)
+        for df in [tsla_d, spy_d, vix_d, tsla_w]:
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+
+        # Inner-join on common dates (matching live path which does the same)
+        common_dates = tsla_d.index.intersection(spy_d.index).intersection(vix_d.index)
+        tsla_d = tsla_d.loc[common_dates]
+        spy_d = spy_d.loc[common_dates]
+        vix_d = vix_d.loc[common_dates]
 
         tsla_rsi = _compute_rsi(tsla_d['close'], 14)
 

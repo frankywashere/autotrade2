@@ -620,7 +620,7 @@ class IntradayAlgo(AlgoBase):
         params = self.config.params
         trail_base = params.get('trail_base', 0.006)
         trail_power = params.get('trail_power', 6)
-        trail_floor = params.get('trail_floor', 0.002)
+        trail_floor = params.get('trail_floor', 0.0)
 
         for pos in open_positions:
             high = bar['high']

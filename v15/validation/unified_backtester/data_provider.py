@@ -142,8 +142,8 @@ class DataProvider:
 
     def _init_from_df1m(self, spy_path: str = None, start: str = None,
                         end: str = None, rth_only: bool = True):
-        """Shared init: resample all TFs, build _tf_bar_end, load SPY."""
-        # Load SPY if provided
+        """Shared init: resample all TFs, build _tf_bar_end, load SPY/VIX."""
+        # Load SPY 1-min if provided (for intraday SPY features, optional)
         self._spy1m = None
         if spy_path and Path(spy_path).exists():
             self._spy1m = load_1min(spy_path, start, end, rth_only)
@@ -160,13 +160,26 @@ class DataProvider:
             for tf, hours in _HOURLY_AGGREGATE_TFS.items():
                 self._tf_data[tf] = _aggregate_from_hourly(hourly, hours)
 
-        # SPY resampled TFs
+        # SPY resampled TFs (from 1-min if available)
         self._spy_tf_data: Dict[str, pd.DataFrame] = {}
         if self._spy1m is not None:
             self._spy_tf_data['1min'] = self._spy1m
             for tf, rule in _RESAMPLE_RULES.items():
                 if rule is not None:
                     self._spy_tf_data[tf] = _resample_ohlcv(self._spy1m, rule)
+
+        # Auxiliary daily data: SPY + VIX from native_tf (yfinance cache).
+        # This is the authoritative daily source — always loaded, overrides
+        # SPY daily from 1-min resampling (which may end earlier).
+        self._aux_daily: Dict[str, pd.DataFrame] = {}  # {symbol: daily DataFrame}
+        self._load_aux_daily(start, end)
+
+        # Build daily completion timestamps from TSLA 1-min bars.
+        # A daily bar is only "complete" after the last 1-min bar of that day.
+        # This prevents lookahead: at 10:30 AM you can't see today's daily bar.
+        self._daily_complete_ts: Dict = {}  # {date -> last_1min_timestamp}
+        for day, group in self._df1m.groupby(self._df1m.index.date):
+            self._daily_complete_ts[day] = group.index[-1]
 
         # Precompute bar timestamps per TF for fast lookup
         self._tf_times: Dict[str, np.ndarray] = {}
@@ -195,6 +208,38 @@ class DataProvider:
                         ends[i] = df.index[i]
             self._tf_bar_end[tf] = ends
 
+    def _load_aux_daily(self, start: str = None, end: str = None):
+        """Load SPY and VIX daily bars from native_tf (yfinance cache).
+
+        These are the authoritative daily sources for ML features and OE-Sig5.
+        Always loaded — no CLI flag needed. Overrides SPY daily from 1-min
+        resampling since SPYMin.txt may end months before TSLA data.
+        """
+        try:
+            from v15.data.native_tf import fetch_native_tf
+        except ImportError:
+            return
+
+        # Use a wide start for multi-year lookback (channels, RSI, etc.)
+        native_start = '2015-01-01'
+        native_end = end or str(self._df1m.index[-1].date())
+
+        for symbol, yf_symbol in [('SPY', 'SPY'), ('VIX', '^VIX')]:
+            try:
+                df = fetch_native_tf(yf_symbol, 'daily', native_start, native_end)
+                df.columns = [c.lower() for c in df.columns]
+                # Strip timezone if present (match TSLA resampled daily which is tz-naive)
+                if df.index.tz is not None:
+                    df.index = df.index.tz_localize(None)
+                self._aux_daily[symbol] = df
+            except Exception:
+                pass  # Graceful degradation — algo will get None
+
+        # Override SPY daily in _spy_tf_data so get_bars('daily', t, 'SPY')
+        # uses the full-range native data instead of truncated 1-min resample
+        if 'SPY' in self._aux_daily:
+            self._spy_tf_data['daily'] = self._aux_daily['SPY']
+
     @property
     def is_live(self) -> bool:
         return False
@@ -219,21 +264,44 @@ class DataProvider:
         This is the primary data access method. The `up_to` parameter
         enforces no-lookahead — bars after this time are never returned.
 
+        For daily bars, completion gating is enforced: a daily bar is only
+        visible after the last 1-min bar of that trading day (matching live).
+
         Args:
             tf: Timeframe string ('1min', '5min', '1h', '4h', 'daily', etc.)
             up_to: Maximum timestamp (inclusive)
-            symbol: 'TSLA' or 'SPY'
+            symbol: 'TSLA', 'SPY', or 'VIX'
 
         Returns:
             DataFrame with columns [open, high, low, close, volume]
         """
-        source = self._spy_tf_data if symbol == 'SPY' else self._tf_data
+        up_to_ts = pd.Timestamp(up_to)
+
+        # VIX: daily-only from auxiliary store
+        if symbol == 'VIX':
+            if 'VIX' not in self._aux_daily:
+                return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+            df = self._aux_daily['VIX']
+            return self._gate_daily(df, up_to_ts)
+
+        # SPY: route to spy_tf_data (daily overridden by aux_daily in init)
+        if symbol == 'SPY':
+            source = self._spy_tf_data
+            if tf == 'daily' and 'SPY' in self._aux_daily:
+                # Use authoritative native daily (full date range)
+                df = self._aux_daily['SPY']
+                return self._gate_daily(df, up_to_ts)
+            if tf not in source:
+                return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+            return source[tf][source[tf].index <= up_to_ts]
+
+        # TSLA
+        source = self._tf_data
         if tf not in source:
             raise ValueError(f"Timeframe '{tf}' not available for {symbol}. "
                              f"Available: {list(source.keys())}")
 
         df = source[tf]
-        up_to_ts = pd.Timestamp(up_to)
 
         # For start-indexed intraday TFs, only return bars that have completed
         # (a 5-min bar starting at 09:30 is only available after 09:34)
@@ -242,7 +310,27 @@ class DataProvider:
             mask = ends <= np.datetime64(up_to_ts)
             return df[mask]
 
+        # Daily completion gating for TSLA too
+        if tf == 'daily':
+            return self._gate_daily(df, up_to_ts)
+
         return df[df.index <= up_to_ts]
+
+    def _gate_daily(self, df: pd.DataFrame, up_to_ts: pd.Timestamp) -> pd.DataFrame:
+        """Return only completed daily bars — no lookahead into today's bar.
+
+        A daily bar is only visible after the last 1-min bar of that trading
+        day has been processed. This matches live behavior where the daily bar
+        materializes at RTH close.
+        """
+        completed_dates = set()
+        for day, complete_ts in self._daily_complete_ts.items():
+            if complete_ts <= up_to_ts:
+                completed_dates.add(day)
+
+        # Filter: only return bars whose date is in completed set
+        mask = pd.Series(df.index.date, index=df.index).isin(completed_dates)
+        return df[mask.values]
 
     def get_current_bar(self, tf: str, bar_time: 'pd.Timestamp | dt.datetime',
                         symbol: str = 'TSLA') -> Optional[dict]:
@@ -257,6 +345,31 @@ class DataProvider:
 
         Returns None if no bar exists at that time.
         """
+        # VIX: daily-only from auxiliary store
+        if symbol == 'VIX':
+            if 'VIX' not in self._aux_daily or tf != 'daily':
+                return None
+            df = self._aux_daily['VIX']
+            bt = pd.Timestamp(bar_time)
+            target_date = bt.date()
+            # Completion gate: only return if that day is complete
+            if target_date not in self._daily_complete_ts:
+                return None
+            if self._daily_complete_ts[target_date] > bt:
+                return None
+            date_matches = df[df.index.date == target_date]
+            if len(date_matches) == 0:
+                return None
+            row = date_matches.iloc[0]
+            return {
+                'open': float(row['open']),
+                'high': float(row['high']),
+                'low': float(row['low']),
+                'close': float(row['close']),
+                'volume': float(row['volume']),
+                'time': date_matches.index[0],
+            }
+
         source = self._spy_tf_data if symbol == 'SPY' else self._tf_data
         if tf not in source:
             return None
