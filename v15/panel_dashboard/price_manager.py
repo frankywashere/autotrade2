@@ -1,8 +1,8 @@
 """
 PriceManager — Single source of truth for all price data.
 
-Tracks IB (tick-driven) and yfinance (REST-polled) prices independently.
-Thread-safe for concurrent access from price loops and UI callbacks.
+Tracks IB tick-driven prices. Thread-safe for concurrent access from
+price loops and UI callbacks.
 """
 
 import threading
@@ -38,8 +38,8 @@ class PriceData:
 class PriceManager:
     """Single source of truth for all price data.
 
-    Tracks prices from IB (tick-driven) and yfinance (REST-polled) independently.
-    Thread-safe — all updates and reads go through a lock.
+    Tracks IB tick-driven prices. Thread-safe — all updates and reads go
+    through a lock.
     """
 
     STALE_THRESHOLD = 30.0  # seconds before marking a price stale
@@ -70,21 +70,6 @@ class PriceManager:
             pd.updated_at = now
             pd.stale = False
             self._err_counts[symbol] = 0
-
-    def update_yf(self, symbol: str, price: float):
-        """Called from yfinance poll loop."""
-        if price <= 0:
-            return
-        now = time.time()
-        with self._lock:
-            key = (symbol, 'yf')
-            pd = self._prices.get(key)
-            if pd is None:
-                pd = PriceData()
-                self._prices[key] = pd
-            pd.price = price
-            pd.updated_at = now
-            pd.stale = False
 
     def get(self, symbol: str, source: str = 'ib') -> PriceData:
         """Get latest price for (symbol, source). Returns PriceData (never None)."""

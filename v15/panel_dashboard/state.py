@@ -161,7 +161,7 @@ class DashboardState(param.Parameterized):
         except Exception as e:
             logger.error("Initial analysis failed: %s\n%s", e, traceback.format_exc())
 
-    # Price updates handled by loops.py (ib_price_loop / yf_price_loop)
+    # Price updates handled by loops.py (ib_price_loop)
 
     def run_analysis(self):
         """Manual button: recompute channel analysis for UI display."""

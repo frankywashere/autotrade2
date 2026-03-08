@@ -357,7 +357,6 @@ class TradeDB:
           - Default: returns filled + partial rows (real broker exposure)
           - include_pending=True: also returns pending rows (for entry gating)
           - NEVER returns rejected rows
-        For source='yf': returns all open rows (no fill status concept)
         """
         conditions = ["exit_time IS NULL"]
         params = []

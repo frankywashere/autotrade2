@@ -107,25 +107,6 @@ def _update_ib_prices(state):
                 state.positions_version += 1
 
 
-def yf_price_loop(state):
-    """yfinance 30s REST price polling loop.
-
-    Polls yf.Ticker lastPrice for TSLA. Updates PriceManager for fallback display.
-    """
-    while True:
-        time.sleep(30)
-        try:
-            import yfinance as yf
-            ticker = yf.Ticker('TSLA')
-            info = ticker.fast_info
-            price = info.get('lastPrice', 0) or info.get('last_price', 0)
-            if price and price > 0:
-                if state.price_manager:
-                    state.price_manager.update_yf('TSLA', price)
-        except Exception as e:
-            logger.warning("yf price loop error: %s", e)
-
-
 def analysis_loop(state):
     """Analysis loop — triggers on 5-min bar close or 60s timeout."""
     time.sleep(30)  # Initial delay
@@ -170,7 +151,6 @@ def start_all_loops(state):
 
     loops = [
         (ib_price_loop, 'ib-price'),
-        (yf_price_loop, 'yf-price'),
         (analysis_loop, 'analysis'),
         (tf_refresh_loop, 'tf-refresh'),
     ]
