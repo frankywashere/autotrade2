@@ -256,7 +256,7 @@ def create_app():
 
             algo_controls_col.append(
                 pn.Row(sw, label, eq_input, k_label,
-                       margin=(0, 0), height=32))
+                       margin=(0, 0, 8, 0), height=36))
 
     # Build template
     template = pn.template.FastListTemplate(
