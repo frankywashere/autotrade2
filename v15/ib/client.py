@@ -284,10 +284,10 @@ class IBClient:
 
     async def _fetch_historical_async(self, contract, duration, bar_size, use_rth):
         """Async wrapper for reqHistoricalData."""
-        # IB requires MIDPOINT for index contracts (VIX), TRADES for stocks
+        # IB requires TRADES for index contracts (VIX) — MIDPOINT returns 0 bars
         # Index contracts have no RTH distinction — always use useRTH=False
         if contract.secType == 'IND':
-            what_to_show = 'MIDPOINT'
+            what_to_show = 'TRADES'
             actual_use_rth = False
         else:
             what_to_show = 'TRADES'

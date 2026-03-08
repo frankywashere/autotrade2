@@ -317,9 +317,10 @@ class LiveDataProvider:
         """Seed with IB historical bars at startup.
 
         Provides lookback for channel/feature computation:
-        - TSLA: 5 days of 1-min bars (for intraday features + 5min/1h resample)
+        - TSLA: 15 days of 1-min bars (RTH only, for 5min/1h/4h resample — 30 4h bars)
         - TSLA/SPY/VIX: 500 daily bars (for channels + OE-Sig5)
-        - TSLA/SPY/VIX: 104 weekly bars (for weekly channels)
+        - TSLA/SPY: 104 weekly bars (for weekly channels)
+        - VIX: daily only (no algo uses VIX weekly)
         - TSLA monthly: derived from daily resample
         """
         if not self._ib or not self._ib.is_connected():
@@ -327,7 +328,7 @@ class LiveDataProvider:
             return
 
         try:
-            self._seed_1min_bars('TSLA', days=5)
+            self._seed_1min_bars('TSLA', days=15)
         except Exception as e:
             logger.error("Failed to seed 1-min bars: %s", e)
 
@@ -336,10 +337,12 @@ class LiveDataProvider:
                 self._seed_daily_bars(symbol, bars=500)
             except Exception as e:
                 logger.error("Failed to seed %s daily bars: %s", symbol, e)
-            try:
-                self._seed_weekly_bars(symbol)
-            except Exception as e:
-                logger.error("Failed to seed %s weekly bars: %s", symbol, e)
+            # VIX weekly not used by any algo — skip to save IB pacing budget
+            if symbol != 'VIX':
+                try:
+                    self._seed_weekly_bars(symbol)
+                except Exception as e:
+                    logger.error("Failed to seed %s weekly bars: %s", symbol, e)
 
         # Monthly: resample from daily (IB monthly bars limited anyway)
         with self._lock:
@@ -379,7 +382,7 @@ class LiveDataProvider:
     def _seed_1min_bars(self, symbol, days=5):
         """Seed 1-min bars from IB historical API."""
         bars_df = self._ib.fetch_historical(symbol, f'{days} D', '1 min',
-                                             use_rth=False)
+                                             use_rth=True)
         if bars_df is None or len(bars_df) == 0:
             logger.warning("No 1-min bars returned for %s", symbol)
             return
