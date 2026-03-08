@@ -1,7 +1,6 @@
 """
 Intraday algo adapter.
 
-Wraps the existing SurferLiveScanner.evaluate_intraday_signal() for
 5-min intraday signals with confidence-based trailing stop.
 """
 

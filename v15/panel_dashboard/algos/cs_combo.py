@@ -1,8 +1,7 @@
 """
 CS-5TF and CS-DW algo adapters.
 
-Wraps the existing SurferLiveScanner.evaluate_signal() for Channel Surfer
-daily signals with exponential trailing stop.
+Channel Surfer daily signals with exponential trailing stop.
 """
 
 import logging

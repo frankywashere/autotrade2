@@ -235,15 +235,10 @@ def _handle_exits(state, exit_signals, source='ib'):
 
 
 def _run_analysis(state):
-    """Run IB-based analysis (thin wrapper for existing logic)."""
+    """Run analysis to refresh channel chart UI."""
     if not state.native_tf_data:
         return
-    if getattr(state, '_analysis_running', False):
-        return
-
-    # Delegate to existing analysis method on state
-    if hasattr(state, '_run_analysis_bg'):
-        state._run_analysis_bg()
+    state.run_analysis()
 
 
 def start_all_loops(state):

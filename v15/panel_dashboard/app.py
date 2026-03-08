@@ -59,73 +59,7 @@ def _init_state():
     _state = DashboardState()
 
     _state.load_market_data()
-    logger.info("Market data loaded. TSLA=%.2f, c16: CS=%s DW=%s ML=%s Intra=%s OE=%s, c14a: CS=%s DW=%s ML=%s Intra=%s",
-                _state.tsla_price,
-                "OK" if _state.scanner else "NONE",
-                "OK" if _state.scanner_dw else "NONE",
-                "OK" if _state.scanner_ml else "NONE",
-                "OK" if _state.scanner_intra else "NONE",
-                "OK" if _state.scanner_oe else "NONE",
-                "OK" if _state.scanner_14a else "NONE",
-                "OK" if _state.scanner_14a_dw else "NONE",
-                "OK" if _state.scanner_14a_ml else "NONE",
-                "OK" if _state.scanner_14a_intra else "NONE")
-
-    # Log ML model status
-    gbt_ok = hasattr(_state, '_ml_model') and _state._ml_model is not None
-    intra_ok = hasattr(_state, '_intraday_ml_model') and _state._intraday_ml_model is not None
-    gbt_msg = f"LOADED ({len(_state._ml_feature_names or [])} features)" if gbt_ok else "NOT LOADED"
-    intra_msg = (f"LOADED ({len(getattr(_state, '_intraday_ml_features', []) or [])} features, "
-                 f"threshold={getattr(_state, '_intraday_ml_threshold', 0.5):.2f})") if intra_ok else "NOT LOADED"
-
-    from pathlib import Path
-    gbt_path = Path('surfer_models/gbt_model.pkl')
-    intra_path = Path('surfer_models/intraday_ml_model.pkl')
-    gbt_diag = ""
-    intra_diag = ""
-    if not gbt_ok:
-        if gbt_path.exists():
-            gbt_diag = f" (file exists, {os.path.getsize(gbt_path)} bytes — load error)"
-        else:
-            gbt_diag = f" (file missing at {gbt_path.resolve()})"
-    if not intra_ok:
-        if intra_path.exists():
-            intra_diag = f" (file exists, {os.path.getsize(intra_path)} bytes — load error)"
-        else:
-            intra_diag = f" (file missing at {intra_path.resolve()})"
-
-    if gbt_ok:
-        logger.info("ML model (GBT): %s", gbt_msg)
-    else:
-        logger.warning("ML model (GBT): %s%s — c16-ml signals will be skipped", gbt_msg, gbt_diag)
-    if intra_ok:
-        logger.info("ML model (Intraday): %s", intra_msg)
-    else:
-        logger.warning("ML model (Intraday): %s%s — c16-intra ML filter disabled", intra_msg, intra_diag)
-
-    # Send startup notification
-    scanner_err = getattr(_state, '_scanner_init_error', '')
-    gbt_err = getattr(_state, '_gbt_load_error', '')
-    c14a_ok = all([_state.scanner_14a, _state.scanner_14a_dw,
-                    _state.scanner_14a_ml, _state.scanner_14a_intra])
-    startup_msg = (
-        f"c16: CS-5TF={'OK' if _state.scanner else 'FAIL'}, "
-        f"DW={'OK' if _state.scanner_dw else 'FAIL'}, "
-        f"ML={'OK' if _state.scanner_ml else 'FAIL'}, "
-        f"Intra={'OK' if _state.scanner_intra else 'FAIL'}, "
-        f"OE={'OK' if _state.scanner_oe else 'FAIL'}\n"
-        f"c14a: {'ALL OK' if c14a_ok else 'FAIL'} (4 scanners)\n"
-        f"GBT model: {gbt_msg}{gbt_diag}\n"
-        f"Intraday model: {intra_msg}{intra_diag}\n"
-        f"TSLA price: ${_state.tsla_price:.2f}"
-    )
-    if scanner_err:
-        startup_msg += f"\nSCANNER ERROR: {scanner_err[:200]}"
-    if gbt_err:
-        startup_msg += f"\nGBT ERROR: {gbt_err[:200]}"
-    ib_ok = getattr(_state, 'ib_connected', False)
-    startup_msg += f"\nIB Gateway: {'CONNECTED' if ib_ok else 'NOT CONNECTED — NO LIVE PRICES!'}"
-    _state.send_notification(startup_msg, title='c16 Startup')
+    logger.info("Market data loaded. TSLA=%.2f", _state.tsla_price)
 
     # Log IB status
     ib_ok = getattr(_state, 'ib_connected', False)
@@ -134,34 +68,27 @@ def _init_state():
     else:
         logger.error("IB Gateway: NOT CONNECTED — no live price source available!")
 
-    logger.info("Starting background loops...")
-    _state.start_background_loops()
-
-    # Initialize new infrastructure (TradeDB, adapters, order handler, recovery)
-    # This runs alongside the existing scanner system — both coexist
+    # Initialize infrastructure (TradeDB, adapters, order handler, LiveEngine, recovery, loops)
     _init_new_infra(_state)
 
     return _state
 
 
 def _init_new_infra(state):
-    """Initialize the new DB-backed infrastructure alongside existing scanners.
-
-    This adds TradeDB, ScannerManagers, IBOrderHandler, and recovery
-    without disrupting the existing SurferLiveScanner-based system.
-    """
+    """Initialize DB-backed infrastructure: TradeDB, adapters, LiveEngine, recovery, loops."""
     try:
         from v15.panel_dashboard.startup import (
             init_trade_db, create_adapters,
             create_order_handler, create_live_engine,
             reload_degraded_state,
             run_ib_recovery, run_reconciliation,
+            start_loops,
         )
 
-        # 1. Create DB (IB and ML already initialized by load_market_data)
+        # 1. Create DB
         init_trade_db(state)
 
-        # 2. Create adapters + order handler + live engine (IB client already connected)
+        # 2. Create adapters + order handler + live engine
         create_adapters(state)
         create_order_handler(state)
         create_live_engine(state)
@@ -172,14 +99,29 @@ def _init_new_infra(state):
             run_ib_recovery(state)
             run_reconciliation(state)
 
-        logger.info("New infrastructure initialized (trade_db=%s, ib_handler=%s, "
+        # 4. Start background loops (price, exit checks, analysis, TF refresh)
+        start_loops(state)
+
+        logger.info("Infrastructure initialized (trade_db=%s, ib_handler=%s, "
                      "live_engine=%s, ib_degraded=%s)",
                      'OK' if state.trade_db else 'NONE',
                      'OK' if getattr(state, 'ib_order_handler', None) else 'NONE',
                      'OK' if getattr(state, 'live_engine', None) else 'NONE',
                      state.ib_degraded)
+
+        # Send startup notification
+        ib_ok = getattr(state, 'ib_connected', False)
+        engine_ok = getattr(state, 'live_engine', None) is not None
+        startup_msg = (
+            f"LiveEngine: {'OK' if engine_ok else 'FAIL'}\n"
+            f"TSLA price: ${state.tsla_price:.2f}\n"
+            f"IB Gateway: {'CONNECTED' if ib_ok else 'NOT CONNECTED'}\n"
+            f"ib_degraded: {state.ib_degraded}"
+        )
+        state.send_notification(startup_msg, title='c17 Startup')
+
     except Exception as e:
-        logger.error("New infrastructure init failed (non-fatal): %s\n%s",
+        logger.error("Infrastructure init failed (non-fatal): %s\n%s",
                      e, traceback.format_exc())
 
 
@@ -215,58 +157,10 @@ def create_app():
 
     ntfy_test_btn.on_click(_test_ntfy)
 
-    flush_btn = pn.widgets.Button(name='Flush State to Disk', button_type='success')
-    flush_status = pn.pane.Markdown('', width=200)
-
-    def _flush_state(e):
-        flush_status.object = '*Flushing...*'
-        n = state.flush_scanner_state()
-        flush_status.object = f'**Flushed {n} scanners**'
-
-    flush_btn.on_click(_flush_state)
-
-    reset_btn = pn.widgets.Button(name='Reset Scanner', button_type='danger')
-
-    def _reset_scanner(e):
-        if state.scanner:
-            state.scanner.reset()
-            state.positions_version += 1
-            state.trades_version += 1
-
-    reset_btn.on_click(_reset_scanner)
-
-    capital_input = pn.widgets.FloatInput.from_param(
-        state.param.scanner_capital,
-        name='Scanner Capital ($)',
-        step=10_000,
-    )
-    kill_switch = pn.widgets.Toggle.from_param(
-        state.param.kill_switch,
-        name='Kill Switch',
-    )
-
-    # Sync kill switch to scanner
-    def _sync_kill(event):
-        if state.scanner:
-            state.scanner.config.kill_switch = event.new
-    state.param.watch(_sync_kill, 'kill_switch')
-
     # Last analysis timestamp display
     last_analysis_display = pn.bind(
         lambda ts: pn.pane.Markdown(f"Last analysis: **{ts}**" if ts else "*No analysis yet*"),
         state.param.last_analysis,
-    )
-
-    # ML model status display
-    gbt_ok = hasattr(state, '_ml_model') and state._ml_model is not None
-    intra_ok = hasattr(state, '_intraday_ml_model') and state._intraday_ml_model is not None
-    gbt_info = f"{len(state._ml_feature_names or [])}f" if gbt_ok else "MISSING"
-    intra_info = (f"{len(getattr(state, '_intraday_ml_features', []) or [])}f"
-                  if intra_ok else "MISSING")
-    ml_status = pn.pane.Markdown(
-        f"GBT: **{'OK' if gbt_ok else 'MISSING'}** ({gbt_info})  \n"
-        f"Intra: **{'OK' if intra_ok else 'MISSING'}** ({intra_info})",
-        width=200,
     )
 
     # IB connection status (reactive)
@@ -335,9 +229,6 @@ def create_app():
         sidebar=[
             pn.pane.Markdown("### Controls"),
             run_btn,
-            pn.layout.Divider(),
-            capital_input,
-            kill_switch,
             _kill_switch_panel(state),
             pn.layout.Divider(),
             last_analysis_display,
@@ -345,16 +236,9 @@ def create_app():
             ib_status_display,
             ib_reconnect_btn,
             ib_reconnect_status,
-            pn.pane.Markdown("### ML Models"),
-            ml_status,
             pn.layout.Divider(),
             ntfy_test_btn,
             ntfy_status,
-            pn.layout.Divider(),
-            flush_btn,
-            flush_status,
-            pn.layout.Divider(),
-            reset_btn,
         ],
         main=[
             pn.Tabs(
