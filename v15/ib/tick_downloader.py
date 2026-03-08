@@ -129,8 +129,9 @@ def _fetch_ticks_page(client, contract, start_dt_str: str,
                       num_ticks: int = 1000) -> list:
     """Fetch one page of historical trade ticks from IB.
 
-    reqHistoricalTicksAsync returns an ib_async Future (not a coroutine),
-    so we schedule it on the event loop and bridge to a concurrent.futures.Future.
+    reqHistoricalTicksAsync returns an ib_async Future (Awaitable but not coroutine).
+    We schedule it on the event loop via call_soon_threadsafe and bridge results
+    back through a concurrent.futures.Future.
     """
     import concurrent.futures
     result_future = concurrent.futures.Future()
@@ -145,10 +146,15 @@ def _fetch_ticks_page(client, contract, start_dt_str: str,
             useRth=False,
             ignoreSize=False,
         )
-        task = asyncio.ensure_future(awaitable, loop=client._loop)
+        # awaitable is ib_async's own Future type — wrap as asyncio Task
+        task = asyncio.ensure_future(awaitable)
 
         def _on_done(t):
-            exc = t.exception()
+            try:
+                exc = t.exception()
+            except asyncio.CancelledError:
+                result_future.set_exception(asyncio.CancelledError())
+                return
             if exc:
                 result_future.set_exception(exc)
             else:
