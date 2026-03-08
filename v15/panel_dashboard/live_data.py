@@ -394,6 +394,37 @@ class LiveDataProvider:
                     'close': 'last', 'volume': 'sum',
                 }).dropna()
                 self._bars[symbol][tf] = resampled
+            # Derive 4h bars from 1h using same logic as _check_4h_resample
+            df_1h = self._bars[symbol].get('1h', pd.DataFrame())
+            if len(df_1h) > 0:
+                bars_4h = []
+                for day in sorted(set(df_1h.index.date)):
+                    day_bars = df_1h[df_1h.index.date == day]
+                    # First 4h: hours <= 13
+                    chunk1 = day_bars[day_bars.index.hour <= 13]
+                    if len(chunk1) > 0:
+                        bars_4h.append((chunk1.index[-1], {
+                            'open': float(chunk1['open'].iloc[0]),
+                            'high': float(chunk1['high'].max()),
+                            'low': float(chunk1['low'].min()),
+                            'close': float(chunk1['close'].iloc[-1]),
+                            'volume': float(chunk1['volume'].sum()),
+                        }))
+                    # Second 4h: hours > 13
+                    chunk2 = day_bars[day_bars.index.hour > 13]
+                    if len(chunk2) > 0:
+                        bars_4h.append((chunk2.index[-1], {
+                            'open': float(chunk2['open'].iloc[0]),
+                            'high': float(chunk2['high'].max()),
+                            'low': float(chunk2['low'].min()),
+                            'close': float(chunk2['close'].iloc[-1]),
+                            'volume': float(chunk2['volume'].sum()),
+                        }))
+                if bars_4h:
+                    self._bars[symbol]['4h'] = pd.DataFrame(
+                        [b for _, b in bars_4h],
+                        index=[t for t, _ in bars_4h],
+                    )
         logger.info("Seeded %s 1-min bars: %d", symbol, len(bars_df))
 
     def _seed_daily_bars(self, symbol, bars=500):

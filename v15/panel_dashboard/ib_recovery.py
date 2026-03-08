@@ -225,10 +225,8 @@ def seed_seen_exec_ids(state):
 
     handler = state.ib_order_handler
     try:
-        import asyncio
-        future = asyncio.run_coroutine_threadsafe(
-            state.ib_client.ib.reqExecutionsAsync(), state.ib_client._loop)
-        fills = future.result(timeout=30)
+        # ib.fills() reads from already-populated cache (synchronous)
+        fills = state.ib_client.ib.fills()
 
         for fill in fills:
             exec_id = fill.execution.execId
@@ -272,12 +270,9 @@ def reconcile_ib_db(state):
 
     db = state.trade_db
 
-    # Get broker positions
+    # Get broker positions (synchronous cache read)
     try:
-        import asyncio
-        future = asyncio.run_coroutine_threadsafe(
-            state.ib_client.ib.reqPositionsAsync(), state.ib_client._loop)
-        broker_positions = future.result(timeout=15)
+        broker_positions = state.ib_client.ib.positions()
     except Exception as e:
         logger.error("Reconciliation failed: could not get broker positions: %s — setting ib_degraded", e)
         state.ib_degraded = True
