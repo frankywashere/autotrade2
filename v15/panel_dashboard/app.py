@@ -79,7 +79,7 @@ def _init_new_infra(state):
     try:
         from v15.panel_dashboard.startup import (
             init_trade_db,
-            create_order_handler, create_live_engine, create_yf_engine,
+            create_order_handler, create_live_engine,
             reload_degraded_state,
             run_ib_recovery, run_reconciliation,
             start_loops,
@@ -88,10 +88,9 @@ def _init_new_infra(state):
         # 1. Create DB
         init_trade_db(state)
 
-        # 2. Create order handler + live engines
+        # 2. Create order handler + live engine
         create_order_handler(state)
         create_live_engine(state)
-        create_yf_engine(state)
         reload_degraded_state(state)
 
         # 3. Recovery + reconciliation (if IB connected)
@@ -129,8 +128,6 @@ def create_app():
     logger.info("create_app() called (session factory)")
     try:
         from v15.panel_dashboard.tabs.ib_live import ib_live_tab, _kill_switch_panel
-        from v15.panel_dashboard.tabs.yf_sim import yf_sim_tab
-        from v15.panel_dashboard.tabs.comparison import comparison_tab
     except Exception:
         logger.error("Tab import failed:\n%s", traceback.format_exc())
         raise
@@ -241,12 +238,7 @@ def create_app():
             ntfy_status,
         ],
         main=[
-            pn.Tabs(
-                ('IB Live', ib_live_tab(state)),
-                ('yf Sim', yf_sim_tab(state)),
-                ('IB vs yf', comparison_tab(state)),
-                sizing_mode='stretch_width',
-            ),
+            ib_live_tab(state),
         ],
     )
     logger.info("c14a Dashboard template built successfully — ready to serve")

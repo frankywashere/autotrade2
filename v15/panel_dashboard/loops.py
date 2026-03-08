@@ -110,28 +110,18 @@ def _update_ib_prices(state):
 def yf_price_loop(state):
     """yfinance 30s REST price polling loop.
 
-    Polls yf.Ticker lastPrice for TSLA/SPY/VIX.
-    Feeds prices to PriceManager + YfinanceDataProvider (for bar construction).
-    Exit/trailing handled by yf LiveEngine via bar events.
+    Polls yf.Ticker lastPrice for TSLA. Updates PriceManager for fallback display.
     """
     while True:
         time.sleep(30)
         try:
             import yfinance as yf
-            for symbol, yf_sym in [('TSLA', 'TSLA'), ('SPY', 'SPY'), ('VIX', '^VIX')]:
-                try:
-                    ticker = yf.Ticker(yf_sym)
-                    info = ticker.fast_info
-                    price = info.get('lastPrice', 0) or info.get('last_price', 0)
-                    if price and price > 0:
-                        if state.price_manager:
-                            state.price_manager.update_yf(symbol, price)
-                        # Feed to YfinanceDataProvider for synthetic bar construction
-                        yf_data = getattr(state, 'yf_data_provider', None)
-                        if yf_data:
-                            yf_data.on_price_update(symbol, price)
-                except Exception as e:
-                    logger.debug("yf price fetch %s: %s", symbol, e)
+            ticker = yf.Ticker('TSLA')
+            info = ticker.fast_info
+            price = info.get('lastPrice', 0) or info.get('last_price', 0)
+            if price and price > 0:
+                if state.price_manager:
+                    state.price_manager.update_yf('TSLA', price)
         except Exception as e:
             logger.warning("yf price loop error: %s", e)
 
