@@ -2,7 +2,7 @@
 Background loop functions — extracted from state.py.
 
 Each loop runs in a daemon thread. Functions take `state` as their first argument
-and access state.price_manager, state.trade_db, state.ib_scanner_manager, etc.
+and access state.price_manager, state.trade_db, etc.
 """
 
 import logging
@@ -98,31 +98,7 @@ def _update_ib_prices(state):
         if price_changed:
             state.tsla_price = price
 
-        # Check exits for IB trades
-        if hasattr(state, 'ib_scanner_manager') and state.ib_scanner_manager:
-            try:
-                bid = state.price_manager.get('TSLA', 'ib').bid if state.price_manager else price
-                ask = state.price_manager.get('TSLA', 'ib').ask if state.price_manager else price
-                exits = state.ib_scanner_manager.check_all_exits(price, bid, ask)
-                if exits:
-                    _handle_exits(state, exits, source='ib')
-            except Exception as e:
-                logger.warning("IB exit check failed: %s", e)
-
-        # Update trailing stops for IB trades
-        if hasattr(state, 'ib_scanner_manager') and state.ib_scanner_manager:
-            try:
-                updates = state.ib_scanner_manager.update_all_trailing(price)
-                for trade_id, changes in updates:
-                    state.trade_db.update_trade_state(trade_id, **changes)
-                    # If stop_price changed, modify the resting IB stop
-                    if ('stop_price' in changes
-                            and hasattr(state, 'ib_order_handler')
-                            and state.ib_order_handler):
-                        state.ib_order_handler.modify_trailing_stop(
-                            trade_id, changes['stop_price'])
-            except Exception as e:
-                logger.warning("IB trailing update failed: %s", e)
+        # Exit checks + trailing handled by LiveEngine via bar events
 
         # Bump position version for live P&L
         if price_changed:
@@ -132,31 +108,30 @@ def _update_ib_prices(state):
 
 
 def yf_price_loop(state):
-    """yfinance 2s REST price polling loop.
+    """yfinance 30s REST price polling loop.
 
-    Polls yf.Ticker('TSLA').fast_info['lastPrice'] for live P&L display.
+    Polls yf.Ticker lastPrice for TSLA/SPY/VIX.
+    Feeds prices to PriceManager + YfinanceDataProvider (for bar construction).
+    Exit/trailing handled by yf LiveEngine via bar events.
     """
     while True:
-        time.sleep(2)
+        time.sleep(30)
         try:
             import yfinance as yf
-            ticker = yf.Ticker('TSLA')
-            info = ticker.fast_info
-            price = info.get('lastPrice', 0) or info.get('last_price', 0)
-            if price and price > 0:
-                if state.price_manager:
-                    state.price_manager.update_yf('TSLA', price)
-
-                # Check exits for yf trades
-                if hasattr(state, 'yf_scanner_manager') and state.yf_scanner_manager:
-                    exits = state.yf_scanner_manager.check_all_exits(price)
-                    if exits:
-                        _handle_exits(state, exits, source='yf')
-
-                    # Update trailing stops for yf trades
-                    updates = state.yf_scanner_manager.update_all_trailing(price)
-                    for trade_id, changes in updates:
-                        state.trade_db.update_trade_state(trade_id, **changes)
+            for symbol, yf_sym in [('TSLA', 'TSLA'), ('SPY', 'SPY'), ('VIX', '^VIX')]:
+                try:
+                    ticker = yf.Ticker(yf_sym)
+                    info = ticker.fast_info
+                    price = info.get('lastPrice', 0) or info.get('last_price', 0)
+                    if price and price > 0:
+                        if state.price_manager:
+                            state.price_manager.update_yf(symbol, price)
+                        # Feed to YfinanceDataProvider for synthetic bar construction
+                        yf_data = getattr(state, 'yf_data_provider', None)
+                        if yf_data:
+                            yf_data.on_price_update(symbol, price)
+                except Exception as e:
+                    logger.debug("yf price fetch %s: %s", symbol, e)
         except Exception as e:
             logger.warning("yf price loop error: %s", e)
 
@@ -190,48 +165,6 @@ def tf_refresh_loop(state):
                     logger.info("Higher TF data refreshed from IB")
             except Exception as e:
                 logger.warning("Higher TF refresh failed: %s", e)
-
-
-def _handle_exits(state, exit_signals, source='ib'):
-    """Process exit signals — close trades in DB (yf) or place IB orders (ib).
-
-    For source='yf': instant close at signal price.
-    For source='ib': two-phase commit (order placement + fill callback).
-    """
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    ET = ZoneInfo('US/Eastern')
-
-    for exit_sig in exit_signals:
-        trade_id = exit_sig.trade_id
-        exit_price = exit_sig.exit_price
-        exit_reason = exit_sig.exit_reason
-
-        if source == 'yf':
-            # Instant close for yfinance
-            try:
-                now_et = datetime.now(ET).isoformat()
-                state.trade_db.close_trade(
-                    trade_id, exit_time=now_et,
-                    exit_price=exit_price, exit_reason=exit_reason)
-                state.positions_version += 1
-                state.trades_version += 1
-                logger.info("yf trade %d closed: %s @ $%.2f",
-                            trade_id, exit_reason, exit_price)
-            except Exception as e:
-                logger.error("Failed to close yf trade %d: %s", trade_id, e)
-        else:
-            # IB exit: two-phase commit via IBOrderHandler
-            if hasattr(state, 'ib_order_handler') and state.ib_order_handler:
-                try:
-                    state.ib_order_handler.place_exit(
-                        trade_id, exit_reason, exit_price)
-                except Exception as e:
-                    logger.error("IB exit failed for trade %d: %s",
-                                 trade_id, e)
-            else:
-                logger.warning("No IB order handler — exit signal for trade %d "
-                               "not placed", trade_id)
 
 
 def _run_analysis(state):

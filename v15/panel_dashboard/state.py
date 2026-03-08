@@ -52,8 +52,7 @@ class DashboardState(param.Parameterized):
     # These are set during startup.full_init() and used by new tabs/loops
     trade_db = param.Parameter(None, precedence=-1)             # TradeDB instance
     price_manager = param.Parameter(None, precedence=-1)        # PriceManager instance
-    ib_scanner_manager = param.Parameter(None, precedence=-1)   # ScannerManager (source='ib')
-    yf_scanner_manager = param.Parameter(None, precedence=-1)   # ScannerManager (source='yf')
+    yf_engine = param.Parameter(None, precedence=-1)             # LiveEngine (source='yf', sim-only)
     ib_order_handler = param.Parameter(None, precedence=-1)     # IBOrderHandler instance
     fa_supported = param.Boolean(False, precedence=-1)          # IB FA account support
 

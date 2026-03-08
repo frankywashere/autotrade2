@@ -42,12 +42,13 @@ class LiveEngine:
     """
 
     def __init__(self, algos: List[AlgoBase], data, trade_db=None,
-                 ib_order_handler=None):
+                 ib_order_handler=None, source: str = 'live'):
         self._algos = algos
         self._algo_map: Dict[str, AlgoBase] = {a.algo_id: a for a in algos}
         self._data = data
         self._db = trade_db
         self._orders = ib_order_handler
+        self._source = source
         self._eval_lock = threading.Lock()
         self._pending_entries: List[PendingEntry] = []
         self._eval_counters: Dict[str, int] = {}
@@ -302,7 +303,7 @@ class LiveEngine:
                     from zoneinfo import ZoneInfo
                     now_et = datetime.now(ZoneInfo('US/Eastern')).isoformat()
                     trade_id = self._db.open_trade(
-                        source='live',
+                        source=self._source,
                         algo_id=algo.algo_id,
                         symbol='TSLA',
                         direction=signal.direction,

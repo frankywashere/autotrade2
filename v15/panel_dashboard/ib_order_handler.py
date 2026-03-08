@@ -5,7 +5,7 @@ Manages the full lifecycle of IB orders: entry, exit, protective stops.
 Handles race conditions between IB fill callbacks and DB writes via
 in-memory buffers protected by _buffer_lock.
 
-This module sits between ScannerManager/order_entry and IBClient.
+This module sits between LiveEngine/order_entry and IBClient.
 Both automated and manual orders use the same handler.
 """
 
@@ -87,7 +87,7 @@ class TerminalInfo:
 class IBOrderHandler:
     """Manages IB order lifecycle with two-phase commit.
 
-    Shared between ScannerManager (automated) and order_entry (manual).
+    Shared between LiveEngine (automated) and order_entry (manual).
     All buffers are protected by _buffer_lock for thread safety.
     """
 

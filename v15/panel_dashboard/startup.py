@@ -1,13 +1,13 @@
 """
-Startup sequence — initializes TradeDB, IB, adapters, LiveEngine, scanners.
+Startup sequence — initializes TradeDB, IB, LiveEngine(s), scanners.
 
 Follows the startup order from REBUILD_PLAN.md Part 8:
   1. Create DB
   3. Connect IB
   4. Load ML models
-  5. Create adapters, register with ScannerManagers
   5b. Create IBOrderHandler
   5c. Create LiveEngine (unified backtester algos + tick-to-bar feed)
+  5d. Create yf LiveEngine (CS-DW + OE-Sig5, yfinance data, sim-only)
   6. Reload ib_degraded, populate open-order cache, scan unlinked, recover, seed+wire
   7. Reconcile IB/DB
   8. Start background loops
@@ -68,86 +68,6 @@ def load_models(state):
 
     if models.load_errors:
         logger.warning("ML model load errors: %s", models.load_errors)
-
-
-def create_adapters(state):
-    """Step 5: Create algo adapters and register with ScannerManagers."""
-    from v15.panel_dashboard.algos.cs_combo import CSComboAdapter
-    from v15.panel_dashboard.algos.surfer_ml import SurferMLAdapter
-    from v15.panel_dashboard.algos.intraday import IntradayAdapter
-    from v15.panel_dashboard.algos.oe_sig5 import OESig5Adapter
-    from v15.panel_dashboard.algos.scanner_manager import ScannerManager
-
-    # --- IB ScannerManager ---
-    ib_manager = ScannerManager(
-        trade_db=state.trade_db,
-        source='ib',
-        ib_client=state.ib_client,
-    )
-
-    # c16 generation: flat $100K, trail^12
-    ib_manager.register(CSComboAdapter('c16', config={
-        'signal_source': 'CS-5TF', 'equity': 100_000, 'trail_power': 12,
-    }))
-    ib_manager.register(CSComboAdapter('c16-dw', config={
-        'signal_source': 'CS-DW', 'equity': 100_000, 'trail_power': 12,
-    }))
-    ib_manager.register(SurferMLAdapter('c16-ml', config={
-        'equity': 100_000,
-    }))
-    ib_manager.register(IntradayAdapter('c16-intra', config={
-        'equity': 100_000, 'trail_power': 12,
-    }))
-    ib_manager.register(OESig5Adapter('c16-oe', config={
-        'equity': 100_000, 'trail_power': 12,
-    }))
-
-    state.ib_scanner_manager = ib_manager
-
-    # --- yfinance ScannerManager ---
-    yf_manager = ScannerManager(
-        trade_db=state.trade_db,
-        source='yf',
-        ib_client=None,
-    )
-
-    # Same adapters, separate instances (state isolation)
-    yf_manager.register(CSComboAdapter('c16', config={
-        'signal_source': 'CS-5TF', 'equity': 100_000, 'trail_power': 12,
-    }))
-    yf_manager.register(CSComboAdapter('c16-dw', config={
-        'signal_source': 'CS-DW', 'equity': 100_000, 'trail_power': 12,
-    }))
-    yf_manager.register(SurferMLAdapter('c16-ml', config={
-        'equity': 100_000,
-    }))
-    yf_manager.register(IntradayAdapter('c16-intra', config={
-        'equity': 100_000, 'trail_power': 12,
-    }))
-    yf_manager.register(OESig5Adapter('c16-oe', config={
-        'equity': 100_000, 'trail_power': 12,
-    }))
-
-    # c14a generation for yf (different config)
-    yf_manager.register(CSComboAdapter('c14a', config={
-        'signal_source': 'CS-5TF', 'equity': 100_000,
-        'trail_power': 8, 'flat_sizing': False,
-    }))
-    yf_manager.register(CSComboAdapter('c14a-dw', config={
-        'signal_source': 'CS-DW', 'equity': 100_000,
-        'trail_power': 8, 'flat_sizing': False,
-    }))
-    yf_manager.register(SurferMLAdapter('c14a-ml', config={
-        'equity': 100_000,
-    }))
-    yf_manager.register(IntradayAdapter('c14a-intra', config={
-        'equity': 100_000, 'trail_power': 8,
-    }))
-
-    state.yf_scanner_manager = yf_manager
-
-    logger.info("Adapters registered: IB=%d, yf=%d",
-                len(ib_manager.adapters), len(yf_manager.adapters))
 
 
 def create_live_engine(state):
@@ -274,6 +194,7 @@ def _wire_tick_to_bar_feed(state, data):
     """
     import threading
     import time as _time
+    import pandas as pd
 
     symbols = ['TSLA', 'SPY', 'VIX']
     aggregators = {}
@@ -311,6 +232,71 @@ def _wire_tick_to_bar_feed(state, data):
     t = threading.Thread(target=_feed_loop, daemon=True, name='TickToBarFeed')
     t.start()
     logger.info("Tick-to-bar feed started for %s", symbols)
+
+
+def create_yf_engine(state):
+    """Step 5d: Create second LiveEngine with yfinance data for A/B comparison.
+
+    Runs CS-DW and OE-Sig5 only (daily algos). live_orders=False, source='yf'.
+    """
+    from v15.panel_dashboard.yf_data import YfinanceDataProvider
+    from v15.panel_dashboard.live_engine import LiveEngine
+    from v15.validation.unified_backtester.algo_base import AlgoConfig, CostModel
+    from v15.validation.unified_backtester.algos.cs_combo import CSComboAlgo
+    from v15.validation.unified_backtester.algos.oe_sig5 import OESig5Algo
+
+    try:
+        data = YfinanceDataProvider()
+        state.yf_data_provider = data
+
+        cost = CostModel(slippage_pct=0.0, commission_per_share=0.0)
+
+        yf_algos = [
+            CSComboAlgo(config=AlgoConfig(
+                algo_id='yf-dw', live_orders=False,
+                initial_equity=100_000.0, max_equity_per_trade=100_000.0,
+                max_positions=1, primary_tf='daily', eval_interval=1,
+                exit_check_tf='5min', cost_model=cost,
+                params={
+                    'signal_source': 'CS-DW', 'flat_sizing': True,
+                    'stop_pct': 0.02, 'tp_pct': 0.04,
+                    'target_tfs': ['daily', 'weekly'],
+                    'trail_power': 12, 'trail_base': 0.025,
+                    'max_hold_days': 10, 'cooldown_days': 0,
+                    'min_confidence': 0.45,
+                },
+            ), data=data),
+            OESig5Algo(config=AlgoConfig(
+                algo_id='yf-oe', live_orders=False,
+                initial_equity=100_000.0, max_equity_per_trade=100_000.0,
+                max_positions=1, primary_tf='daily', eval_interval=1,
+                exit_check_tf='5min', cost_model=cost,
+                params={
+                    'flat_sizing': True,
+                    'stop_pct': 0.03, 'tp_pct': 0.04,
+                    'default_confidence': 0.7,
+                    'trail_power': 12, 'trail_base': 0.025,
+                    'max_hold_days': 10, 'cooldown_days': 0,
+                },
+            ), data=data),
+        ]
+
+        engine = LiveEngine(
+            algos=yf_algos,
+            data=data,
+            trade_db=state.trade_db,
+            ib_order_handler=None,
+            source='yf',
+        )
+
+        engine.recover_after_restart()
+        state.yf_engine = engine
+
+        logger.info("yf LiveEngine created with %d algos: %s",
+                     len(yf_algos), [a.algo_id for a in yf_algos])
+    except Exception as e:
+        logger.error("Failed to create yf LiveEngine: %s", e, exc_info=True)
+        state.yf_engine = None
 
 
 def reload_degraded_state(state):
@@ -407,9 +393,9 @@ def full_init(state):
     init_trade_db(state)        # 1
     connect_ib(state)           # 3
     load_models(state)          # 4
-    create_adapters(state)      # 5
     create_order_handler(state) # 5b
     create_live_engine(state)   # 5c
+    create_yf_engine(state)     # 5d
     reload_degraded_state(state)  # 6
     run_ib_recovery(state)      # 6b-6e
     run_reconciliation(state)   # 7

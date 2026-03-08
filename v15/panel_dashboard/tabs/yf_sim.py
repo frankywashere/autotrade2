@@ -2,7 +2,7 @@
 yfinance Simulation Tab — Hypothetical trade tracking using yfinance prices.
 
 All trades logged to DB with source='yf'. No IB orders placed.
-Same algo adapters registered separately for yf source.
+Runs CS-DW + OE-Sig5 via a second LiveEngine fed by YfinanceDataProvider.
 """
 
 import logging
@@ -48,8 +48,7 @@ def _yf_algo_summary(state):
         db = state.trade_db
         rows_html = []
 
-        algos = ['c16', 'c16-dw', 'c16-ml', 'c16-intra', 'c16-oe',
-                 'c14a', 'c14a-dw', 'c14a-ml', 'c14a-intra']
+        algos = ['yf-dw', 'yf-oe']
         for algo_id in algos:
             open_trades = db.get_open_trades(source='yf', algo_id=algo_id)
             closed = db.get_closed_trades(source='yf', algo_id=algo_id)

@@ -78,8 +78,8 @@ def _init_new_infra(state):
     """Initialize DB-backed infrastructure: TradeDB, adapters, LiveEngine, recovery, loops."""
     try:
         from v15.panel_dashboard.startup import (
-            init_trade_db, create_adapters,
-            create_order_handler, create_live_engine,
+            init_trade_db,
+            create_order_handler, create_live_engine, create_yf_engine,
             reload_degraded_state,
             run_ib_recovery, run_reconciliation,
             start_loops,
@@ -88,10 +88,10 @@ def _init_new_infra(state):
         # 1. Create DB
         init_trade_db(state)
 
-        # 2. Create adapters + order handler + live engine
-        create_adapters(state)
+        # 2. Create order handler + live engines
         create_order_handler(state)
         create_live_engine(state)
+        create_yf_engine(state)
         reload_degraded_state(state)
 
         # 3. Recovery + reconciliation (if IB connected)

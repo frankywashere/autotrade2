@@ -104,10 +104,8 @@ def _algo_pnl_summary(state):
 
             # Enabled toggle state
             enabled = True
-            if hasattr(state, 'ib_scanner_manager') and state.ib_scanner_manager:
-                adapter = state.ib_scanner_manager.get_adapter(algo_id)
-                if adapter:
-                    enabled = adapter.enabled
+            if hasattr(state, 'live_engine') and state.live_engine:
+                enabled = state.live_engine._algo_enabled.get(algo_id, True)
 
             dot = '\u25cf' if enabled else '\u25cb'
             dot_color = '#00e676' if enabled else '#666'
@@ -322,15 +320,17 @@ def _kill_switch_panel(state):
     status = pn.pane.HTML('', width=200)
 
     def _on_kill(event):
-        if hasattr(state, 'ib_scanner_manager') and state.ib_scanner_manager:
+        engine = getattr(state, 'live_engine', None)
+        if engine:
             if state.kill_switch:
-                state.ib_scanner_manager.unkill()
+                for algo_id in engine._algo_enabled:
+                    engine.set_algo_enabled(algo_id, True)
                 state.kill_switch = False
                 kill_btn.name = 'KILL ALL'
                 kill_btn.button_type = 'danger'
                 status.object = '<span style="color:#00e676;">Algos re-enabled</span>'
             else:
-                state.ib_scanner_manager.kill_all()
+                engine.kill_all()
                 state.kill_switch = True
                 kill_btn.name = 'UNKILL'
                 kill_btn.button_type = 'warning'
