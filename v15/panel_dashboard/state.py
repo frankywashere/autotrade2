@@ -26,7 +26,7 @@ class DashboardState(param.Parameterized):
     price_delta = param.Number(0.0)
     vix_price = param.Number(0.0)
     price_source = param.String('NONE')  # 'IB LIVE' or 'NONE'
-    data_source = param.String('yfinance')  # 'IB' or 'yfinance'
+    data_source = param.String('NONE')  # 'IB' or 'NONE'
 
     # Market data (loaded on startup, refreshed every 5 min)
     current_tsla = param.Parameter(None)      # 5-min OHLCV DataFrame
@@ -70,10 +70,10 @@ class DashboardState(param.Parameterized):
     _last_intraday_exit_check = param.Number(0.0, precedence=-1)  # throttle intraday exits to 5s
 
     def load_market_data(self):
-        """Startup: connect IB, load TF data (IB first, yfinance fallback), init scanner."""
+        """Startup: connect IB, load TF data. Fails loudly if IB unavailable."""
         logger.info("Loading market data...")
 
-        # Price feed: IB first
+        # Price feed: IB only
         self._ws_client = None
         self._price_err_count = 0
         self.ib_client = None
@@ -81,38 +81,24 @@ class DashboardState(param.Parameterized):
         self._historical_5min_tsla = None
         self._init_ib()
 
-        # Try IB-based data loading first, fall back to yfinance
-        ib_data_ok = False
+        # Load historical data from IB
         if self.ib_client and self.ib_client.is_connected():
             try:
                 self.native_tf_data = self._load_ib_historical()
                 if self.native_tf_data and 'TSLA' in self.native_tf_data:
-                    ib_data_ok = True
                     self.data_source = 'IB'
                     logger.info("Data source: IB (all TFs)")
             except Exception as e:
-                logger.warning("IB historical load failed, falling back to yfinance: %s", e)
-
-        if not ib_data_ok:
-            self.data_source = 'yfinance'
-            logger.info("Data source: yfinance fallback (degraded — no tick-level updates)")
-            try:
-                from v15.data.native_tf import load_native_tf_data
-                from pathlib import Path
-                cache_dir = Path('/tmp/.x14_native_tf_cache') if os.environ.get('SPACE_ID') else None
-                self.native_tf_data = load_native_tf_data(
-                    symbols=['TSLA', 'SPY', '^VIX'],
-                    timeframes=['daily', 'weekly', 'monthly', '1h', '2h', '3h', '4h'],
-                    verbose=True,
-                    cache_dir=cache_dir,
-                )
-                logger.info("Native TF data loaded (yfinance): %s", list(self.native_tf_data.keys()))
-            except Exception as e:
-                logger.error("Failed to load native TF data: %s", e)
+                logger.error("IB historical load failed: %s", e)
                 self.native_tf_data = {}
+        else:
+            logger.error("IB NOT CONNECTED — no data source available. "
+                         "Dashboard will be empty until IB reconnects.")
+            self.data_source = 'NONE'
+            self.native_tf_data = {}
 
-        # Fetch 5-min bars (IB or yfinance)
-        if ib_data_ok:
+        # Fetch 5-min bars from IB
+        if self.ib_client and self.ib_client.is_connected():
             try:
                 tsla_5m = self.ib_client.fetch_historical('TSLA', '5 D', '5 mins', use_rth=False)
                 if tsla_5m is not None and len(tsla_5m) > 0:
@@ -124,19 +110,7 @@ class DashboardState(param.Parameterized):
                 # Set up live 5-min bar aggregator for TSLA
                 self._bar_aggregator = self.ib_client.create_bar_aggregator('TSLA', 5)
             except Exception as e:
-                logger.warning("IB 5-min fetch failed: %s", e)
-
-        if self.current_tsla is None:
-            try:
-                from v15.live_data import fetch_live_data
-                tsla_df, spy_df, vix_df = fetch_live_data(period='5d', interval='5m')
-                self.current_tsla = tsla_df
-                if spy_df is not None and len(spy_df) > 0:
-                    self.spy_price = float(spy_df['close'].iloc[-1])
-                logger.info("5-min data loaded (yfinance): %d bars",
-                            len(tsla_df) if tsla_df is not None else 0)
-            except Exception as e:
-                logger.error("Failed to fetch 5-min data: %s", e)
+                logger.error("IB 5-min fetch failed: %s", e)
 
         # Set initial prices from loaded data
         if self.current_tsla is not None and len(self.current_tsla) > 0:
@@ -201,7 +175,7 @@ class DashboardState(param.Parameterized):
         """
         from v15.core.channel_surfer import prepare_multi_tf_analysis
 
-        # Refresh 5-min bars: IB aggregator first, then yfinance fallback
+        # Refresh 5-min bars from IB aggregator
         tsla_df = None
         if self._bar_aggregator and self._historical_5min_tsla is not None:
             live_bars = self._bar_aggregator.get_bars_df(include_current=False)
@@ -212,12 +186,6 @@ class DashboardState(param.Parameterized):
                            len(self._historical_5min_tsla), len(live_bars), len(tsla_df))
             else:
                 tsla_df = self._historical_5min_tsla
-        if tsla_df is None:
-            try:
-                from v15.live_data import fetch_live_data
-                tsla_df, spy_df, vix_df = fetch_live_data(period='5d', interval='5m')
-            except Exception as e:
-                logger.warning("Failed to refresh 5-min data: %s", e)
 
         effective_tsla = tsla_df if tsla_df is not None and len(tsla_df) > 0 else self.current_tsla
 
