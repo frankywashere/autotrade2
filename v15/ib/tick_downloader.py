@@ -128,8 +128,8 @@ class RateLimiter:
 def _fetch_ticks_page(client, contract, start_dt_str: str,
                       num_ticks: int = 1000) -> list:
     """Fetch one page of historical trade ticks from IB."""
-    future = asyncio.run_coroutine_threadsafe(
-        client.ib.reqHistoricalTicksAsync(
+    async def _req():
+        return await client.ib.reqHistoricalTicksAsync(
             contract,
             startDateTime=start_dt_str,
             endDateTime='',
@@ -137,9 +137,9 @@ def _fetch_ticks_page(client, contract, start_dt_str: str,
             whatToShow='TRADES',
             useRth=False,
             ignoreSize=False,
-        ),
-        client._loop,
-    )
+        )
+
+    future = asyncio.run_coroutine_threadsafe(_req(), client._loop)
     return future.result(timeout=60)
 
 
