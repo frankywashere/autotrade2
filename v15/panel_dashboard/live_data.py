@@ -75,23 +75,28 @@ class LiveDataProvider:
 
         Same interface as DataProvider.get_bars(). Thread-safe.
         Only returns completed bars (end-indexed).
+        Always returns tz-naive DataFrames (matching backtester convention).
         """
         with self._lock:
             df = self._bars.get(symbol, {}).get(tf, pd.DataFrame())
             if len(df) == 0:
                 return pd.DataFrame()
             if up_to is not None:
-                # Normalize tz: strip timezone from up_to if index is naive,
-                # or localize index if up_to is aware (IB bar timestamps are
-                # tz-aware ET, historical seeded bars may be naive)
+                # Normalize up_to to match index tz for filtering
                 idx_tz = getattr(df.index, 'tz', None)
                 up_tz = getattr(up_to, 'tz', None) or getattr(up_to, 'tzinfo', None)
                 if idx_tz is None and up_tz is not None:
                     up_to = up_to.tz_localize(None) if hasattr(up_to, 'tz_localize') else up_to.replace(tzinfo=None)
                 elif idx_tz is not None and up_tz is None:
                     up_to = up_to.tz_localize(idx_tz)
-                return df[df.index <= up_to].copy()
-            return df.copy()
+                result = df[df.index <= up_to].copy()
+            else:
+                result = df.copy()
+            # Always return tz-naive — algos expect naive timestamps
+            # (IB historical bars are tz-aware US/Eastern, live bars may be too)
+            if getattr(result.index, 'tz', None) is not None:
+                result.index = result.index.tz_localize(None)
+            return result
 
     def get_bars_symbol(self, symbol: str, tf: str,
                         up_to: pd.Timestamp = None) -> pd.DataFrame:
