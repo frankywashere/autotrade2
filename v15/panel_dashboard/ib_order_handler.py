@@ -582,11 +582,11 @@ class IBOrderHandler:
                              "aborting exit for trade %d", session, trade_id)
                 self._exit_in_progress.pop(trade_id, None)
                 return False
-            # Aggressive pricing to ensure fill
+            # Use bid for sells, ask for buys — fills immediately
             if close_action == 'SELL' and bid > 0:
-                lmt_price = round(bid - 0.01, 2)
+                lmt_price = round(bid, 2)
             elif close_action == 'BUY' and ask > 0:
-                lmt_price = round(ask + 0.01, 2)
+                lmt_price = round(ask, 2)
 
             overnight = session == 'overnight'
             result = self.ib.place_order(
