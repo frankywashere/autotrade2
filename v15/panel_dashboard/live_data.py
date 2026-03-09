@@ -156,6 +156,7 @@ class LiveDataProvider:
         # Order: 1min first, then higher TFs ascending
         if symbol == 'TSLA':
             for tf, time, bar_data in emit_events:
+                logger.info("Queue bar event: %s %s @ %s", symbol, tf, time)
                 self._bar_queue.put({'tf': tf, 'time': time, 'bar': bar_data,
                                       'symbol': symbol})
 

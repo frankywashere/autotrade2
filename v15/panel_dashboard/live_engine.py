@@ -97,6 +97,9 @@ class LiveEngine:
         executes them AFTER releasing _eval_lock to prevent deadlock
         (IB fill callbacks need to acquire _eval_lock).
         """
+        logger.info("Bar close: %s @ %s  O=%.2f H=%.2f L=%.2f C=%.2f",
+                     tf, time, bar.get('open', 0), bar.get('high', 0),
+                     bar.get('low', 0), bar.get('close', 0))
         deferred_ib_ops = []
         with self._eval_lock:
             self._process_bar(tf, time, bar, deferred_ib_ops)
