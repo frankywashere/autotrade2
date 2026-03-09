@@ -378,7 +378,7 @@ class IBOrderHandler:
 
         result = self.ib.place_order(
             'TSLA', close_action, qty, 'STP', price=stop_price,
-            order_ref=order_ref, outside_rth=True)
+            tif='GTC', order_ref=order_ref, outside_rth=True)
 
         if 'error' in result:
             logger.critical("EMERGENCY STOP FAILED for entry %d: %s — "
@@ -487,7 +487,7 @@ class IBOrderHandler:
 
         result = self.ib.place_order(
             'TSLA', close_action, effective_open, 'MKT',
-            order_ref=order_ref, model_code=model_code)
+            tif='GTC', order_ref=order_ref, model_code=model_code)
 
         if 'error' in result:
             logger.error("Exit order failed for trade %d: %s",
@@ -552,7 +552,7 @@ class IBOrderHandler:
 
         result = self.ib.place_order(
             'TSLA', close_action, qty, 'STP', price=stop_price,
-            order_ref=order_ref, outside_rth=True)
+            tif='GTC', order_ref=order_ref, outside_rth=True)
 
         if 'error' in result:
             logger.error("Protective stop failed for trade %d: %s",
@@ -858,7 +858,7 @@ class IBOrderHandler:
             counter_ref = f'counter:{trade_id}'
             try:
                 self.ib.place_order('TSLA', counter_action, fill.shares, 'MKT',
-                                    order_ref=counter_ref)
+                                    tif='GTC', order_ref=counter_ref)
                 logger.warning("Counter-trade placed: %s %d shares for double-close on trade %d",
                                counter_action, fill.shares, trade_id)
             except Exception as e:

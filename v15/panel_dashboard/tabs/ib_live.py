@@ -172,20 +172,59 @@ def _algo_pnl_summary(state):
 
 
 def _open_positions(state):
-    """Open IB positions with live P&L. Bound to positions_version."""
+    """Open IB positions with live P&L + Close button. Bound to positions_version."""
+    container = pn.Column(sizing_mode='stretch_width', margin=(0, 0, 8, 0))
+
+    def _make_close_callback(trade_id):
+        def _on_close(event):
+            btn = event.obj
+            btn.disabled = True
+            btn.name = 'Closing...'
+            handler = getattr(state, 'ib_order_handler', None)
+            if not handler:
+                btn.name = 'No handler'
+                logger.error("Close trade %d: no ib_order_handler", trade_id)
+                return
+            try:
+                ok = handler.place_exit(trade_id, exit_reason='manual_close')
+                if ok:
+                    btn.name = 'Sent'
+                    btn.button_type = 'success'
+                    logger.info("Manual close sent for trade %d", trade_id)
+                else:
+                    btn.name = 'Failed'
+                    btn.button_type = 'danger'
+                    btn.disabled = False
+                    logger.error("Manual close failed for trade %d", trade_id)
+            except Exception as e:
+                btn.name = 'Error'
+                btn.button_type = 'danger'
+                btn.disabled = False
+                logger.error("Manual close error for trade %d: %s", trade_id, e)
+        return _on_close
+
     def _render(positions_version):
+        container.clear()
         if not hasattr(state, 'trade_db') or state.trade_db is None:
-            return pn.pane.HTML('')
+            container.append(pn.pane.HTML(''))
+            return container
 
         trades = state.trade_db.get_open_trades(source='ib')
         if not trades:
-            return pn.pane.HTML(
+            container.append(pn.pane.HTML(
                 '<div style="color:#888; padding:8px; background:#1a1a2e; '
                 'border-radius:8px; border:1px solid #333; margin-bottom:8px;">'
-                'No open IB positions</div>')
+                'No open IB positions</div>'))
+            return container
 
-        cards = []
+        header = pn.pane.HTML(f"""
+        <div style="font-size:14px; font-weight:bold; color:white; margin-bottom:6px;">
+            OPEN POSITIONS ({len(trades)})
+        </div>""", sizing_mode='stretch_width')
+        container.append(header)
+
         for t in trades:
+            trade_id = t['id']
             entry = t.get('entry_price', 0)
             shares = t.get('open_shares', t.get('shares', 0))
             direction = t.get('direction', 'long')
@@ -195,7 +234,6 @@ def _open_positions(state):
             algo = t.get('algo_id', '?')
             fill_status = t.get('ib_fill_status', 'filled')
 
-            # P&L
             price = state.tsla_price if state.tsla_price > 0 else entry
             if direction == 'long':
                 pnl = (price - entry) * shares
@@ -214,15 +252,16 @@ def _open_positions(state):
             elif fill_status == 'partial':
                 status_badge = '<span style="background:#ff9800; color:black; padding:2px 6px; border-radius:4px; font-size:11px;">PARTIAL</span>'
 
-            cards.append(f"""
+            card_html = pn.pane.HTML(f"""
             <div style="background:#1a1a2e; border:1px solid #333; border-radius:8px;
-                        padding:12px; margin-bottom:6px;">
+                        padding:12px;">
                 <div style="display:flex; justify-content:space-between; align-items:center;">
                     <div>
                         <span style="color:{dir_color}; font-weight:bold;">
                             {dir_arrow} {direction.upper()}
                         </span>
                         <span style="color:#aaa; margin-left:8px;">{algo}</span>
+                        <span style="color:#555; margin-left:8px; font-size:11px;">#{trade_id}</span>
                         {status_badge}
                     </div>
                     <div style="color:{pnl_color}; font-weight:bold; font-size:16px;">
@@ -237,17 +276,18 @@ def _open_positions(state):
                     <span>Best: ${best:,.2f}</span>
                 </div>
             </div>
-            """)
+            """, sizing_mode='stretch_width')
 
-        html = f"""
-        <div style="margin-bottom:8px;">
-            <div style="font-size:14px; font-weight:bold; color:white; margin-bottom:6px;">
-                OPEN POSITIONS ({len(trades)})
-            </div>
-            {''.join(cards)}
-        </div>
-        """
-        return pn.pane.HTML(html, sizing_mode='stretch_width')
+            close_btn = pn.widgets.Button(
+                name='Close', button_type='danger', width=70, height=30,
+                margin=(0, 0, 6, 0))
+            close_btn.on_click(_make_close_callback(trade_id))
+
+            row = pn.Row(card_html, close_btn, sizing_mode='stretch_width',
+                         margin=(0, 0, 6, 0))
+            container.append(row)
+
+        return container
 
     return pn.bind(_render, positions_version=state.param.positions_version)
 

@@ -340,6 +340,30 @@ def recover_inflight_orders(state):
         if stop_oid:
             handler._stop_orders[stop_oid] = {'trade_id': trade_id}
 
+        # ── Refresh best_price from current market price ──
+        # DB best_price may be stale (from last bar of old session).
+        # Use current IB price to ensure trailing stops compute correctly.
+        if open_shares > 0:
+            current_price = getattr(state, 'tsla_price', None) or 0
+            if current_price > 0:
+                db_best = trade.get('best_price', trade.get('entry_price', 0))
+                if direction == 'long' and current_price > db_best:
+                    try:
+                        db.update_trade_state(trade_id, best_price=current_price)
+                        logger.info("Recovery: trade %d best_price updated $%.2f → $%.2f "
+                                    "(current market)", trade_id, db_best, current_price)
+                    except Exception as e:
+                        logger.error("Recovery: best_price update failed for trade %d: %s",
+                                     trade_id, e)
+                elif direction == 'short' and current_price < db_best:
+                    try:
+                        db.update_trade_state(trade_id, best_price=current_price)
+                        logger.info("Recovery: trade %d best_price updated $%.2f → $%.2f "
+                                    "(current market)", trade_id, db_best, current_price)
+                    except Exception as e:
+                        logger.error("Recovery: best_price update failed for trade %d: %s",
+                                     trade_id, e)
+
         # Check stop protection
         if open_shares > 0 and not stop_oid and not exit_oid:
             # No stop and no exit — naked position, re-arm
