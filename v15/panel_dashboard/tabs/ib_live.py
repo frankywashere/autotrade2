@@ -215,31 +215,7 @@ def _open_positions(state):
 
             mgmt = trade.get('management_mode', 'algo')
 
-            if mgmt == 'algo':
-                # Algo trade: auto-place exit through handler (session-aware)
-                btn.disabled = True
-                btn.name = 'Closing...'
-                handler = getattr(state, 'ib_order_handler', None)
-                if not handler:
-                    btn.name = 'No handler'
-                    return
-                try:
-                    ok = handler.place_exit(trade_id, exit_reason='manual_close')
-                    if ok:
-                        btn.name = 'Sent'
-                        btn.button_type = 'success'
-                    else:
-                        btn.name = 'Failed'
-                        btn.button_type = 'danger'
-                        btn.disabled = False
-                except Exception as e:
-                    btn.name = 'Error'
-                    btn.button_type = 'danger'
-                    btn.disabled = False
-                    logger.error("Close error for trade %d: %s", trade_id, e)
-                return
-
-            # Manual trade: toggle inline order form
+            # Toggle inline order form (both algo and manual trades)
             if trade_id in _active_forms:
                 # Close the form
                 form = _active_forms.pop(trade_id)
@@ -295,6 +271,8 @@ def _open_positions(state):
                     submit_btn.name = 'Submit'
                     return
                 try:
+                    # Algo trades: use place_manual_exit which cancels stop + places order
+                    # Manual trades: same method (stop already cancelled by take_over)
                     ok = handler.place_manual_exit(
                         trade_id,
                         order_type=type_select.value,
