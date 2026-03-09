@@ -148,10 +148,20 @@ class LiveEngine:
             # Get open positions for this algo from DB
             positions = self._get_positions(algo)
 
+            # Filter out manual-mode trades — algo must not generate exits for them
+            algo_positions = positions
+            if self._db and positions:
+                algo_positions = []
+                for pos in positions:
+                    trade = self._db.get_trade(int(pos.pos_id))
+                    if trade and trade.get('management_mode') == 'manual':
+                        continue
+                    algo_positions.append(pos)
+
             # 2. Check exits (ALWAYS — regardless of enabled state)
-            if tf == algo.config.exit_check_tf and positions:
+            if tf == algo.config.exit_check_tf and algo_positions:
                 try:
-                    exits = algo.check_exits(time, bar, positions)
+                    exits = algo.check_exits(time, bar, algo_positions)
                 except Exception as e:
                     logger.error("CRITICAL: %s.check_exits() FAILED — exits SKIPPED, "
                                  "positions may be unprotected: %s",
@@ -277,6 +287,11 @@ class LiveEngine:
         """Sync effective stop from algo state to IB resting stop orders."""
         import math
         for pos in positions:
+            # Skip manual trades — user manages their own stops
+            if self._db:
+                trade = self._db.get_trade(int(pos.pos_id))
+                if trade and trade.get('management_mode') == 'manual':
+                    continue
             try:
                 effective_stop = algo.get_effective_stop(pos)
             except Exception as e:

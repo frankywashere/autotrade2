@@ -172,39 +172,180 @@ def _algo_pnl_summary(state):
 
 
 def _open_positions(state):
-    """Open IB positions with live P&L + Close button. Bound to positions_version."""
+    """Open IB positions with live P&L + Close/Hold buttons. Bound to positions_version."""
     container = pn.Column(sizing_mode='stretch_width', margin=(0, 0, 8, 0))
 
-    def _make_close_callback(trade_id):
-        def _on_close(event):
-            btn = event.obj
-            btn.disabled = True
-            btn.name = 'Closing...'
+    # Track which trade has an open exit form
+    _active_forms = {}  # trade_id -> Column widget
+
+    def _make_hold_callback(trade_id, hold_btn, close_btn):
+        def _on_hold(event):
+            hold_btn.disabled = True
+            hold_btn.name = 'Holding...'
             handler = getattr(state, 'ib_order_handler', None)
             if not handler:
-                btn.name = 'No handler'
-                logger.error("Close trade %d: no ib_order_handler", trade_id)
+                hold_btn.name = 'No handler'
+                logger.error("Hold trade %d: no ib_order_handler", trade_id)
                 return
             try:
-                ok = handler.place_exit(trade_id, exit_reason='manual_close')
+                ok = handler.take_over_trade(trade_id)
                 if ok:
-                    btn.name = 'Sent'
-                    btn.button_type = 'success'
-                    logger.info("Manual close sent for trade %d", trade_id)
+                    hold_btn.name = 'MANUAL'
+                    hold_btn.button_type = 'warning'
+                    close_btn.name = 'Close'
+                    close_btn.disabled = False
+                    state.positions_version += 1
+                    logger.info("Trade %d switched to manual", trade_id)
                 else:
-                    btn.name = 'Failed'
+                    hold_btn.name = 'Failed'
+                    hold_btn.button_type = 'danger'
+                    hold_btn.disabled = False
+            except Exception as e:
+                hold_btn.name = 'Error'
+                hold_btn.disabled = False
+                logger.error("Hold error for trade %d: %s", trade_id, e)
+        return _on_hold
+
+    def _make_close_callback(trade_id, card_col):
+        def _on_close(event):
+            btn = event.obj
+            trade = state.trade_db.get_trade(trade_id) if state.trade_db else None
+            if not trade:
+                return
+
+            mgmt = trade.get('management_mode', 'algo')
+
+            if mgmt == 'algo':
+                # Algo trade: auto-place exit through handler (session-aware)
+                btn.disabled = True
+                btn.name = 'Closing...'
+                handler = getattr(state, 'ib_order_handler', None)
+                if not handler:
+                    btn.name = 'No handler'
+                    return
+                try:
+                    ok = handler.place_exit(trade_id, exit_reason='manual_close')
+                    if ok:
+                        btn.name = 'Sent'
+                        btn.button_type = 'success'
+                    else:
+                        btn.name = 'Failed'
+                        btn.button_type = 'danger'
+                        btn.disabled = False
+                except Exception as e:
+                    btn.name = 'Error'
                     btn.button_type = 'danger'
                     btn.disabled = False
-                    logger.error("Manual close failed for trade %d", trade_id)
-            except Exception as e:
-                btn.name = 'Error'
-                btn.button_type = 'danger'
-                btn.disabled = False
-                logger.error("Manual close error for trade %d: %s", trade_id, e)
+                    logger.error("Close error for trade %d: %s", trade_id, e)
+                return
+
+            # Manual trade: toggle inline order form
+            if trade_id in _active_forms:
+                # Close the form
+                form = _active_forms.pop(trade_id)
+                try:
+                    card_col.remove(form)
+                except Exception:
+                    pass
+                btn.name = 'Close'
+                return
+
+            # Open inline exit form
+            direction = trade.get('direction', 'long')
+            shares = trade.get('open_shares', trade.get('shares', 0))
+            close_action = 'SELL' if direction == 'long' else 'BUY'
+
+            type_select = pn.widgets.Select(
+                name='Type', options=['LMT', 'MKT', 'STP'],
+                value='LMT', width=80)
+            session_select = pn.widgets.Select(
+                name='Session', options=['rth', 'extended', 'overnight'],
+                width=100)
+
+            # Auto-detect current session
+            handler = getattr(state, 'ib_order_handler', None)
+            if handler:
+                routing = handler._get_exit_routing()
+                session_select.value = routing['session']
+
+            # Default price from current market
+            default_price = state.tsla_price if state.tsla_price > 0 else 0
+            price_input = pn.widgets.FloatInput(
+                name='Price', value=round(default_price, 2),
+                step=0.01, start=0.01, width=100)
+
+            info_html = pn.pane.HTML(
+                f'<span style="color:#aaa; font-size:12px;">'
+                f'{close_action} {shares} shares</span>',
+                width=120)
+
+            submit_btn = pn.widgets.Button(
+                name='Submit', button_type='success', width=70, height=28)
+            cancel_btn = pn.widgets.Button(
+                name='Cancel', button_type='light', width=60, height=28)
+
+            status_msg = pn.pane.HTML('', width=200)
+
+            def _on_submit(event):
+                submit_btn.disabled = True
+                submit_btn.name = 'Sending...'
+                if not handler:
+                    status_msg.object = '<span style="color:#ff5252;">No handler</span>'
+                    submit_btn.disabled = False
+                    submit_btn.name = 'Submit'
+                    return
+                try:
+                    ok = handler.place_manual_exit(
+                        trade_id,
+                        order_type=type_select.value,
+                        price=price_input.value,
+                        session=session_select.value)
+                    if ok:
+                        submit_btn.name = 'Sent'
+                        status_msg.object = '<span style="color:#00e676;">Order sent</span>'
+                        # Remove form after success
+                        if trade_id in _active_forms:
+                            form = _active_forms.pop(trade_id)
+                            try:
+                                card_col.remove(form)
+                            except Exception:
+                                pass
+                        btn.name = 'Close'
+                    else:
+                        submit_btn.name = 'Submit'
+                        submit_btn.disabled = False
+                        status_msg.object = '<span style="color:#ff5252;">Failed</span>'
+                except Exception as e:
+                    submit_btn.name = 'Submit'
+                    submit_btn.disabled = False
+                    status_msg.object = f'<span style="color:#ff5252;">{e}</span>'
+                    logger.error("Manual exit error for trade %d: %s", trade_id, e)
+
+            def _on_cancel(event):
+                if trade_id in _active_forms:
+                    form = _active_forms.pop(trade_id)
+                    try:
+                        card_col.remove(form)
+                    except Exception:
+                        pass
+                btn.name = 'Close'
+
+            submit_btn.on_click(_on_submit)
+            cancel_btn.on_click(_on_cancel)
+
+            form_row = pn.Row(
+                info_html, type_select, price_input, session_select,
+                submit_btn, cancel_btn, status_msg,
+                align='center', margin=(8, 0, 0, 0))
+            _active_forms[trade_id] = form_row
+            card_col.append(form_row)
+            btn.name = 'Cancel'
+
         return _on_close
 
     def _render(positions_version):
         container.clear()
+        _active_forms.clear()
         if not hasattr(state, 'trade_db') or state.trade_db is None:
             container.append(pn.pane.HTML(''))
             return container
@@ -233,6 +374,7 @@ def _open_positions(state):
             best = t.get('best_price', entry)
             algo = t.get('algo_id', '?')
             fill_status = t.get('ib_fill_status', 'filled')
+            mgmt = t.get('management_mode', 'algo')
 
             price = state.tsla_price if state.tsla_price > 0 else entry
             if direction == 'long':
@@ -246,11 +388,19 @@ def _open_positions(state):
             dir_color = '#00e676' if direction == 'long' else '#ff5252'
             dir_arrow = '\u25b2' if direction == 'long' else '\u25bc'
 
-            status_badge = ''
+            # Status badges
+            badges = ''
             if fill_status == 'pending':
-                status_badge = '<span style="background:#ffab00; color:black; padding:2px 6px; border-radius:4px; font-size:11px;">PENDING</span>'
+                badges += '<span style="background:#ffab00; color:black; padding:2px 6px; border-radius:4px; font-size:11px; margin-left:6px;">PENDING</span>'
             elif fill_status == 'partial':
-                status_badge = '<span style="background:#ff9800; color:black; padding:2px 6px; border-radius:4px; font-size:11px;">PARTIAL</span>'
+                badges += '<span style="background:#ff9800; color:black; padding:2px 6px; border-radius:4px; font-size:11px; margin-left:6px;">PARTIAL</span>'
+            if mgmt == 'manual':
+                badges += '<span style="background:#e040fb; color:white; padding:2px 6px; border-radius:4px; font-size:11px; margin-left:6px;">MANUAL</span>'
+                # Check if position has no stop/exit protection
+                has_stop = bool(t.get('ib_stop_order_id'))
+                has_exit = bool(t.get('ib_exit_order_id'))
+                if not has_stop and not has_exit:
+                    badges += '<span style="background:#ff1744; color:white; padding:2px 6px; border-radius:4px; font-size:11px; margin-left:6px;">UNPROTECTED</span>'
 
             card_html = pn.pane.HTML(f"""
                 <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -260,7 +410,7 @@ def _open_positions(state):
                         </span>
                         <span style="color:#aaa; margin-left:8px;">{algo}</span>
                         <span style="color:#555; margin-left:8px; font-size:11px;">#{trade_id}</span>
-                        {status_badge}
+                        {badges}
                     </div>
                     <div style="color:{pnl_color}; font-weight:bold; font-size:16px;">
                         ${pnl:,.0f} ({pnl_pct:+.1f}%)
@@ -275,18 +425,32 @@ def _open_positions(state):
                 </div>
             """, sizing_mode='stretch_width')
 
+            # Build button row based on management mode
             close_btn = pn.widgets.Button(
                 name='Close', button_type='danger', width=65, height=28,
-                margin=(0, 8, 0, 0))
-            close_btn.on_click(_make_close_callback(trade_id))
+                margin=(0, 4, 0, 0))
 
-            top_row = pn.Row(card_html, close_btn, align='center',
-                             sizing_mode='stretch_width')
             card = pn.Column(
-                top_row,
                 styles={'background': '#1a1a2e', 'border': '1px solid #333',
                         'border-radius': '8px', 'padding': '12px'},
                 sizing_mode='stretch_width', margin=(0, 0, 6, 0))
+
+            close_btn.on_click(_make_close_callback(trade_id, card))
+
+            if mgmt == 'algo':
+                # Algo mode: Close + Hold buttons
+                hold_btn = pn.widgets.Button(
+                    name='Hold', button_type='warning', width=55, height=28,
+                    margin=(0, 0, 0, 0))
+                hold_btn.on_click(_make_hold_callback(trade_id, hold_btn, close_btn))
+                btn_row = pn.Row(close_btn, hold_btn)
+            else:
+                # Manual mode: just Close (opens inline form)
+                btn_row = pn.Row(close_btn)
+
+            top_row = pn.Row(card_html, btn_row, align='center',
+                             sizing_mode='stretch_width')
+            card.append(top_row)
             container.append(card)
 
         return container

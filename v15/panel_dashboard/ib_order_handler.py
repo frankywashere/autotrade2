@@ -424,6 +424,190 @@ class IBOrderHandler:
         else:
             return {'session': 'overnight', 'overnight': True, 'outside_rth': False}
 
+    def take_over_trade(self, trade_id: int) -> bool:
+        """Switch a trade from algo management to manual management.
+
+        Cancels the algo's resting stop order and sets management_mode='manual'
+        so that LiveEngine and handler callbacks stop touching the trade.
+        The position stays open but is now UNPROTECTED until the user acts.
+
+        Returns True on success.
+        """
+        trade = self._get_trade(trade_id)
+        if not trade:
+            logger.error("take_over_trade: trade %d not found", trade_id)
+            return False
+
+        if trade.get('management_mode') == 'manual':
+            logger.info("take_over_trade: trade %d already manual", trade_id)
+            return True
+
+        # Cancel the resting stop (if any) — set _exit_in_progress to suppress re-arm
+        stop_oid = trade.get('ib_stop_order_id')
+        if stop_oid:
+            self._exit_in_progress[trade_id] = True
+            try:
+                self.db.update_trade_state(trade_id, ib_stop_order_id=None)
+            except Exception as e:
+                logger.error("take_over_trade: failed to NULL stop for trade %d: %s",
+                             trade_id, e)
+                self._exit_in_progress.pop(trade_id, None)
+                return False
+            self._stop_orders.pop(stop_oid, None)
+            self.ib.cancel_order(stop_oid)
+            logger.info("take_over_trade: cancelled stop %d for trade %d",
+                        stop_oid, trade_id)
+
+        # Cancel any resting exit order
+        exit_oid = trade.get('ib_exit_order_id')
+        if exit_oid:
+            try:
+                self.db.update_trade_state(trade_id, ib_exit_order_id=None,
+                                           ib_exit_perm_id=None)
+            except Exception as e:
+                logger.error("take_over_trade: failed to NULL exit for trade %d: %s",
+                             trade_id, e)
+            self._exit_orders.pop(exit_oid, None)
+            self.ib.cancel_order(exit_oid)
+
+        # Set management_mode='manual' in DB
+        try:
+            self.db.update_trade_state(trade_id, management_mode='manual')
+        except Exception as e:
+            logger.error("take_over_trade: failed to set manual mode for trade %d: %s",
+                         trade_id, e)
+            self._exit_in_progress.pop(trade_id, None)
+            return False
+
+        self._exit_in_progress.pop(trade_id, None)
+        self._state.positions_version += 1
+
+        logger.warning("Trade %d switched to MANUAL management — "
+                       "position is UNPROTECTED until user places stop/exit",
+                       trade_id)
+        return True
+
+    def place_manual_exit(self, trade_id: int, order_type: str,
+                          price: float, session: str) -> bool:
+        """Place a user-specified exit order for a manual-mode trade.
+
+        Args:
+            trade_id: DB trade ID
+            order_type: 'MKT', 'LMT', or 'STP'
+            price: limit/stop price (ignored for MKT)
+            session: 'rth', 'extended', or 'overnight'
+
+        Routes through proper handler lifecycle (DB tracking, fill callbacks).
+        Returns True if order placed.
+        """
+        trade = self._get_trade(trade_id)
+        if not trade:
+            logger.error("place_manual_exit: trade %d not found", trade_id)
+            return False
+
+        direction = trade.get('direction', 'long')
+        close_action = 'SELL' if direction == 'long' else 'BUY'
+        effective_open = self._effective_open_shares(trade)
+
+        if effective_open <= 0:
+            logger.warning("place_manual_exit: trade %d has no open shares", trade_id)
+            return False
+
+        # Cancel any existing stop/exit first
+        stop_oid = trade.get('ib_stop_order_id')
+        if stop_oid:
+            self._exit_in_progress[trade_id] = True
+            try:
+                self.db.update_trade_state(trade_id, ib_stop_order_id=None)
+            except Exception:
+                pass
+            self._stop_orders.pop(stop_oid, None)
+            self.ib.cancel_order(stop_oid)
+
+        exit_oid = trade.get('ib_exit_order_id')
+        if exit_oid:
+            try:
+                self.db.update_trade_state(trade_id, ib_exit_order_id=None,
+                                           ib_exit_perm_id=None)
+            except Exception:
+                pass
+            self._exit_orders.pop(exit_oid, None)
+            self.ib.cancel_order(exit_oid)
+
+        order_ref = f'exit:{trade_id}'
+        model_code = trade.get('algo_id') if self._state.fa_supported else None
+
+        # Build order kwargs based on session
+        overnight = session == 'overnight'
+        outside_rth = session == 'extended'
+
+        if order_type == 'MKT':
+            if session != 'rth':
+                logger.error("place_manual_exit: MKT not allowed in %s session", session)
+                self._exit_in_progress.pop(trade_id, None)
+                return False
+            result = self.ib.place_order(
+                'TSLA', close_action, effective_open, 'MKT',
+                tif='GTC', order_ref=order_ref, model_code=model_code)
+        elif order_type == 'LMT':
+            if price <= 0:
+                logger.error("place_manual_exit: LMT needs price > 0")
+                self._exit_in_progress.pop(trade_id, None)
+                return False
+            tif = 'DAY' if overnight else 'GTC'
+            result = self.ib.place_order(
+                'TSLA', close_action, effective_open, 'LMT',
+                price=round(price, 2), tif=tif,
+                outside_rth=outside_rth, overnight=overnight,
+                order_ref=order_ref, model_code=model_code)
+        elif order_type == 'STP':
+            if price <= 0:
+                logger.error("place_manual_exit: STP needs price > 0")
+                self._exit_in_progress.pop(trade_id, None)
+                return False
+            result = self.ib.place_order(
+                'TSLA', close_action, effective_open, 'STP',
+                price=round(price, 2), tif='GTC',
+                outside_rth=True, order_ref=order_ref, model_code=model_code)
+        else:
+            logger.error("place_manual_exit: unknown order type '%s'", order_type)
+            self._exit_in_progress.pop(trade_id, None)
+            return False
+
+        if 'error' in result:
+            logger.error("Manual exit failed for trade %d: %s",
+                         trade_id, result['error'])
+            self._exit_in_progress.pop(trade_id, None)
+            return False
+
+        exit_order_id = result['order_id']
+        exit_perm_id = result.get('perm_id', 0)
+
+        # Register for fill routing
+        self._exit_orders[exit_order_id] = {
+            'trade_id': trade_id, 'exit_reason': 'manual_close'}
+
+        # Persist to DB
+        try:
+            self.db.update_trade_state(trade_id,
+                                       ib_exit_order_id=exit_order_id,
+                                       ib_exit_perm_id=exit_perm_id)
+        except Exception as e:
+            logger.error("DB update failed for manual exit order %d (trade %d): %s",
+                         exit_order_id, trade_id, e)
+            self.ib.cancel_order(exit_order_id)
+            self._exit_in_progress.pop(trade_id, None)
+            return False
+
+        # Drain early fills
+        self._drain_pending_exit(exit_order_id, trade_id, 'manual_close')
+
+        logger.info("Manual exit placed: order_id=%d, trade %d, %s %d shares, "
+                     "type=%s, price=$%.2f, session=%s",
+                     exit_order_id, trade_id, close_action, effective_open,
+                     order_type, price, session)
+        return True
+
     def place_exit(self, trade_id: int, exit_reason: str,
                    exit_price: float = 0.0) -> bool:
         """Place an IB exit order with two-phase commit.
@@ -744,6 +928,10 @@ class IBOrderHandler:
 
         trade = self._get_trade(trade_id)
         if not trade:
+            return
+
+        # Guard: skip manual trades — user manages their own stops
+        if trade.get('management_mode') == 'manual':
             return
 
         stop_order_id = trade.get('ib_stop_order_id')
@@ -1199,7 +1387,12 @@ class IBOrderHandler:
         # Remove from routing dict so duplicate callbacks are ignored
         self._exit_orders.pop(order_id, None)
 
-        # Re-arm protective stop
+        # Re-arm protective stop (skip for manual trades — user manages stops)
+        if trade.get('management_mode') == 'manual':
+            logger.info("Exit %d rejected/cancelled for manual trade %d — "
+                        "NOT re-arming stop", order_id, trade_id)
+            return
+
         effective_open = self._effective_open_shares(trade)
         if effective_open > 0:
             direction = trade.get('direction', 'long')
@@ -1227,6 +1420,13 @@ class IBOrderHandler:
 
         trade = self._get_trade(trade_id)
         if not trade:
+            return
+
+        # Guard: manual trades — don't re-arm, user manages stops
+        if trade.get('management_mode') == 'manual':
+            logger.info("Stop %d cancelled for manual trade %d — NOT re-arming",
+                        order_id, trade_id)
+            self._stop_orders.pop(order_id, None)
             return
 
         # Guard 2: idempotency — is this still the current stop?

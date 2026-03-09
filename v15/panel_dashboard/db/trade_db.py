@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS trades (
     ib_exit_perm_id   INTEGER,
     ib_stop_order_id  INTEGER,
     ib_stop_perm_id   INTEGER,
+    management_mode TEXT DEFAULT 'algo',
     legacy_pos_id   TEXT,
     metadata        TEXT,
     created_at      TEXT DEFAULT (datetime('now'))
@@ -107,7 +108,7 @@ _TRADE_COLUMNS = [
     'ib_entry_order_id', 'ib_exit_order_id', 'ib_perm_id', 'ib_fill_status',
     'filled_shares', 'open_shares', 'avg_fill_price', 'exit_filled_shares',
     'avg_exit_price', 'ib_exit_perm_id', 'ib_stop_order_id',
-    'ib_stop_perm_id', 'legacy_pos_id', 'metadata', 'created_at',
+    'ib_stop_perm_id', 'management_mode', 'legacy_pos_id', 'metadata', 'created_at',
 ]
 
 
@@ -135,6 +136,14 @@ class TradeDB:
     def _create_tables(self):
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            # Migration: add management_mode column if missing (existing DBs)
+            try:
+                self._conn.execute(
+                    "ALTER TABLE trades ADD COLUMN management_mode TEXT DEFAULT 'algo'")
+                self._conn.commit()
+                logger.info("Migration: added management_mode column")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
 
     # ------------------------------------------------------------------
     # Core trade operations
@@ -280,6 +289,7 @@ class TradeDB:
             'entry_price', 'entry_time', 'shares', 'tp_price',
             'el_flagged', 'trail_width_mult', 'ou_half_life',
             'ib_entry_order_id', 'ib_perm_id', 'exit_reason',
+            'management_mode',
         }
         invalid = set(kwargs) - allowed
         if invalid:

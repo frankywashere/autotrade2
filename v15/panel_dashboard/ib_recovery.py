@@ -403,14 +403,20 @@ def recover_inflight_orders(state):
 
         # Check stop protection
         if open_shares > 0 and not stop_oid and not exit_oid:
-            # No stop and no exit — naked position, re-arm
-            stop_price = trade.get('stop_price', 0)
-            if stop_price > 0:
-                logger.warning("Trade %d has %d open shares with no stop/exit — "
-                               "re-arming stop @ $%.2f",
-                               trade_id, open_shares, stop_price)
-                handler._place_protective_stop(
-                    trade_id, stop_price, open_shares, direction)
+            # Skip re-arm for manual trades — user manages their own stops
+            if trade.get('management_mode') == 'manual':
+                logger.warning("Trade %d is MANUAL with %d open shares and "
+                               "NO stop/exit — UNPROTECTED (user responsibility)",
+                               trade_id, open_shares)
+            else:
+                # No stop and no exit — naked position, re-arm
+                stop_price = trade.get('stop_price', 0)
+                if stop_price > 0:
+                    logger.warning("Trade %d has %d open shares with no stop/exit — "
+                                   "re-arming stop @ $%.2f",
+                                   trade_id, open_shares, stop_price)
+                    handler._place_protective_stop(
+                        trade_id, stop_price, open_shares, direction)
 
     logger.info("Recovery complete: %d trades processed", len(open_trades))
 
