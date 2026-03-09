@@ -325,21 +325,32 @@ def _degraded_banner(state):
         width=250, visible=False)
 
     def _on_dismiss(event):
-        state.ib_degraded = False
+        logger.info("Acknowledge button clicked — clearing ib_degraded")
+        try:
+            state.ib_degraded = False
+        except Exception as e:
+            logger.error("CRITICAL: Failed to clear ib_degraded in-memory: %s", e,
+                         exc_info=True)
+            return
         if state.trade_db:
             try:
                 state.trade_db.set_metadata('ib_degraded', '0')
-            except Exception:
-                pass
+                logger.info("ib_degraded=0 persisted to DB")
+            except Exception as e:
+                logger.error("CRITICAL: Failed to persist ib_degraded=0 to DB: %s", e,
+                             exc_info=True)
+        else:
+            logger.error("CRITICAL: No trade_db — cannot persist ib_degraded=0")
         dismiss_btn.visible = False
         banner_html.object = ''
-        logger.info("IB/DB mismatch acknowledged by user — ib_degraded cleared")
+        logger.info("IB/DB mismatch acknowledged by user — ib_degraded cleared, "
+                     "entries resumed")
 
     dismiss_btn.on_click(_on_dismiss)
 
-    def _render(ib_connected):
+    def _render(ib_connected, ib_degraded):
         parts = []
-        if hasattr(state, 'ib_degraded') and state.ib_degraded:
+        if ib_degraded:
             parts.append("""
             <div style="background:#ff9800; color:black; padding:12px; border-radius:8px;
                         margin-bottom:8px; font-weight:bold;">
@@ -359,7 +370,8 @@ def _degraded_banner(state):
         return pn.Column(banner_html, dismiss_btn, sizing_mode='stretch_width',
                          margin=(0, 0, 0, 0))
 
-    return pn.bind(_render, ib_connected=state.param.ib_connected)
+    return pn.bind(_render, ib_connected=state.param.ib_connected,
+                   ib_degraded=state.param.ib_degraded)
 
 
 def _kill_switch_panel(state):
