@@ -537,7 +537,7 @@ class IntradayAlgo(AlgoBase):
 
         # Check intraday window
         t = bar_ts.time()
-        if not (params['intraday_start'] <= t <= params['intraday_end']):
+        if not (params.get('intraday_start', dt.time(9, 30)) <= t <= params.get('intraday_end', dt.time(15, 25))):
             return []
 
         # Get features — live or precomputed

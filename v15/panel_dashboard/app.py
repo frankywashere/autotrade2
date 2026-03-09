@@ -8,6 +8,7 @@ import sys
 import os
 import logging
 import logging.handlers
+import threading
 import traceback
 
 # Ensure project root is on sys.path so v15.* imports work
@@ -50,6 +51,7 @@ sys.excepthook = _exc_hook
 
 # ── Singleton state — initialized once, shared across all sessions ────────────
 _state = None
+_state_lock = threading.Lock()
 
 
 def _init_state():
@@ -58,23 +60,30 @@ def _init_state():
     if _state is not None:
         return _state
 
-    from v15.panel_dashboard.state import DashboardState
+    with _state_lock:
+        # Double-check after acquiring lock
+        if _state is not None:
+            return _state
 
-    logger.info("Initializing DashboardState (one-time)...")
-    _state = DashboardState()
+        from v15.panel_dashboard.state import DashboardState
 
-    _state.load_market_data()
-    logger.info("Market data loaded. TSLA=%.2f", _state.tsla_price)
+        logger.info("Initializing DashboardState (one-time)...")
+        state = DashboardState()
 
-    # Log IB status
-    ib_ok = getattr(_state, 'ib_connected', False)
-    if ib_ok:
-        logger.info("IB Gateway: CONNECTED")
-    else:
-        logger.error("IB Gateway: NOT CONNECTED — no live price source available!")
+        state.load_market_data()
+        logger.info("Market data loaded. TSLA=%.2f", state.tsla_price)
 
-    # Initialize infrastructure (TradeDB, adapters, order handler, LiveEngine, recovery, loops)
-    _init_new_infra(_state)
+        # Log IB status
+        ib_ok = getattr(state, 'ib_connected', False)
+        if ib_ok:
+            logger.info("IB Gateway: CONNECTED")
+        else:
+            logger.error("IB Gateway: NOT CONNECTED — no live price source available!")
+
+        # Initialize infrastructure (TradeDB, adapters, order handler, LiveEngine, recovery, loops)
+        _init_new_infra(state)
+
+        _state = state
 
     return _state
 
