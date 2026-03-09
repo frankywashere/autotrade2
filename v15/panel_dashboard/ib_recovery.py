@@ -68,11 +68,15 @@ def scan_unlinked_orders(state):
                     direction = parts[2]
                     try:
                         stop_price = float(parts[3])
-                    except (ValueError, IndexError):
+                    except (ValueError, IndexError) as e:
+                        logger.error("Failed to parse stop_price from orderRef '%s': %s",
+                                     order_ref, e)
                         stop_price = 0
                     try:
                         tp_price = float(parts[4])
-                    except (ValueError, IndexError):
+                    except (ValueError, IndexError) as e:
+                        logger.error("Failed to parse tp_price from orderRef '%s': %s",
+                                     order_ref, e)
                         tp_price = 0
 
                     # Check if order has fills
@@ -140,7 +144,9 @@ def scan_unlinked_orders(state):
             # Check if DB has the exit linked
             try:
                 trade_id = int(order_ref.split(':')[1])
-            except (ValueError, IndexError):
+            except (ValueError, IndexError) as e:
+                logger.error("Failed to parse trade_id from exit orderRef '%s': %s",
+                             order_ref, e)
                 continue
             # Register for fill tracking
             handler._exit_orders[order_id] = {
@@ -149,7 +155,9 @@ def scan_unlinked_orders(state):
         elif order_ref.startswith('stop:'):
             try:
                 trade_id = int(order_ref.split(':')[1])
-            except (ValueError, IndexError):
+            except (ValueError, IndexError) as e:
+                logger.error("Failed to parse trade_id from stop orderRef '%s': %s",
+                             order_ref, e)
                 continue
             handler._stop_orders[order_id] = {'trade_id': trade_id}
 
@@ -283,8 +291,8 @@ def reconcile_ib_db(state):
         state.ib_degraded = True
         try:
             state.trade_db.set_metadata('ib_degraded', '1')
-        except Exception:
-            pass
+        except Exception as e2:
+            logger.error("Failed to persist ib_degraded: %s", e2)
         return
 
     # Sum broker TSLA position
@@ -325,6 +333,6 @@ def reconcile_ib_db(state):
     state.ib_degraded = True
     try:
         db.set_metadata('ib_degraded', '1')
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error("Failed to persist ib_degraded after reconciliation mismatch: %s", e)
     logger.error("ib_degraded=True set from reconciliation mismatch")

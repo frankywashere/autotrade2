@@ -65,7 +65,8 @@ def _channel_at(df_slice):
         from v15.core.channel import detect_channel
         ch = detect_channel(df_slice)
         return ch if (ch and ch.valid) else None
-    except Exception:
+    except Exception as e:
+        logger.warning("OE-Sig5 channel detection failed: %s", e)
         return None
 
 
@@ -335,7 +336,8 @@ class OESig5Algo(AlgoBase):
         # Get weekly bars (native from IB seeding, not resampled)
         try:
             tsla_w = self.data.get_bars('weekly', time, symbol='TSLA')
-        except Exception:
+        except Exception as e:
+            logger.debug("OE-Sig5: weekly bars not available, will resample from daily: %s", e)
             tsla_w = None
 
         # Fallback: resample from daily if no native weekly

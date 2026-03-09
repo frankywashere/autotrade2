@@ -582,7 +582,8 @@ class IntradayAlgo(AlgoBase):
         # Run signal function
         try:
             from v15.trading.intraday_signals import sig_union_enhanced
-        except ImportError:
+        except ImportError as e:
+            logger.error("Intraday: ImportError for sig_union_enhanced: %s", e)
             return []
 
         result = sig_union_enhanced(

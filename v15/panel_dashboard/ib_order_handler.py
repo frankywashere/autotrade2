@@ -599,8 +599,9 @@ class IBOrderHandler:
                          "reverting to $%.2f", trade_id, old_stop)
             try:
                 self.db.update_trade_state(trade_id, stop_price=old_stop)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("CRITICAL: Failed to revert stop price for trade %d: %s",
+                             trade_id, e)
             self._set_degraded(f"Stop modification failed for trade {trade_id}")
 
     # ── Fill Callbacks ──────────────────────────────────────────────
@@ -632,8 +633,8 @@ class IBOrderHandler:
                     fill_time = broker_time.astimezone(ET).isoformat()
                 else:
                     fill_time = str(broker_time)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Failed to parse broker fill time: %s", e)
 
         fill_data = FillData(
             exec_id=exec_id, shares=fill_shares,
@@ -959,8 +960,9 @@ class IBOrderHandler:
         try:
             self.db.update_trade_state(trade_id, ib_exit_order_id=None,
                                        ib_exit_perm_id=None)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("Failed to clear exit order ID for trade %d: %s",
+                         trade_id, e)
 
         self._exit_in_progress.pop(trade_id, None)
 
@@ -1052,8 +1054,8 @@ class IBOrderHandler:
             for t in closed:
                 if t['id'] == trade_id:
                     return t
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("Failed to lookup trade %d: %s", trade_id, e)
         return None
 
     def _effective_open_shares(self, trade: dict) -> int:

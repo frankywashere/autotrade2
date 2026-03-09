@@ -59,6 +59,8 @@ def _update_ib_prices(state):
                 bid = getattr(state.ib_client, 'get_bid', lambda s: 0.0)('TSLA')
                 ask = getattr(state.ib_client, 'get_ask', lambda s: 0.0)('TSLA')
                 state.price_manager.update_ib('TSLA', price, bid, ask)
+        elif ib_price < 0:
+            logger.error("IB returned negative TSLA price: %.2f (error code?)", ib_price)
 
         # SPY + VIX
         for sym in ['SPY', 'VIX']:

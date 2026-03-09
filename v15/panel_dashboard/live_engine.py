@@ -78,7 +78,10 @@ class LiveEngine:
                 info = self._data._bar_queue.get(timeout=60)
             except queue.Empty:
                 continue
-            except Exception:
+            except Exception as e:
+                logger.error("Unexpected error in bar queue: %s", e, exc_info=True)
+                import time as _t
+                _t.sleep(1)  # backoff to avoid spinning
                 continue
 
             try:
@@ -103,7 +106,7 @@ class LiveEngine:
             try:
                 op()
             except Exception as e:
-                logger.error("Deferred IB op failed: %s", e)
+                logger.error("CRITICAL: Deferred IB op failed: %s", e, exc_info=True)
 
     def _process_bar(self, tf, time, bar, deferred_ib_ops=None):
         """Process a bar close. Follows backtester causal loop order.
@@ -136,7 +139,13 @@ class LiveEngine:
 
             # 2. Check exits (ALWAYS — regardless of enabled state)
             if tf == algo.config.exit_check_tf and positions:
-                exits = algo.check_exits(time, bar, positions)
+                try:
+                    exits = algo.check_exits(time, bar, positions)
+                except Exception as e:
+                    logger.error("CRITICAL: %s.check_exits() FAILED — exits SKIPPED, "
+                                 "positions may be unprotected: %s",
+                                 algo.algo_id, e, exc_info=True)
+                    continue
                 for exit_sig in exits:
                     self._execute_exit(algo, exit_sig, deferred_ib_ops)
 
@@ -158,7 +167,12 @@ class LiveEngine:
             # 6. Generate new entry signals (signals always run for visibility)
             if should_eval:
                 context = self._build_trade_context(algo)
-                signals = algo.on_bar(time, bar, positions, context=context)
+                try:
+                    signals = algo.on_bar(time, bar, positions, context=context)
+                except Exception as e:
+                    logger.error("CRITICAL: %s.on_bar() FAILED — signals SKIPPED: %s",
+                                 algo.algo_id, e, exc_info=True)
+                    continue
                 for sig in signals:
                     if not algo_enabled:
                         logger.info("BLOCKED: %s signal %s (algo disabled)",
@@ -188,8 +202,9 @@ class LiveEngine:
                 if trade.get('metadata'):
                     try:
                         metadata = json.loads(trade['metadata'])
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+                    except (json.JSONDecodeError, TypeError) as e:
+                        logger.error("Failed to parse metadata for trade %d: %s",
+                                     trade['id'], e)
                 pos = Position(
                     pos_id=str(trade['id']),
                     algo_id=trade['algo_id'],
@@ -210,8 +225,8 @@ class LiveEngine:
                 positions.append(pos)
             return positions
         except Exception as e:
-            logger.error("Failed to get positions for %s: %s",
-                         algo.algo_id, e)
+            logger.error("CRITICAL: Failed to get positions for %s: %s",
+                         algo.algo_id, e, exc_info=True)
             return []
 
     def _ratchet_positions(self, algo, positions, bar):
@@ -239,9 +254,27 @@ class LiveEngine:
 
     def _sync_trailing_stops(self, algo, positions, deferred_ib_ops=None):
         """Sync effective stop from algo state to IB resting stop orders."""
+        import math
         for pos in positions:
-            effective_stop = algo.get_effective_stop(pos)
+            try:
+                effective_stop = algo.get_effective_stop(pos)
+            except Exception as e:
+                logger.error("CRITICAL: %s.get_effective_stop() FAILED for trade %s: %s",
+                             algo.algo_id, pos.pos_id, e, exc_info=True)
+                continue
             trade_id = int(pos.pos_id)
+            if effective_stop is not None and not isinstance(effective_stop, (int, float)):
+                logger.error("CRITICAL: %s.get_effective_stop() returned invalid type %s "
+                             "for trade %d", algo.algo_id, type(effective_stop), trade_id)
+                continue
+            if effective_stop and (math.isnan(effective_stop) or math.isinf(effective_stop)):
+                logger.error("CRITICAL: %s.get_effective_stop() returned %s for trade %d",
+                             algo.algo_id, effective_stop, trade_id)
+                continue
+            if effective_stop and effective_stop <= 0:
+                logger.error("CRITICAL: %s.get_effective_stop() returned %.2f for trade %d",
+                             algo.algo_id, effective_stop, trade_id)
+                continue
             if effective_stop and effective_stop != pos.stop_price:
                 try:
                     self._db.update_trade_state(trade_id,
@@ -351,11 +384,16 @@ class LiveEngine:
                         pos = self._get_positions(algo)
                         for p in pos:
                             if p.pos_id == str(trade_id):
-                                algo.on_position_opened(p)
+                                try:
+                                    algo.on_position_opened(p)
+                                except Exception as e2:
+                                    logger.error("CRITICAL: %s.on_position_opened() FAILED "
+                                                 "in sim entry for trade %d: %s",
+                                                 algo.algo_id, trade_id, e2, exc_info=True)
                                 break
                 except Exception as e:
-                    logger.error("Sim entry failed for %s: %s",
-                                 algo.algo_id, e)
+                    logger.error("CRITICAL: Sim entry FAILED for %s — entry DROPPED: %s",
+                                 algo.algo_id, e, exc_info=True)
             return
 
         # IB mode: defer order placement to prevent deadlock
@@ -420,8 +458,9 @@ class LiveEngine:
                         exit_price=exit_signal.price,
                         exit_reason=exit_signal.reason)
                 except Exception as e:
-                    logger.error("Sim exit failed for trade %d: %s",
-                                 trade_id, e)
+                    logger.error("CRITICAL: Sim exit FAILED for trade %d — "
+                                 "position NOT closed in DB: %s",
+                                 trade_id, e, exc_info=True)
             return
 
         # IB mode: defer order placement to prevent deadlock
@@ -444,12 +483,21 @@ class LiveEngine:
         """Callback from IBOrderHandler on IB fill."""
         with self._eval_lock:
             if not self._db:
+                logger.error("CRITICAL: on_fill(trade=%d) — DB unavailable, fill LOST",
+                             trade_id)
                 return
             trade = self._db.get_trade(trade_id)
             if not trade:
+                logger.error("CRITICAL: on_fill(trade=%d) — trade NOT FOUND in DB, "
+                             "IB has fill but no DB record (price=%.2f, qty=%d, entry=%s)",
+                             trade_id, fill_price, fill_qty, is_entry)
                 return
             algo = self._algo_map.get(trade.get('algo_id'))
             if not algo:
+                logger.error("CRITICAL: on_fill(trade=%d) — algo_id '%s' not in engine "
+                             "(known algos: %s)",
+                             trade_id, trade.get('algo_id'),
+                             list(self._algo_map.keys()))
                 return
             if is_entry:
                 # Only initialize algo state on first fill, not partial follow-ups
@@ -458,15 +506,24 @@ class LiveEngine:
                     pos = self._get_positions(algo)
                     for p in pos:
                         if p.pos_id == str(trade_id):
-                            algo.on_position_opened(p)
+                            try:
+                                algo.on_position_opened(p)
+                            except Exception as e:
+                                logger.error("CRITICAL: %s.on_position_opened() FAILED "
+                                             "for trade %d — algo state NOT initialized: %s",
+                                             algo.algo_id, trade_id, e, exc_info=True)
                             # Persist algo state
-                            state = algo.serialize_state(p.pos_id)
-                            if state:
-                                metadata = json.loads(
-                                    trade.get('metadata', '{}') or '{}')
-                                metadata['algo_state'] = state
-                                self._db.update_trade_state(
-                                    trade_id, metadata=json.dumps(metadata))
+                            try:
+                                state = algo.serialize_state(p.pos_id)
+                                if state:
+                                    metadata = json.loads(
+                                        trade.get('metadata', '{}') or '{}')
+                                    metadata['algo_state'] = state
+                                    self._db.update_trade_state(
+                                        trade_id, metadata=json.dumps(metadata))
+                            except Exception as e:
+                                logger.error("Failed to persist algo state for trade %d: %s",
+                                             trade_id, e, exc_info=True)
                             break
             else:
                 # Adapt dict to have pos_id attribute for algo.on_fill()
@@ -476,7 +533,11 @@ class LiveEngine:
                         self.algo_id = d.get('algo_id', '')
                         self.pnl = d.get('pnl', 0.0)
                         self.net_pnl = d.get('pnl', 0.0)
-                algo.on_fill(_TradeProxy(trade))
+                try:
+                    algo.on_fill(_TradeProxy(trade))
+                except Exception as e:
+                    logger.error("CRITICAL: %s.on_fill() FAILED for trade %d: %s",
+                                 algo.algo_id, trade_id, e, exc_info=True)
 
     def _build_trade_context(self, algo) -> TradeContext:
         """Build TradeContext from TradeDB queries."""
@@ -504,7 +565,9 @@ class LiveEngine:
                 win_streak=win_streak,
                 loss_streak=loss_streak,
             )
-        except Exception:
+        except Exception as e:
+            logger.error("Failed to build TradeContext for %s: %s",
+                         algo.algo_id, e, exc_info=True)
             return TradeContext()
 
     # ── UI Mutation Methods (all acquire _eval_lock) ──
@@ -637,7 +700,13 @@ class LiveEngine:
             for algo in self._algos:
                 positions = self._get_positions(algo)
                 for pos in positions:
-                    state = algo.serialize_state(pos.pos_id)
+                    try:
+                        state = algo.serialize_state(pos.pos_id)
+                    except Exception as e:
+                        logger.error("CRITICAL: %s.serialize_state() FAILED for "
+                                     "trade %s: %s", algo.algo_id, pos.pos_id, e,
+                                     exc_info=True)
+                        continue
                     if state and self._db:
                         trade_id = int(pos.pos_id)
                         trade = self._db.get_trade(trade_id)
@@ -660,17 +729,40 @@ class LiveEngine:
                     if trade.get('metadata'):
                         try:
                             metadata = json.loads(trade['metadata'])
-                        except (json.JSONDecodeError, TypeError):
-                            pass
+                        except (json.JSONDecodeError, TypeError) as e:
+                            logger.error("Failed to parse metadata for trade %d "
+                                         "during recovery: %s", trade['id'], e)
                     algo_state = metadata.get('algo_state')
                     if algo_state:
-                        algo.restore_state(str(trade['id']), algo_state)
+                        try:
+                            algo.restore_state(str(trade['id']), algo_state)
+                        except Exception as e:
+                            logger.error("CRITICAL: %s.restore_state() FAILED for "
+                                         "trade %d — falling back to on_position_opened: %s",
+                                         algo.algo_id, trade['id'], e, exc_info=True)
+                            # Fallback: reconstruct from DB
+                            positions = self._get_positions(algo)
+                            for pos in positions:
+                                if pos.pos_id == str(trade['id']):
+                                    try:
+                                        algo.on_position_opened(pos)
+                                    except Exception as e2:
+                                        logger.error("CRITICAL: %s.on_position_opened() "
+                                                     "also FAILED for trade %d: %s",
+                                                     algo.algo_id, trade['id'], e2,
+                                                     exc_info=True)
+                                    break
                     else:
                         # Reconstruct from DB fields
                         positions = self._get_positions(algo)
                         for pos in positions:
                             if pos.pos_id == str(trade['id']):
-                                algo.on_position_opened(pos)
+                                try:
+                                    algo.on_position_opened(pos)
+                                except Exception as e:
+                                    logger.error("CRITICAL: %s.on_position_opened() FAILED "
+                                                 "during recovery for trade %d: %s",
+                                                 algo.algo_id, trade['id'], e, exc_info=True)
                                 break
 
                 # Restore per-algo counters

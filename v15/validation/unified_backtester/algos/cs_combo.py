@@ -149,7 +149,7 @@ class CSComboAlgo(AlgoBase):
         try:
             from v15.core.channel_surfer import prepare_multi_tf_analysis
         except ImportError as e:
-            print(f"  WARNING: Cannot import channel_surfer: {e}")
+            logger.error("Cannot import channel_surfer: %s", e)
             return {}
 
         signals = {}
@@ -230,7 +230,8 @@ class CSComboAlgo(AlgoBase):
                 df = self.data.get_bars(tf, time)
                 if len(df) >= 15:
                     native_slice[tf] = df
-            except Exception:
+            except Exception as e:
+                logger.warning("CS %s: get_bars('%s') failed: %s", self.algo_id, tf, e)
                 continue
 
         if not native_slice:

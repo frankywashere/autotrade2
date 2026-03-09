@@ -198,8 +198,9 @@ def create_live_engine(state):
                         algo.config.max_equity_per_trade = float(eq_val)
                         logger.info("Loaded %s equity=$%.0f from DB",
                                     algo.algo_id, float(eq_val))
-                    except ValueError:
-                        pass
+                    except ValueError as e:
+                        logger.warning("Invalid equity value for %s: %s",
+                                       algo.algo_id, eq_val)
 
         # Recover state from DB
         engine.recover_after_restart()
@@ -214,8 +215,15 @@ def create_live_engine(state):
                      len(ib_algos),
                      [a.algo_id for a in ib_algos])
     except Exception as e:
-        logger.error("Failed to create LiveEngine: %s", e, exc_info=True)
+        logger.error("CRITICAL: Failed to create LiveEngine — "
+                     "NO algo execution possible: %s", e, exc_info=True)
         state.live_engine = None
+        state.ib_degraded = True
+        if state.trade_db:
+            try:
+                state.trade_db.set_metadata('ib_degraded', '1')
+            except Exception as e:
+                logger.error("Failed to persist ib_degraded: %s", e)
 
 
 def _wire_tick_to_bar_feed(state, data):

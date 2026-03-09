@@ -392,8 +392,8 @@ class DashboardState(param.Parameterized):
                     cfg = json.load(f)
                 bot_token = cfg.get('telegram', {}).get('bot_token', '')
                 chat_id = cfg.get('telegram', {}).get('chat_id', '')
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Failed to load Telegram config from api_keys.json: %s", e)
         if not bot_token or not chat_id:
             return 'NO_CHANNEL'
 

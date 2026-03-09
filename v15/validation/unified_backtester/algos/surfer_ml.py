@@ -10,8 +10,11 @@ Sizing: Flat $100K (c16) or risk-based
 """
 
 import datetime as dt
+import logging
 import time as _time_mod
 from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 import pandas as pd
@@ -102,11 +105,11 @@ class SurferMLAlgo(AlgoBase):
                     with open(path, 'rb') as f:
                         setattr(self, attr, pickle.load(f))
                 except Exception as e:
-                    print(f"  Warning: Failed to load {name}: {e}")
+                    logger.warning("Failed to load ML model %s: %s", name, e)
 
         loaded = sum(1 for m in [self._gbt_model, self._el_model,
                                   self._er_model, self._fast_rev_model] if m is not None)
-        print(f"  Loaded {loaded}/4 ML models from {model_dir}")
+        logger.info("Loaded %d/4 ML models from %s", loaded, model_dir)
 
     def warmup_bars(self) -> int:
         return 300  # Need enough history for channel detection
@@ -124,7 +127,8 @@ class SurferMLAlgo(AlgoBase):
         try:
             from v15.core.channel import detect_channels_multi_window, select_best_channel
             from v15.core.channel_surfer import analyze_channels, TF_WINDOWS
-        except ImportError:
+        except ImportError as e:
+            logger.error("SurferML.on_bar() FAILED: ImportError: %s", e)
             return []
 
         # Anti-pyramid: skip if already have position in same direction
@@ -141,7 +145,8 @@ class SurferMLAlgo(AlgoBase):
         try:
             multi = detect_channels_multi_window(df_slice, windows=[10, 15, 20, 30, 40])
             best_ch, _ = select_best_channel(multi)
-        except Exception:
+        except Exception as e:
+            logger.error("SurferML channel detection failed: %s", e, exc_info=True)
             return []
 
         if best_ch is None or not best_ch.valid:
@@ -185,7 +190,8 @@ class SurferMLAlgo(AlgoBase):
                     current_prices[tf_label] = float(tf_recent['close'].iloc[-1])
                     if 'volume' in tf_recent.columns:
                         volumes_dict[tf_label] = tf_recent['volume'].values
-            except Exception:
+            except Exception as e:
+                logger.warning("SurferML %s channel detection failed: %s", tf_label, e)
                 continue
 
         try:
@@ -193,7 +199,8 @@ class SurferMLAlgo(AlgoBase):
                 channels_by_tf, prices_by_tf, current_prices,
                 volumes_by_tf=volumes_dict if volumes_dict else None,
             )
-        except Exception:
+        except Exception as e:
+            logger.error("SurferML analyze_channels() failed: %s", e, exc_info=True)
             return []
 
         sig = analysis.signal
@@ -255,14 +262,14 @@ class SurferMLAlgo(AlgoBase):
                     spy_daily = self.data.get_bars('daily', time, symbol='SPY')
                     if len(spy_daily) > 0:
                         spy_df = spy_daily
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("SPY daily bars not available: %s", e)
                 try:
                     vix_daily = self.data.get_bars('daily', time, symbol='VIX')
                     if len(vix_daily) > 0:
                         vix_df = vix_daily
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("VIX daily bars not available: %s", e)
                 feature_vec, _ = build_feature_vector(
                     analysis=analysis,
                     bar_data=bar,
@@ -275,7 +282,8 @@ class SurferMLAlgo(AlgoBase):
                     context=context,
                     bars_df=df5,
                 )
-            except Exception:
+            except Exception as e:
+                logger.warning("SurferML feature vector build failed: %s", e)
                 feature_vec = None
 
         # GBT soft gate: scale confidence, don't hard-skip
@@ -296,8 +304,8 @@ class SurferMLAlgo(AlgoBase):
                     predicted_life = float(ml_pred['lifetime'][0])
                     if predicted_life > 0:
                         pass  # Informational only for now
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("SurferML GBT prediction failed: %s", e)
 
         # Extended Run predictor
         if self._er_model is not None and feature_vec is not None:
@@ -308,8 +316,8 @@ class SurferMLAlgo(AlgoBase):
                     twm = 2.0  # Let winners run — wider trail
                 elif er_prob > 0.55:
                     twm = 1.5
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("SurferML ER model prediction failed: %s", e)
 
         # Extreme Loser detector
         if self._el_model is not None and feature_vec is not None:
@@ -320,8 +328,8 @@ class SurferMLAlgo(AlgoBase):
                     el_flagged = True
                     if signal_type == 'bounce':
                         conf *= 0.80  # Penalize EL bounces
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("SurferML EL model prediction failed: %s", e)
 
         # Fast Reversion (Momentum Reversal) detector
         if self._fast_rev_model is not None and feature_vec is not None:
@@ -330,8 +338,8 @@ class SurferMLAlgo(AlgoBase):
                 fast_rev_prob = float(rev_pred.get('fast_reversion_prob', [0.0])[0])
                 if fast_rev_prob > 0.55:
                     fast_rev = True
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("SurferML fast_rev model prediction failed: %s", e)
 
         # Re-check confidence after ML gating
         if conf < self.config.params.get('min_confidence', 0.01):
