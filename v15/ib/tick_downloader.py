@@ -4,6 +4,7 @@ Usage:
     python -m v15.ib.tick_downloader --symbol TSLA --start 2025-01-01 --end 2026-03-06
     python -m v15.ib.tick_downloader --symbol TSLA --start 2025-01-01 --end 2026-03-06 --verify-only
     python -m v15.ib.tick_downloader --symbol TSLA --start 2025-01-01 --end 2026-03-06 --redownload 2025-01-15
+    python -m v15.ib.tick_downloader --symbol VIX --start 2025-01-01 --end 2026-03-06 --type IND
 
 Output: data/bars_5s/{SYMBOL}/YYYY-MM-DD.parquet (one file per trading day)
 
@@ -331,10 +332,11 @@ def verify_bar_files(bar_dir: Path, symbol: str, start: date, end: date):
 
 
 def download_bars(symbol: str, start: date, end: date, output_dir: str,
-                  host: str, port: int, redownload: str = None):
+                  host: str, port: int, redownload: str = None,
+                  sec_type: str = 'STK'):
     """Download 5-second bars for a date range."""
     from v15.ib.client import IBClient
-    from ib_async import Stock
+    from ib_async import Stock, Index
 
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -344,7 +346,10 @@ def download_bars(symbol: str, start: date, end: date, output_dir: str,
     client.connect()
     logger.info("Connected.")
 
-    contract = Stock(symbol, 'SMART', 'USD')
+    if sec_type == 'IND':
+        contract = Index(symbol, 'CBOE', 'USD')
+    else:
+        contract = Stock(symbol, 'SMART', 'USD')
     # Qualify contract (required for historical data requests)
     qf = asyncio.run_coroutine_threadsafe(
         client.ib.qualifyContractsAsync(contract), client._loop)
@@ -425,6 +430,8 @@ def main():
                         help='Only verify existing files, do not download')
     parser.add_argument('--redownload', default=None,
                         help='Re-download specific date YYYY-MM-DD')
+    parser.add_argument('--type', default='STK', choices=['STK', 'IND'],
+                        help='Security type: STK (stock) or IND (index, e.g. VIX)')
 
     args = parser.parse_args()
 
@@ -445,6 +452,7 @@ def main():
             host=args.host,
             port=args.port,
             redownload=args.redownload,
+            sec_type=args.type,
         )
 
 
