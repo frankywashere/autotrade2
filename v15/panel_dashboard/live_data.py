@@ -428,12 +428,13 @@ class LiveDataProvider:
         # Validate seeded data meets algo minimum requirements
         self._validate_seeded_bars()
 
-        # Fail loudly if critical seeds are missing
+        # Warn loudly if critical seeds are missing (don't crash — recovery
+        # must still run to protect open positions like trade #79)
         tsla_1m = len(self._bars.get('TSLA', {}).get('1min', pd.DataFrame()))
         if tsla_1m < 100:
-            raise RuntimeError(
-                f"TSLA 1-min seed failed ({tsla_1m} bars, need >=100) — "
-                "engine cannot start safely")
+            logger.error("TSLA 1-min seed INSUFFICIENT (%d bars, need >=100) — "
+                         "algos will not generate signals until bars accumulate",
+                         tsla_1m)
 
         logger.info("Historical seeding complete: %s",
                      {s: list(tfs.keys()) for s, tfs in self._bars.items()})
