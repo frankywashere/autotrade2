@@ -318,24 +318,46 @@ def _trade_history(state):
 
 
 def _degraded_banner(state):
-    """Warning banner for ib_degraded state."""
+    """Warning banner for ib_degraded state with dismiss button."""
+    banner_html = pn.pane.HTML('', sizing_mode='stretch_width')
+    dismiss_btn = pn.widgets.Button(
+        name='Acknowledge — Resume Entries', button_type='warning',
+        width=250, visible=False)
+
+    def _on_dismiss(event):
+        state.ib_degraded = False
+        if state.trade_db:
+            try:
+                state.trade_db.set_metadata('ib_degraded', '0')
+            except Exception:
+                pass
+        dismiss_btn.visible = False
+        banner_html.object = ''
+        logger.info("IB/DB mismatch acknowledged by user — ib_degraded cleared")
+
+    dismiss_btn.on_click(_on_dismiss)
+
     def _render(ib_connected):
         parts = []
         if hasattr(state, 'ib_degraded') and state.ib_degraded:
             parts.append("""
             <div style="background:#ff9800; color:black; padding:12px; border-radius:8px;
                         margin-bottom:8px; font-weight:bold;">
-                IB/DB MISMATCH — Automated entries paused. Review positions and re-reconcile.
+                IB/DB MISMATCH — Automated entries paused. If this is from a manual order,
+                click Acknowledge to resume algo entries.
             </div>""")
+            dismiss_btn.visible = True
+        else:
+            dismiss_btn.visible = False
         if not ib_connected:
             parts.append("""
             <div style="background:#ff5252; color:white; padding:8px; border-radius:8px;
                         margin-bottom:8px;">
                 IB DISCONNECTED — No live price source
             </div>""")
-        if not parts:
-            return pn.pane.HTML('')
-        return pn.pane.HTML('\n'.join(parts), sizing_mode='stretch_width')
+        banner_html.object = '\n'.join(parts) if parts else ''
+        return pn.Column(banner_html, dismiss_btn, sizing_mode='stretch_width',
+                         margin=(0, 0, 0, 0))
 
     return pn.bind(_render, ib_connected=state.param.ib_connected)
 

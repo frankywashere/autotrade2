@@ -242,19 +242,7 @@ def order_entry_panel(state) -> pn.Column:
         else:
             lock_toggle.name = 'Unlocked'
             lock_toggle.button_type = 'default'
-            # Reset slider to current mid when unlocking
-            if state.ib_client:
-                data = state.ib_client.get_price_data('TSLA')
-                b = data.get('bid', 0.0)
-                a = data.get('ask', 0.0)
-                if b > 0 and a > 0:
-                    m = round((b + a) / 2, 2)
-                    _programmatic[0] = True
-                    try:
-                        price_slider.value = m
-                        price_input.value = m
-                    finally:
-                        _programmatic[0] = False
+            # Unlocked — next periodic tick will auto-track mid
 
     price_slider.param.watch(_on_slider_change, 'value')
     price_input.param.watch(_on_price_input_change, 'value')
@@ -438,29 +426,29 @@ def order_entry_panel(state) -> pn.Column:
                 mid = round((bid + ask) / 2, 2)
                 spread = ask - bid
 
-                price_info.object = (
-                    f'<div style="display:flex;justify-content:space-between;'
-                    f'font-size:13px;padding:0 4px">'
-                    f'<span><b style="color:#00e676">Bid ${bid:.2f}</b></span>'
-                    f'<span>Mid <b>${mid:.2f}</b>'
-                    f'&nbsp;&nbsp;<span style="color:#888">Spd ${spread:.2f}</span></span>'
-                    f'<span><b style="color:#ff5252">Ask ${ask:.2f}</b></span>'
-                    f'</div>')
+                if not _locked[0]:
+                    # Unlocked: update everything — text, slider, input
+                    price_info.object = (
+                        f'<div style="display:flex;justify-content:space-between;'
+                        f'font-size:13px;padding:0 4px">'
+                        f'<span><b style="color:#00e676">Bid ${bid:.2f}</b></span>'
+                        f'<span>Mid <b>${mid:.2f}</b>'
+                        f'&nbsp;&nbsp;<span style="color:#888">Spd ${spread:.2f}</span></span>'
+                        f'<span><b style="color:#ff5252">Ask ${ask:.2f}</b></span>'
+                        f'</div>')
 
-                # Set slider range to ±$2 from mid (wide enough to not jump)
-                # Only update range when it would shift significantly (>$0.50)
-                slider_mid = (price_slider.start + price_slider.end) / 2
-                if abs(slider_mid - mid) > 0.50 or price_slider.end <= price_slider.start + 0.01:
                     _programmatic[0] = True
                     try:
-                        price_slider.start = round(mid - 2.0, 2)
-                        price_slider.end = round(mid + 2.0, 2)
-                        # Only set value if slider was never touched (initial state)
-                        if not _locked[0] and price_slider.value < 1.0:
-                            price_slider.value = mid
-                            price_input.value = mid
+                        # Adjust range if mid drifted >$0.50 or uninitialized
+                        slider_mid = (price_slider.start + price_slider.end) / 2
+                        if abs(slider_mid - mid) > 0.50 or price_slider.end <= price_slider.start + 0.01:
+                            price_slider.start = round(mid - 2.0, 2)
+                            price_slider.end = round(mid + 2.0, 2)
+                        price_slider.value = mid
+                        price_input.value = mid
                     finally:
                         _programmatic[0] = False
+                # Locked: freeze everything — no text, slider, or input updates
 
             # Check if IB order log changed
             v = state.ib_client.get_order_log_version()

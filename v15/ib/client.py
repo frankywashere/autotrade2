@@ -787,7 +787,11 @@ class IBClient:
     def sync_orders(self):
         """Thread-safe trigger to re-sync orders from IB."""
         if self._loop and self._connected:
-            asyncio.run_coroutine_threadsafe(self._sync_orders_from_ib(), self._loop)
+            # Guard: skip if a previous sync is still running
+            if hasattr(self, '_sync_task') and self._sync_task and not self._sync_task.done():
+                return
+            self._sync_task = asyncio.run_coroutine_threadsafe(
+                self._sync_orders_from_ib(), self._loop)
 
 
 class LiveBarAggregator:
