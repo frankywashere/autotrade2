@@ -515,7 +515,8 @@ class IBOrderHandler:
 
         result = self.ib.place_order(
             'TSLA', close_action, effective_open, 'MKT',
-            tif='GTC', order_ref=order_ref, model_code=model_code)
+            tif='GTC', outside_rth=True,
+            order_ref=order_ref, model_code=model_code)
 
         if 'error' in result:
             logger.error("Exit order failed for trade %d: %s",

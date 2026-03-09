@@ -391,7 +391,17 @@ def order_entry_panel(state) -> pn.Column:
 
                 def _make_cancel(perm_id):
                     def _cancel(event):
-                        state.ib_client.cancel_order(perm_id)
+                        logger.info("Cancel button clicked for permId %d", perm_id)
+                        try:
+                            ok = state.ib_client.cancel_order(perm_id)
+                            if ok:
+                                logger.info("Cancel sent for permId %d", perm_id)
+                            else:
+                                logger.error("Cancel failed for permId %d — "
+                                             "order may belong to another session",
+                                             perm_id)
+                        except Exception as e:
+                            logger.error("Cancel error for permId %d: %s", perm_id, e)
                         state.order_version += 1
                     return _cancel
 
