@@ -103,6 +103,7 @@ class IBOrderHandler:
         self._pending_exit_fills: dict[int, list[FillData]] = {}   # exit order_id -> fills
         self._pending_terminal: dict[int, TerminalStatus] = {}     # entry order_id -> status
         self._pending_exit_terminal: dict[int, TerminalStatus] = {}  # exit order_id -> status
+        self._unregistered_fills: dict[int, list[FillData]] = {}   # order_id -> fills (arrived before registration)
         self._buffer_lock = threading.Lock()
 
         # Failed order tracking
@@ -1022,9 +1023,12 @@ class IBOrderHandler:
         elif order_id in self._failed_orders:
             self._on_failed_entry_fill(order_id, fill_data)
         else:
-            # Unknown order — could be foreign or from before restart
+            # Order not yet registered — race between place_order() return
+            # and IB fill callback. Buffer for drain when registration arrives.
+            with self._buffer_lock:
+                self._unregistered_fills.setdefault(order_id, []).append(fill_data)
             logger.warning("Fill for unregistered order %d: %d shares @ $%.2f "
-                           "(exec_id=%s). NOT auto-cancelling.",
+                           "(exec_id=%s). Buffered for late registration.",
                            order_id, fill_shares, fill_price, exec_id)
 
     def _on_entry_fill(self, order_id: int, fill: FillData):
@@ -1467,7 +1471,14 @@ class IBOrderHandler:
         # Drain fills first
         with self._buffer_lock:
             fills = self._pending_fills.pop(order_id, [])
+            # Also drain fills that arrived before order was registered
+            late_fills = self._unregistered_fills.pop(order_id, [])
+            fills.extend(late_fills)
             terminal = self._pending_terminal.pop(order_id, None)
+
+        if late_fills:
+            logger.info("Draining %d late-registered fills for entry order %d (trade %d)",
+                        len(late_fills), order_id, trade_id)
 
         for fill in fills:
             self._apply_entry_fill(trade_id, fill, ctx)
@@ -1483,7 +1494,14 @@ class IBOrderHandler:
 
         with self._buffer_lock:
             fills = self._pending_exit_fills.pop(exit_order_id, [])
+            # Also drain fills that arrived before order was registered
+            late_fills = self._unregistered_fills.pop(exit_order_id, [])
+            fills.extend(late_fills)
             terminal = self._pending_exit_terminal.pop(exit_order_id, None)
+
+        if late_fills:
+            logger.info("Draining %d late-registered fills for exit order %d (trade %d)",
+                        len(late_fills), exit_order_id, trade_id)
 
         for fill in fills:
             self._apply_exit_fill(trade_id, fill, ctx)
