@@ -268,6 +268,12 @@ class LiveEngine:
         if tf != '1min':
             return
         remaining = []
+        # Use wall-clock Eastern time for RTH check — bar timestamps may be
+        # in the server's local timezone (CDT), not ET
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo
+        now_et = _dt.now(ZoneInfo('US/Eastern')).time()
+
         for pending in self._pending_entries:
             # Check enabled gate at fill time (algo may have been disabled since queued)
             if not self._algo_enabled.get(pending.algo.algo_id, True):
@@ -276,8 +282,9 @@ class LiveEngine:
                 continue  # Drop the pending entry
 
             if pending.fill_at == 'next_rth_open':
-                # Live bars are end-indexed: the 9:30-9:31 bar has time=9:31
-                if time.time() == dt.time(9, 31):
+                # RTH opens at 9:30 ET; first end-indexed 1-min bar = 9:31 ET
+                # Use wall-clock ET time (server may be in CDT/PST/etc.)
+                if dt.time(9, 31) <= now_et < dt.time(9, 35):
                     self._execute_entry(pending.algo, pending.signal,
                                         bar['open'], deferred_ib_ops)
                 else:
@@ -378,6 +385,8 @@ class LiveEngine:
                 el_flagged=signal.metadata.get('el_flagged', False),
                 trail_width_mult=signal.metadata.get('trail_width_mult', 1.0),
                 entry_price=fill_price,
+                stop_pct=signal.stop_pct,
+                tp_pct=signal.tp_pct,
             )
             if deferred_ib_ops is not None:
                 epoch_at_signal = self._kill_epoch
@@ -443,19 +452,22 @@ class LiveEngine:
             if not algo:
                 return
             if is_entry:
-                pos = self._get_positions(algo)
-                for p in pos:
-                    if p.pos_id == str(trade_id):
-                        algo.on_position_opened(p)
-                        # Persist algo state
-                        state = algo.serialize_state(p.pos_id)
-                        if state:
-                            metadata = json.loads(
-                                trade.get('metadata', '{}') or '{}')
-                            metadata['algo_state'] = state
-                            self._db.update_trade_state(
-                                trade_id, metadata=json.dumps(metadata))
-                        break
+                # Only initialize algo state on first fill, not partial follow-ups
+                prior_filled = (trade.get('filled_shares', 0) or 0) - fill_qty
+                if prior_filled <= 0:
+                    pos = self._get_positions(algo)
+                    for p in pos:
+                        if p.pos_id == str(trade_id):
+                            algo.on_position_opened(p)
+                            # Persist algo state
+                            state = algo.serialize_state(p.pos_id)
+                            if state:
+                                metadata = json.loads(
+                                    trade.get('metadata', '{}') or '{}')
+                                metadata['algo_state'] = state
+                                self._db.update_trade_state(
+                                    trade_id, metadata=json.dumps(metadata))
+                            break
             else:
                 # Adapt dict to have pos_id attribute for algo.on_fill()
                 class _TradeProxy:
@@ -498,8 +510,9 @@ class LiveEngine:
     # ── UI Mutation Methods (all acquire _eval_lock) ──
 
     def kill_all(self):
-        """Disable all algos, purge pending entries, cancel IB pending orders."""
-        deferred_cancels = []
+        """Disable all algos, purge pending entries, cancel IB pending + stop orders."""
+        deferred_entry_cancels = []
+        deferred_stop_cancels = []
         with self._eval_lock:
             # Save pre-kill state for unkill restore
             self._pre_kill_snapshot = dict(self._algo_enabled)
@@ -509,23 +522,44 @@ class LiveEngine:
             # Purge pending entries
             n_purged = len(self._pending_entries)
             self._pending_entries.clear()
-            # Collect IB cancels (deferred outside lock)
+            # Collect pending entry order cancels
             if self._orders:
                 for order_id in list(self._orders._entry_orders):
                     ctx = self._orders._entry_orders[order_id]
                     if not ctx.get('trade_id'):
-                        # Still pending DB write — cancel IB order
-                        deferred_cancels.append(order_id)
-            logger.warning("LiveEngine: kill_all — epoch=%d, purged=%d pending entries",
-                           self._kill_epoch, n_purged)
+                        deferred_entry_cancels.append(order_id)
+            # Collect resting stop order cancels (leaves positions unprotected!)
+            if self._orders and self._db:
+                try:
+                    open_trades = self._db.get_open_trades(source='ib')
+                    for trade in open_trades:
+                        stop_oid = trade.get('ib_stop_order_id')
+                        if stop_oid:
+                            deferred_stop_cancels.append(
+                                (stop_oid, trade['id']))
+                except Exception as e:
+                    logger.error("kill_all: failed to get open trades: %s", e)
+            logger.warning("LiveEngine: kill_all — epoch=%d, purged=%d entries, "
+                           "%d stops to cancel",
+                           self._kill_epoch, n_purged, len(deferred_stop_cancels))
 
         # Cancel IB orders outside lock
-        for oid in deferred_cancels:
+        for oid in deferred_entry_cancels:
             try:
                 self._orders.ib.cancel_order(oid)
                 logger.info("kill_all: cancelled IB entry order %d", oid)
             except Exception as e:
-                logger.error("kill_all: failed to cancel order %d: %s", oid, e)
+                logger.error("kill_all: failed to cancel entry %d: %s", oid, e)
+        for stop_oid, trade_id in deferred_stop_cancels:
+            try:
+                # NULL the stop in DB before cancelling
+                self._db.update_trade_state(trade_id, ib_stop_order_id=None)
+                self._orders.ib.cancel_order(stop_oid)
+                logger.info("kill_all: cancelled resting stop %d (trade %d)",
+                            stop_oid, trade_id)
+            except Exception as e:
+                logger.error("kill_all: failed to cancel stop %d: %s",
+                             stop_oid, e)
 
     def unkill(self):
         """Restore pre-kill enabled state (or enable all if no snapshot)."""

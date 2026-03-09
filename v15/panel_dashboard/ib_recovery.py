@@ -249,14 +249,19 @@ def wire_exec_details_callbacks(state):
 
     handler = state.ib_order_handler
 
-    # Wire execDetailsEvent for fill tracking
+    # Wire execDetailsEvent for fill tracking (global — persists across reconnects)
     state.ib_client.ib.execDetailsEvent += handler.on_exec_details
 
-    # Wire statusEvent on existing trades for stop monitoring
-    for trade in state.ib_client.ib.openTrades():
-        trade.statusEvent += handler.on_order_status
+    # Register handler.on_order_status as a global status callback on IBClient.
+    # This fires for ALL orders (existing + post-startup) via _on_order_status,
+    # replacing the old per-trade wiring which missed post-startup orders.
+    state.ib_client.register_order_status_callback(handler.on_order_status)
 
-    logger.info("execDetailsEvent + statusEvent wired")
+    # Wire IBClient._on_order_status on existing trades so the callback chain fires
+    for trade in state.ib_client.ib.openTrades():
+        trade.statusEvent += state.ib_client._on_order_status
+
+    logger.info("execDetailsEvent + statusEvent wired (global callback)")
 
 
 def reconcile_ib_db(state):

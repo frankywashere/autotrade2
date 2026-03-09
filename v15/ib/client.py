@@ -40,6 +40,10 @@ class IBClient:
         self._order_lock = threading.Lock()
         self._order_time_cache = {}  # {perm_id: (order_time, sort_time)} for stable timestamps
         self._order_log_version = 0  # Bumped on any change
+        # External callbacks
+        self._order_status_external = None   # IBOrderHandler.on_order_status
+        self._reconnect_callbacks = []       # fired after IB reconnect
+
         # Account data (cached from IB event loop, read from Panel thread)
         self._account = {}         # {tag: value}
         self._account_lock = threading.Lock()
@@ -75,6 +79,7 @@ class IBClient:
     async def _connect_and_run(self):
         """Connect and keep running. Auto-reconnect on disconnect."""
         delay = self._reconnect_delay
+        first_connect = True
         # Monkey-patch ib_async wrapper to preserve completedTime on Trade objects.
         # ib_async discards OrderState (which has completedTime) when building Trade
         # from completed orders — we patch to save it on OrderStatus as a custom attr.
@@ -118,6 +123,27 @@ class IBClient:
 
                 # Fetch all open + completed orders from IB
                 await self._sync_orders_from_ib()
+
+                # On reconnect (not first connect): re-wire statusEvent on new
+                # Trade objects and fire reconnect callbacks in a separate thread
+                # to avoid deadlocking the IB event loop (callbacks may call
+                # fetch_historical which uses run_coroutine_threadsafe on this loop).
+                if not first_connect:
+                    for trade in self.ib.openTrades():
+                        trade.statusEvent += self._on_order_status
+                    if self._reconnect_callbacks:
+                        import threading as _th
+                        def _fire_reconnect_cbs(cbs=list(self._reconnect_callbacks)):
+                            for cb in cbs:
+                                try:
+                                    cb()
+                                except Exception as e:
+                                    logger.error("Reconnect callback failed: %s", e)
+                        _th.Thread(target=_fire_reconnect_cbs, daemon=True,
+                                   name='ib-reconnect-cb').start()
+                        logger.info("IB reconnected — fired %d callbacks in background",
+                                    len(self._reconnect_callbacks))
+                first_connect = False
 
                 # Run until disconnected
                 while self.ib.isConnected():
@@ -511,6 +537,12 @@ class IBClient:
         order_id = trade.order.orderId
         status = trade.orderStatus.status
         logger.info("Order %d status: %s", order_id, status)
+        # Forward to external handler (IBOrderHandler) for terminal status tracking
+        if self._order_status_external:
+            try:
+                self._order_status_external(trade)
+            except Exception as e:
+                logger.error("External order status callback failed: %s", e)
         # Schedule a re-sync to update the blotter from IB source of truth
         if self._loop and self._connected:
             asyncio.run_coroutine_threadsafe(self._sync_orders_from_ib(), self._loop)
@@ -740,6 +772,17 @@ class IBClient:
         """Return the current order log version (for change detection)."""
         with self._order_lock:
             return self._order_log_version
+
+    def register_order_status_callback(self, callback):
+        """Register external callback for order status events (e.g., IBOrderHandler).
+
+        Called from _on_order_status for every status change on every order.
+        """
+        self._order_status_external = callback
+
+    def register_reconnect_callback(self, callback):
+        """Register callback fired after IB auto-reconnect."""
+        self._reconnect_callbacks.append(callback)
 
     def sync_orders(self):
         """Thread-safe trigger to re-sync orders from IB."""

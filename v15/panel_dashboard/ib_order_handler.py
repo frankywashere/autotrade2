@@ -177,7 +177,8 @@ class IBOrderHandler:
                     signal_type: str, trail_width: float = 0.01,
                     ou_half_life: float = 5.0, el_flagged: bool = False,
                     trail_width_mult: float = 1.0,
-                    entry_price: float = 0.0) -> Optional[int]:
+                    entry_price: float = 0.0,
+                    stop_pct: float = 0.0, tp_pct: float = 0.0) -> Optional[int]:
         """Place an IB entry order with two-phase commit.
 
         Returns trade_id on success, None on failure.
@@ -210,6 +211,7 @@ class IBOrderHandler:
             'algo_id': algo_id, 'direction': direction,
             'stop_price': stop_price, 'tp_price': tp_price,
             'shares': shares, 'signal_type': signal_type,
+            'stop_pct': stop_pct, 'tp_pct': tp_pct,
         }
 
         # Step 3: Insert DB row with pending status
@@ -281,7 +283,7 @@ class IBOrderHandler:
 
         result = self.ib.place_order(
             'TSLA', close_action, qty, 'STP', price=stop_price,
-            order_ref=order_ref)
+            order_ref=order_ref, outside_rth=True)
 
         if 'error' in result:
             logger.critical("EMERGENCY STOP FAILED for entry %d: %s — "
@@ -425,7 +427,7 @@ class IBOrderHandler:
 
         result = self.ib.place_order(
             'TSLA', close_action, qty, 'STP', price=stop_price,
-            order_ref=order_ref)
+            order_ref=order_ref, outside_rth=True)
 
         if 'error' in result:
             logger.error("Protective stop failed for trade %d: %s",
@@ -494,6 +496,10 @@ class IBOrderHandler:
 
     def modify_trailing_stop(self, trade_id: int, new_stop_price: float):
         """Update the resting IB stop to a new price level (trailing ratchet)."""
+        # Guard: skip if exit is already in progress (stop may have been cancelled)
+        if self._exit_in_progress.get(trade_id):
+            return
+
         trade = self._get_trade(trade_id)
         if not trade:
             return
@@ -628,11 +634,26 @@ class IBOrderHandler:
             'open_shares': new_filled,  # open = filled (no exits yet)
         }
 
-        # First fill: update entry_time to broker timestamp
+        # First fill: update entry_time to broker timestamp + recalculate stop/TP
         if old_filled == 0:
             updates['entry_time'] = fill.time
             updates['best_price'] = fill.price
             updates['worst_price'] = fill.price
+            # Recalculate stop/TP from actual fill price (not estimated)
+            # This corrects for MKT order slippage
+            s_pct = ctx.get('stop_pct', 0)
+            t_pct = ctx.get('tp_pct', 0)
+            direction = trade.get('direction', ctx.get('direction', 'long'))
+            if s_pct > 0:
+                if direction == 'long':
+                    updates['stop_price'] = fill.price * (1 - s_pct)
+                else:
+                    updates['stop_price'] = fill.price * (1 + s_pct)
+            if t_pct > 0:
+                if direction == 'long':
+                    updates['tp_price'] = fill.price * (1 + t_pct)
+                else:
+                    updates['tp_price'] = fill.price * (1 - t_pct)
 
         # Update fill status
         if new_filled >= total_shares:
@@ -652,8 +673,11 @@ class IBOrderHandler:
                      trade_id, new_filled, total_shares, fill.price, new_avg)
 
         # Place/resize protective stop on EVERY fill
+        # Use recalculated stop from updates (actual fill price) if available,
+        # otherwise fall back to DB value (which may be stale pre-update)
         direction = trade.get('direction', ctx.get('direction', 'long'))
-        stop_price = trade.get('stop_price', ctx.get('stop_price', 0))
+        stop_price = updates.get('stop_price',
+                                  trade.get('stop_price', ctx.get('stop_price', 0)))
         self.place_or_resize_stop(trade_id, stop_price, new_filled, direction)
 
         self._state.positions_version += 1

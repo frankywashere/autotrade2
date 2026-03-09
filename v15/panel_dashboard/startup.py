@@ -225,11 +225,18 @@ def _wire_tick_to_bar_feed(state, data):
     overwriting the existing 5-min TSLA aggregator used by the old scanner system).
     A daemon thread watches for completed bars and routes them to
     LiveDataProvider.on_1min_close().
+
+    Bar timestamps are converted from local time to naive ET (matching IB historical
+    bar timestamps). This is critical when the server runs in CDT/PST/etc. —
+    all boundary checks (RTH open at 9:31, daily close at 16:00, 4h at 13:00/16:00)
+    assume Eastern time.
     """
     import threading
     import time as _time
+    from zoneinfo import ZoneInfo
     import pandas as pd
 
+    ET = ZoneInfo('US/Eastern')
     symbols = ['TSLA', 'SPY', 'VIX']
     aggregators = {}
     for symbol in symbols:
@@ -251,8 +258,12 @@ def _wire_tick_to_bar_feed(state, data):
                     with agg._lock:
                         new_bars = list(agg._completed_bars[consumed[symbol]:])
                     for bar in new_bars:
-                        # bar['time'] is bar start; end-index = start + 1 min
-                        bar_time = pd.Timestamp(bar['time']) + pd.Timedelta(minutes=1)
+                        # bar['time'] is naive local datetime from datetime.now().
+                        # Convert to naive ET (matching IB historical bars).
+                        bar_local = bar['time']
+                        bar_et = bar_local.astimezone().astimezone(ET).replace(
+                            tzinfo=None)
+                        bar_time = pd.Timestamp(bar_et) + pd.Timedelta(minutes=1)
                         try:
                             data.on_1min_close(symbol, bar_time, bar)
                         except Exception as e:
@@ -266,6 +277,27 @@ def _wire_tick_to_bar_feed(state, data):
     t = threading.Thread(target=_feed_loop, daemon=True, name='TickToBarFeed')
     t.start()
     logger.info("Tick-to-bar feed started for %s", symbols)
+
+    # Register reconnect callback: re-seed exec_ids + backfill data gaps
+    def _on_ib_reconnect():
+        logger.info("IB reconnected — running mid-session recovery")
+        handler = getattr(state, 'ib_order_handler', None)
+        if handler:
+            try:
+                fills = state.ib_client.ib.fills()
+                for fill in fills:
+                    handler.seen_exec_ids.add(fill.execution.execId)
+                logger.info("Re-seeded seen_exec_ids: %d", len(handler.seen_exec_ids))
+            except Exception as e:
+                logger.error("Mid-session re-seed failed: %s", e)
+        # Backfill 1-min bars for any gap
+        for sym in symbols:
+            try:
+                data.backfill_gap(sym, pd.Timestamp.now() - pd.Timedelta(hours=1))
+            except Exception as e:
+                logger.error("Backfill %s failed: %s", sym, e)
+
+    state.ib_client.register_reconnect_callback(_on_ib_reconnect)
 
 
 def reload_degraded_state(state):
