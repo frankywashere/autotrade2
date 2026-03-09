@@ -397,6 +397,33 @@ class IBOrderHandler:
 
     # ── Exit Flow ───────────────────────────────────────────────────
 
+    def _get_exit_routing(self) -> dict:
+        """Determine order routing based on current market session.
+
+        Returns dict with keys: overnight, outside_rth.
+        - RTH (9:30-16:00 ET): MKT on SMART
+        - Extended (4:00-9:30 or 16:00-20:00 ET): MKT on SMART + outsideRth
+        - Overnight (20:00-4:00 ET): LMT on OVERNIGHT (Blue Ocean)
+        """
+        now = datetime.now(ZoneInfo('America/New_York'))
+        t = now.hour * 60 + now.minute  # minutes since midnight ET
+
+        if now.weekday() >= 5:
+            logger.info("Exit routing: weekend — order will queue until next session")
+
+        # RTH: 9:30-16:00 ET
+        if 570 <= t < 960:
+            return {'overnight': False, 'outside_rth': False}
+        # Extended pre-market: 4:00-9:30 ET
+        elif 240 <= t < 570:
+            return {'overnight': False, 'outside_rth': True}
+        # Extended after-hours: 16:00-20:00 ET
+        elif 960 <= t < 1200:
+            return {'overnight': False, 'outside_rth': True}
+        # Overnight: 20:00-4:00 ET (or weekend)
+        else:
+            return {'overnight': True, 'outside_rth': False}
+
     def place_exit(self, trade_id: int, exit_reason: str,
                    exit_price: float = 0.0) -> bool:
         """Place an IB exit order with two-phase commit.
@@ -509,14 +536,59 @@ class IBOrderHandler:
                     logger.warning("Stop cancel timeout for trade %d (stop=%d) — "
                                    "proceeding cautiously", trade_id, stop_order_id)
 
+        # Safety net: scan broker for ANY in-flight stop orders for this trade
+        # that DB doesn't know about (e.g., stop timed out → ib_stop_order_id=NULL)
+        stop_ref = f'stop:{trade_id}'
+        try:
+            for bt in self.ib.ib.openTrades():
+                ref = getattr(bt.order, 'orderRef', '') or ''
+                if ref.startswith(stop_ref):
+                    oid = bt.order.orderId
+                    if bt.orderStatus.status in ('PreSubmitted', 'Submitted',
+                                                  'PendingSubmit'):
+                        logger.warning("place_exit: found untracked stop %d "
+                                       "(ref=%s) for trade %d — cancelling",
+                                       oid, ref, trade_id)
+                        self._exit_in_progress[trade_id] = True
+                        self.ib.cancel_order(oid)
+        except Exception as e:
+            logger.warning("place_exit: broker stop scan failed: %s — "
+                           "proceeding cautiously", e)
+
         # Step 3: Place closing order
         order_ref = f'exit:{trade_id}'
         model_code = trade.get('algo_id') if self._state.fa_supported else None
 
-        result = self.ib.place_order(
-            'TSLA', close_action, effective_open, 'MKT',
-            tif='GTC', outside_rth=True,
-            order_ref=order_ref, model_code=model_code)
+        # Session-aware routing
+        routing = self._get_exit_routing()
+        if routing['overnight']:
+            # Overnight (Blue Ocean ATS) — LMT at aggressive price, no MKT available
+            price_data = self.ib.get_price_data('TSLA')
+            bid = price_data.get('bid', 0) or 0
+            ask = price_data.get('ask', 0) or 0
+            if bid > 0 and ask > 0:
+                lmt_price = round((bid + ask) / 2, 2)
+            else:
+                lmt_price = getattr(self._state, 'tsla_price', 0) or 0
+            if lmt_price <= 0:
+                logger.error("place_exit: no price available for overnight LMT — "
+                             "aborting exit for trade %d", trade_id)
+                self._exit_in_progress.pop(trade_id, None)
+                return False
+            # Sell aggressively: use bid for sells, ask for buys
+            if close_action == 'SELL' and bid > 0:
+                lmt_price = round(bid - 0.01, 2)
+            elif close_action == 'BUY' and ask > 0:
+                lmt_price = round(ask + 0.01, 2)
+            result = self.ib.place_order(
+                'TSLA', close_action, effective_open, 'LMT',
+                price=lmt_price, tif='DAY', overnight=True,
+                order_ref=order_ref, model_code=model_code)
+        else:
+            result = self.ib.place_order(
+                'TSLA', close_action, effective_open, 'MKT',
+                tif='GTC', outside_rth=routing['outside_rth'],
+                order_ref=order_ref, model_code=model_code)
 
         if 'error' in result:
             logger.error("Exit order failed for trade %d: %s",

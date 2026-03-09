@@ -800,6 +800,7 @@ class IBClient:
                 'fill_price': fill_price,
                 'fill_time': fill_time,
                 'exchange': getattr(contract, 'exchange', ''),
+                'order_ref': getattr(order, 'orderRef', ''),
             }
         except Exception as e:
             logger.error("_trade_to_entry failed: %s", e)

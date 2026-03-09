@@ -334,7 +334,11 @@ def order_entry_panel(state) -> pn.Column:
                 color = '#00e676'
             elif status in ('Submitted', 'PreSubmitted', 'PendingSubmit'):
                 color = '#ffab00'
-                pending_ids.append(entry.get('perm_id') or entry['order_id'])
+                # Only show cancel for manual orders, not algo-managed ones
+                ref = entry.get('order_ref', '')
+                algo_prefixes = ('stop:', 'exit:', 'entry:', 'emstop:', 'counter:')
+                if not ref.startswith(algo_prefixes):
+                    pending_ids.append(entry.get('perm_id') or entry['order_id'])
             elif 'Cancel' in status:
                 color = '#ff5252'
             elif 'Reject' in status or 'Inactive' in status:
