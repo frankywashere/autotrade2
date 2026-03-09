@@ -400,9 +400,9 @@ class IBOrderHandler:
     def _get_exit_routing(self) -> dict:
         """Determine order routing based on current market session.
 
-        Returns dict with keys: overnight, outside_rth.
+        Returns dict with keys: session, overnight, outside_rth.
         - RTH (9:30-16:00 ET): MKT on SMART
-        - Extended (4:00-9:30 or 16:00-20:00 ET): MKT on SMART + outsideRth
+        - Extended (4:00-9:30 or 16:00-20:00 ET): LMT on SMART + outsideRth
         - Overnight (20:00-4:00 ET): LMT on OVERNIGHT (Blue Ocean)
         """
         now = datetime.now(ZoneInfo('America/New_York'))
@@ -413,16 +413,16 @@ class IBOrderHandler:
 
         # RTH: 9:30-16:00 ET
         if 570 <= t < 960:
-            return {'overnight': False, 'outside_rth': False}
+            return {'session': 'rth', 'overnight': False, 'outside_rth': False}
         # Extended pre-market: 4:00-9:30 ET
         elif 240 <= t < 570:
-            return {'overnight': False, 'outside_rth': True}
+            return {'session': 'extended', 'overnight': False, 'outside_rth': True}
         # Extended after-hours: 16:00-20:00 ET
         elif 960 <= t < 1200:
-            return {'overnight': False, 'outside_rth': True}
+            return {'session': 'extended', 'overnight': False, 'outside_rth': True}
         # Overnight: 20:00-4:00 ET (or weekend)
         else:
-            return {'overnight': True, 'outside_rth': False}
+            return {'session': 'overnight', 'overnight': True, 'outside_rth': False}
 
     def place_exit(self, trade_id: int, exit_reason: str,
                    exit_price: float = 0.0) -> bool:
@@ -561,8 +561,15 @@ class IBOrderHandler:
 
         # Session-aware routing
         routing = self._get_exit_routing()
-        if routing['overnight']:
-            # Overnight (Blue Ocean ATS) — LMT at aggressive price, no MKT available
+        session = routing['session']
+
+        if session == 'rth':
+            # Regular hours — MKT fills immediately
+            result = self.ib.place_order(
+                'TSLA', close_action, effective_open, 'MKT',
+                tif='GTC', order_ref=order_ref, model_code=model_code)
+        else:
+            # Extended hours or overnight — must use LMT
             price_data = self.ib.get_price_data('TSLA')
             bid = price_data.get('bid', 0) or 0
             ask = price_data.get('ask', 0) or 0
@@ -571,24 +578,25 @@ class IBOrderHandler:
             else:
                 lmt_price = getattr(self._state, 'tsla_price', 0) or 0
             if lmt_price <= 0:
-                logger.error("place_exit: no price available for overnight LMT — "
-                             "aborting exit for trade %d", trade_id)
+                logger.error("place_exit: no price available for %s LMT — "
+                             "aborting exit for trade %d", session, trade_id)
                 self._exit_in_progress.pop(trade_id, None)
                 return False
-            # Sell aggressively: use bid for sells, ask for buys
+            # Aggressive pricing to ensure fill
             if close_action == 'SELL' and bid > 0:
                 lmt_price = round(bid - 0.01, 2)
             elif close_action == 'BUY' and ask > 0:
                 lmt_price = round(ask + 0.01, 2)
+
+            overnight = session == 'overnight'
             result = self.ib.place_order(
                 'TSLA', close_action, effective_open, 'LMT',
-                price=lmt_price, tif='DAY', overnight=True,
+                price=lmt_price, tif='DAY',
+                outside_rth=routing['outside_rth'],
+                overnight=overnight,
                 order_ref=order_ref, model_code=model_code)
-        else:
-            result = self.ib.place_order(
-                'TSLA', close_action, effective_open, 'MKT',
-                tif='GTC', outside_rth=routing['outside_rth'],
-                order_ref=order_ref, model_code=model_code)
+            logger.info("Exit LMT placed: %s %d @ $%.2f (session=%s, overnight=%s)",
+                        close_action, effective_open, lmt_price, session, overnight)
 
         if 'error' in result:
             logger.error("Exit order failed for trade %d: %s",
