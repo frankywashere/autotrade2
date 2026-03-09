@@ -97,6 +97,14 @@ class LiveEngine:
         executes them AFTER releasing _eval_lock to prevent deadlock
         (IB fill callbacks need to acquire _eval_lock).
         """
+        # Normalize to tz-naive — bar DataFrames from historical seeding are
+        # tz-naive, but live bar timestamps from tick aggregators are tz-aware ET.
+        # All algo comparisons (df.index <= time) require consistent tz.
+        if hasattr(time, 'tz') and time.tz is not None:
+            time = time.tz_localize(None)
+        elif hasattr(time, 'tzinfo') and time.tzinfo is not None:
+            time = time.replace(tzinfo=None)
+
         logger.info("Bar close: %s @ %s  O=%.2f H=%.2f L=%.2f C=%.2f",
                      tf, time, bar.get('open', 0), bar.get('high', 0),
                      bar.get('low', 0), bar.get('close', 0))
