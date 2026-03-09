@@ -531,8 +531,9 @@ class IntradayAlgo(AlgoBase):
         if open_positions:
             return []
 
-        # Check max trades per day
-        if self._trades_today >= params.get('max_trades_per_day', 30):
+        # Check max trades per day (0 = unlimited)
+        max_trades = params.get('max_trades_per_day', 0)
+        if max_trades > 0 and self._trades_today >= max_trades:
             return []
 
         # Check intraday window

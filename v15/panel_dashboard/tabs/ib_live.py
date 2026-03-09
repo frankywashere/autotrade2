@@ -86,7 +86,7 @@ def _algo_pnl_summary(state):
             open_trades = db.get_open_trades(source='ib', algo_id=algo_id)
             closed = db.get_closed_trades(source='ib', algo_id=algo_id)
 
-            total_pnl = sum(t.get('pnl', 0) for t in closed)
+            total_pnl = sum(t.get('pnl') or 0 for t in closed)
             # Today's realized P&L (trades closed today ET)
             today_et = pd.Timestamp.now(tz='US/Eastern').date()
             day_pnl = 0
@@ -101,13 +101,13 @@ def _algo_pnl_summary(state):
                         else:
                             ts = ts.tz_convert('US/Eastern')
                         if ts.date() == today_et:
-                            day_pnl += t.get('pnl', 0)
+                            day_pnl += t.get('pnl') or 0
                             day_trades += 1
                     except Exception:
                         pass
             n_trades = len(closed)
             n_open = len(open_trades)
-            wins = sum(1 for t in closed if t.get('pnl', 0) > 0)
+            wins = sum(1 for t in closed if (t.get('pnl') or 0) > 0)
             wr = (wins / n_trades * 100) if n_trades > 0 else 0
 
             # Live unrealized P&L
@@ -265,7 +265,7 @@ def _trade_history(state):
 
         rows = []
         for t in trades:
-            pnl = t.get('pnl', 0)
+            pnl = t.get('pnl') or 0
             pnl_color = '#00e676' if pnl >= 0 else '#ff5252'
             direction = t.get('direction', 'long')
             dir_arrow = '\u25b2' if direction == 'long' else '\u25bc'

@@ -85,8 +85,23 @@ def create_live_engine(state):
     import datetime as dt
 
     try:
-        # Create LiveDataProvider
-        data = LiveDataProvider(ib_client=state.ib_client)
+        # Build pre-seeded data from state (avoid double IB historical fetch)
+        pre_seeded = None
+        ntf = getattr(state, 'native_tf_data', None) or {}
+        current_tsla = getattr(state, 'current_tsla', None)
+        if ntf or current_tsla is not None:
+            pre_seeded = {}
+            if current_tsla is not None and len(current_tsla) > 0:
+                pre_seeded.setdefault('TSLA', {})['5min'] = current_tsla
+            for symbol in ('TSLA', 'SPY', 'VIX'):
+                sym_data = ntf.get(symbol, {})
+                for tf in ('daily', 'weekly', 'monthly', '1h'):
+                    df = sym_data.get(tf)
+                    if df is not None and len(df) > 0:
+                        pre_seeded.setdefault(symbol, {})[tf] = df
+
+        # Create LiveDataProvider (shares pre-seeded data to avoid IB pacing issues)
+        data = LiveDataProvider(ib_client=state.ib_client, pre_seeded=pre_seeded)
         state.live_data_provider = data
 
         # Create algo instances for IB execution
@@ -113,7 +128,7 @@ def create_live_engine(state):
                 active_start=dt.time(9, 30), active_end=dt.time(15, 25),
                 params={
                     'flat_sizing': True,
-                    'max_trades_per_day': 30,
+                    'max_trades_per_day': 0,  # 0 = unlimited
                     'trail_base': 0.006,
                     'trail_power': 6,
                     'trail_floor': 0.0,
@@ -286,9 +301,11 @@ def _wire_tick_to_bar_feed(state, data):
     t.start()
     logger.info("Tick-to-bar feed started for %s", symbols)
 
-    # Register reconnect callback: re-seed exec_ids + backfill data gaps
+    # Register reconnect callback: full mid-session recovery
     def _on_ib_reconnect():
         logger.info("IB reconnected — running mid-session recovery")
+
+        # 1. Re-seed exec IDs (prevent double-counting replayed fills)
         handler = getattr(state, 'ib_order_handler', None)
         if handler:
             try:
@@ -298,7 +315,42 @@ def _wire_tick_to_bar_feed(state, data):
                 logger.info("Re-seeded seen_exec_ids: %d", len(handler.seen_exec_ids))
             except Exception as e:
                 logger.error("Mid-session re-seed failed: %s", e)
-        # Backfill 1-min bars for any gap
+
+        # 2. Sync open-order cache (so recovery sees current broker state)
+        try:
+            state.ib_client.sync_orders()
+            import time as _time
+            sync_task = getattr(state.ib_client, '_sync_task', None)
+            if sync_task:
+                try:
+                    sync_task.result(timeout=10)
+                except Exception as e:
+                    logger.warning("Reconnect sync_orders wait failed: %s", e)
+        except Exception as e:
+            logger.error("Reconnect sync_orders failed: %s", e)
+
+        # 3. Run inflight recovery (checks if stops/exits filled while disconnected)
+        try:
+            from v15.panel_dashboard.ib_recovery import recover_inflight_orders
+            recover_inflight_orders(state)
+        except Exception as e:
+            logger.error("Reconnect recovery failed: %s", e)
+
+        # 4. Re-wire statusEvent on new Trade objects (IB creates fresh objects on reconnect)
+        try:
+            for trade in state.ib_client.ib.openTrades():
+                trade.statusEvent += state.ib_client._on_order_status
+        except Exception as e:
+            logger.error("Reconnect re-wire failed: %s", e)
+
+        # 5. Reconcile IB/DB positions
+        try:
+            from v15.panel_dashboard.ib_recovery import reconcile_ib_db
+            reconcile_ib_db(state)
+        except Exception as e:
+            logger.error("Reconnect reconciliation failed: %s", e)
+
+        # 6. Backfill 1-min bars for any gap
         for sym in symbols:
             try:
                 data.backfill_gap(sym, pd.Timestamp.now() - pd.Timedelta(hours=1))
@@ -339,9 +391,17 @@ def run_ib_recovery(state):
         seed_seen_exec_ids, wire_exec_details_callbacks,
     )
 
-    # 6b. Populate open-order cache
+    # 6b. Populate open-order cache (blocking — wait for completion)
     try:
         state.ib_client.sync_orders()
+        # Wait for the async sync to complete before scanning broker state
+        import time as _time
+        sync_task = getattr(state.ib_client, '_sync_task', None)
+        if sync_task:
+            try:
+                sync_task.result(timeout=10)
+            except Exception as e:
+                logger.warning("sync_orders async wait failed: %s", e)
         logger.info("Open-order cache populated")
     except Exception as e:
         logger.error("Failed to populate open-order cache: %s", e)

@@ -39,14 +39,30 @@ def scan_unlinked_orders(state):
     db = state.trade_db
     handler = state.ib_order_handler
 
-    # Get all open + completed orders from IB
+    # Get all open orders from IB
     try:
         open_trades = ib.ib.openTrades()
     except Exception as e:
         logger.error("scan_unlinked_orders: failed to get open trades: %s", e)
         return
 
-    for trade in open_trades:
+    # Also scan completed orders (catches fast fills during app downtime)
+    completed_trades = []
+    try:
+        completed_trades = ib.ib.trades()  # includes open + recently completed
+    except Exception as e:
+        logger.warning("scan_unlinked_orders: failed to get completed trades: %s", e)
+
+    # Merge: use all trades, dedup by orderId
+    seen_order_ids = set()
+    all_trades = []
+    for t in list(open_trades) + list(completed_trades):
+        oid = t.order.orderId
+        if oid not in seen_order_ids:
+            seen_order_ids.add(oid)
+            all_trades.append(t)
+
+    for trade in all_trades:
         order = trade.order
         order_ref = getattr(order, 'orderRef', '') or ''
         order_id = order.orderId
@@ -152,7 +168,7 @@ def scan_unlinked_orders(state):
             handler._exit_orders[order_id] = {
                 'trade_id': trade_id, 'exit_reason': 'recovered'}
 
-        elif order_ref.startswith('stop:'):
+        elif order_ref.startswith('stop:') or order_ref.startswith('emstop:'):
             try:
                 trade_id = int(order_ref.split(':')[1])
             except (ValueError, IndexError) as e:
@@ -161,15 +177,17 @@ def scan_unlinked_orders(state):
                 continue
             handler._stop_orders[order_id] = {'trade_id': trade_id}
 
-    logger.info("scan_unlinked_orders complete: processed %d open trades",
-                len(open_trades))
+    logger.info("scan_unlinked_orders complete: processed %d trades (%d open, %d total)",
+                len(all_trades), len(open_trades), len(all_trades))
 
 
 def recover_inflight_orders(state):
     """Step 6d: Recover pending/partial entries + exits + stops.
 
     Queries DB for open IB trades and reconciles with broker state.
-    execDetailsEvent is NOT wired yet — safe to apply historical fills.
+    Checks IB for fills that occurred while the app was down (e.g. stop
+    triggered during a restart). execDetailsEvent is NOT wired yet —
+    safe to apply historical fills.
     """
     if not state.ib_client or not state.ib_client.is_connected():
         return
@@ -177,9 +195,20 @@ def recover_inflight_orders(state):
     db = state.trade_db
     handler = state.ib_order_handler
 
+    # Build lookup: orderId → IB Trade object (open + recently completed)
+    all_broker_trades = {}
+    try:
+        for t in state.ib_client.ib.trades():
+            all_broker_trades[t.order.orderId] = t
+    except Exception as e:
+        logger.error("Recovery: failed to get broker trades: %s", e)
+
     # Get all open IB trades (including pending)
     open_trades = db.get_open_trades(source='ib', include_pending=True)
-    logger.info("Recovery: %d open IB trades to check", len(open_trades))
+    logger.info("Recovery: %d open IB trades to check (broker has %d trades)",
+                len(open_trades), len(all_broker_trades))
+
+    now_et = datetime.now(ET).isoformat()
 
     for trade in open_trades:
         trade_id = trade['id']
@@ -187,8 +216,112 @@ def recover_inflight_orders(state):
         direction = trade.get('direction', 'long')
         open_shares = trade.get('open_shares', 0)
 
-        # Register entry/exit/stop orders for fill routing
+        # ── Check pending entries against broker state ──
         entry_oid = trade.get('ib_entry_order_id')
+        if entry_oid and fill_status == 'pending' and entry_oid in all_broker_trades:
+            bt = all_broker_trades[entry_oid]
+            broker_status = bt.orderStatus.status
+            broker_filled = int(bt.orderStatus.filled or 0)
+            broker_avg = float(bt.orderStatus.avgFillPrice or 0)
+
+            if broker_status in ('Cancelled', 'Inactive', 'ApiCancelled') and broker_filled == 0:
+                # Entry was cancelled with no fills — delete the pending row
+                logger.warning("Recovery: pending entry %d is %s with 0 fills — "
+                               "deleting trade %d", entry_oid, broker_status, trade_id)
+                try:
+                    db.delete_trade(trade_id)
+                except Exception as e:
+                    logger.error("Recovery: failed to delete cancelled trade %d: %s",
+                                 trade_id, e)
+                continue
+
+            if broker_filled > 0 and fill_status == 'pending':
+                # Entry filled while app was down — apply to DB
+                logger.warning("Recovery: pending entry %d filled %d @ $%.2f — "
+                               "updating trade %d",
+                               entry_oid, broker_filled, broker_avg, trade_id)
+                try:
+                    fill_time = now_et
+                    if bt.fills:
+                        first_exec = bt.fills[0].execution
+                        fill_time = _broker_time_to_et(
+                            getattr(first_exec, 'time', None))
+                    db.update_trade_state(
+                        trade_id,
+                        entry_price=broker_avg, avg_fill_price=broker_avg,
+                        filled_shares=broker_filled, open_shares=broker_filled,
+                        ib_fill_status='filled', entry_time=fill_time,
+                    )
+                    # Update local state for subsequent stop/exit checks
+                    fill_status = 'filled'
+                    open_shares = broker_filled
+                except Exception as e:
+                    logger.error("Recovery: failed to apply entry fills for trade %d: %s",
+                                 trade_id, e)
+
+        # ── Check stops against broker state ──
+        stop_oid = trade.get('ib_stop_order_id')
+        if stop_oid and stop_oid in all_broker_trades:
+            bt = all_broker_trades[stop_oid]
+            broker_status = bt.orderStatus.status
+            broker_filled = int(bt.orderStatus.filled or 0)
+
+            if broker_filled > 0:
+                # Stop fired while app was down — close the trade
+                exit_price = float(bt.orderStatus.avgFillPrice or 0)
+                exit_time = now_et
+                if bt.fills:
+                    last_exec = bt.fills[-1].execution
+                    exit_time = _broker_time_to_et(
+                        getattr(last_exec, 'time', None))
+                logger.warning("Recovery: stop %d FILLED @ $%.2f for trade %d — "
+                               "closing in DB", stop_oid, exit_price, trade_id)
+                try:
+                    db.close_trade(trade_id, exit_time=exit_time,
+                                   exit_price=exit_price,
+                                   exit_reason='stop_filled_during_restart')
+                except Exception as e:
+                    logger.error("Recovery: failed to close trade %d after stop fill: %s",
+                                 trade_id, e)
+                continue  # Trade is closed — don't re-register
+
+            if broker_status in ('Cancelled', 'ApiCancelled') and broker_filled == 0:
+                # Stop was cancelled (e.g. by TWS user) — clear and re-arm below
+                logger.warning("Recovery: stop %d cancelled for trade %d — "
+                               "will re-arm", stop_oid, trade_id)
+                try:
+                    db.update_trade_state(trade_id, ib_stop_order_id=None)
+                except Exception as e:
+                    logger.error("Recovery: failed to clear stop_id for trade %d: %s",
+                                 trade_id, e)
+                stop_oid = None  # Force re-arm below
+
+        # ── Check exits against broker state ──
+        exit_oid = trade.get('ib_exit_order_id')
+        if exit_oid and exit_oid in all_broker_trades:
+            bt = all_broker_trades[exit_oid]
+            broker_filled = int(bt.orderStatus.filled or 0)
+
+            if broker_filled > 0:
+                # Exit filled while app was down — close the trade
+                exit_price = float(bt.orderStatus.avgFillPrice or 0)
+                exit_time = now_et
+                if bt.fills:
+                    last_exec = bt.fills[-1].execution
+                    exit_time = _broker_time_to_et(
+                        getattr(last_exec, 'time', None))
+                logger.warning("Recovery: exit %d FILLED @ $%.2f for trade %d — "
+                               "closing in DB", exit_oid, exit_price, trade_id)
+                try:
+                    db.close_trade(trade_id, exit_time=exit_time,
+                                   exit_price=exit_price,
+                                   exit_reason='exit_filled_during_restart')
+                except Exception as e:
+                    logger.error("Recovery: failed to close trade %d after exit fill: %s",
+                                 trade_id, e)
+                continue  # Trade is closed — don't re-register
+
+        # ── Register for fill routing (existing logic) ──
         if entry_oid:
             handler._entry_orders[entry_oid] = {
                 'trade_id': trade_id,
@@ -198,14 +331,12 @@ def recover_inflight_orders(state):
                 'tp_price': trade.get('tp_price', 0),
             }
 
-        exit_oid = trade.get('ib_exit_order_id')
         if exit_oid:
             handler._exit_orders[exit_oid] = {
                 'trade_id': trade_id,
                 'exit_reason': 'recovered',
             }
 
-        stop_oid = trade.get('ib_stop_order_id')
         if stop_oid:
             handler._stop_orders[stop_oid] = {'trade_id': trade_id}
 
@@ -312,8 +443,26 @@ def reconcile_ib_db(state):
         else:
             db_net -= open_shares
 
+    # Per-algo breakdown for visibility (helps debug multi-algo conflicts)
+    algo_ids = set(t.get('algo_id') for t in open_trades if t.get('algo_id'))
+    for algo_id in sorted(algo_ids):
+        algo_trades = [t for t in open_trades if t.get('algo_id') == algo_id]
+        algo_net = sum(
+            (t.get('open_shares', 0) if t.get('direction') == 'long'
+             else -t.get('open_shares', 0))
+            for t in algo_trades)
+        logger.info("  Algo %s: DB net=%d (%d trades)", algo_id, algo_net, len(algo_trades))
+
     if db_net == broker_net:
         logger.info("Reconciliation OK: broker=%d, DB=%d", broker_net, db_net)
+        # Auto-clear ib_degraded on successful reconciliation
+        if state.ib_degraded:
+            state.ib_degraded = False
+            try:
+                db.set_metadata('ib_degraded', '0')
+                logger.info("ib_degraded auto-cleared after successful reconciliation")
+            except Exception as e:
+                logger.error("Failed to clear ib_degraded: %s", e)
         return
 
     # Mismatch
@@ -321,15 +470,45 @@ def reconcile_ib_db(state):
                  broker_net, db_net, broker_net - db_net)
 
     if db_net != 0 and broker_net == 0:
-        # DB says open, broker is flat
-        logger.error("DB has positions but broker is flat — marking orphaned")
+        # DB says open, broker is flat — close all orphaned trades
+        # This happens when stops fill during restart or orders complete while app is down
+        logger.error("DB has positions but broker is flat — closing orphaned trades")
+        now_et = datetime.now(ET).isoformat()
         for t in open_trades:
             try:
-                db.update_trade_state(t['id'], ib_fill_status='orphaned')
-            except Exception as e:
-                logger.error("Failed to mark trade %d orphaned: %s", t['id'], e)
+                # Try to find the fill price from IB completed orders
+                exit_price = t.get('stop_price', t.get('entry_price', 0))
+                try:
+                    completed = state.ib_client.ib.trades()
+                    stop_oid = t.get('ib_stop_order_id')
+                    for ct in completed:
+                        if ct.order.orderId == stop_oid and ct.orderStatus.filled > 0:
+                            exit_price = float(ct.orderStatus.avgFillPrice)
+                            break
+                except Exception:
+                    pass  # Use stop_price as fallback
 
-    # Set degraded
+                db.close_trade(
+                    t['id'], exit_time=now_et,
+                    exit_price=exit_price,
+                    exit_reason='stop_filled_during_restart')
+                logger.warning("Closed orphaned trade %d: exit @ $%.2f (stop filled while app was down)",
+                               t['id'], exit_price)
+            except Exception as e:
+                logger.error("Failed to close orphaned trade %d: %s", t['id'], e)
+
+        # Broker is flat and we closed all DB trades — reconciliation is now clean
+        logger.info("All orphaned trades closed — reconciliation resolved (broker=0, DB=0)")
+        if state.ib_degraded:
+            state.ib_degraded = False
+            try:
+                db.set_metadata('ib_degraded', '0')
+                logger.info("ib_degraded auto-cleared after orphaned trade cleanup")
+            except Exception as e:
+                logger.error("Failed to clear ib_degraded: %s", e)
+        return
+
+    # Set degraded for other mismatches (non-zero on both sides)
     state.ib_degraded = True
     try:
         db.set_metadata('ib_degraded', '1')

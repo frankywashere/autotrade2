@@ -196,17 +196,27 @@ class LiveEngine:
                         self._pending_entries.append(PendingEntry(
                             signal=sig, algo=algo, queued_time=time,
                             fill_at=fill_at))
+                        self._persist_pending_entries()
+                        logger.info("Queued delayed entry for %s (%s, conf=%.2f, fill_at=%s)",
+                                    algo.algo_id, sig.direction, sig.confidence, fill_at)
                     else:
                         self._execute_entry(algo, sig, bar['close'],
                                             deferred_ib_ops)
 
     def _get_positions(self, algo):
-        """Get open positions for an algo from DB, convert to Position objects."""
+        """Get open positions for an algo from DB, convert to Position objects.
+
+        For IB algos (live_orders=True): passes source='ib' which excludes
+        pending rows (only partial/filled = real broker exposure).
+        For sim algos: passes engine source (e.g. 'yf').
+        """
         if not self._db:
             return []
         try:
             from v15.validation.unified_backtester.portfolio import Position
-            open_trades = self._db.get_open_trades(algo_id=algo.algo_id)
+            source = 'ib' if algo.config.live_orders else self._source
+            open_trades = self._db.get_open_trades(
+                algo_id=algo.algo_id, source=source)
             positions = []
             for trade in open_trades:
                 metadata = {}
@@ -328,7 +338,8 @@ class LiveEngine:
             if pending.fill_at == 'next_rth_open':
                 # RTH opens at 9:30 ET; first end-indexed 1-min bar = 9:31 ET
                 # Use wall-clock ET time (server may be in CDT/PST/etc.)
-                if dt.time(9, 31) <= now_et < dt.time(9, 35):
+                # Window is 9:31-9:45 to handle late first ticks after open
+                if dt.time(9, 31) <= now_et < dt.time(9, 45):
                     self._execute_entry(pending.algo, pending.signal,
                                         bar['open'], deferred_ib_ops)
                 else:
@@ -342,7 +353,11 @@ class LiveEngine:
                                         bar['open'], deferred_ib_ops)
             else:
                 remaining.append(pending)
+        n_before = len(self._pending_entries)
         self._pending_entries = remaining
+        # Update persisted entries if any were consumed or dropped
+        if n_before > 0 and len(remaining) < n_before:
+            self._persist_pending_entries()
 
     def _execute_entry(self, algo, signal, fill_price, deferred_ib_ops=None):
         """Place entry order or record sim trade."""
@@ -357,11 +372,11 @@ class LiveEngine:
             if self._db:
                 try:
                     if signal.direction == 'long':
-                        stop_price = fill_price * (1 - signal.stop_pct)
-                        tp_price = fill_price * (1 + signal.tp_pct)
+                        stop_price = round(fill_price * (1 - signal.stop_pct), 2)
+                        tp_price = round(fill_price * (1 + signal.tp_pct), 2)
                     else:
-                        stop_price = fill_price * (1 + signal.stop_pct)
-                        tp_price = fill_price * (1 - signal.tp_pct)
+                        stop_price = round(fill_price * (1 + signal.stop_pct), 2)
+                        tp_price = round(fill_price * (1 - signal.tp_pct), 2)
 
                     shares = signal.shares
                     if shares == 0:
@@ -410,11 +425,11 @@ class LiveEngine:
         # IB mode: defer order placement to prevent deadlock
         if self._orders:
             if signal.direction == 'long':
-                stop_price = fill_price * (1 - signal.stop_pct)
-                tp_price = fill_price * (1 + signal.tp_pct)
+                stop_price = round(fill_price * (1 - signal.stop_pct), 2)
+                tp_price = round(fill_price * (1 + signal.tp_pct), 2)
             else:
-                stop_price = fill_price * (1 + signal.stop_pct)
-                tp_price = fill_price * (1 - signal.tp_pct)
+                stop_price = round(fill_price * (1 + signal.stop_pct), 2)
+                tp_price = round(fill_price * (1 - signal.tp_pct), 2)
 
             shares = signal.shares
             if shares == 0:
@@ -555,8 +570,9 @@ class LiveEngine:
         if not self._db:
             return TradeContext()
         try:
+            source = 'ib' if algo.config.live_orders else self._source
             closed = self._db.get_closed_trades(algo_id=algo.algo_id,
-                                                 limit=10)
+                                                 source=source, limit=10)
             recent_dicts = [{'pnl': t.get('pnl', 0), 'pnl_pct': t.get('pnl_pct', 0)}
                             for t in (closed or [])]
             win_streak = 0
@@ -785,5 +801,78 @@ class LiveEngine:
                     algo._trades_today = len([t for t in today_trades
                                               if t.get('exit_time')])
 
+            # Recover pending entries from DB metadata
+            self._recover_pending_entries()
+
             logger.info("LiveEngine: recovery complete for %d algos",
                          len(self._algos))
+
+    def _persist_pending_entries(self):
+        """Persist pending delayed entries to DB metadata as JSON.
+
+        Called after queuing a delayed entry so it survives restarts.
+        Daily algos fire at 16:00 and queue for 9:31 next day — the
+        dashboard may restart overnight.
+        """
+        if not self._db:
+            return
+        try:
+            entries = []
+            for p in self._pending_entries:
+                entries.append({
+                    'algo_id': p.algo.algo_id,
+                    'direction': p.signal.direction,
+                    'confidence': p.signal.confidence,
+                    'stop_pct': p.signal.stop_pct,
+                    'tp_pct': p.signal.tp_pct,
+                    'signal_type': p.signal.signal_type,
+                    'shares': p.signal.shares,
+                    'metadata': p.signal.metadata,
+                    'queued_time': str(p.queued_time),
+                    'fill_at': p.fill_at,
+                })
+            self._db.set_metadata('pending_entries', json.dumps(entries))
+        except Exception as e:
+            logger.error("Failed to persist pending entries: %s", e)
+
+    def _recover_pending_entries(self):
+        """Recover pending delayed entries from DB metadata after restart."""
+        if not self._db:
+            return
+        try:
+            raw = self._db.get_metadata('pending_entries')
+            if not raw:
+                return
+            entries = json.loads(raw)
+            if not entries:
+                return
+            for entry in entries:
+                algo = self._algo_map.get(entry['algo_id'])
+                if not algo:
+                    logger.warning("Pending entry recovery: algo %s not found, skipping",
+                                   entry['algo_id'])
+                    continue
+                sig = Signal(
+                    algo_id=entry['algo_id'],
+                    direction=entry['direction'],
+                    price=0,  # Will be filled at bar open
+                    confidence=entry['confidence'],
+                    stop_pct=entry['stop_pct'],
+                    tp_pct=entry['tp_pct'],
+                    signal_type=entry.get('signal_type', ''),
+                    shares=entry.get('shares', 0),
+                    metadata=entry.get('metadata', {}),
+                    delayed_entry=True,
+                )
+                self._pending_entries.append(PendingEntry(
+                    signal=sig, algo=algo,
+                    queued_time=pd.Timestamp(entry['queued_time']),
+                    fill_at=entry['fill_at'],
+                ))
+            logger.info("Recovered %d pending entries from DB: %s",
+                         len(entries),
+                         [e['algo_id'] for e in entries])
+            # Clear from DB after loading (will be re-persisted if still pending)
+            self._db.set_metadata('pending_entries', '[]')
+        except Exception as e:
+            logger.error("Failed to recover pending entries: %s", e)

@@ -30,9 +30,10 @@ class LiveDataProvider:
     Deadlock prevention: bar-close events are emitted AFTER releasing the lock.
     """
 
-    def __init__(self, ib_client=None):
+    def __init__(self, ib_client=None, pre_seeded=None):
         self._ib = ib_client
         self._lock = threading.Lock()
+        self._pre_seeded = pre_seeded
 
         # Per-symbol bar storage: {symbol: {tf: pd.DataFrame}}
         self._bars: Dict[str, Dict[str, pd.DataFrame]] = {}
@@ -103,19 +104,36 @@ class LiveDataProvider:
         """Multi-symbol variant (for OE-Sig5 SPY/VIX access)."""
         return self.get_bars(tf, up_to, symbol=symbol)
 
+    @staticmethod
+    def _is_rth(bar_time: pd.Timestamp) -> bool:
+        """Check if a bar time falls within Regular Trading Hours (9:30-16:00 ET).
+
+        Bars are end-indexed, so bar_time=9:31 is the first RTH bar.
+        Pre-market (4:00-9:30) and after-hours (16:00-20:00) return False.
+        """
+        h, m = bar_time.hour, bar_time.minute
+        total_min = h * 60 + m
+        # RTH: 9:31 (first end-indexed 1-min bar) through 16:00
+        return 9 * 60 + 31 <= total_min <= 16 * 60
+
     def on_1min_close(self, symbol: str, bar_time: pd.Timestamp,
                       bar: dict):
         """Called when a 1-min bar closes. Appends and resamples.
 
         Thread-safe: acquires lock for data mutation, then emits event
         AFTER releasing lock to prevent deadlock with get_bars().
+
+        Extended-hours bars are stored in 1-min but NOT resampled to higher
+        TFs (5min/1h/4h/daily). This prevents AH/pre-market data from
+        contaminating intraday channel detection and signal generation.
         """
         emit_events = []
+        is_rth = self._is_rth(bar_time)
 
         with self._lock:
             storage = self._bars.setdefault(symbol, {})
 
-            # Append to 1-min storage
+            # Append to 1-min storage (always, including extended hours)
             df_1m = storage.get('1min', pd.DataFrame())
             new_row = pd.DataFrame({
                 'open': [bar['open']],
@@ -129,33 +147,36 @@ class LiveDataProvider:
             # Always emit 1min event
             emit_events.append(('1min', bar_time, bar))
 
-            # Resample to higher TFs
-            for tf, period_mins in [('5min', 5), ('15min', 15), ('30min', 30),
-                                     ('1h', 60)]:
-                completed = self._check_and_resample(storage, tf, period_mins,
-                                                      bar_time)
-                if completed is not None:
-                    emit_events.append((tf, completed['time'],
-                                        completed['bar']))
+            # Only resample to higher TFs during RTH — AH/pre-market data
+            # would contaminate channel detection and signal generation
+            if is_rth:
+                # Resample to higher TFs
+                for tf, period_mins in [('5min', 5), ('15min', 15), ('30min', 30),
+                                         ('1h', 60)]:
+                    completed = self._check_and_resample(storage, tf, period_mins,
+                                                          bar_time)
+                    if completed is not None:
+                        emit_events.append((tf, completed['time'],
+                                            completed['bar']))
 
-            # 4h: sequential hourly aggregation (matching backtester)
-            completed_4h = self._check_4h_resample(storage, bar_time)
-            if completed_4h is not None:
-                emit_events.append(('4h', completed_4h['time'],
-                                    completed_4h['bar']))
+                # 4h: sequential hourly aggregation (matching backtester)
+                completed_4h = self._check_4h_resample(storage, bar_time)
+                if completed_4h is not None:
+                    emit_events.append(('4h', completed_4h['time'],
+                                        completed_4h['bar']))
 
-            # Daily: emit at RTH close (last bar of session)
-            completed_daily = self._check_daily_resample(storage, bar_time)
-            if completed_daily is not None:
-                emit_events.append(('daily', completed_daily['time'],
-                                    completed_daily['bar']))
+                # Daily: emit at RTH close (last bar of session)
+                completed_daily = self._check_daily_resample(storage, bar_time)
+                if completed_daily is not None:
+                    emit_events.append(('daily', completed_daily['time'],
+                                        completed_daily['bar']))
 
-                # Weekly/Monthly: resample from daily
-                for tf in ('weekly', 'monthly'):
-                    completed_tf = self._resample_from_daily(storage, tf)
-                    if completed_tf is not None:
-                        emit_events.append((tf, completed_tf['time'],
-                                            completed_tf['bar']))
+                    # Weekly/Monthly: resample from daily
+                    for tf in ('weekly', 'monthly'):
+                        completed_tf = self._resample_from_daily(storage, tf)
+                        if completed_tf is not None:
+                            emit_events.append((tf, completed_tf['time'],
+                                                completed_tf['bar']))
 
         # Emit events AFTER releasing lock (deadlock prevention)
         # Order: 1min first, then higher TFs ascending
@@ -251,13 +272,32 @@ class LiveDataProvider:
         return {'time': bar_time, 'bar': bar_dict}
 
     def _check_daily_resample(self, storage, bar_time):
-        """Daily bar: emit at RTH close (15:59 or 16:00 bar)."""
-        # RTH close: last bar at 16:00 (or 13:00 on early close days)
+        """Daily bar: emit at RTH close (16:00 or 13:00 on early-close days).
+
+        Early-close days (day before Thanksgiving, Jul 3, Dec 24) close at 13:00.
+        We fire daily bars at both 13:00 and 16:00 boundaries, but skip 13:00
+        on normal days (no 1-min bars accumulate between 13:00 and 16:00 if
+        the market closed at 13:00).
+        """
         hour = bar_time.hour
         minute = bar_time.minute
 
-        if not (hour == 16 and minute == 0):
+        is_normal_close = (hour == 16 and minute == 0)
+        is_early_close = (hour == 13 and minute == 0)
+
+        if not (is_normal_close or is_early_close):
             return None
+
+        # For early close: only emit if no bars exist after 13:00
+        # (on normal days, there WILL be bars after 13:00, so skip)
+        if is_early_close:
+            df_1m = storage.get('1min', pd.DataFrame())
+            today = bar_time.date()
+            today_bars = df_1m[df_1m.index.date == today]
+            after_13 = today_bars[today_bars.index.hour > 13]
+            if len(after_13) > 0:
+                # Normal trading day — bars exist after 13:00, skip
+                return None
 
         df_1m = storage.get('1min', pd.DataFrame())
         if len(df_1m) == 0:
@@ -337,23 +377,43 @@ class LiveDataProvider:
         - TSLA/SPY: 104 weekly bars (for weekly channels)
         - VIX: daily only (no algo uses VIX weekly)
         - TSLA monthly: derived from daily resample
+
+        If pre_seeded data is provided (from state.load_market_data()),
+        those TFs are used directly — skipping the IB fetch to avoid
+        double-hitting the IB pacing queue.
         """
+        # Apply pre-seeded data first (shared from UI historical load)
+        if self._pre_seeded:
+            with self._lock:
+                for symbol, tfs in self._pre_seeded.items():
+                    for tf, df in tfs.items():
+                        if df is not None and len(df) > 0:
+                            self._bars.setdefault(symbol, {})[tf] = df.copy()
+                            logger.info("Pre-seeded %s %s: %d bars",
+                                        symbol, tf, len(df))
+
         if not self._ib or not self._ib.is_connected():
             logger.warning("IB not connected, skipping historical seeding")
             return
 
-        try:
-            self._seed_1min_bars('TSLA', days=15)
-        except Exception as e:
-            logger.error("Failed to seed 1-min bars: %s", e)
+        # Only fetch from IB for TFs not already pre-seeded
+        def _have(symbol, tf):
+            return len(self._bars.get(symbol, {}).get(tf, pd.DataFrame())) > 0
+
+        if not _have('TSLA', '1min'):
+            try:
+                self._seed_1min_bars('TSLA', days=15)
+            except Exception as e:
+                logger.error("Failed to seed 1-min bars: %s", e)
 
         for symbol in ('TSLA', 'SPY', 'VIX'):
-            try:
-                self._seed_daily_bars(symbol, bars=500)
-            except Exception as e:
-                logger.error("Failed to seed %s daily bars: %s", symbol, e)
+            if not _have(symbol, 'daily'):
+                try:
+                    self._seed_daily_bars(symbol, bars=500)
+                except Exception as e:
+                    logger.error("Failed to seed %s daily bars: %s", symbol, e)
             # VIX weekly not used by any algo — skip to save IB pacing budget
-            if symbol != 'VIX':
+            if symbol != 'VIX' and not _have(symbol, 'weekly'):
                 try:
                     self._seed_weekly_bars(symbol)
                 except Exception as e:
@@ -367,6 +427,13 @@ class LiveDataProvider:
 
         # Validate seeded data meets algo minimum requirements
         self._validate_seeded_bars()
+
+        # Fail loudly if critical seeds are missing
+        tsla_1m = len(self._bars.get('TSLA', {}).get('1min', pd.DataFrame()))
+        if tsla_1m < 100:
+            raise RuntimeError(
+                f"TSLA 1-min seed failed ({tsla_1m} bars, need >=100) — "
+                "engine cannot start safely")
 
         logger.info("Historical seeding complete: %s",
                      {s: list(tfs.keys()) for s, tfs in self._bars.items()})
@@ -473,7 +540,11 @@ class LiveDataProvider:
         logger.info("Seeded %s weekly bars: %d", symbol, len(weekly_df))
 
     def backfill_gap(self, symbol: str, since: pd.Timestamp):
-        """Backfill bars after IB disconnect/reconnect."""
+        """Backfill bars after IB disconnect/reconnect.
+
+        Fetches 1-min bars for the gap period, then resamples to higher TFs
+        so channel detection and algos see the gap data immediately.
+        """
         if not self._ib or not self._ib.is_connected():
             return
         try:
@@ -492,8 +563,55 @@ class LiveDataProvider:
                                                                pd.DataFrame())
                     combined = pd.concat([existing, bars_df])
                     combined = combined[~combined.index.duplicated(keep='last')]
-                    self._bars.setdefault(symbol, {})['1min'] = combined.sort_index()
-                logger.info("Backfilled %d 1-min bars for %s", len(bars_df),
-                             symbol)
+                    storage = self._bars.setdefault(symbol, {})
+                    storage['1min'] = combined.sort_index()
+
+                    # Resample higher TFs from updated 1-min bars (RTH only)
+                    df_1m = storage['1min']
+                    # Filter to RTH bars for resampling
+                    rth_mask = df_1m.index.map(
+                        lambda t: 9 * 60 + 31 <= t.hour * 60 + t.minute <= 16 * 60)
+                    rth_bars = df_1m[rth_mask]
+                    if len(rth_bars) > 0:
+                        for tf, rule in [('5min', '5min'), ('15min', '15min'),
+                                          ('1h', '1h')]:
+                            resampled = rth_bars.resample(rule).agg({
+                                'open': 'first', 'high': 'max', 'low': 'min',
+                                'close': 'last', 'volume': 'sum',
+                            }).dropna()
+                            if len(resampled) > 0:
+                                storage[tf] = resampled
+                        # 4h from 1h (same logic as _seed_1min_bars)
+                        df_1h = storage.get('1h', pd.DataFrame())
+                        if len(df_1h) > 0:
+                            bars_4h = []
+                            for day in sorted(set(df_1h.index.date)):
+                                day_bars = df_1h[df_1h.index.date == day]
+                                chunk1 = day_bars[day_bars.index.hour <= 13]
+                                if len(chunk1) > 0:
+                                    bars_4h.append((chunk1.index[-1], {
+                                        'open': float(chunk1['open'].iloc[0]),
+                                        'high': float(chunk1['high'].max()),
+                                        'low': float(chunk1['low'].min()),
+                                        'close': float(chunk1['close'].iloc[-1]),
+                                        'volume': float(chunk1['volume'].sum()),
+                                    }))
+                                chunk2 = day_bars[day_bars.index.hour > 13]
+                                if len(chunk2) > 0:
+                                    bars_4h.append((chunk2.index[-1], {
+                                        'open': float(chunk2['open'].iloc[0]),
+                                        'high': float(chunk2['high'].max()),
+                                        'low': float(chunk2['low'].min()),
+                                        'close': float(chunk2['close'].iloc[-1]),
+                                        'volume': float(chunk2['volume'].sum()),
+                                    }))
+                            if bars_4h:
+                                storage['4h'] = pd.DataFrame(
+                                    [b for _, b in bars_4h],
+                                    index=[t for t, _ in bars_4h],
+                                )
+
+                logger.info("Backfilled %d 1-min bars for %s (higher TFs resampled)",
+                             len(bars_df), symbol)
         except Exception as e:
             logger.error("Backfill failed for %s: %s", symbol, e)

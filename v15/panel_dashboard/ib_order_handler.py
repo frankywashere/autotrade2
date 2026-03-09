@@ -257,6 +257,22 @@ class IBOrderHandler:
             logger.warning("Entry blocked: IB not connected")
             return None
 
+        # Block opposite-direction entry when another algo has an open position.
+        # Non-FA accounts have a single IB position bucket — opposite trades
+        # would net to 0 at the broker, making stops/exits/reconciliation invalid.
+        open_trades = self.db.get_open_trades(source='ib')
+        opposite = [t for t in open_trades
+                    if t.get('direction') != direction
+                    and t.get('open_shares', 0) > 0]
+        if opposite:
+            opp_algos = [t.get('algo_id', '?') for t in opposite]
+            opp_shares = sum(t.get('open_shares', 0) for t in opposite)
+            logger.warning(
+                "Entry BLOCKED: %s wants %s %d shares but %d opposite-direction "
+                "trades open (algos=%s, %d shares) — would corrupt IB net position",
+                algo_id, direction, shares, len(opposite), opp_algos, opp_shares)
+            return None
+
         action = 'BUY' if direction == 'long' else 'SELL'
         order_ref = f'entry:{algo_id}:{direction}:{stop_price:.2f}:{tp_price:.2f}'
         model_code = algo_id if self._state.fa_supported else None
@@ -267,7 +283,13 @@ class IBOrderHandler:
             order_ref=order_ref, model_code=model_code)
 
         if 'error' in result:
-            logger.error("Entry order failed: %s", result['error'])
+            error_msg = result['error']
+            logger.error("Entry order failed: %s", error_msg)
+            # If timeout, the order may be in-flight — set degraded so
+            # recovery on next restart can find it via orderRef
+            if 'Timeout' in str(error_msg) or 'in-flight' in str(error_msg):
+                self._set_degraded(f"Entry order timeout for {algo_id} — "
+                                   f"order may be in-flight at IB")
             return None
 
         order_id = result['order_id']
@@ -429,9 +451,35 @@ class IBOrderHandler:
                 return False
 
             self._exit_in_progress[trade_id] = True
-            self.ib.cancel_order(stop_order_id)
-            # TODO: Wait for cancel confirmation and check if stop filled
-            # For now, proceed optimistically
+            cancel_ok = self.ib.cancel_order(stop_order_id)
+
+            if cancel_ok:
+                # Wait up to 3s for terminal status (Cancelled or Filled)
+                import time as _time
+                for _ in range(30):  # 30 × 0.1s = 3s
+                    _time.sleep(0.1)
+                    # Check if stop filled while we waited (DB close applied by callback)
+                    trade_now = self._get_trade(trade_id)
+                    if trade_now and trade_now.get('exit_time'):
+                        logger.warning("Stop %d filled during cancel wait for trade %d — "
+                                       "exit already applied, skipping MKT exit",
+                                       stop_order_id, trade_id)
+                        self._exit_in_progress.pop(trade_id, None)
+                        return True  # Trade is closed
+                    # Check broker-side status
+                    with self.ib._order_lock:
+                        bt = self.ib._trades.get(stop_order_id)
+                        if bt and bt.orderStatus.status in ('Cancelled', 'ApiCancelled'):
+                            break  # Safe to proceed with MKT exit
+                        if bt and bt.orderStatus.status == 'Filled':
+                            logger.warning("Stop %d FILLED during cancel for trade %d — "
+                                           "skipping MKT exit",
+                                           stop_order_id, trade_id)
+                            self._exit_in_progress.pop(trade_id, None)
+                            return True
+                else:
+                    logger.warning("Stop cancel timeout for trade %d (stop=%d) — "
+                                   "proceeding cautiously", trade_id, stop_order_id)
 
         # Step 3: Place closing order
         order_ref = f'exit:{trade_id}'
@@ -494,6 +542,10 @@ class IBOrderHandler:
         """
         if stop_price <= 0 or qty <= 0:
             return None
+
+        # Round to tick size ($0.01 for TSLA) — IB Error 110 rejects
+        # prices that don't conform to minimum price variation
+        stop_price = round(stop_price, 2)
 
         close_action = 'SELL' if direction == 'long' else 'BUY'
         order_ref = f'stop:{trade_id}'
@@ -636,12 +688,23 @@ class IBOrderHandler:
             except Exception as e:
                 logger.warning("Failed to parse broker fill time: %s", e)
 
+        perm_id = int(getattr(exec_obj, 'permId', 0))
+
         fill_data = FillData(
             exec_id=exec_id, shares=fill_shares,
             price=fill_price, time=fill_time, order_id=order_id)
 
         # Route based on registration
         if order_id in self._entry_orders:
+            # Update ib_perm_id on first fill (was 0 at placement time)
+            if perm_id > 0:
+                ctx = self._entry_orders.get(order_id, {})
+                trade_id = ctx.get('trade_id')
+                if trade_id:
+                    try:
+                        self.db.update_trade_state(trade_id, ib_perm_id=perm_id)
+                    except Exception:
+                        pass  # non-critical, just for linkage
             self._on_entry_fill(order_id, fill_data)
         elif order_id in self._exit_orders:
             self._on_exit_fill(order_id, fill_data)
@@ -720,14 +783,14 @@ class IBOrderHandler:
             direction = trade.get('direction', ctx.get('direction', 'long'))
             if s_pct > 0:
                 if direction == 'long':
-                    updates['stop_price'] = fill.price * (1 - s_pct)
+                    updates['stop_price'] = round(fill.price * (1 - s_pct), 2)
                 else:
-                    updates['stop_price'] = fill.price * (1 + s_pct)
+                    updates['stop_price'] = round(fill.price * (1 + s_pct), 2)
             if t_pct > 0:
                 if direction == 'long':
-                    updates['tp_price'] = fill.price * (1 + t_pct)
+                    updates['tp_price'] = round(fill.price * (1 + t_pct), 2)
                 else:
-                    updates['tp_price'] = fill.price * (1 - t_pct)
+                    updates['tp_price'] = round(fill.price * (1 - t_pct), 2)
 
         # Update fill status
         if new_filled >= total_shares:
@@ -738,9 +801,9 @@ class IBOrderHandler:
         try:
             self.db.update_trade_state(trade_id, **updates)
         except Exception as e:
-            logger.error("DB update failed for entry fill on trade %d: %s",
+            logger.error("CRITICAL: DB update failed for entry fill on trade %d: %s",
                          trade_id, e)
-            # This fill is "unapplied" — tracked by the failed_orders dict
+            self._set_degraded(f"Entry fill DB write failed for trade {trade_id}")
             return
 
         logger.info("Entry fill applied: trade %d, %d/%d shares @ $%.2f (avg $%.2f)",
@@ -772,9 +835,36 @@ class IBOrderHandler:
         self._apply_exit_fill(trade_id, fill, ctx)
 
     def _apply_exit_fill(self, trade_id: int, fill: FillData, ctx: dict):
-        """Apply an exit fill to the DB."""
+        """Apply an exit fill to the DB.
+
+        Guards against double-close from stop-cancel race: if the stop fills
+        between cancel_order() and exit MKT placement, both the stop fill and
+        the exit fill arrive. The second one finds the trade already closed.
+        """
         trade = self._get_trade(trade_id)
         if not trade:
+            return
+
+        # Guard: trade already closed (stop-cancel race — stop filled first)
+        if trade.get('exit_time'):
+            logger.error("DOUBLE-CLOSE RACE: exit fill on already-closed trade %d "
+                         "(%d shares @ $%.2f, reason=%s). Placing counter-trade.",
+                         trade_id, fill.shares, fill.price,
+                         ctx.get('exit_reason', '?'))
+            # We now have excess broker exposure. Place a counter-trade to flatten.
+            direction = trade.get('direction', 'long')
+            # The exit sold (long) or bought (short) — reverse it
+            counter_action = 'BUY' if direction == 'long' else 'SELL'
+            counter_ref = f'counter:{trade_id}'
+            try:
+                self.ib.place_order('TSLA', counter_action, fill.shares, 'MKT',
+                                    order_ref=counter_ref)
+                logger.warning("Counter-trade placed: %s %d shares for double-close on trade %d",
+                               counter_action, fill.shares, trade_id)
+            except Exception as e:
+                logger.critical("COUNTER-TRADE FAILED for trade %d: %s — "
+                                "MANUAL INTERVENTION REQUIRED", trade_id, e)
+            self._set_degraded(f"Double-close race on trade {trade_id}")
             return
 
         old_exit_filled = trade.get('exit_filled_shares', 0)
@@ -798,8 +888,9 @@ class IBOrderHandler:
                                        avg_exit_price=new_exit_avg,
                                        open_shares=max(new_open, 0))
         except Exception as e:
-            logger.error("DB update failed for exit fill on trade %d: %s",
+            logger.error("CRITICAL: DB update failed for exit fill on trade %d: %s",
                          trade_id, e)
+            self._set_degraded(f"Exit fill DB write failed for trade {trade_id}")
             return
 
         logger.info("Exit fill applied: trade %d, %d/%d shares exited @ $%.2f",
@@ -833,7 +924,9 @@ class IBOrderHandler:
                     exit_reason=exit_reason, pnl=pnl,
                     entry_price=entry_price)
             except Exception as e:
-                logger.error("close_trade failed for trade %d: %s", trade_id, e)
+                logger.error("CRITICAL: close_trade failed for trade %d: %s",
+                             trade_id, e)
+                self._set_degraded(f"close_trade DB write failed for trade {trade_id}")
 
         self._state.positions_version += 1
         self._notify_live_engine(trade_id, fill.price, fill.shares, is_entry=False)
@@ -877,14 +970,30 @@ class IBOrderHandler:
     def on_order_status(self, trade):
         """Handle statusEvent from IB.
 
-        Used for terminal status detection (Cancelled/Rejected) and
-        stop runtime monitoring. NOT used for fill tracking (use execDetailsEvent).
+        Used for terminal status detection (Cancelled/Rejected),
+        stop runtime monitoring, and permId backfill (when permId was 0
+        at placement time). NOT used for fill tracking (use execDetailsEvent).
         """
         order_id = trade.order.orderId
         status = trade.orderStatus.status
+        perm_id = trade.order.permId
 
-        if status not in ('Cancelled', 'Inactive', 'ApiCancelled'):
-            return  # Only care about terminal statuses here
+        # Backfill permId if it was 0 at placement time
+        if perm_id > 0 and order_id in self._entry_orders:
+            ctx = self._entry_orders[order_id]
+            trade_id = ctx.get('trade_id')
+            if trade_id:
+                try:
+                    db_trade = self._get_trade(trade_id)
+                    if db_trade and (db_trade.get('ib_perm_id') or 0) == 0:
+                        self.db.update_trade_state(trade_id, ib_perm_id=perm_id)
+                        logger.info("Backfilled permId=%d for trade %d (order %d)",
+                                    perm_id, trade_id, order_id)
+                except Exception:
+                    pass  # Non-critical — on_exec_details also updates permId
+
+        if status not in ('Cancelled', 'Inactive', 'ApiCancelled', 'Rejected'):
+            return  # Only care about terminal statuses below
 
         # Check if this is an entry order
         if order_id in self._entry_orders:
@@ -1059,7 +1168,11 @@ class IBOrderHandler:
         return None
 
     def _effective_open_shares(self, trade: dict) -> int:
-        """Compute effective open shares including unapplied fills."""
-        filled = trade.get('filled_shares', 0) or trade.get('shares', 0)
-        exit_filled = trade.get('exit_filled_shares', 0)
+        """Compute effective open shares including unapplied fills.
+
+        Uses filled_shares only (not shares) — a pending entry with 0 fills
+        has 0 effective exposure, not the requested share count.
+        """
+        filled = trade.get('filled_shares', 0) or 0
+        exit_filled = trade.get('exit_filled_shares', 0) or 0
         return max(filled - exit_filled, 0)

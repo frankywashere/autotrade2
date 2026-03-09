@@ -479,6 +479,14 @@ class IBClient:
                                         overnight, order_ref, model_code),
                 self._loop)
             return future.result(timeout=10)
+        except TimeoutError:
+            # Order may be in-flight at IB but we didn't get the response.
+            # The order_ref is set, so recovery can find it on next restart.
+            logger.error("place_order TIMED OUT: %s %d %s %s @ %.2f (ref=%s) — "
+                         "order may be in-flight at IB",
+                         action, qty, symbol, order_type, price,
+                         order_ref[:30] if order_ref else '')
+            return {'error': f'Timeout — order may be in-flight (ref={order_ref[:30]})'}
         except Exception as e:
             logger.error("place_order failed: %s", e)
             return {'error': str(e)}
@@ -521,7 +529,19 @@ class IBClient:
 
         trade = self.ib.placeOrder(contract, order)
         order_id = trade.order.orderId
+
+        # Wait for IB to assign permId (usually arrives in <100ms)
+        if trade.order.permId == 0:
+            for _ in range(10):  # 10 × 50ms = 500ms max
+                await asyncio.sleep(0.05)
+                if trade.order.permId != 0:
+                    break
+
         perm_id = trade.order.permId
+        if perm_id == 0:
+            logger.warning("permId still 0 after 500ms for order %d (ref=%s) — "
+                           "will update on first fill",
+                           order_id, order_ref[:30] if order_ref else '')
 
         with self._order_lock:
             self._trades[order_id] = trade
