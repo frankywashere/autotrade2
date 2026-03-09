@@ -253,8 +253,6 @@ def _open_positions(state):
                 status_badge = '<span style="background:#ff9800; color:black; padding:2px 6px; border-radius:4px; font-size:11px;">PARTIAL</span>'
 
             card_html = pn.pane.HTML(f"""
-            <div style="background:#1a1a2e; border:1px solid #333; border-radius:8px;
-                        padding:12px;">
                 <div style="display:flex; justify-content:space-between; align-items:center;">
                     <div>
                         <span style="color:{dir_color}; font-weight:bold;">
@@ -275,17 +273,21 @@ def _open_positions(state):
                     <span>TP: ${tp:,.2f}</span>
                     <span>Best: ${best:,.2f}</span>
                 </div>
-            </div>
             """, sizing_mode='stretch_width')
 
             close_btn = pn.widgets.Button(
-                name='Close', button_type='danger', width=70, height=30,
-                margin=(0, 0, 6, 0))
+                name='Close', button_type='danger', width=65, height=28,
+                margin=(0, 8, 0, 0))
             close_btn.on_click(_make_close_callback(trade_id))
 
-            row = pn.Row(card_html, close_btn, sizing_mode='stretch_width',
-                         margin=(0, 0, 6, 0))
-            container.append(row)
+            top_row = pn.Row(card_html, close_btn, align='center',
+                             sizing_mode='stretch_width')
+            card = pn.Column(
+                top_row,
+                styles={'background': '#1a1a2e', 'border': '1px solid #333',
+                        'border-radius': '8px', 'padding': '12px'},
+                sizing_mode='stretch_width', margin=(0, 0, 6, 0))
+            container.append(card)
 
         return container
 
