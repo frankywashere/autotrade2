@@ -26,14 +26,18 @@ _log_file = os.path.join(_log_dir, 'dashboard.log')
 
 # Force-add file handler to root logger (basicConfig is a no-op when
 # Panel's --log-level flag already configured the root logger).
+# Guard: only add handlers once (module may be re-imported by Panel).
 _root = logging.getLogger()
 _root.setLevel(logging.INFO)
 _fmt = logging.Formatter('%(asctime)s [%(name)s] %(levelname)s: %(message)s',
                          datefmt='%H:%M:%S')
-_fh = logging.handlers.RotatingFileHandler(
-    _log_file, maxBytes=5_000_000, backupCount=3)
-_fh.setFormatter(_fmt)
-_root.addHandler(_fh)
+if not any(isinstance(h, logging.handlers.RotatingFileHandler)
+           and getattr(h, 'baseFilename', '') == os.path.abspath(_log_file)
+           for h in _root.handlers):
+    _fh = logging.handlers.RotatingFileHandler(
+        _log_file, maxBytes=5_000_000, backupCount=3)
+    _fh.setFormatter(_fmt)
+    _root.addHandler(_fh)
 # Ensure a stream handler exists too (Panel may already add one)
 if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
            for h in _root.handlers):
