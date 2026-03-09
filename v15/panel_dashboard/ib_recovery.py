@@ -261,6 +261,17 @@ def recover_inflight_orders(state):
 
         # ── Check stops against broker state ──
         stop_oid = trade.get('ib_stop_order_id')
+        if stop_oid and stop_oid not in all_broker_trades:
+            # Order not in IB at all (old session, different clientId) — stale
+            logger.warning("Recovery: stop %d for trade %d not found at IB — "
+                           "clearing stale DB ref", stop_oid, trade_id)
+            try:
+                db.update_trade_state(trade_id, ib_stop_order_id=None)
+            except Exception as e:
+                logger.error("Recovery: failed to clear stop ref for trade %d: %s",
+                             trade_id, e)
+            stop_oid = None  # Force re-arm below
+
         if stop_oid and stop_oid in all_broker_trades:
             bt = all_broker_trades[stop_oid]
             broker_status = bt.orderStatus.status
