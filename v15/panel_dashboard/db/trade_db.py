@@ -54,10 +54,10 @@ CREATE TABLE IF NOT EXISTS trades (
     ib_exit_perm_id   INTEGER,
     ib_stop_order_id  INTEGER,
     ib_stop_perm_id   INTEGER,
-    management_mode TEXT DEFAULT 'algo',
     legacy_pos_id   TEXT,
     metadata        TEXT,
-    created_at      TEXT DEFAULT (datetime('now'))
+    created_at      TEXT DEFAULT (datetime('now')),
+    management_mode TEXT DEFAULT 'algo'
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_legacy
@@ -108,7 +108,7 @@ _TRADE_COLUMNS = [
     'ib_entry_order_id', 'ib_exit_order_id', 'ib_perm_id', 'ib_fill_status',
     'filled_shares', 'open_shares', 'avg_fill_price', 'exit_filled_shares',
     'avg_exit_price', 'ib_exit_perm_id', 'ib_stop_order_id',
-    'ib_stop_perm_id', 'management_mode', 'legacy_pos_id', 'metadata', 'created_at',
+    'ib_stop_perm_id', 'legacy_pos_id', 'metadata', 'created_at', 'management_mode',
 ]
 
 
