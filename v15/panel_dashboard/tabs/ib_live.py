@@ -206,6 +206,18 @@ def _open_positions(state):
                 logger.error("Hold error for trade %d: %s", trade_id, e)
         return _on_hold
 
+    # Track periodic callbacks for exit form sliders (trade_id -> callback)
+    _slider_callbacks = {}
+
+    def _cleanup_slider_cb(trade_id):
+        """Stop and remove the periodic slider update for a trade's exit form."""
+        cb = _slider_callbacks.pop(trade_id, None)
+        if cb is not None:
+            try:
+                cb.stop()
+            except Exception:
+                pass
+
     def _make_close_callback(trade_id, card_col):
         def _on_close(event):
             btn = event.obj
@@ -217,7 +229,8 @@ def _open_positions(state):
 
             # Toggle inline order form (both algo and manual trades)
             if trade_id in _active_forms:
-                # Close the form
+                # Close the form — clean up slider callback
+                _cleanup_slider_cb(trade_id)
                 form = _active_forms.pop(trade_id)
                 try:
                     card_col.remove(form)
@@ -246,9 +259,117 @@ def _open_positions(state):
 
             # Default price from current market
             default_price = state.tsla_price if state.tsla_price > 0 else 0
+
+            # ── Price slider (TOS-style) ──────────────────────────────
+            price_info = pn.pane.HTML('', sizing_mode='stretch_width',
+                                       margin=(0, 0, 0, 0))
+            price_slider = pn.widgets.FloatSlider(
+                name='', start=round(default_price - 2.0, 2) if default_price > 2 else 0.01,
+                end=round(default_price + 2.0, 2) if default_price > 0 else 1000.0,
+                step=0.01, value=round(default_price, 2),
+                sizing_mode='stretch_width', show_value=False,
+                margin=(0, 0, 0, 0))
             price_input = pn.widgets.FloatInput(
-                name='Price', value=round(default_price, 2),
-                step=0.01, start=0.01, width=100)
+                value=round(default_price, 2), step=0.01, width=90,
+                height=36, format='0.00', margin=(0, 5, 0, 0))
+            lock_toggle = pn.widgets.Toggle(
+                name='Unlocked', button_type='default', width=75, height=36,
+                value=False, margin=(0, 0, 0, 0))
+
+            _locked = [False]
+            _programmatic = [False]
+
+            def _on_slider_change(event):
+                if _programmatic[0]:
+                    return
+                _locked[0] = True
+                lock_toggle.value = True
+                lock_toggle.name = 'Locked'
+                lock_toggle.button_type = 'warning'
+                price_input.value = round(event.new, 2)
+
+            def _on_price_input_change(event):
+                if _programmatic[0]:
+                    return
+                _locked[0] = True
+                lock_toggle.value = True
+                lock_toggle.name = 'Locked'
+                lock_toggle.button_type = 'warning'
+                _programmatic[0] = True
+                try:
+                    price_slider.value = event.new
+                finally:
+                    _programmatic[0] = False
+
+            def _on_lock_toggle(event):
+                _locked[0] = event.new
+                if event.new:
+                    lock_toggle.name = 'Locked'
+                    lock_toggle.button_type = 'warning'
+                else:
+                    lock_toggle.name = 'Unlocked'
+                    lock_toggle.button_type = 'default'
+
+            price_slider.param.watch(_on_slider_change, 'value')
+            price_input.param.watch(_on_price_input_change, 'value')
+            lock_toggle.param.watch(_on_lock_toggle, 'value')
+
+            slider_container = pn.Column(
+                price_info,
+                price_slider,
+                pn.Row(pn.pane.HTML(
+                    '<span style="color:#888;font-size:11px">Price $</span>',
+                    width=42, margin=(0, 2, 0, 0), align='center'),
+                    price_input, lock_toggle,
+                    align='center', margin=(2, 0, 0, 0)),
+                visible=(type_select.value != 'MKT'),
+                margin=(4, 0, 0, 0),
+                styles={'background': '#16213e', 'padding': '8px',
+                        'border-radius': '6px'},
+                sizing_mode='stretch_width',
+            )
+
+            def _on_type_change(event):
+                slider_container.visible = event.new != 'MKT'
+
+            type_select.param.watch(_on_type_change, 'value')
+
+            # Periodic slider update (250ms) — syncs bid/ask/mid
+            def _slider_tick():
+                if not state.ib_client:
+                    return
+                data = state.ib_client.get_price_data('TSLA')
+                bid = data.get('bid', 0.0)
+                ask = data.get('ask', 0.0)
+                if bid <= 0 or ask <= 0:
+                    return
+                mid = round((bid + ask) / 2, 2)
+                spread = ask - bid
+
+                if not _locked[0]:
+                    price_info.object = (
+                        f'<div style="display:flex;justify-content:space-between;'
+                        f'font-size:13px;padding:0 4px">'
+                        f'<span><b style="color:#00e676">Bid ${bid:.2f}</b></span>'
+                        f'<span>Mid <b>${mid:.2f}</b>'
+                        f'&nbsp;&nbsp;<span style="color:#888">Spd ${spread:.2f}</span></span>'
+                        f'<span><b style="color:#ff5252">Ask ${ask:.2f}</b></span>'
+                        f'</div>')
+                    _programmatic[0] = True
+                    try:
+                        slider_mid = (price_slider.start + price_slider.end) / 2
+                        if abs(slider_mid - mid) > 0.50 or price_slider.end <= price_slider.start + 0.01:
+                            price_slider.start = round(mid - 2.0, 2)
+                            price_slider.end = round(mid + 2.0, 2)
+                        price_slider.value = mid
+                        price_input.value = mid
+                    finally:
+                        _programmatic[0] = False
+
+            cb = pn.state.add_periodic_callback(_slider_tick, period=250)
+            _slider_callbacks[trade_id] = cb
+
+            # ── End slider ────────────────────────────────────────────
 
             info_html = pn.pane.HTML(
                 f'<span style="color:#aaa; font-size:12px;">'
@@ -282,6 +403,7 @@ def _open_positions(state):
                         submit_btn.name = 'Sent'
                         status_msg.object = '<span style="color:#00e676;">Order sent</span>'
                         # Remove form after success
+                        _cleanup_slider_cb(trade_id)
                         if trade_id in _active_forms:
                             form = _active_forms.pop(trade_id)
                             try:
@@ -300,6 +422,7 @@ def _open_positions(state):
                     logger.error("Manual exit error for trade %d: %s", trade_id, e)
 
             def _on_cancel(event):
+                _cleanup_slider_cb(trade_id)
                 if trade_id in _active_forms:
                     form = _active_forms.pop(trade_id)
                     try:
@@ -311,17 +434,23 @@ def _open_positions(state):
             submit_btn.on_click(_on_submit)
             cancel_btn.on_click(_on_cancel)
 
-            form_row = pn.Row(
-                info_html, type_select, price_input, session_select,
+            controls_row = pn.Row(
+                info_html, type_select, session_select,
                 submit_btn, cancel_btn, status_msg,
-                align='center', margin=(8, 0, 0, 0))
-            _active_forms[trade_id] = form_row
-            card_col.append(form_row)
+                align='center', margin=(4, 0, 0, 0))
+            form_col = pn.Column(
+                controls_row, slider_container,
+                margin=(8, 0, 0, 0), sizing_mode='stretch_width')
+            _active_forms[trade_id] = form_col
+            card_col.append(form_col)
             btn.name = 'Cancel'
 
         return _on_close
 
     def _render(positions_version):
+        # Clean up any active slider callbacks before clearing forms
+        for tid in list(_slider_callbacks):
+            _cleanup_slider_cb(tid)
         container.clear()
         _active_forms.clear()
         if not hasattr(state, 'trade_db') or state.trade_db is None:
