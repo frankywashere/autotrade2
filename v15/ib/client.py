@@ -40,6 +40,7 @@ class IBClient:
         self._order_lock = threading.Lock()
         self._order_time_cache = {}  # {perm_id: (order_time, sort_time)} for stable timestamps
         self._order_log_version = 0  # Bumped on any change
+        self._completed_cache = {}   # {perm_id: blotter_entry} — seeded once, updated reactively
         # External callbacks
         self._order_status_external = None   # IBOrderHandler.on_order_status
         self._reconnect_callbacks = []       # fired after IB reconnect
@@ -121,8 +122,9 @@ class IBClient:
                 await self._subscribe_account_async()
                 self._snapshot_positions()
 
-                # Fetch all open + completed orders from IB
-                await self._sync_orders_from_ib()
+                # Seed completed orders (one-time) then sync open orders
+                await self._seed_completed_orders()
+                await self._sync_open_orders()
 
                 # On reconnect (not first connect): re-wire statusEvent on new
                 # Trade objects and fire reconnect callbacks in a separate thread
@@ -533,7 +535,7 @@ class IBClient:
                 'status': trade.orderStatus.status or 'Submitted', 'message': 'OK'}
 
     def _on_order_status(self, trade):
-        """Callback fired by ib_async on order status change — re-sync from IB."""
+        """Callback fired by ib_async on order status change."""
         order_id = trade.order.orderId
         status = trade.orderStatus.status
         logger.info("Order %d status: %s", order_id, status)
@@ -543,9 +545,13 @@ class IBClient:
                 self._order_status_external(trade)
             except Exception as e:
                 logger.error("External order status callback failed: %s", e)
-        # Schedule a re-sync to update the blotter from IB source of truth
-        if self._loop and self._connected:
-            asyncio.run_coroutine_threadsafe(self._sync_orders_from_ib(), self._loop)
+        # Update completed cache reactively when order reaches terminal state
+        if status in ('Filled', 'Cancelled', 'Inactive'):
+            entry = self._trade_to_entry(trade)
+            if entry:
+                with self._order_lock:
+                    self._completed_cache[entry['perm_id']] = entry
+                    self._order_log_version += 1
 
     # IB warning codes that do NOT indicate order rejection
     _IB_WARNING_CODES = {
@@ -558,9 +564,9 @@ class IBClient:
         """Callback for IB errors — log warnings vs rejections."""
         if reqId > 0 and errorCode not in self._IB_WARNING_CODES:
             logger.warning("Order %d rejected: [%d] %s", reqId, errorCode, errorString)
-            # Re-sync to pick up the rejection status
-            if self._loop and self._connected:
-                asyncio.run_coroutine_threadsafe(self._sync_orders_from_ib(), self._loop)
+            # Bump version so blotter refreshes on next periodic tick
+            with self._order_lock:
+                self._order_log_version += 1
         elif reqId > 0:
             logger.info("Order %d warning: [%d] %s", reqId, errorCode, errorString)
 
@@ -608,34 +614,48 @@ class IBClient:
 
     # ── IB Order Sync (source of truth) ──────────────────────────────
 
-    async def _sync_orders_from_ib(self):
-        """Fetch open + completed orders from IB and rebuild _order_log."""
+    async def _seed_completed_orders(self):
+        """One-time startup: fetch completed orders from IB for blotter history."""
         try:
-            # Request ALL open orders across all client IDs (populates ib.openTrades cache)
+            completed = await asyncio.wait_for(
+                self.ib.reqCompletedOrdersAsync(apiOnly=False), timeout=10.0)
+            with self._order_lock:
+                for trade in completed:
+                    entry = self._trade_to_entry(trade)
+                    if entry:
+                        self._completed_cache[entry['perm_id']] = entry
+            logger.info("Seeded %d completed orders from IB", len(self._completed_cache))
+        except asyncio.TimeoutError:
+            logger.warning("reqCompletedOrdersAsync timed out at startup — "
+                           "blotter may miss older filled orders")
+        except Exception as e:
+            logger.error("_seed_completed_orders failed: %s", e)
+
+    async def _sync_open_orders(self):
+        """Lightweight periodic sync — only fetches open orders (cached by ib_async).
+
+        Completed orders are seeded once at startup and updated reactively
+        via _on_order_status when orders reach terminal state.
+        """
+        try:
             await asyncio.wait_for(self.ib.reqAllOpenOrdersAsync(), timeout=5.0)
             open_trades = self.ib.openTrades()
-            # Request completed orders (last 24h) — timeout prevents permanent hang
-            completed = await asyncio.wait_for(
-                self.ib.reqCompletedOrdersAsync(apiOnly=False), timeout=5.0)
 
             orders = {}  # keyed by permId to deduplicate
 
-            # Process open trades
+            # Open orders from IB
             for trade in open_trades:
                 entry = self._trade_to_entry(trade)
                 if entry:
                     orders[entry['perm_id']] = entry
-                    # Also store Trade object for cancel support
                     with self._order_lock:
                         self._trades[trade.order.orderId] = trade
 
-            # Process completed orders
-            for trade in completed:
-                entry = self._trade_to_entry(trade)
-                if entry:
-                    # Don't overwrite open with completed (open is more current)
-                    if entry['perm_id'] not in orders:
-                        orders[entry['perm_id']] = entry
+            # Merge in completed order cache (don't overwrite open with completed)
+            with self._order_lock:
+                for perm_id, entry in self._completed_cache.items():
+                    if perm_id not in orders:
+                        orders[perm_id] = entry
 
             # Sort by time descending (newest first), limit to 50
             sorted_orders = sorted(orders.values(),
@@ -643,7 +663,6 @@ class IBClient:
                                    reverse=True)[:50]
 
             with self._order_lock:
-                # Only bump version if data actually changed (fix #8)
                 old_snapshot = [(e.get('perm_id'), e.get('status')) for e in self._order_log]
                 new_snapshot = [(e.get('perm_id'), e.get('status')) for e in sorted_orders]
                 self._order_log = sorted_orders
@@ -651,9 +670,9 @@ class IBClient:
                     self._order_log_version += 1
 
         except asyncio.TimeoutError:
-            logger.debug("_sync_orders_from_ib timed out (IB slow to respond)")
+            logger.debug("_sync_open_orders timed out")
         except Exception as e:
-            logger.error("_sync_orders_from_ib failed: %s", e)
+            logger.error("_sync_open_orders failed: %s", e)
 
     def _trade_to_entry(self, trade) -> dict:
         """Convert an ib_async Trade or CompletedOrder to a blotter entry."""
@@ -788,13 +807,17 @@ class IBClient:
         self._reconnect_callbacks.append(callback)
 
     def sync_orders(self):
-        """Thread-safe trigger to re-sync orders from IB."""
+        """Thread-safe trigger to re-sync open orders from IB.
+
+        Only fetches open orders (lightweight). Completed orders are tracked
+        reactively via _on_order_status callbacks.
+        """
         if self._loop and self._connected:
             # Guard: skip if a previous sync is still running
             if hasattr(self, '_sync_task') and self._sync_task and not self._sync_task.done():
                 return
             self._sync_task = asyncio.run_coroutine_threadsafe(
-                self._sync_orders_from_ib(), self._loop)
+                self._sync_open_orders(), self._loop)
 
 
 class LiveBarAggregator:
