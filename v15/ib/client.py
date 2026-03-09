@@ -612,10 +612,11 @@ class IBClient:
         """Fetch open + completed orders from IB and rebuild _order_log."""
         try:
             # Request ALL open orders across all client IDs (populates ib.openTrades cache)
-            await self.ib.reqAllOpenOrdersAsync()
+            await asyncio.wait_for(self.ib.reqAllOpenOrdersAsync(), timeout=5.0)
             open_trades = self.ib.openTrades()
-            # Request completed orders (last 24h)
-            completed = await self.ib.reqCompletedOrdersAsync(apiOnly=False)
+            # Request completed orders (last 24h) — timeout prevents permanent hang
+            completed = await asyncio.wait_for(
+                self.ib.reqCompletedOrdersAsync(apiOnly=False), timeout=5.0)
 
             orders = {}  # keyed by permId to deduplicate
 
@@ -649,6 +650,8 @@ class IBClient:
                 if new_snapshot != old_snapshot:
                     self._order_log_version += 1
 
+        except asyncio.TimeoutError:
+            logger.debug("_sync_orders_from_ib timed out (IB slow to respond)")
         except Exception as e:
             logger.error("_sync_orders_from_ib failed: %s", e)
 
