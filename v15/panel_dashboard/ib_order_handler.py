@@ -408,11 +408,39 @@ class IBOrderHandler:
             logger.error("place_exit: trade %d not found", trade_id)
             return False
 
-        # Check exit_pending suppression
-        if trade.get('ib_exit_order_id'):
-            logger.info("Exit already pending for trade %d (order %d)",
-                        trade_id, trade['ib_exit_order_id'])
-            return False
+        # Check exit_pending suppression — verify order is actually alive at IB
+        exit_oid = trade.get('ib_exit_order_id')
+        if exit_oid:
+            # Check if the exit order is still active at IB
+            order_alive = False
+            try:
+                for bt in self.ib.ib.trades():
+                    if bt.order.permId == trade.get('ib_exit_perm_id', 0) or \
+                       bt.order.orderId == exit_oid:
+                        if bt.orderStatus.status in ('PreSubmitted', 'Submitted',
+                                                      'PendingSubmit'):
+                            order_alive = True
+                        break
+            except Exception as e:
+                logger.warning("place_exit: could not verify exit order %d: %s — "
+                               "assuming alive", exit_oid, e)
+                order_alive = True
+
+            if order_alive:
+                logger.info("Exit already pending for trade %d (order %d)",
+                            trade_id, exit_oid)
+                return False
+            else:
+                # Exit order is dead (Cancelled/Filled/Inactive) — clear stale DB ref
+                logger.warning("Exit order %d for trade %d is dead at IB — clearing "
+                               "stale DB ref and proceeding", exit_oid, trade_id)
+                try:
+                    self.db.update_trade_state(trade_id, ib_exit_order_id=None,
+                                               ib_exit_perm_id=None)
+                except Exception as e:
+                    logger.error("Failed to clear stale exit order for trade %d: %s",
+                                 trade_id, e)
+                    return False
 
         if self._exit_in_progress.get(trade_id):
             logger.info("Exit already in progress for trade %d", trade_id)

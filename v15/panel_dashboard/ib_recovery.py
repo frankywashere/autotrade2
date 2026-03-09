@@ -298,9 +298,22 @@ def recover_inflight_orders(state):
 
         # ── Check exits against broker state ──
         exit_oid = trade.get('ib_exit_order_id')
+        if exit_oid and exit_oid not in all_broker_trades:
+            # Order not in IB at all (old session, IB no longer reports it) — stale
+            logger.warning("Recovery: exit %d for trade %d not found at IB — "
+                           "clearing stale DB ref", exit_oid, trade_id)
+            try:
+                db.update_trade_state(trade_id, ib_exit_order_id=None,
+                                      ib_exit_perm_id=None)
+            except Exception as e:
+                logger.error("Recovery: failed to clear exit ref for trade %d: %s",
+                             trade_id, e)
+            exit_oid = None
+
         if exit_oid and exit_oid in all_broker_trades:
             bt = all_broker_trades[exit_oid]
             broker_filled = int(bt.orderStatus.filled or 0)
+            broker_status = bt.orderStatus.status
 
             if broker_filled > 0:
                 # Exit filled while app was down — close the trade
@@ -320,6 +333,19 @@ def recover_inflight_orders(state):
                     logger.error("Recovery: failed to close trade %d after exit fill: %s",
                                  trade_id, e)
                 continue  # Trade is closed — don't re-register
+
+            if broker_status in ('Cancelled', 'ApiCancelled', 'Inactive'):
+                # Exit order died (e.g. DAY expiry) — clear stale ref
+                logger.warning("Recovery: exit %d for trade %d is %s — "
+                               "clearing stale DB ref", exit_oid, trade_id,
+                               broker_status)
+                try:
+                    db.update_trade_state(trade_id, ib_exit_order_id=None,
+                                          ib_exit_perm_id=None)
+                except Exception as e:
+                    logger.error("Recovery: failed to clear exit ref for trade %d: %s",
+                                 trade_id, e)
+                exit_oid = None  # So it's not re-registered below
 
         # ── Register for fill routing (existing logic) ──
         if entry_oid:
