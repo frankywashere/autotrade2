@@ -399,10 +399,10 @@ class DashboardState(param.Parameterized):
 
         try:
             import requests as _req
-            text = f"*{title or 'c14a Alert'}*\n{msg}" if title else msg
+            text = f"{title or 'c14a Alert'}\n{'='*len(title or 'c14a Alert')}\n{msg}" if title else msg
             resp = _req.post(
                 f'https://api.telegram.org/bot{bot_token}/sendMessage',
-                json={'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'},
+                json={'chat_id': chat_id, 'text': text},
                 timeout=10,
             )
             logger.info("Telegram: HTTP %d", resp.status_code)
