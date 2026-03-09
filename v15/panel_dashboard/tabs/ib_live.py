@@ -369,14 +369,14 @@ def _kill_switch_panel(state):
 
 
 # ---------------------------------------------------------------------------
-# Exit Alerts
+# Trade Alerts (entry + exit)
 # ---------------------------------------------------------------------------
 
-def _exit_alerts_pane(exit_alert_html):
-    """Exit alerts. Only re-renders when an exit actually happens."""
-    if not exit_alert_html:
+def _trade_alerts_pane(trade_alert_html):
+    """Trade alert card. Fires on any entry or exit from any algo."""
+    if not trade_alert_html:
         return pn.pane.HTML('')
-    return pn.pane.HTML(exit_alert_html, sizing_mode='stretch_width')
+    return pn.pane.HTML(trade_alert_html, sizing_mode='stretch_width')
 
 
 # ---------------------------------------------------------------------------
@@ -665,58 +665,54 @@ def _tf_positions(analysis):
 _PREV_TRADES_VERSION = [0]
 
 
-def _audio_alert(trades_version, exit_alert_html):
+def _audio_alert(trades_version, trade_alert_type):
     if trades_version <= _PREV_TRADES_VERSION[0]:
         return pn.pane.HTML('')
     _PREV_TRADES_VERSION[0] = trades_version
 
-    # Exit alert present -> exit sound, otherwise entry sound
-    is_exit = bool(exit_alert_html)
-    if is_exit:
-        is_profit = 'take_profit' in exit_alert_html or 'trailing_stop' in exit_alert_html
-        if is_profit:
-            # Celebratory ascending chime: C5 -> E5 -> G5
-            js = """
-            <script>
-            (function() {
-                try {
-                    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-                    [523, 659, 784].forEach(function(f, i) {
-                        const osc = ctx.createOscillator();
-                        const gain = ctx.createGain();
-                        osc.connect(gain); gain.connect(ctx.destination);
-                        osc.type = 'sine';
-                        osc.frequency.value = f;
-                        gain.gain.setValueAtTime(0.25, ctx.currentTime + i*0.15);
-                        gain.gain.linearRampToValueAtTime(0, ctx.currentTime + i*0.15 + 0.3);
-                        osc.start(ctx.currentTime + i*0.15);
-                        osc.stop(ctx.currentTime + i*0.15 + 0.3);
-                    });
-                } catch(e) {}
-            })();
-            </script>
-            """
-        else:
-            # Stop loss / other exit: descending tone
-            js = """
-            <script>
-            (function() {
-                try {
-                    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if trade_alert_type == 'exit_profit':
+        # Celebratory ascending chime: C5 -> E5 -> G5
+        js = """
+        <script>
+        (function() {
+            try {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                [523, 659, 784].forEach(function(f, i) {
                     const osc = ctx.createOscillator();
                     const gain = ctx.createGain();
                     osc.connect(gain); gain.connect(ctx.destination);
-                    osc.type = 'square';
-                    osc.frequency.setValueAtTime(600, ctx.currentTime);
-                    osc.frequency.linearRampToValueAtTime(300, ctx.currentTime + 0.4);
-                    gain.gain.setValueAtTime(0.15, ctx.currentTime);
-                    gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.4);
-                    osc.start(ctx.currentTime);
-                    osc.stop(ctx.currentTime + 0.4);
-                } catch(e) {}
-            })();
-            </script>
-            """
+                    osc.type = 'sine';
+                    osc.frequency.value = f;
+                    gain.gain.setValueAtTime(0.25, ctx.currentTime + i*0.15);
+                    gain.gain.linearRampToValueAtTime(0, ctx.currentTime + i*0.15 + 0.3);
+                    osc.start(ctx.currentTime + i*0.15);
+                    osc.stop(ctx.currentTime + i*0.15 + 0.3);
+                });
+            } catch(e) {}
+        })();
+        </script>
+        """
+    elif trade_alert_type == 'exit_loss':
+        # Stop loss / other exit: descending tone
+        js = """
+        <script>
+        (function() {
+            try {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain); gain.connect(ctx.destination);
+                osc.type = 'square';
+                osc.frequency.setValueAtTime(600, ctx.currentTime);
+                osc.frequency.linearRampToValueAtTime(300, ctx.currentTime + 0.4);
+                gain.gain.setValueAtTime(0.15, ctx.currentTime);
+                gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.4);
+                osc.start(ctx.currentTime);
+                osc.stop(ctx.currentTime + 0.4);
+            } catch(e) {}
+        })();
+        </script>
+        """
     else:
         # Entry: ascending tone
         js = """
@@ -761,8 +757,8 @@ def ib_live_tab(state):
     except ImportError:
         pass
 
-    # Exit alerts
-    components.append(pn.bind(_exit_alerts_pane, state.param.exit_alert_html))
+    # Trade alerts (entry + exit cards)
+    components.append(pn.bind(_trade_alerts_pane, state.param.trade_alert_html))
 
     # Market insights
     components.append(pn.bind(_market_insights, state.param.analysis))
@@ -778,6 +774,6 @@ def ib_live_tab(state):
 
     # Audio alerts (fires on trade open/close)
     components.append(pn.bind(_audio_alert, state.param.trades_version,
-                              state.param.exit_alert_html))
+                              state.param.trade_alert_type))
 
     return pn.Column(*components, sizing_mode='stretch_width')

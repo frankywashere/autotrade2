@@ -37,7 +37,9 @@ class DashboardState(param.Parameterized):
     # UI version bumps (trigger reactive re-renders)
     positions_version = param.Integer(0)      # Bump to trigger position card re-render (price-sensitive)
     trades_version = param.Integer(0)        # Bump only on actual trade open/close (not price ticks)
-    exit_alert_html = param.String('')        # Latest exit alert HTML
+    exit_alert_html = param.String('')        # Latest exit alert HTML (legacy)
+    trade_alert_html = param.String('')       # Entry/exit alert card HTML
+    trade_alert_type = param.String('')       # 'entry', 'exit_profit', 'exit_loss' (for audio)
 
     # Config (sidebar widgets bind to these)
     kill_switch = param.Boolean(False)
@@ -380,6 +382,18 @@ class DashboardState(param.Parameterized):
         """Send a push notification via Telegram. Returns status string."""
         bot_token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
         chat_id = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
+        if not bot_token or not chat_id:
+            # Fall back to config/api_keys.json
+            try:
+                import json
+                cfg_path = os.path.join(os.path.dirname(__file__), '..', '..',
+                                        'config', 'api_keys.json')
+                with open(cfg_path) as f:
+                    cfg = json.load(f)
+                bot_token = cfg.get('telegram', {}).get('bot_token', '')
+                chat_id = cfg.get('telegram', {}).get('chat_id', '')
+            except Exception:
+                pass
         if not bot_token or not chat_id:
             return 'NO_CHANNEL'
 

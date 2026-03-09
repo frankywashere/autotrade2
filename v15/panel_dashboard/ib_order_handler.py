@@ -170,6 +170,73 @@ class IBOrderHandler:
             logger.error("Failed to persist ib_degraded: %s", e)
         logger.error("IB DEGRADED: %s", reason)
 
+    def _fire_trade_alert(self, action: str, algo_id: str, direction: str,
+                          shares: int, price: float, **kwargs):
+        """Fire UI alert card + Telegram notification for entry/exit.
+
+        Works for any algo — uses algo_id dynamically.
+        """
+        import threading as _th
+
+        now = datetime.now(ET).strftime('%H:%M:%S ET')
+        if action == 'entry':
+            signal_type = kwargs.get('signal_type', '')
+            stop_price = kwargs.get('stop_price', 0)
+            tp_price = kwargs.get('tp_price', 0)
+            emoji = '\U0001f7e2' if direction == 'long' else '\U0001f534'
+            title = f"{emoji} {algo_id} — {direction.upper()} Entry"
+            body = (f"{shares} shares TSLA @ ~${price:.2f}\n"
+                    f"Signal: {signal_type}\n"
+                    f"Stop: ${stop_price:.2f} | TP: ${tp_price:.2f}\n"
+                    f"Time: {now}")
+            alert_type = 'entry'
+            card_color = '#1a472a' if direction == 'long' else '#4a1a1a'
+            card_icon = '\u2191' if direction == 'long' else '\u2193'
+            card_html = (
+                f'<div style="background:{card_color};border-radius:8px;'
+                f'padding:12px 16px;margin:8px 0;color:#fff;'
+                f'font-family:monospace;border-left:4px solid '
+                f'{"#4caf50" if direction == "long" else "#f44336"};">'
+                f'<b>{card_icon} {algo_id}</b> &mdash; '
+                f'{direction.upper()} {shares} shares @ ${price:.2f}<br>'
+                f'<small>{signal_type} | Stop ${stop_price:.2f} '
+                f'| TP ${tp_price:.2f} | {now}</small></div>')
+        else:
+            exit_reason = kwargs.get('exit_reason', 'exit')
+            pnl = kwargs.get('pnl', 0)
+            entry_price = kwargs.get('entry_price', 0)
+            is_profit = pnl >= 0
+            emoji = '\u2705' if is_profit else '\u274c'
+            title = f"{emoji} {algo_id} — {direction.upper()} Exit ({exit_reason})"
+            body = (f"{shares} shares TSLA @ ${price:.2f}\n"
+                    f"Entry: ${entry_price:.2f} | P&L: ${pnl:+.2f}\n"
+                    f"Reason: {exit_reason}\n"
+                    f"Time: {now}")
+            alert_type = 'exit_profit' if is_profit else 'exit_loss'
+            card_color = '#1a3a1a' if is_profit else '#3a1a1a'
+            border_color = '#4caf50' if is_profit else '#f44336'
+            card_html = (
+                f'<div style="background:{card_color};border-radius:8px;'
+                f'padding:12px 16px;margin:8px 0;color:#fff;'
+                f'font-family:monospace;border-left:4px solid {border_color};">'
+                f'<b>{emoji} {algo_id}</b> &mdash; '
+                f'{exit_reason} {shares} shares @ ${price:.2f}<br>'
+                f'<small>Entry ${entry_price:.2f} | '
+                f'P&L <span style="color:{border_color}">${pnl:+.2f}</span>'
+                f' | {now}</small></div>')
+
+        # Set UI alert (triggers card + audio reactively)
+        self._state.trade_alert_type = alert_type
+        self._state.trade_alert_html = card_html
+
+        # Send Telegram in background thread (non-blocking)
+        def _send():
+            try:
+                self._state.send_notification(body, title=title)
+            except Exception as e:
+                logger.error("Trade alert Telegram failed: %s", e)
+        _th.Thread(target=_send, daemon=True, name='trade-alert-tg').start()
+
     # ── Entry Flow ──────────────────────────────────────────────────
 
     def place_entry(self, algo_id: str, direction: str, shares: int,
@@ -243,6 +310,12 @@ class IBOrderHandler:
 
         logger.info("Entry order placed: order_id=%d, trade_id=%d, algo=%s, "
                      "%s %d shares", order_id, trade_id, algo_id, direction, shares)
+
+        # Fire trade alert (UI card + Telegram)
+        self._fire_trade_alert(
+            'entry', algo_id, direction, shares,
+            self._state.tsla_price, signal_type=signal_type,
+            stop_price=stop_price, tp_price=tp_price)
 
         self._state.positions_version += 1
         self._state.trades_version += 1
@@ -745,6 +818,19 @@ class IBOrderHandler:
                 self._state.trades_version += 1
                 logger.info("Trade %d closed: %s @ $%.2f", trade_id,
                              exit_reason, new_exit_avg)
+
+                # Fire exit alert (UI card + Telegram)
+                entry_price = trade.get('avg_fill_price',
+                                         trade.get('entry_price', 0))
+                direction = trade.get('direction', 'long')
+                pnl = (new_exit_avg - entry_price) * filled_shares
+                if direction == 'short':
+                    pnl = -pnl
+                self._fire_trade_alert(
+                    'exit', trade.get('algo_id', ''), direction,
+                    filled_shares, new_exit_avg,
+                    exit_reason=exit_reason, pnl=pnl,
+                    entry_price=entry_price)
             except Exception as e:
                 logger.error("close_trade failed for trade %d: %s", trade_id, e)
 
