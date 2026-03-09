@@ -677,6 +677,24 @@ class IntradayAlgo(AlgoBase):
 
         return exits
 
+    def get_effective_stop(self, position) -> Optional[float]:
+        """Return current effective stop for broker-side sync."""
+        params = self.config.params
+        trail_base = params.get('trail_base', 0.006)
+        trail_power = params.get('trail_power', 6)
+        trail_floor = params.get('trail_floor', 0.0)
+
+        trail_pct = trail_base * (1.0 - position.confidence) ** trail_power
+        if trail_floor > 0:
+            trail_pct = max(trail_floor, trail_pct)
+
+        if position.direction == 'long':
+            trail_stop = position.best_price * (1.0 - trail_pct)
+            return max(position.stop_price, trail_stop)
+        else:
+            trail_stop = position.best_price * (1.0 + trail_pct)
+            return min(position.stop_price, trail_stop)
+
     def on_fill(self, trade):
         """Track win/loss streaks."""
         pass

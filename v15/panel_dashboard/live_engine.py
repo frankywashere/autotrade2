@@ -276,7 +276,8 @@ class LiveEngine:
                 continue  # Drop the pending entry
 
             if pending.fill_at == 'next_rth_open':
-                if time.time() == dt.time(9, 30):
+                # Live bars are end-indexed: the 9:30-9:31 bar has time=9:31
+                if time.time() == dt.time(9, 31):
                     self._execute_entry(pending.algo, pending.signal,
                                         bar['open'], deferred_ib_ops)
                 else:

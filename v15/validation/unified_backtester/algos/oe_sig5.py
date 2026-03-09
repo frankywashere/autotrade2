@@ -11,7 +11,7 @@ Entry: next-day RTH open (delayed_entry=True).
 
 import logging
 import time as _time_mod
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -440,9 +440,16 @@ class OESig5Algo(AlgoBase):
                     self._cooldown_remaining = params.get('cooldown_days', 0)
                     continue
 
-                # Timeout
-                hold_days = pos.hold_bars
-                if hold_days >= max_hold:
+                # Check take profit
+                if high >= pos.tp_price:
+                    exits.append(ExitSignal(
+                        pos_id=pos.pos_id, price=pos.tp_price, reason='tp'))
+                    self._cooldown_remaining = params.get('cooldown_days', 0)
+                    continue
+
+                # Timeout: convert max_hold_days to 5-min bars (78 per day)
+                max_hold_5m = max_hold * 78
+                if pos.hold_bars >= max_hold_5m:
                     exits.append(ExitSignal(
                         pos_id=pos.pos_id,
                         price=close,
@@ -451,6 +458,24 @@ class OESig5Algo(AlgoBase):
                     self._cooldown_remaining = params.get('cooldown_days', 0)
 
         return exits
+
+    def get_effective_stop(self, position) -> Optional[float]:
+        """Return current effective stop for broker-side sync."""
+        params = self.config.params
+        trail_base = params.get('trail_base', 0.025)
+        trail_power = params.get('trail_power', 12)
+        trail_pct = trail_base * (1.0 - position.confidence) ** trail_power
+
+        if position.direction == 'long':
+            trailing_stop = position.best_price * (1.0 - trail_pct)
+            if position.best_price > position.entry_price:
+                return max(position.stop_price, trailing_stop)
+            return position.stop_price
+        else:
+            trailing_stop = position.best_price * (1.0 + trail_pct)
+            if position.best_price < position.entry_price:
+                return min(position.stop_price, trailing_stop)
+            return position.stop_price
 
     def on_fill(self, trade):
         pass

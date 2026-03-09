@@ -65,7 +65,7 @@ lookahead_audit.py  Codex audit tool for detecting lookahead bugs
 
 1. **Fill pending entries** at this bar's open price
 2. **Process exits** using stop/trail known at bar open (BEFORE ratcheting)
-3. **Update best/worst prices** + ratchet trail (effective NEXT bar). `hold_bars` increments only at exit_check_tf boundaries
+3. **Ratchet best/worst prices** on every 1-min bar (matching broker-side continuous stop tracking in live). `hold_bars` increments only at exit_check_tf boundaries.
 4. **Generate new signals** at primary TF boundaries -> queue as pending
 
 Intraday TF bars are dispatched at **bar-end** timestamps (e.g., the 9:30-9:34 5-min bar dispatches at 9:34), ensuring the complete OHLCV is available without lookahead.
@@ -107,7 +107,7 @@ Post-causal-fix (no lookahead):
 - **Causal execution**: Stops/trails use values known at bar open. Ratcheting happens after exits. No intrabar lookahead.
 - **Bar-end dispatch**: Intraday TF bars dispatch at their last 1-min bar, not their start. Ensures complete OHLCV is legitimately available.
 - **Delayed entries**: CS-combo/DW/OE signals fire at day-end, fill at next RTH open (9:30). Intraday/surfer signals fill at next 1-min bar's open.
-- **hold_bars units**: Counted in exit_check_tf units (daily bars for CS algos, 5-min bars for intraday), not raw 1-min bars.
+- **hold_bars units**: Counted in exit_check_tf units (5-min bars for all algos). CS/OE convert max_hold_days to 5-min bars (× 78).
 - **Config isolation**: DEFAULT_*_CONFIG dicts are deepcopied per instance to prevent cross-contamination in multi-algo runs.
 
 ## Files Outside unified_backtester

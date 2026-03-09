@@ -369,13 +369,32 @@ class CSComboAlgo(AlgoBase):
                         pos_id=pos.pos_id, price=pos.tp_price, reason='tp'))
                     continue
 
-            # hold_bars counts in exit_check_tf units (daily bars)
-            hold_days = pos.hold_bars
-            if hold_days >= max_hold:
+            # hold_bars counts in exit_check_tf units (5-min bars).
+            # Convert max_hold_days to 5-min bars: 78 per trading day.
+            max_hold_5m = max_hold * 78
+            if pos.hold_bars >= max_hold_5m:
                 exits.append(ExitSignal(
                     pos_id=pos.pos_id, price=close, reason='timeout'))
 
         return exits
+
+    def get_effective_stop(self, position) -> Optional[float]:
+        """Return current effective stop for broker-side sync."""
+        params = self.config.params
+        trail_base = params.get('trail_base', 0.025)
+        trail_power = params.get('trail_power', 12)
+        trail_pct = trail_base * (1.0 - position.confidence) ** trail_power
+
+        if position.direction == 'long':
+            trailing_stop = position.best_price * (1.0 - trail_pct)
+            if position.best_price > position.entry_price:
+                return max(position.stop_price, trailing_stop)
+            return position.stop_price
+        else:
+            trailing_stop = position.best_price * (1.0 + trail_pct)
+            if position.best_price < position.entry_price:
+                return min(position.stop_price, trailing_stop)
+            return position.stop_price
 
     def on_fill(self, trade):
         """Set cooldown after trade close."""

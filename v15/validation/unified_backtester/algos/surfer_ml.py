@@ -504,6 +504,8 @@ class SurferMLAlgo(AlgoBase):
                 if not is_breakout and hold_5m >= max(6, int(ou_hl * 3)):
                     exits.append(ExitSignal(pos_id=pos.pos_id, price=close, reason='ou_timeout'))
                     continue
+                # Store effective stop for broker-side sync (get_effective_stop)
+                state['effective_stop'] = effective_stop
                 # Ratchet trailing stop AFTER exit check (causal: effective next eval)
                 if high > trailing:
                     state['trailing_stop'] = high
@@ -561,6 +563,8 @@ class SurferMLAlgo(AlgoBase):
                 if not is_breakout and hold_5m >= max(6, int(ou_hl * 3)):
                     exits.append(ExitSignal(pos_id=pos.pos_id, price=close, reason='ou_timeout'))
                     continue
+                # Store effective stop for broker-side sync (get_effective_stop)
+                state['effective_stop'] = effective_stop
                 # Ratchet trailing stop AFTER exit check (causal: effective next eval)
                 if trailing == 0 or low < trailing:
                     state['trailing_stop'] = low
@@ -577,9 +581,9 @@ class SurferMLAlgo(AlgoBase):
         self._pos_state.pop(trade.pos_id, None)
 
     def get_effective_stop(self, position) -> Optional[float]:
-        """Return current trailing stop for broker-side sync."""
+        """Return current effective stop (tier-adjusted) for broker-side sync."""
         state = self._pos_state.get(position.pos_id, {})
-        return state.get('trailing_stop', position.stop_price)
+        return state.get('effective_stop', position.stop_price)
 
     def serialize_state(self, pos_id: str) -> dict:
         """Persist trail state for crash recovery."""

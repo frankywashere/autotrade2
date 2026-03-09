@@ -207,9 +207,10 @@ class BacktestEngine:
                             algo.on_fill(trade)
 
                 # ---- STEP 3: Update best/worst prices AFTER exits (causal) ----
-                # This ensures trail ratcheting only affects NEXT bar's stop level.
-                # hold_bars only increments at exit-check TF boundaries so algos
-                # count in their natural units (5-min bars, daily bars, etc.).
+                # Ratchet best/worst on every 1-min bar to capture true price
+                # extremes (matching broker-side stops that track continuously
+                # in live). hold_bars only increments at exit-check TF boundaries
+                # so algos count in their natural units (5-min bars).
                 is_exit_boundary = ts in self._algo_exit_bar_times.get(algo_id, set())
                 for pos in self.portfolio.get_open_positions(algo_id):
                     self.portfolio.update_position(
