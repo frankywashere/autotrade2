@@ -183,7 +183,7 @@ def order_entry_panel(state) -> pn.Column:
                               margin=(0, 0, 0, 0))
 
     price_slider = pn.widgets.FloatSlider(
-        name='', start=0.0, end=1.0, step=0.01, value=0.0,
+        name='', start=0.0, end=1000.0, step=0.01, value=0.0,
         sizing_mode='stretch_width', show_value=False,
         margin=(0, 0, 0, 0))
 
@@ -242,6 +242,19 @@ def order_entry_panel(state) -> pn.Column:
         else:
             lock_toggle.name = 'Unlocked'
             lock_toggle.button_type = 'default'
+            # Reset slider to current mid when unlocking
+            if state.ib_client:
+                data = state.ib_client.get_price_data('TSLA')
+                b = data.get('bid', 0.0)
+                a = data.get('ask', 0.0)
+                if b > 0 and a > 0:
+                    m = round((b + a) / 2, 2)
+                    _programmatic[0] = True
+                    try:
+                        price_slider.value = m
+                        price_input.value = m
+                    finally:
+                        _programmatic[0] = False
 
     price_slider.param.watch(_on_slider_change, 'value')
     price_input.param.watch(_on_price_input_change, 'value')
@@ -434,21 +447,20 @@ def order_entry_panel(state) -> pn.Column:
                     f'<span><b style="color:#ff5252">Ask ${ask:.2f}</b></span>'
                     f'</div>')
 
-                # Always update slider range to bid/ask (guard against zero spread)
-                slider_start = round(bid, 2)
-                slider_end = round(ask, 2)
-                if slider_end <= slider_start:
-                    slider_start = round(bid - 0.25, 2)
-                    slider_end = round(ask + 0.25, 2)
-                _programmatic[0] = True
-                try:
-                    price_slider.start = slider_start
-                    price_slider.end = slider_end
-                    if not _locked[0]:
-                        price_slider.value = mid
-                        price_input.value = mid
-                finally:
-                    _programmatic[0] = False
+                # Set slider range to ±$2 from mid (wide enough to not jump)
+                # Only update range when it would shift significantly (>$0.50)
+                slider_mid = (price_slider.start + price_slider.end) / 2
+                if abs(slider_mid - mid) > 0.50 or price_slider.end <= price_slider.start + 0.01:
+                    _programmatic[0] = True
+                    try:
+                        price_slider.start = round(mid - 2.0, 2)
+                        price_slider.end = round(mid + 2.0, 2)
+                        # Only set value if slider was never touched (initial state)
+                        if not _locked[0] and price_slider.value < 1.0:
+                            price_slider.value = mid
+                            price_input.value = mid
+                    finally:
+                        _programmatic[0] = False
 
             # Check if IB order log changed
             v = state.ib_client.get_order_log_version()
