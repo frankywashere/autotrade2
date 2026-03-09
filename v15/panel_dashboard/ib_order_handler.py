@@ -584,6 +584,14 @@ class IBOrderHandler:
             tif='GTC', order_ref=order_ref, outside_rth=True)
 
         if 'error' in result:
+            error_msg = result['error']
+            if 'Timeout' in str(error_msg) or 'in-flight' in str(error_msg):
+                # Order may be live at IB despite timeout — do NOT re-arm.
+                # Recovery on next restart will find it via orderRef.
+                logger.warning("Stop placement TIMED OUT for trade %d — "
+                               "order may be in-flight, NOT re-arming "
+                               "(recovery will reconcile)", trade_id)
+                return -1  # Sentinel: not None (don't re-arm), not a real ID
             logger.error("Protective stop failed for trade %d: %s",
                          trade_id, result['error'])
             self._set_degraded(f"Stop placement failed for trade {trade_id}")
@@ -674,8 +682,8 @@ class IBOrderHandler:
         new_stop_id = self._place_protective_stop(
             trade_id, new_stop_price, effective_open, direction)
 
-        if not new_stop_id:
-            # Revert DB stop_price to match what IB still has
+        if new_stop_id is None:
+            # Real failure — revert DB stop_price to match what IB still has
             logger.error("Stop modification failed for trade %d — "
                          "reverting to $%.2f", trade_id, old_stop)
             try:
@@ -684,6 +692,10 @@ class IBOrderHandler:
                 logger.error("CRITICAL: Failed to revert stop price for trade %d: %s",
                              trade_id, e)
             self._set_degraded(f"Stop modification failed for trade {trade_id}")
+        elif new_stop_id == -1:
+            # Timeout — order may be in-flight, recovery will reconcile
+            logger.warning("Stop modification timed out for trade %d — "
+                           "order may be in-flight at IB", trade_id)
 
     # ── Fill Callbacks ──────────────────────────────────────────────
 
@@ -1104,15 +1116,23 @@ class IBOrderHandler:
 
         self._exit_in_progress.pop(trade_id, None)
 
+        # Remove from routing dict so duplicate callbacks are ignored
+        self._exit_orders.pop(order_id, None)
+
         # Re-arm protective stop
         effective_open = self._effective_open_shares(trade)
         if effective_open > 0:
             direction = trade.get('direction', 'long')
             stop_price = trade.get('stop_price', 0)
-            self._place_protective_stop(trade_id, stop_price,
-                                        effective_open, direction)
+            new_stop = self._place_protective_stop(trade_id, stop_price,
+                                                   effective_open, direction)
+            if new_stop is None:
+                self._set_degraded(
+                    f"Stop re-arm after exit cancel failed for trade {trade_id}")
+            # new_stop == -1 means timeout (in-flight) — recovery will reconcile
             logger.warning("Exit %d rejected/cancelled for trade %d — "
-                           "stop re-armed", order_id, trade_id)
+                           "stop re-armed (stop_id=%s)", order_id, trade_id,
+                           new_stop)
 
     def _on_stop_terminal(self, order_id: int, status: str):
         """Handle terminal status for a protective stop (unexpected cancel)."""
@@ -1121,7 +1141,7 @@ class IBOrderHandler:
         if not trade_id:
             return
 
-        # Guard 1: intentional cancel?
+        # Guard 1: intentional cancel (exit in progress)?
         if self._exit_in_progress.get(trade_id):
             return
 
@@ -1133,6 +1153,18 @@ class IBOrderHandler:
         if trade.get('ib_stop_order_id') != order_id:
             return
 
+        # Guard 3: prevent re-arm storm — NULL the DB stop_id BEFORE re-arming
+        # so duplicate callbacks for the same order_id are blocked by Guard 2
+        try:
+            self.db.update_trade_state(trade_id, ib_stop_order_id=None)
+        except Exception as e:
+            logger.error("Failed to NULL stop_id for trade %d during re-arm: %s",
+                         trade_id, e)
+            return
+
+        # Remove from routing dict so further callbacks are ignored
+        self._stop_orders.pop(order_id, None)
+
         # Unexpected stop cancellation — re-arm
         effective_open = self._effective_open_shares(trade)
         if effective_open > 0:
@@ -1142,8 +1174,9 @@ class IBOrderHandler:
                            order_id, trade_id)
             new_stop = self._place_protective_stop(
                 trade_id, stop_price, effective_open, direction)
-            if not new_stop:
+            if new_stop is None:
                 self._set_degraded(f"Stop re-arm failed for trade {trade_id}")
+            # new_stop == -1 means timeout (in-flight) — don't set degraded
 
     # ── Drain Buffers ───────────────────────────────────────────────
 
