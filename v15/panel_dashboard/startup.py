@@ -259,10 +259,10 @@ def _wire_tick_to_bar_feed(state, data):
                         new_bars = list(agg._completed_bars[consumed[symbol]:])
                     for bar in new_bars:
                         # bar['time'] is naive local datetime from datetime.now().
-                        # Convert to naive ET (matching IB historical bars).
+                        # Convert to tz-aware ET (matching IB historical bars
+                        # which are tz-aware from ib_async).
                         bar_local = bar['time']
-                        bar_et = bar_local.astimezone().astimezone(ET).replace(
-                            tzinfo=None)
+                        bar_et = bar_local.astimezone().astimezone(ET)
                         bar_time = pd.Timestamp(bar_et) + pd.Timedelta(minutes=1)
                         try:
                             data.on_1min_close(symbol, bar_time, bar)
