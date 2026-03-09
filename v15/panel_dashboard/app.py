@@ -23,17 +23,22 @@ _log_dir = os.path.join(_project_root, 'logs')
 os.makedirs(_log_dir, exist_ok=True)
 _log_file = os.path.join(_log_dir, 'dashboard.log')
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
-    datefmt='%H:%M:%S',
-    handlers=[
-        logging.StreamHandler(),
-        logging.handlers.RotatingFileHandler(
-            _log_file, maxBytes=5_000_000, backupCount=3,
-        ),
-    ],
-)
+# Force-add file handler to root logger (basicConfig is a no-op when
+# Panel's --log-level flag already configured the root logger).
+_root = logging.getLogger()
+_root.setLevel(logging.INFO)
+_fmt = logging.Formatter('%(asctime)s [%(name)s] %(levelname)s: %(message)s',
+                         datefmt='%H:%M:%S')
+_fh = logging.handlers.RotatingFileHandler(
+    _log_file, maxBytes=5_000_000, backupCount=3)
+_fh.setFormatter(_fmt)
+_root.addHandler(_fh)
+# Ensure a stream handler exists too (Panel may already add one)
+if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+           for h in _root.handlers):
+    _sh = logging.StreamHandler()
+    _sh.setFormatter(_fmt)
+    _root.addHandler(_sh)
 logger = logging.getLogger('x14.panel')
 
 # Also capture unhandled exceptions to log file
