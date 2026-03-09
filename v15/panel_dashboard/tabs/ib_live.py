@@ -473,12 +473,12 @@ def _open_positions(state):
 
         for t in trades:
             trade_id = t['id']
-            entry = t.get('entry_price', 0)
-            shares = t.get('open_shares', t.get('shares', 0))
-            direction = t.get('direction', 'long')
-            stop = t.get('stop_price', 0)
-            tp = t.get('tp_price', 0)
-            best = t.get('best_price', entry)
+            entry = t.get('entry_price') or 0
+            shares = t.get('open_shares') or t.get('shares') or 0
+            direction = t.get('direction') or 'long'
+            stop = t.get('stop_price') or 0
+            tp = t.get('tp_price') or 0
+            best = t.get('best_price') or entry
             algo = t.get('algo_id', '?')
             fill_status = t.get('ib_fill_status', 'filled')
             mgmt = t.get('management_mode', 'algo')
