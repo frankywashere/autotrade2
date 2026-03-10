@@ -473,7 +473,9 @@ class LiveDataProvider:
         if bars_df is None or len(bars_df) == 0:
             logger.warning("No 1-min bars returned for %s", symbol)
             return
-        bars_df['date'] = pd.to_datetime(bars_df['date'], utc=True).dt.tz_convert('US/Eastern').dt.tz_localize(None)
+        bars_df['date'] = pd.to_datetime(bars_df['date'])
+        if getattr(bars_df['date'].dt, 'tz', None) is not None:
+            bars_df['date'] = bars_df['date'].dt.tz_localize(None)
         bars_df = bars_df.set_index('date')
         with self._lock:
             self._bars.setdefault(symbol, {})['1min'] = bars_df
@@ -565,7 +567,9 @@ class LiveDataProvider:
             bars_df = self._ib.fetch_historical(
                 symbol, f'{duration_secs} S', '1 min', use_rth=False)
             if bars_df is not None and len(bars_df) > 0:
-                bars_df['date'] = pd.to_datetime(bars_df['date'], utc=True).dt.tz_convert('US/Eastern').dt.tz_localize(None)
+                bars_df['date'] = pd.to_datetime(bars_df['date'])
+                if getattr(bars_df['date'].dt, 'tz', None) is not None:
+                    bars_df['date'] = bars_df['date'].dt.tz_localize(None)
                 bars_df = bars_df.set_index('date')
                 with self._lock:
                     existing = self._bars.get(symbol, {}).get('1min',
