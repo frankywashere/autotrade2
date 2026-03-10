@@ -1,4 +1,13 @@
-"""Manual order entry panel for IB paper trading."""
+"""Manual order entry panel for IB paper trading.
+
+Supports two modes:
+- Normal: general BUY/SELL order entry (no DB trade link)
+- Algo Exit: pre-filled exit for a specific DB trade (linked via trade_id,
+  cancels stops, routes through IBOrderHandler.place_manual_exit)
+
+The Close button on position cards activates algo exit mode via
+state.order_entry_controller['activate_algo_exit'](trade_id).
+"""
 
 import logging
 import panel as pn
@@ -6,6 +15,7 @@ import panel as pn
 logger = logging.getLogger(__name__)
 
 ORDER_TYPE_MAP = {'Market': 'MKT', 'Limit': 'LMT', 'Stop': 'STP'}
+SESSION_MAP = {'RTH': 'rth', 'Extended Hours': 'extended', 'Overnight': 'overnight'}
 
 
 def order_entry_panel(state) -> pn.Column:
@@ -161,6 +171,8 @@ def order_entry_panel(state) -> pn.Column:
     status_msg = pn.pane.HTML('', width=200, margin=(0, 0, 0, 5), align='center')
 
     def _click_buy(event):
+        if _algo_exit_ctx['enabled']:
+            return  # Locked in algo exit mode
         _direction[0] = 'BUY'
         buy_btn.button_type = 'success'
         sell_btn.button_type = 'default'
@@ -168,6 +180,8 @@ def order_entry_panel(state) -> pn.Column:
         submit_btn.button_type = 'success'
 
     def _click_sell(event):
+        if _algo_exit_ctx['enabled']:
+            return  # Locked in algo exit mode
         _direction[0] = 'SELL'
         buy_btn.button_type = 'default'
         sell_btn.button_type = 'danger'
@@ -176,6 +190,138 @@ def order_entry_panel(state) -> pn.Column:
 
     buy_btn.on_click(_click_buy)
     sell_btn.on_click(_click_sell)
+
+    # ── Algo Exit Mode ──────────────────────────────────────────────
+
+    algo_exit_banner = pn.pane.HTML('', sizing_mode='stretch_width',
+                                     margin=(0, 0, 4, 0))
+    algo_exit_clear_btn = pn.widgets.Button(
+        name='X', button_type='light', width=30, height=28,
+        visible=False, margin=(0, 0, 0, 5))
+    algo_exit_row = pn.Row(algo_exit_banner, algo_exit_clear_btn,
+                            visible=False, sizing_mode='stretch_width',
+                            margin=(0, 0, 4, 0))
+
+    _algo_exit_ctx = {
+        'enabled': False,
+        'trade_id': None,
+        'manual_snapshot': None,  # {direction, qty, buy_btn_type, sell_btn_type}
+    }
+
+    def _activate_algo_exit(trade_id):
+        """Switch panel into algo exit mode for a specific trade."""
+        db = getattr(state, 'trade_db', None)
+        if not db:
+            return
+        trade = db.get_trade(trade_id)
+        if not trade or trade.get('exit_time'):
+            status_msg.object = ('<span style="color:#ff5252;font-weight:bold">'
+                                 'Trade not found or already closed</span>')
+            return
+
+        direction = trade.get('direction') or 'long'
+        shares = trade.get('open_shares') or trade.get('shares') or 0
+        algo_id = trade.get('algo_id') or '?'
+        close_action = 'SELL' if direction == 'long' else 'BUY'
+
+        # Save current manual state (only if not already in algo mode)
+        if not _algo_exit_ctx['enabled']:
+            _algo_exit_ctx['manual_snapshot'] = {
+                'direction': _direction[0],
+                'qty': qty_input.value,
+                'buy_type': buy_btn.button_type,
+                'sell_type': sell_btn.button_type,
+                'submit_name': submit_btn.name,
+                'submit_type': submit_btn.button_type,
+            }
+
+        _algo_exit_ctx['enabled'] = True
+        _algo_exit_ctx['trade_id'] = trade_id
+
+        # Set form to exit mode
+        _direction[0] = close_action
+        qty_input.value = shares
+        qty_input.disabled = True
+        buy_btn.disabled = True
+        sell_btn.disabled = True
+
+        if close_action == 'SELL':
+            buy_btn.button_type = 'default'
+            sell_btn.button_type = 'danger'
+            submit_btn.name = 'SUBMIT EXIT'
+            submit_btn.button_type = 'danger'
+        else:
+            buy_btn.button_type = 'success'
+            sell_btn.button_type = 'default'
+            submit_btn.name = 'SUBMIT EXIT'
+            submit_btn.button_type = 'success'
+
+        tif_select.disabled = True
+
+        # Auto-detect session
+        handler = getattr(state, 'ib_order_handler', None)
+        if handler:
+            routing = handler._get_exit_routing()
+            session_map_rev = {'rth': 'RTH', 'extended': 'Extended Hours',
+                               'overnight': 'Overnight'}
+            session_select.value = session_map_rev.get(routing['session'], 'RTH')
+
+        # Show slider for non-MKT
+        if order_type_select.value == 'Market' and session_select.value != 'RTH':
+            order_type_select.value = 'Limit'
+        slider_container.visible = order_type_select.value in ('Limit', 'Stop')
+
+        # Banner
+        dir_arrow = '\u25b2' if direction == 'long' else '\u25bc'
+        dir_color = '#00e676' if direction == 'long' else '#ff5252'
+        algo_exit_banner.object = (
+            f'<div style="background:#1a3a5c;padding:8px 12px;border-radius:6px;'
+            f'border-left:4px solid #2196f3;font-size:13px;">'
+            f'<b style="color:#2196f3;">ALGO EXIT MODE</b> &mdash; '
+            f'Trade <b>#{trade_id}</b> ({algo_id}) '
+            f'<span style="color:{dir_color}">{dir_arrow} {direction.upper()}</span> '
+            f'{close_action} {shares} shares'
+            f'</div>')
+        algo_exit_clear_btn.visible = True
+        algo_exit_row.visible = True
+
+        status_msg.object = ''
+        logger.info("Order entry: algo exit mode activated for trade %d", trade_id)
+
+    def _clear_algo_exit(event=None):
+        """Clear algo exit mode, restore manual entry."""
+        if not _algo_exit_ctx['enabled']:
+            return
+        snap = _algo_exit_ctx.get('manual_snapshot') or {}
+        _algo_exit_ctx['enabled'] = False
+        _algo_exit_ctx['trade_id'] = None
+
+        qty_input.disabled = False
+        buy_btn.disabled = False
+        sell_btn.disabled = False
+        tif_select.disabled = False
+
+        # Restore saved state
+        _direction[0] = snap.get('direction', 'BUY')
+        qty_input.value = snap.get('qty', 100)
+        buy_btn.button_type = snap.get('buy_type', 'success')
+        sell_btn.button_type = snap.get('sell_type', 'default')
+        submit_btn.name = snap.get('submit_name', 'SUBMIT BUY')
+        submit_btn.button_type = snap.get('submit_type', 'success')
+
+        algo_exit_banner.object = ''
+        algo_exit_clear_btn.visible = False
+        algo_exit_row.visible = False
+
+        logger.info("Order entry: algo exit mode cleared")
+
+    algo_exit_clear_btn.on_click(_clear_algo_exit)
+
+    # Expose controller on state for ib_live.py to call
+    state.order_entry_controller = {
+        'activate_algo_exit': _activate_algo_exit,
+        'clear_algo_exit': _clear_algo_exit,
+    }
 
     # ── Price Section (Limit/Stop only) ──────────────────────────────
 
@@ -261,6 +407,70 @@ def order_entry_panel(state) -> pn.Column:
                                  'IB not connected</span>')
             return
 
+        # ── Algo Exit Mode ──
+        if _algo_exit_ctx['enabled']:
+            trade_id = _algo_exit_ctx['trade_id']
+            handler = getattr(state, 'ib_order_handler', None)
+            if not handler:
+                status_msg.object = ('<span style="color:#ff5252;font-weight:bold">'
+                                     'No order handler</span>')
+                return
+
+            # Re-validate trade
+            db = getattr(state, 'trade_db', None)
+            if db:
+                trade = db.get_trade(trade_id)
+                if not trade or trade.get('exit_time'):
+                    status_msg.object = ('<span style="color:#ff5252;font-weight:bold">'
+                                         'Trade already closed</span>')
+                    _clear_algo_exit()
+                    return
+                # Refresh qty from current open_shares (may have changed from partial fill)
+                current_open = trade.get('open_shares') or 0
+                if current_open != qty_input.value and current_open > 0:
+                    qty_input.value = current_open
+
+            otype = ORDER_TYPE_MAP[order_type_select.value]
+            session = SESSION_MAP[session_select.value]
+            price = price_input.value if otype in ('LMT', 'STP') else 0.0
+
+            # Coerce MKT to LMT outside RTH
+            if otype == 'MKT' and session != 'rth':
+                otype = 'LMT'
+                data = state.ib_client.get_price_data('TSLA')
+                bid = data.get('bid', 0.0)
+                ask = data.get('ask', 0.0)
+                if bid > 0 and ask > 0:
+                    price = round((bid + ask) / 2, 2)
+                else:
+                    status_msg.object = ('<span style="color:#ff5252;font-weight:bold">'
+                                         'No bid/ask — use Limit order</span>')
+                    return
+
+            submit_btn.disabled = True
+            submit_btn.name = 'Sending...'
+            try:
+                ok = handler.place_manual_exit(
+                    trade_id, order_type=otype, price=price, session=session)
+                if ok:
+                    status_msg.object = (
+                        f'<span style="color:#00e676;font-weight:bold">'
+                        f'Exit order sent for trade #{trade_id}</span>')
+                    state.order_version += 1
+                    _clear_algo_exit()
+                else:
+                    status_msg.object = ('<span style="color:#ff5252;font-weight:bold">'
+                                         'Exit order failed</span>')
+            except Exception as e:
+                status_msg.object = (f'<span style="color:#ff5252;font-weight:bold">'
+                                     f'Error: {e}</span>')
+                logger.error("Algo exit submit error for trade %d: %s", trade_id, e)
+            finally:
+                submit_btn.disabled = False
+                submit_btn.name = 'SUBMIT EXIT' if _algo_exit_ctx['enabled'] else 'SUBMIT BUY'
+            return
+
+        # ── Normal Manual Mode ──
         action = _direction[0]
         qty = qty_input.value
         otype = ORDER_TYPE_MAP[order_type_select.value]
@@ -470,7 +680,23 @@ def order_entry_panel(state) -> pn.Column:
                 _last_log_version[0] = v
                 state.order_version += 1
 
+        # Auto-clear algo exit mode if trade closed
+        if _algo_exit_ctx['enabled']:
+            db = getattr(state, 'trade_db', None)
+            if db:
+                trade = db.get_trade(_algo_exit_ctx['trade_id'])
+                if trade and (trade.get('exit_time') or
+                              (trade.get('open_shares') or 0) <= 0):
+                    _clear_algo_exit()
+                    status_msg.object = (
+                        '<span style="color:#00e676;font-weight:bold">'
+                        'Trade closed — exit mode cleared</span>')
+
     # ── Assemble ─────────────────────────────────────────────────────
+
+    title_pane = pn.pane.HTML(
+        '<b style="font-size:15px">Manual Order Entry (TSLA)</b>',
+        margin=(0, 0, 4, 0))
 
     controls_row = pn.Row(
         buy_btn, sell_btn,
@@ -483,11 +709,10 @@ def order_entry_panel(state) -> pn.Column:
     )
 
     form = pn.Column(
-        pn.pane.HTML(
-            '<b style="font-size:15px">Manual Order Entry (TSLA)</b>',
-            margin=(0, 0, 4, 0)),
+        title_pane,
         account_pane,
         positions_pane,
+        algo_exit_row,
         controls_row,
         slider_container,
         styles={'background': '#1a1a2e', 'padding': '10px 12px',
