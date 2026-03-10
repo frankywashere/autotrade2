@@ -481,6 +481,7 @@ def wire_exec_details_callbacks(state):
     # This fires for ALL orders (existing + post-startup) via _on_order_status,
     # replacing the old per-trade wiring which missed post-startup orders.
     state.ib_client.register_order_status_callback(handler.on_order_status)
+    state.ib_client.register_degraded_callback(handler._set_degraded)
 
     # Wire IBClient._on_order_status on existing trades so the callback chain fires
     for trade in state.ib_client.ib.openTrades():

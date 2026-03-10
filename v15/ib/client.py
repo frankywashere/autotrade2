@@ -43,6 +43,7 @@ class IBClient:
         self._completed_cache = {}   # {perm_id: blotter_entry} — seeded once, updated reactively
         # External callbacks
         self._order_status_external = None   # IBOrderHandler.on_order_status
+        self._degraded_callback = None       # called when critical callback fails
         self._reconnect_callbacks = []       # fired after IB reconnect
 
         # Account data (cached from IB event loop, read from Panel thread)
@@ -162,6 +163,7 @@ class IBClient:
     def _on_disconnect(self):
         """Called when IB Gateway disconnects."""
         self._connected = False
+        self._disconnect_time = time.time()
         logger.warning("IB disconnected — will auto-reconnect")
         for cb in getattr(self, '_disconnect_callbacks', []):
             try:
@@ -579,7 +581,15 @@ class IBClient:
             try:
                 self._order_status_external(trade)
             except Exception as e:
-                logger.error("External order status callback failed: %s", e)
+                logger.error("CRITICAL: Order status callback failed for "
+                             "order %d (%s): %s", order_id, status, e, exc_info=True)
+                if self._degraded_callback:
+                    try:
+                        self._degraded_callback(
+                            f"Order status callback failed: order {order_id}, "
+                            f"status {status}")
+                    except Exception:
+                        pass
         # Update completed cache reactively when order reaches terminal state
         if status in ('Filled', 'Cancelled', 'Inactive'):
             entry = self._trade_to_entry(trade)
@@ -605,6 +615,27 @@ class IBClient:
                 self._order_log_version += 1
         elif reqId > 0:
             logger.info("Order %d warning: [%d] %s", reqId, errorCode, errorString)
+
+    def modify_stop_price(self, order_id: int, new_price: float) -> bool:
+        """Modify stop price on an existing order in place (no cancel+replace)."""
+        with self._order_lock:
+            trade = self._trades.get(order_id)
+        if not trade:
+            logger.error("modify_stop_price: order %d not found", order_id)
+            return False
+        try:
+            trade.order.auxPrice = round(new_price, 2)
+            future = asyncio.run_coroutine_threadsafe(
+                self._modify_order_async(trade), self._loop)
+            future.result(timeout=5)
+            return True
+        except Exception as e:
+            logger.error("modify_stop_price failed for order %d: %s", order_id, e)
+            return False
+
+    async def _modify_order_async(self, trade):
+        """Modify an existing order (IB treats placeOrder with existing orderId as modify)."""
+        self.ib.placeOrder(trade.contract, trade.order)
 
     def cancel_order(self, order_id: int) -> bool:
         """Cancel a pending order by orderId or permId. Returns True if cancel request sent."""
@@ -840,6 +871,10 @@ class IBClient:
         Called from _on_order_status for every status change on every order.
         """
         self._order_status_external = callback
+
+    def register_degraded_callback(self, callback):
+        """Register callback to set degraded when a critical callback fails."""
+        self._degraded_callback = callback
 
     def register_reconnect_callback(self, callback):
         """Register callback fired after IB auto-reconnect."""

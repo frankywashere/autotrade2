@@ -778,6 +778,14 @@ class IBOrderHandler:
             price_data = self.ib.get_price_data('TSLA')
             bid = price_data.get('bid', 0) or 0
             ask = price_data.get('ask', 0) or 0
+            # Warn on stale quotes
+            price_time = price_data.get('time')
+            if price_time:
+                age_s = (datetime.now() - price_time).total_seconds()
+                if age_s > 60:
+                    logger.warning("place_exit: quote is %.0fs old for trade %d "
+                                   "(bid=%.2f, ask=%.2f) — price may be stale",
+                                   age_s, trade_id, bid, ask)
             if bid > 0 and ask > 0:
                 lmt_price = round((bid + ask) / 2, 2)
             else:
@@ -974,7 +982,21 @@ class IBOrderHandler:
         if effective_open <= 0:
             return
 
-        # Cancel old stop and place new one at updated price
+        # Try to modify in place — no cancel race
+        ok = self.ib.modify_stop_price(stop_order_id, new_stop_price)
+        if ok:
+            try:
+                self.db.update_trade_state(trade_id, stop_price=new_stop_price)
+            except Exception as e:
+                logger.error("Stop price DB update failed for trade %d: %s",
+                             trade_id, e)
+            logger.info("Trailing stop modified: trade %d, order %d → $%.2f",
+                        trade_id, stop_order_id, new_stop_price)
+            return
+
+        # Fallback: cancel + replace (if modify failed for this order)
+        logger.warning("modify_stop_price failed for trade %d — "
+                       "falling back to cancel+replace", trade_id)
         self.ib.cancel_order(stop_order_id)
         new_stop_id = self._place_protective_stop(
             trade_id, new_stop_price, effective_open, direction)

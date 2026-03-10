@@ -280,7 +280,8 @@ def _wire_tick_to_bar_feed(state, data):
                 if n > consumed[symbol]:
                     with agg._lock:
                         new_bars = list(agg._completed_bars[consumed[symbol]:])
-                    for bar in new_bars:
+                    success_count = consumed[symbol]
+                    for i, bar in enumerate(new_bars):
                         # bar['time'] is naive local datetime from datetime.now().
                         # Convert to tz-aware ET (matching IB historical bars
                         # which are tz-aware from ib_async).
@@ -289,10 +290,12 @@ def _wire_tick_to_bar_feed(state, data):
                         bar_time = pd.Timestamp(bar_et) + pd.Timedelta(minutes=1)
                         try:
                             data.on_1min_close(symbol, bar_time, bar)
+                            success_count = consumed[symbol] + i + 1
                         except Exception as e:
-                            logger.error("Feed %s 1-min bar failed: %s",
-                                         symbol, e)
-                    consumed[symbol] = n
+                            logger.error("Feed %s 1-min bar failed at %s: %s",
+                                         symbol, bar_time, e)
+                            break  # Stop here, retry from this bar next cycle
+                    consumed[symbol] = success_count
                     any_new = True
             if not any_new:
                 _time.sleep(0.5)
@@ -371,6 +374,16 @@ def _wire_tick_to_bar_feed(state, data):
                 data.backfill_gap(sym, pd.Timestamp.now() - pd.Timedelta(hours=1))
             except Exception as e:
                 logger.error("Backfill %s failed: %s", sym, e)
+
+        # Flag long gaps where signals may have been missed
+        import time as _time2
+        disconnect_time = getattr(state.ib_client, '_disconnect_time', None)
+        if disconnect_time:
+            gap_seconds = _time2.time() - disconnect_time
+            if gap_seconds > 300:  # > 5 minutes
+                _set_degraded(
+                    f"Reconnect after {gap_seconds:.0f}s gap — "
+                    f"signals during gap may have been missed")
 
     state.ib_client.register_reconnect_callback(_on_ib_reconnect)
     state.ib_client.register_disconnect_callback(

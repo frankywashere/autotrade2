@@ -209,6 +209,10 @@ class LiveDataProvider:
         if len(period_bars) == 0:
             return None
 
+        if len(period_bars) < period_mins // 2:
+            logger.warning("Partial %s bar at %s: %d of ~%d expected 1-min bars",
+                           tf, bar_end, len(period_bars), period_mins)
+
         bar_dict = {
             'open': float(period_bars['open'].iloc[0]),
             'high': float(period_bars['high'].max()),

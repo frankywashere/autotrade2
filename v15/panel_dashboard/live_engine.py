@@ -87,8 +87,13 @@ class LiveEngine:
             try:
                 self.on_bar_close(info['tf'], info['time'], info['bar'])
             except Exception as e:
-                logger.error("LiveEngine dispatch failed for %s bar at %s: %s",
+                logger.error("Bar dispatch failed for %s @ %s: %s — retrying",
                              info.get('tf'), info.get('time'), e, exc_info=True)
+                try:
+                    self.on_bar_close(info['tf'], info['time'], info['bar'])
+                except Exception as e2:
+                    logger.error("Bar dispatch RETRY FAILED %s @ %s: %s — bar DROPPED",
+                                 info.get('tf'), info.get('time'), e2)
 
     def on_bar_close(self, tf: str, time: pd.Timestamp, bar: dict):
         """Called when a TF bar closes. Serialized, deadlock-safe.
