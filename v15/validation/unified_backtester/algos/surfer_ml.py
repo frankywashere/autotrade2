@@ -500,6 +500,10 @@ class SurferMLAlgo(AlgoBase):
                     else:
                         effective_stop = pos.stop_price
 
+                # Store effective stop for broker-side sync BEFORE exit check
+                # so get_effective_stop() always reflects the latest computation.
+                state['effective_stop'] = effective_stop
+
                 # Check exit conditions
                 if low <= effective_stop:
                     reason = 'stop' if effective_stop == pos.stop_price else 'trail'
@@ -512,8 +516,6 @@ class SurferMLAlgo(AlgoBase):
                 if not is_breakout and hold_5m >= max(6, int(ou_hl * 3)):
                     exits.append(ExitSignal(pos_id=pos.pos_id, price=close, reason='ou_timeout'))
                     continue
-                # Store effective stop for broker-side sync (get_effective_stop)
-                state['effective_stop'] = effective_stop
                 # Ratchet trailing stop AFTER exit check (causal: effective next eval)
                 if high > trailing:
                     state['trailing_stop'] = high
@@ -560,6 +562,9 @@ class SurferMLAlgo(AlgoBase):
                     else:
                         effective_stop = pos.stop_price
 
+                # Store effective stop for broker-side sync BEFORE exit check
+                state['effective_stop'] = effective_stop
+
                 if high >= effective_stop:
                     reason = 'stop' if effective_stop == pos.stop_price else 'trail'
                     exits.append(ExitSignal(pos_id=pos.pos_id, price=effective_stop, reason=reason))
@@ -571,8 +576,6 @@ class SurferMLAlgo(AlgoBase):
                 if not is_breakout and hold_5m >= max(6, int(ou_hl * 3)):
                     exits.append(ExitSignal(pos_id=pos.pos_id, price=close, reason='ou_timeout'))
                     continue
-                # Store effective stop for broker-side sync (get_effective_stop)
-                state['effective_stop'] = effective_stop
                 # Ratchet trailing stop AFTER exit check (causal: effective next eval)
                 if trailing == 0 or low < trailing:
                     state['trailing_stop'] = low

@@ -506,6 +506,17 @@ class LiveEngine:
         """Place closing order."""
         trade_id = int(exit_signal.pos_id)
 
+        # Update DB stop_price to the effective stop that triggered the exit,
+        # so the DB always reflects the true trailing level (not just the last
+        # _sync_trailing_stops value).
+        if self._db and exit_signal.reason in ('trail', 'stop'):
+            try:
+                self._db.update_trade_state(trade_id,
+                                            stop_price=exit_signal.price)
+            except Exception as e:
+                logger.error("Failed to sync exit stop for trade %d: %s",
+                             trade_id, e)
+
         if not algo.config.live_orders:
             # Sim mode: instant close (no IB calls, safe inside lock)
             if self._db:
