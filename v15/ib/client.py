@@ -320,7 +320,14 @@ class IBClient:
                 'close': bar.close,
                 'volume': int(bar.volume),
             })
-        return pd.DataFrame(records)
+        df = pd.DataFrame(records)
+        # Normalize all timestamps to tz-naive (project convention).
+        # IB returns tz-aware datetimes for intraday bars, tz-naive date
+        # objects for daily+.  Strip tz here so callers never see tz-aware.
+        df['date'] = pd.to_datetime(df['date'])
+        if getattr(df['date'].dt, 'tz', None) is not None:
+            df['date'] = df['date'].dt.tz_localize(None)
+        return df
 
     async def _fetch_historical_async(self, contract, duration, bar_size, use_rth):
         """Async wrapper for reqHistoricalData."""
@@ -474,13 +481,16 @@ class IBClient:
                     order_type: str = 'MKT', price: float = 0.0,
                     tif: str = 'DAY', outside_rth: bool = False,
                     overnight: bool = False,
-                    order_ref: str = '', model_code: str = None) -> dict:
+                    order_ref: str = '', model_code: str = None,
+                    good_after_time: str = '') -> dict:
         """Place an order via IB. Thread-safe (called from Panel UI thread).
 
         Args:
             overnight: Enable Blue Ocean ATS routing (8PM-3:50AM ET) via includeOvernight.
             order_ref: Durable orderRef for crash recovery matching (max 80 chars).
             model_code: IB modelCode for FA accounts (algo_id). None = don't set.
+            good_after_time: IB goodAfterTime string (yyyymmdd hh:mm:ss {tz}).
+                             Order stays inactive until this time.
         """
         if not self.is_connected():
             return {'error': 'Not connected to IB'}
@@ -488,7 +498,8 @@ class IBClient:
             future = asyncio.run_coroutine_threadsafe(
                 self._place_order_async(symbol, action, qty, order_type,
                                         price, tif, outside_rth,
-                                        overnight, order_ref, model_code),
+                                        overnight, order_ref, model_code,
+                                        good_after_time),
                 self._loop)
             return future.result(timeout=10)
         except TimeoutError:
@@ -506,7 +517,8 @@ class IBClient:
     async def _place_order_async(self, symbol, action, qty, order_type,
                                   price, tif, outside_rth,
                                   overnight=False, order_ref='',
-                                  model_code=None):
+                                  model_code=None,
+                                  good_after_time=''):
         """Async order placement (runs in IB event loop)."""
         from ib_async import MarketOrder, LimitOrder, StopOrder
 
@@ -542,6 +554,10 @@ class IBClient:
         # FA modelCode for per-algo position tracking
         if model_code:
             order.modelCode = model_code
+
+        # Delay activation (stop stays inactive until this time)
+        if good_after_time:
+            order.goodAfterTime = good_after_time
 
         trade = self.ib.placeOrder(contract, order)
         order_id = trade.order.orderId
