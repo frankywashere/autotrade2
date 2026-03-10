@@ -155,6 +155,9 @@ def scan_unlinked_orders(state):
                         except Exception as e:
                             logger.error("Failed to create pending row for "
                                          "unlinked entry %d: %s", order_id, e)
+                            state.ib_degraded = True
+                            logger.error("ib_degraded=True — unlinked broker entry "
+                                         "%d is untracked", order_id)
 
         elif order_ref.startswith('exit:'):
             # Check if DB has the exit linked
@@ -201,7 +204,10 @@ def recover_inflight_orders(state):
         for t in state.ib_client.ib.trades():
             all_broker_trades[t.order.orderId] = t
     except Exception as e:
-        logger.error("Recovery: failed to get broker trades: %s", e)
+        logger.error("Recovery: failed to get broker trades: %s — aborting recovery", e)
+        state.ib_degraded = True
+        logger.error("ib_degraded=True — recovery aborted, broker state unknown")
+        return
 
     # Get all open IB trades (including pending)
     open_trades = db.get_open_trades(source='ib', include_pending=True)
@@ -415,8 +421,12 @@ def recover_inflight_orders(state):
                     logger.warning("Trade %d has %d open shares with no stop/exit — "
                                    "re-arming stop @ $%.2f",
                                    trade_id, open_shares, stop_price)
-                    handler._place_protective_stop(
+                    result = handler._place_protective_stop(
                         trade_id, stop_price, open_shares, direction)
+                    if result is None or result == -1:
+                        logger.error("CRITICAL: Failed to re-arm stop for trade %d — "
+                                     "position UNPROTECTED", trade_id)
+                        state.ib_degraded = True
 
     logger.info("Recovery complete: %d trades processed", len(open_trades))
 

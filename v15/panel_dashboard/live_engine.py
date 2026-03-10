@@ -118,6 +118,9 @@ class LiveEngine:
                 op()
             except Exception as e:
                 logger.error("CRITICAL: Deferred IB op failed: %s", e, exc_info=True)
+                if self._orders and hasattr(self._orders, '_set_degraded'):
+                    self._orders._set_degraded(
+                        f"Deferred IB op failed: {e}")
 
     def _process_bar(self, tf, time, bar, deferred_ib_ops=None):
         """Process a bar close. Follows backtester causal loop order.
@@ -266,9 +269,10 @@ class LiveEngine:
                 positions.append(pos)
             return positions
         except Exception as e:
-            logger.error("CRITICAL: Failed to get positions for %s: %s",
+            logger.error("CRITICAL: Failed to get positions for %s: %s — "
+                         "skipping algo to avoid phantom flat state",
                          algo.algo_id, e, exc_info=True)
-            return []
+            raise  # Let per-algo fault isolation skip this algo entirely
 
     def _ratchet_positions(self, algo, positions, bar):
         """Direction-aware best/worst/hold_bars update."""

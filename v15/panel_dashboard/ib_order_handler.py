@@ -1481,6 +1481,8 @@ class IBOrderHandler:
         except Exception as e:
             logger.error("Failed to NULL stop_id for trade %d during re-arm: %s",
                          trade_id, e)
+            self._set_degraded(f"Stop NULL write failed for trade {trade_id} "
+                               f"during re-arm — position may be unprotected")
             return
 
         # Remove from routing dict so further callbacks are ignored
