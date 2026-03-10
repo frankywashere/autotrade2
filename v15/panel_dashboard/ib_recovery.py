@@ -155,9 +155,11 @@ def scan_unlinked_orders(state):
                         except Exception as e:
                             logger.error("Failed to create pending row for "
                                          "unlinked entry %d: %s", order_id, e)
-                            state.ib_degraded = True
-                            logger.error("ib_degraded=True — unlinked broker entry "
-                                         "%d is untracked", order_id)
+                            if handler and hasattr(handler, '_set_degraded'):
+                                handler._set_degraded(
+                                    f"Unlinked broker entry {order_id} is untracked")
+                            else:
+                                state.ib_degraded = True
 
         elif order_ref.startswith('exit:'):
             # Check if DB has the exit linked
@@ -205,8 +207,10 @@ def recover_inflight_orders(state):
             all_broker_trades[t.order.orderId] = t
     except Exception as e:
         logger.error("Recovery: failed to get broker trades: %s — aborting recovery", e)
-        state.ib_degraded = True
-        logger.error("ib_degraded=True — recovery aborted, broker state unknown")
+        if handler and hasattr(handler, '_set_degraded'):
+            handler._set_degraded("Recovery aborted — cannot load broker trades")
+        else:
+            state.ib_degraded = True
         return
 
     # Get all open IB trades (including pending)
@@ -424,9 +428,14 @@ def recover_inflight_orders(state):
                     result = handler._place_protective_stop(
                         trade_id, stop_price, open_shares, direction)
                     if result is None or result == -1:
-                        logger.error("CRITICAL: Failed to re-arm stop for trade %d — "
-                                     "position UNPROTECTED", trade_id)
-                        state.ib_degraded = True
+                        if handler and hasattr(handler, '_set_degraded'):
+                            handler._set_degraded(
+                                f"Failed to re-arm stop for trade {trade_id} — "
+                                f"position UNPROTECTED")
+                        else:
+                            state.ib_degraded = True
+                            logger.error("CRITICAL: Failed to re-arm stop for "
+                                         "trade %d — position UNPROTECTED", trade_id)
 
     logger.info("Recovery complete: %d trades processed", len(open_trades))
 

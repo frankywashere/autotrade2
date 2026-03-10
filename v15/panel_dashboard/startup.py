@@ -306,6 +306,15 @@ def _wire_tick_to_bar_feed(state, data):
         logger.info("IB reconnected — running mid-session recovery")
         state.ib_connected = True
 
+        # Helper: set degraded through handler (persists to DB) or fallback to state
+        def _set_degraded(reason):
+            h = getattr(state, 'ib_order_handler', None)
+            if h and hasattr(h, '_set_degraded'):
+                h._set_degraded(reason)
+            else:
+                state.ib_degraded = True
+                logger.error("IB DEGRADED: %s", reason)
+
         # 1. Re-seed exec IDs (prevent double-counting replayed fills)
         handler = getattr(state, 'ib_order_handler', None)
         if handler:
@@ -316,8 +325,7 @@ def _wire_tick_to_bar_feed(state, data):
                 logger.info("Re-seeded seen_exec_ids: %d", len(handler.seen_exec_ids))
             except Exception as e:
                 logger.error("Mid-session re-seed failed: %s", e)
-                state.ib_degraded = True
-                logger.error("ib_degraded=True — re-seed failure may cause double fills")
+                _set_degraded("Reconnect re-seed failed — may cause double fills")
 
         # 2. Sync open-order cache (so recovery sees current broker state)
         try:
@@ -331,8 +339,7 @@ def _wire_tick_to_bar_feed(state, data):
                     logger.warning("Reconnect sync_orders wait failed: %s", e)
         except Exception as e:
             logger.error("Reconnect sync_orders failed: %s", e)
-            state.ib_degraded = True
-            logger.error("ib_degraded=True — sync failure, broker state unknown")
+            _set_degraded("Reconnect sync_orders failed — broker state unknown")
 
         # 3. Run inflight recovery (checks if stops/exits filled while disconnected)
         try:
@@ -340,8 +347,7 @@ def _wire_tick_to_bar_feed(state, data):
             recover_inflight_orders(state)
         except Exception as e:
             logger.error("Reconnect recovery failed: %s", e)
-            state.ib_degraded = True
-            logger.error("ib_degraded=True — recovery failure, trades may be stale")
+            _set_degraded("Reconnect recovery failed — trades may be stale")
 
         # 4. Re-wire statusEvent on new Trade objects (IB creates fresh objects on reconnect)
         try:
@@ -349,8 +355,7 @@ def _wire_tick_to_bar_feed(state, data):
                 trade.statusEvent += state.ib_client._on_order_status
         except Exception as e:
             logger.error("Reconnect re-wire failed: %s", e)
-            state.ib_degraded = True
-            logger.error("ib_degraded=True — status callbacks not wired")
+            _set_degraded("Reconnect re-wire failed — status callbacks not wired")
 
         # 5. Reconcile IB/DB positions
         try:
@@ -358,8 +363,7 @@ def _wire_tick_to_bar_feed(state, data):
             reconcile_ib_db(state)
         except Exception as e:
             logger.error("Reconnect reconciliation failed: %s", e)
-            state.ib_degraded = True
-            logger.error("ib_degraded=True — reconciliation failed")
+            _set_degraded("Reconnect reconciliation failed")
 
         # 6. Backfill 1-min bars for any gap
         for sym in symbols:
