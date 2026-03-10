@@ -214,7 +214,7 @@ def recover_inflight_orders(state):
         trade_id = trade['id']
         fill_status = trade.get('ib_fill_status', 'filled')
         direction = trade.get('direction', 'long')
-        open_shares = trade.get('open_shares', 0)
+        open_shares = trade.get('open_shares') or 0
 
         # ── Check pending entries against broker state ──
         entry_oid = trade.get('ib_entry_order_id')
@@ -364,8 +364,8 @@ def recover_inflight_orders(state):
                 'trade_id': trade_id,
                 'algo_id': trade.get('algo_id', ''),
                 'direction': direction,
-                'stop_price': trade.get('stop_price', 0),
-                'tp_price': trade.get('tp_price', 0),
+                'stop_price': trade.get('stop_price') or 0,
+                'tp_price': trade.get('tp_price') or 0,
             }
 
         if exit_oid:
@@ -383,7 +383,7 @@ def recover_inflight_orders(state):
         if open_shares > 0:
             current_price = getattr(state, 'tsla_price', None) or 0
             if current_price > 0:
-                db_best = trade.get('best_price', trade.get('entry_price', 0))
+                db_best = trade.get('best_price') or trade.get('entry_price') or 0
                 if direction == 'long' and current_price > db_best:
                     try:
                         db.update_trade_state(trade_id, best_price=current_price)
@@ -410,7 +410,7 @@ def recover_inflight_orders(state):
                                trade_id, open_shares)
             else:
                 # No stop and no exit — naked position, re-arm
-                stop_price = trade.get('stop_price', 0)
+                stop_price = trade.get('stop_price') or 0
                 if stop_price > 0:
                     logger.warning("Trade %d has %d open shares with no stop/exit — "
                                    "re-arming stop @ $%.2f",
@@ -503,7 +503,7 @@ def reconcile_ib_db(state):
     open_trades = db.get_open_trades(source='ib')
     db_net = 0
     for t in open_trades:
-        open_shares = t.get('open_shares', 0)
+        open_shares = t.get('open_shares') or 0
         direction = t.get('direction', 'long')
         if direction == 'long':
             db_net += open_shares
@@ -515,8 +515,8 @@ def reconcile_ib_db(state):
     for algo_id in sorted(algo_ids):
         algo_trades = [t for t in open_trades if t.get('algo_id') == algo_id]
         algo_net = sum(
-            (t.get('open_shares', 0) if t.get('direction') == 'long'
-             else -t.get('open_shares', 0))
+            ((t.get('open_shares') or 0) if t.get('direction') == 'long'
+             else -(t.get('open_shares') or 0))
             for t in algo_trades)
         logger.info("  Algo %s: DB net=%d (%d trades)", algo_id, algo_net, len(algo_trades))
 
@@ -544,7 +544,7 @@ def reconcile_ib_db(state):
         for t in open_trades:
             try:
                 # Try to find the fill price from IB completed orders
-                exit_price = t.get('stop_price', t.get('entry_price', 0))
+                exit_price = t.get('stop_price') or t.get('entry_price') or 0
                 try:
                     completed = state.ib_client.ib.trades()
                     stop_oid = t.get('ib_stop_order_id')
