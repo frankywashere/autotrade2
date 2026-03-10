@@ -473,7 +473,7 @@ class LiveDataProvider:
         if bars_df is None or len(bars_df) == 0:
             logger.warning("No 1-min bars returned for %s", symbol)
             return
-        bars_df['date'] = pd.to_datetime(bars_df['date'])
+        bars_df['date'] = pd.to_datetime(bars_df['date'], utc=True).dt.tz_convert('US/Eastern').dt.tz_localize(None)
         bars_df = bars_df.set_index('date')
         with self._lock:
             self._bars.setdefault(symbol, {})['1min'] = bars_df
@@ -525,6 +525,8 @@ class LiveDataProvider:
             logger.warning("No daily bars returned for %s", symbol)
             return
         daily_df['date'] = pd.to_datetime(daily_df['date'])
+        if getattr(daily_df['date'].dt, 'tz', None) is not None:
+            daily_df['date'] = daily_df['date'].dt.tz_localize(None)
         daily_df = daily_df.set_index('date')
         with self._lock:
             self._bars.setdefault(symbol, {})['daily'] = daily_df.tail(bars)
@@ -539,6 +541,8 @@ class LiveDataProvider:
             logger.warning("No weekly bars returned for %s", symbol)
             return
         weekly_df['date'] = pd.to_datetime(weekly_df['date'])
+        if getattr(weekly_df['date'].dt, 'tz', None) is not None:
+            weekly_df['date'] = weekly_df['date'].dt.tz_localize(None)
         weekly_df = weekly_df.set_index('date')
         with self._lock:
             self._bars.setdefault(symbol, {})['weekly'] = weekly_df
@@ -561,7 +565,7 @@ class LiveDataProvider:
             bars_df = self._ib.fetch_historical(
                 symbol, f'{duration_secs} S', '1 min', use_rth=False)
             if bars_df is not None and len(bars_df) > 0:
-                bars_df['date'] = pd.to_datetime(bars_df['date'])
+                bars_df['date'] = pd.to_datetime(bars_df['date'], utc=True).dt.tz_convert('US/Eastern').dt.tz_localize(None)
                 bars_df = bars_df.set_index('date')
                 with self._lock:
                     existing = self._bars.get(symbol, {}).get('1min',
