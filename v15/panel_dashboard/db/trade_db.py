@@ -289,7 +289,7 @@ class TradeDB:
             'entry_price', 'entry_time', 'shares', 'tp_price',
             'el_flagged', 'trail_width_mult', 'ou_half_life',
             'ib_entry_order_id', 'ib_perm_id', 'exit_reason',
-            'management_mode',
+            'management_mode', 'metadata',
         }
         invalid = set(kwargs) - allowed
         if invalid:
