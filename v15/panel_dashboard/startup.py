@@ -37,7 +37,7 @@ def connect_ib(state):
 
     try:
         from v15.ib.client import IBClient
-        cid = random.randint(10, 99)
+        cid = 7  # Fixed clientId so orders are always cancellable across restarts
         state.ib_client = IBClient(host='127.0.0.1', port=4002, client_id=cid)
         state.ib_client.connect()
         state.ib_client.subscribe('TSLA')
@@ -304,6 +304,7 @@ def _wire_tick_to_bar_feed(state, data):
     # Register reconnect callback: full mid-session recovery
     def _on_ib_reconnect():
         logger.info("IB reconnected — running mid-session recovery")
+        state.ib_connected = True
 
         # 1. Re-seed exec IDs (prevent double-counting replayed fills)
         handler = getattr(state, 'ib_order_handler', None)
@@ -358,6 +359,8 @@ def _wire_tick_to_bar_feed(state, data):
                 logger.error("Backfill %s failed: %s", sym, e)
 
     state.ib_client.register_reconnect_callback(_on_ib_reconnect)
+    state.ib_client.register_disconnect_callback(
+        lambda: setattr(state, 'ib_connected', False))
 
 
 def reload_degraded_state(state):

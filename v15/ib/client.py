@@ -163,6 +163,11 @@ class IBClient:
         """Called when IB Gateway disconnects."""
         self._connected = False
         logger.warning("IB disconnected — will auto-reconnect")
+        for cb in getattr(self, '_disconnect_callbacks', []):
+            try:
+                cb()
+            except Exception as e:
+                logger.error("Disconnect callback failed: %s", e)
 
     def disconnect(self):
         """Disconnect from IB Gateway."""
@@ -172,11 +177,8 @@ class IBClient:
         logger.info("IB disconnected (manual)")
 
     def reconnect(self):
-        """Force reconnect with a new random client ID (clears stale sessions)."""
-        import random
-        old_id = self._client_id
-        self._client_id = random.randint(10, 99)
-        logger.info("IB reconnect: client_id %d -> %d", old_id, self._client_id)
+        """Force reconnect (reuses same client ID so orders stay cancellable)."""
+        logger.info("IB reconnect: reusing client_id %d", self._client_id)
         if self.ib.isConnected():
             self.ib.disconnect()
         self._connected = False
@@ -466,7 +468,7 @@ class IBClient:
         """Place an order via IB. Thread-safe (called from Panel UI thread).
 
         Args:
-            overnight: Route to OVERNIGHT exchange (Blue Ocean ATS, 8PM-3:50AM ET).
+            overnight: Enable Blue Ocean ATS routing (8PM-3:50AM ET) via includeOvernight.
             order_ref: Durable orderRef for crash recovery matching (max 80 chars).
             model_code: IB modelCode for FA accounts (algo_id). None = don't set.
         """
@@ -503,10 +505,6 @@ class IBClient:
         if qualified:
             contract = qualified[0]
 
-        # Route to OVERNIGHT exchange for Blue Ocean ATS
-        if overnight:
-            contract.exchange = 'OVERNIGHT'
-
         if order_type == 'MKT':
             order = MarketOrder(action, qty)
         elif order_type == 'LMT':
@@ -518,6 +516,14 @@ class IBClient:
 
         order.tif = tif
         order.outsideRth = outside_rth
+
+        if overnight:
+            # Blue Ocean ATS: exchange='OVERNIGHT', LMT only, DAY TIF only, 8PM-3:50AM ET
+            # IBC config BypassOrderPrecautions=yes required (clears Error 10329)
+            # outsideRth is ignored for OVERNIGHT exchange (IB warning 2109)
+            contract.exchange = 'OVERNIGHT'
+            order.tif = 'DAY'
+            order.outsideRth = False
 
         # Durable orderRef for crash recovery matching
         if order_ref:
@@ -579,6 +585,7 @@ class IBClient:
         105, 110, 161, 165, 321, 329, 399, 404, 434, 492,
         2100, 2101, 2102, 2103, 2104, 2105, 2106, 2107, 2108, 2109,
         2110, 2137, 2158, 2169, 10167, 10197,
+        10329,  # OVERNIGHT exchange precautionary (bypassed via IBC BypassOrderPrecautions)
     }
 
     def _on_error(self, reqId, errorCode, errorString, contract):
@@ -802,6 +809,7 @@ class IBClient:
                 'fill_time': fill_time,
                 'exchange': getattr(contract, 'exchange', ''),
                 'order_ref': getattr(order, 'orderRef', ''),
+                'client_id': getattr(order, 'clientId', 0),
             }
         except Exception as e:
             logger.error("_trade_to_entry failed: %s", e)
@@ -827,6 +835,12 @@ class IBClient:
     def register_reconnect_callback(self, callback):
         """Register callback fired after IB auto-reconnect."""
         self._reconnect_callbacks.append(callback)
+
+    def register_disconnect_callback(self, callback):
+        """Register callback fired when IB disconnects."""
+        if not hasattr(self, '_disconnect_callbacks'):
+            self._disconnect_callbacks = []
+        self._disconnect_callbacks.append(callback)
 
     def sync_orders(self):
         """Thread-safe trigger to re-sync open orders from IB.

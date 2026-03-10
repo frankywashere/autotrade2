@@ -401,10 +401,10 @@ class IBOrderHandler:
     def _get_exit_routing(self) -> dict:
         """Determine order routing based on current market session.
 
-        Returns dict with keys: session, overnight, outside_rth.
+        Returns dict with keys: session, outside_rth.
         - RTH (9:30-16:00 ET): MKT on SMART
         - Extended (4:00-9:30 or 16:00-20:00 ET): LMT on SMART + outsideRth
-        - Overnight (20:00-4:00 ET): LMT on OVERNIGHT (Blue Ocean)
+        - Overnight (20:00-3:50 ET): LMT DAY on OVERNIGHT exchange (Blue Ocean ATS)
         """
         now = datetime.now(ZoneInfo('America/New_York'))
         t = now.hour * 60 + now.minute  # minutes since midnight ET
@@ -414,16 +414,16 @@ class IBOrderHandler:
 
         # RTH: 9:30-16:00 ET
         if 570 <= t < 960:
-            return {'session': 'rth', 'overnight': False, 'outside_rth': False}
+            return {'session': 'rth', 'outside_rth': False}
         # Extended pre-market: 4:00-9:30 ET
         elif 240 <= t < 570:
-            return {'session': 'extended', 'overnight': False, 'outside_rth': True}
+            return {'session': 'extended', 'outside_rth': True}
         # Extended after-hours: 16:00-20:00 ET
         elif 960 <= t < 1200:
-            return {'session': 'extended', 'overnight': False, 'outside_rth': True}
+            return {'session': 'extended', 'outside_rth': True}
         # Overnight: 20:00-4:00 ET (or weekend)
         else:
-            return {'session': 'overnight', 'overnight': True, 'outside_rth': False}
+            return {'session': 'overnight', 'outside_rth': True}
 
     def take_over_trade(self, trade_id: int) -> bool:
         """Switch a trade from algo management to manual management.
@@ -540,8 +540,8 @@ class IBOrderHandler:
         model_code = trade.get('algo_id') if self._state.fa_supported else None
 
         # Build order kwargs based on session
+        outside_rth = session in ('extended', 'overnight')
         overnight = session == 'overnight'
-        outside_rth = session == 'extended'
 
         if order_type == 'MKT':
             if session != 'rth':
@@ -764,6 +764,7 @@ class IBOrderHandler:
         # Session-aware routing
         routing = self._get_exit_routing()
         session = routing['session']
+        overnight = session == 'overnight'
 
         if session == 'rth':
             # Regular hours — MKT fills immediately
@@ -790,15 +791,13 @@ class IBOrderHandler:
             elif close_action == 'BUY' and ask > 0:
                 lmt_price = round(ask, 2)
 
-            overnight = session == 'overnight'
             result = self.ib.place_order(
                 'TSLA', close_action, effective_open, 'LMT',
                 price=lmt_price, tif='DAY',
-                outside_rth=routing['outside_rth'],
-                overnight=overnight,
+                outside_rth=True, overnight=overnight,
                 order_ref=order_ref, model_code=model_code)
-            logger.info("Exit LMT placed: %s %d @ $%.2f (session=%s, overnight=%s)",
-                        close_action, effective_open, lmt_price, session, overnight)
+            logger.info("Exit LMT placed: %s %d @ $%.2f (session=%s)",
+                        close_action, effective_open, lmt_price, session)
 
         if 'error' in result:
             logger.error("Exit order failed for trade %d: %s",

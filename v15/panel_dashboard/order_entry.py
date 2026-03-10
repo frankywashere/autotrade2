@@ -435,20 +435,15 @@ def order_entry_panel(state) -> pn.Column:
             session = SESSION_MAP[session_select.value]
             price = price_input.value if otype in ('LMT', 'STP') else 0.0
 
-            # Validate session matches current time (prevent OVERNIGHT outside 8PM-4AM)
-            actual_routing = handler._get_exit_routing()
-            actual_session = actual_routing['session']
-            if session == 'overnight' and actual_session != 'overnight':
-                status_msg.object = (
-                    '<span style="color:#ff5252;font-weight:bold">'
-                    'OVERNIGHT only available 8PM-4AM ET — '
-                    f'current session: {actual_session.upper()}</span>')
-                return
-            if session == 'rth' and actual_session != 'rth':
-                status_msg.object = (
-                    '<span style="color:#ff5252;font-weight:bold">'
-                    f'RTH not open — current session: {actual_session.upper()}</span>')
-                return
+            # Validate RTH session (MKT at RTH-only queues until open — warn user)
+            if session == 'rth':
+                actual_routing = handler._get_exit_routing()
+                if actual_routing['session'] != 'rth':
+                    status_msg.object = (
+                        '<span style="color:#ff5252;font-weight:bold">'
+                        f'RTH not open — current session: '
+                        f'{actual_routing["session"].upper()}</span>')
+                    return
 
             # Coerce MKT to LMT outside RTH
             if otype == 'MKT' and session != 'rth':
@@ -551,20 +546,37 @@ def order_entry_panel(state) -> pn.Column:
             return pn.pane.HTML(
                 '<div style="color:#888;font-size:12px">No orders yet</div>')
 
-        rows_html = ''
-        pending_ids = []
-        td = 'padding:2px 6px'
-        for entry in log:  # Already sorted newest-first by IB sync
+        # Build each row as pn.Row: [cancel_btn | HTML data]
+        sp = 'font-size:12px;font-family:monospace;white-space:nowrap;padding:1px 6px'
+        header_html = (
+            '<div style="display:flex;border-bottom:1px solid #444;padding:2px 0;'
+            'font-size:12px;color:#888">'
+            '<span style="min-width:42px"></span>'  # cancel btn space
+            '<span style="min-width:55px">ID</span>'
+            '<span style="min-width:75px">Time</span>'
+            '<span style="min-width:50px">Action</span>'
+            '<span style="min-width:45px">Qty</span>'
+            '<span style="min-width:90px">Type</span>'
+            '<span style="min-width:80px">Price</span>'
+            '<span style="min-width:100px">Status</span>'
+            '<span style="min-width:70px">Fill</span>'
+            '<span style="min-width:75px">Fill Time</span>'
+            '</div>')
+
+        items = [pn.pane.HTML(header_html, sizing_mode='stretch_width',
+                              margin=(0, 0, 0, 0))]
+
+        for entry in log:
             status = entry['status']
+            cancellable = False
             if status == 'Filled':
                 color = '#00e676'
             elif status in ('Submitted', 'PreSubmitted', 'PendingSubmit'):
                 color = '#ffab00'
-                # Only show cancel for manual orders, not algo-managed ones
                 ref = entry.get('order_ref', '')
-                algo_prefixes = ('stop:', 'exit:', 'entry:', 'emstop:', 'counter:')
-                if not ref.startswith(algo_prefixes):
-                    pending_ids.append(entry.get('perm_id') or entry['order_id'])
+                no_cancel_prefixes = ('stop:', 'entry:', 'emstop:', 'counter:')
+                if not ref.startswith(no_cancel_prefixes):
+                    cancellable = True
             elif 'Cancel' in status:
                 color = '#ff5252'
             elif 'Reject' in status or 'Inactive' in status:
@@ -577,69 +589,72 @@ def order_entry_panel(state) -> pn.Column:
             action_color = '#00e676' if entry.get('action') == 'BUY' else '#ff5252'
             oid = entry.get('order_id', '?')
             exchange = entry.get('exchange', '')
-            exch_label = f' <span style="color:#888;font-size:10px">{exchange}</span>' if exchange else ''
+            exch_label = (f' <span style="color:#888;font-size:10px">{exchange}</span>'
+                          if exchange else '')
 
-            rows_html += (
-                f'<tr>'
-                f'<td style="{td};color:#888">#{oid}</td>'
-                f'<td style="{td}">{entry.get("time", "")}</td>'
-                f'<td style="{td};color:{action_color};font-weight:bold">'
-                f'{entry.get("action", "?")}</td>'
-                f'<td style="{td}">{entry.get("qty", 0)}</td>'
-                f'<td style="{td}">{entry.get("order_type", "?")}{exch_label}</td>'
-                f'<td style="{td}">{price_str}</td>'
-                f'<td style="{td};color:{color};font-weight:bold">{status}</td>'
-                f'<td style="{td}">{fill_str}</td>'
-                f'<td style="{td}">{entry.get("fill_time", "")}</td>'
-                f'</tr>'
-            )
+            row_html = (
+                f'<div style="display:flex;align-items:center;{sp};'
+                f'border-bottom:1px solid #333;padding:2px 0">'
+                f'<span style="min-width:55px;color:#888">#{oid}</span>'
+                f'<span style="min-width:75px">{entry.get("time", "")}</span>'
+                f'<span style="min-width:50px;color:{action_color};font-weight:bold">'
+                f'{entry.get("action", "?")}</span>'
+                f'<span style="min-width:45px">{entry.get("qty", 0)}</span>'
+                f'<span style="min-width:90px">'
+                f'{entry.get("order_type", "?")}{exch_label}</span>'
+                f'<span style="min-width:80px">{price_str}</span>'
+                f'<span style="min-width:100px;color:{color};font-weight:bold">'
+                f'{status}</span>'
+                f'<span style="min-width:70px">{fill_str}</span>'
+                f'<span style="min-width:75px">{entry.get("fill_time", "")}</span>'
+                f'</div>')
 
-        th = 'padding:2px 6px;text-align:left'
-        table_html = (
-            f'<table style="width:100%;font-size:12px;border-collapse:collapse">'
-            f'<tr style="border-bottom:1px solid #444">'
-            f'<th style="{th}">ID</th>'
-            f'<th style="{th}">Time</th>'
-            f'<th style="{th}">Action</th>'
-            f'<th style="{th}">Qty</th>'
-            f'<th style="{th}">Type</th>'
-            f'<th style="{th}">Price</th>'
-            f'<th style="{th}">Status</th>'
-            f'<th style="{th}">Fill</th>'
-            f'<th style="{th}">Fill Time</th>'
-            f'</tr>{rows_html}</table>'
-        )
-
-        items = [pn.pane.HTML(table_html, sizing_mode='stretch_width')]
-
-        if pending_ids:
-            cancel_btns = []
-            for pid in pending_ids:
+            if cancellable:
+                cancel_id = entry.get('perm_id') or entry.get('order_id', 0)
                 btn = pn.widgets.Button(
-                    name=f"Cancel #{pid}", button_type='danger',
-                    width=120, height=26)
+                    name='\u2715', button_type='danger',
+                    width=32, height=22,
+                    margin=(0, 4, 0, 0))
 
                 def _make_cancel(perm_id):
                     def _cancel(event):
-                        logger.info("Cancel button clicked for permId %d", perm_id)
+                        import time as _time
+                        logger.info("Cancel clicked for order %s", perm_id)
                         try:
                             ok = state.ib_client.cancel_order(perm_id)
                             if ok:
-                                logger.info("Cancel sent for permId %d", perm_id)
+                                logger.info("Cancel sent for %s", perm_id)
+                                # Wait for IB to confirm cancel before refreshing
+                                _time.sleep(1.0)
                             else:
-                                logger.error("Cancel failed for permId %d — "
-                                             "order may belong to another session",
-                                             perm_id)
+                                logger.error("Cancel failed for %s", perm_id)
                         except Exception as e:
-                            logger.error("Cancel error for permId %d: %s", perm_id, e)
+                            logger.error("Cancel error for %s: %s", perm_id, e)
+                        # Force sync so blotter sees updated status
+                        try:
+                            state.ib_client.sync_orders()
+                            _time.sleep(0.5)
+                        except Exception:
+                            pass
                         state.order_version += 1
                     return _cancel
 
-                btn.on_click(_make_cancel(pid))
-                cancel_btns.append(btn)
-            items.append(pn.Row(*cancel_btns, margin=(4, 0, 0, 0)))
+                btn.on_click(_make_cancel(cancel_id))
+                row_widget = pn.Row(
+                    btn,
+                    pn.pane.HTML(row_html, sizing_mode='stretch_width'),
+                    sizing_mode='stretch_width',
+                    margin=(0, 0, 0, 0))
+            else:
+                row_widget = pn.Row(
+                    pn.Spacer(width=36),
+                    pn.pane.HTML(row_html, sizing_mode='stretch_width'),
+                    sizing_mode='stretch_width',
+                    margin=(0, 0, 0, 0))
 
-        return pn.Column(*items)
+            items.append(row_widget)
+
+        return pn.Column(*items, sizing_mode='stretch_width')
 
     # ── Periodic Callback (250ms) ────────────────────────────────────
 

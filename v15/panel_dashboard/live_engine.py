@@ -132,6 +132,7 @@ class LiveEngine:
         self._fill_pending_entries(tf, time, bar, deferred_ib_ops)
 
         for algo in self._algos:
+          try:
             # Skip if wrong TF for this algo
             if tf != algo.config.primary_tf and tf != algo.config.exit_check_tf:
                 continue
@@ -187,7 +188,12 @@ class LiveEngine:
 
             # 6. Generate new entry signals (signals always run for visibility)
             if should_eval:
-                context = self._build_trade_context(algo)
+                try:
+                    context = self._build_trade_context(algo)
+                except Exception as e:
+                    logger.error("Failed to build TradeContext for %s: %s",
+                                 algo.algo_id, e, exc_info=True)
+                    context = TradeContext(recent_trades=[], win_streak=0, loss_streak=0)
                 try:
                     signals = algo.on_bar(time, bar, positions, context=context)
                 except Exception as e:
@@ -212,6 +218,10 @@ class LiveEngine:
                     else:
                         self._execute_entry(algo, sig, bar['close'],
                                             deferred_ib_ops)
+          except Exception as e:
+            logger.error("CRITICAL: Unhandled error in %s during bar dispatch — "
+                         "remaining algos will still run: %s",
+                         algo.algo_id, e, exc_info=True)
 
     def _get_positions(self, algo):
         """Get open positions for an algo from DB, convert to Position objects.
@@ -588,12 +598,12 @@ class LiveEngine:
             source = 'ib' if algo.config.live_orders else self._source
             closed = self._db.get_closed_trades(algo_id=algo.algo_id,
                                                  source=source, limit=10)
-            recent_dicts = [{'pnl': t.get('pnl', 0), 'pnl_pct': t.get('pnl_pct', 0)}
+            recent_dicts = [{'pnl': t.get('pnl') or 0, 'pnl_pct': t.get('pnl_pct') or 0}
                             for t in (closed or [])]
             win_streak = 0
             loss_streak = 0
             for t in reversed(closed or []):
-                pnl = t.get('pnl', 0)
+                pnl = t.get('pnl') or 0
                 if pnl > 0:
                     if loss_streak > 0:
                         break
