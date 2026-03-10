@@ -444,6 +444,8 @@ class IBOrderHandler:
             return True
 
         # Cancel the resting stop (if any) — set _exit_in_progress to suppress re-arm
+        # NOTE: Don't pop _stop_orders here — let terminal handler clean up.
+        # If stop fills during cancel window, _on_stop_fill still routes correctly.
         stop_oid = trade.get('ib_stop_order_id')
         if stop_oid:
             self._exit_in_progress[trade_id] = True
@@ -454,12 +456,12 @@ class IBOrderHandler:
                              trade_id, e)
                 self._exit_in_progress.pop(trade_id, None)
                 return False
-            self._stop_orders.pop(stop_oid, None)
             self.ib.cancel_order(stop_oid)
             logger.info("take_over_trade: cancelled stop %d for trade %d",
                         stop_oid, trade_id)
 
         # Cancel any resting exit order
+        # NOTE: Don't pop _exit_orders — let terminal handler clean up.
         exit_oid = trade.get('ib_exit_order_id')
         if exit_oid:
             try:
@@ -468,7 +470,6 @@ class IBOrderHandler:
             except Exception as e:
                 logger.error("take_over_trade: failed to NULL exit for trade %d: %s",
                              trade_id, e)
-            self._exit_orders.pop(exit_oid, None)
             self.ib.cancel_order(exit_oid)
 
         # Set management_mode='manual' in DB
@@ -515,6 +516,8 @@ class IBOrderHandler:
             return False
 
         # Cancel any existing stop/exit first
+        # NOTE: Don't pop routing dicts — let terminal handlers clean up.
+        # If stop/exit fills during cancel window, fills route correctly.
         stop_oid = trade.get('ib_stop_order_id')
         if stop_oid:
             self._exit_in_progress[trade_id] = True
@@ -522,7 +525,6 @@ class IBOrderHandler:
                 self.db.update_trade_state(trade_id, ib_stop_order_id=None)
             except Exception:
                 pass
-            self._stop_orders.pop(stop_oid, None)
             self.ib.cancel_order(stop_oid)
 
         exit_oid = trade.get('ib_exit_order_id')
@@ -532,7 +534,6 @@ class IBOrderHandler:
                                            ib_exit_perm_id=None)
             except Exception:
                 pass
-            self._exit_orders.pop(exit_oid, None)
             self.ib.cancel_order(exit_oid)
 
         order_ref = f'exit:{trade_id}'
@@ -602,6 +603,8 @@ class IBOrderHandler:
 
         # Drain early fills
         self._drain_pending_exit(exit_order_id, trade_id, 'manual_close')
+
+        self._state.positions_version += 1
 
         logger.info("Manual exit placed: order_id=%d, trade %d, %s %d shares, "
                      "type=%s, price=$%.2f, session=%s",
@@ -1315,6 +1318,13 @@ class IBOrderHandler:
             self._on_exit_terminal(order_id, status)
         elif order_id in self._stop_orders:
             self._on_stop_terminal(order_id, status)
+        else:
+            # Unregistered terminal — buffer for late registration drain
+            with self._buffer_lock:
+                self._pending_exit_terminal[order_id] = TerminalStatus(
+                    status=status, timestamp=_now_eastern())
+            logger.info("Terminal status '%s' for unregistered order %d — buffered",
+                        status, order_id)
 
     def _on_entry_terminal(self, order_id: int, status: str):
         """Handle terminal status for an entry order."""
