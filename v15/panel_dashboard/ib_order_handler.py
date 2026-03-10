@@ -523,8 +523,9 @@ class IBOrderHandler:
             self._exit_in_progress[trade_id] = True
             try:
                 self.db.update_trade_state(trade_id, ib_stop_order_id=None)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("Failed to NULL stop_id for trade %d before cancel: %s",
+                             trade_id, e)
             self.ib.cancel_order(stop_oid)
 
         exit_oid = trade.get('ib_exit_order_id')
@@ -532,8 +533,9 @@ class IBOrderHandler:
             try:
                 self.db.update_trade_state(trade_id, ib_exit_order_id=None,
                                            ib_exit_perm_id=None)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("Failed to NULL exit_id for trade %d before cancel: %s",
+                             trade_id, e)
             self.ib.cancel_order(exit_oid)
 
         order_ref = f'exit:{trade_id}'
@@ -1039,8 +1041,9 @@ class IBOrderHandler:
                 if trade_id:
                     try:
                         self.db.update_trade_state(trade_id, ib_perm_id=perm_id)
-                    except Exception:
-                        pass  # non-critical, just for linkage
+                    except Exception as e:
+                        logger.warning("Failed to backfill permId=%d for trade %d: %s",
+                                       perm_id, trade_id, e)
             self._on_entry_fill(order_id, fill_data)
         elif order_id in self._exit_orders:
             self._on_exit_fill(order_id, fill_data)
@@ -1328,8 +1331,9 @@ class IBOrderHandler:
                         self.db.update_trade_state(trade_id, ib_perm_id=perm_id)
                         logger.info("Backfilled permId=%d for trade %d (order %d)",
                                     perm_id, trade_id, order_id)
-                except Exception:
-                    pass  # Non-critical — on_exec_details also updates permId
+                except Exception as e:
+                    logger.warning("Failed to backfill permId=%d for trade %d on status: %s",
+                                   perm_id, trade_id, e)
 
         if status not in ('Cancelled', 'Inactive', 'ApiCancelled', 'Rejected'):
             return  # Only care about terminal statuses below

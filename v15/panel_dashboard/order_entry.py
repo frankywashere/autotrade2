@@ -634,8 +634,8 @@ def order_entry_panel(state) -> pn.Column:
                         try:
                             state.ib_client.sync_orders()
                             _time.sleep(0.5)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.warning("sync_orders after cancel failed: %s", e)
                         state.order_version += 1
                     return _cancel
 

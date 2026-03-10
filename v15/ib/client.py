@@ -253,7 +253,15 @@ class IBClient:
             # Staleness check: reject cached prices older than max_age_s
             age = (datetime.now() - data['time']).total_seconds()
             if age > max_age_s:
-                logger.warning("IB price STALE for %s: %.1fs old (limit %.0fs)", symbol, age, max_age_s)
+                # Rate-limit stale warnings to once per 60s per symbol
+                now = datetime.now()
+                last_warn = getattr(self, '_stale_warn_times', {}).get(symbol)
+                if not last_warn or (now - last_warn).total_seconds() > 60:
+                    if not hasattr(self, '_stale_warn_times'):
+                        self._stale_warn_times = {}
+                    self._stale_warn_times[symbol] = now
+                    logger.warning("IB price STALE for %s: %.1fs old (limit %.0fs)",
+                                   symbol, age, max_age_s)
                 return 0.0
             # Prefer last, fall back to mid of bid/ask
             if data['last'] > 0:
@@ -781,7 +789,8 @@ class IBClient:
                         else:
                             # Couldn't parse — use raw string
                             order_time = completed_time[-8:] if len(completed_time) >= 8 else completed_time
-                    except Exception:
+                    except Exception as e:
+                        logger.warning("Failed to parse order time '%s': %s", completed_time, e)
                         order_time = completed_time[-8:] if len(completed_time) >= 8 else completed_time
 
             # 4. Last resort: reuse previously cached time, or fall back to now
