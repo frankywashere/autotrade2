@@ -585,6 +585,20 @@ class IBOrderHandler:
         exit_order_id = result['order_id']
         exit_perm_id = result.get('perm_id', 0)
 
+        # Check if IB already rejected/cancelled during placement
+        result_status = result.get('status', '')
+        if result_status in ('Cancelled', 'Inactive', 'ApiCancelled', 'Rejected'):
+            logger.error("Manual exit order %d immediately rejected (%s) for trade %d "
+                         "— re-arming stop", exit_order_id, result_status, trade_id)
+            # Re-arm protective stop since we already cancelled it
+            if trade.get('management_mode') != 'manual':
+                stop_price = trade.get('stop_price') or 0
+                if stop_price > 0:
+                    self._place_protective_stop(
+                        trade_id, stop_price, effective_open, direction)
+            self._exit_in_progress.pop(trade_id, None)
+            return False
+
         # Register for fill routing
         self._exit_orders[exit_order_id] = {
             'trade_id': trade_id, 'exit_reason': 'manual_close'}
@@ -797,6 +811,16 @@ class IBOrderHandler:
 
         exit_order_id = result['order_id']
         exit_perm_id = result.get('perm_id', 0)
+
+        # Check if IB already rejected/cancelled during placement
+        result_status = result.get('status', '')
+        if result_status in ('Cancelled', 'Inactive', 'ApiCancelled', 'Rejected'):
+            logger.error("Exit order %d immediately rejected (%s) for trade %d — "
+                         "re-arming stop", exit_order_id, result_status, trade_id)
+            self._place_protective_stop(trade_id, trade.get('stop_price') or 0,
+                                        effective_open, direction)
+            self._exit_in_progress.pop(trade_id, None)
+            return False
 
         # Register for callback routing
         self._exit_orders[exit_order_id] = {

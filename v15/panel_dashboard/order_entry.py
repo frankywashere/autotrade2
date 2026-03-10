@@ -83,7 +83,7 @@ def order_entry_panel(state) -> pn.Column:
             '</div>'
         )
 
-    # ── Open Positions ───────────────────────────────────────────────
+    # ── IB Broker Positions (actual positions at IB, not DB) ─────────
 
     positions_pane = pn.pane.HTML('', sizing_mode='stretch_width')
 
@@ -92,8 +92,7 @@ def order_entry_panel(state) -> pn.Column:
             return ''
         positions = state.ib_client.get_positions()
         if not positions:
-            return ('<div style="color:#888;font-size:12px;padding:4px 0">'
-                    'No open positions</div>')
+            return ''  # Hide section when no broker positions
 
         td = 'padding:2px 8px;color:#ccc'
         th = 'padding:2px 8px;text-align:left;color:#888'
@@ -119,8 +118,10 @@ def order_entry_panel(state) -> pn.Column:
             )
 
         return (
+            f'<div style="font-size:11px;color:#666;margin:4px 0 2px 0">'
+            f'IB Broker Positions (actual)</div>'
             f'<table style="width:100%;font-size:12px;border-collapse:collapse;'
-            f'color:#ccc;margin:4px 0">'
+            f'color:#ccc;margin:0">'
             f'<tr style="border-bottom:1px solid #333">'
             f'<th style="{th}">Symbol</th>'
             f'<th style="{th}">Side</th>'

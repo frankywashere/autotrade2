@@ -530,6 +530,12 @@ class IBClient:
         trade = self.ib.placeOrder(contract, order)
         order_id = trade.order.orderId
 
+        # Wire status callback IMMEDIATELY so rejections during the permId
+        # poll are not lost (IB rejects asynchronously via statusEvent).
+        with self._order_lock:
+            self._trades[order_id] = trade
+        trade.statusEvent += self._on_order_status
+
         # Wait for IB to assign permId (usually arrives in <100ms)
         if trade.order.permId == 0:
             for _ in range(10):  # 10 × 50ms = 500ms max
@@ -542,11 +548,6 @@ class IBClient:
             logger.warning("permId still 0 after 500ms for order %d (ref=%s) — "
                            "will update on first fill",
                            order_id, order_ref[:30] if order_ref else '')
-
-        with self._order_lock:
-            self._trades[order_id] = trade
-
-        trade.statusEvent += self._on_order_status
         logger.info("Order placed: %s %d %s %s @ %.2f (id=%d, perm=%d, ref=%s)",
                      action, qty, symbol, order_type, price, order_id,
                      perm_id, order_ref[:30] if order_ref else '')
