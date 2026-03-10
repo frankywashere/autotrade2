@@ -142,6 +142,15 @@ def _init_new_infra(state):
                      e, traceback.format_exc())
 
 
+def _is_readonly() -> bool:
+    """Check if this session was opened with ?readonly=1 query param."""
+    try:
+        args = pn.state.session_args
+        return args.get('readonly', [b'0'])[0] in (b'1', b'true')
+    except Exception:
+        return False
+
+
 def create_app():
     logger.info("create_app() called (session factory)")
     try:
@@ -151,12 +160,16 @@ def create_app():
         raise
 
     state = _init_state()
+    readonly = _is_readonly()
+    if readonly:
+        logger.info("Read-only session opened")
 
     # UI refresh only — triggers re-render when browser is connected
     pn.state.add_periodic_callback(lambda: None, period=2000)
 
-    # Sidebar controls
-    run_btn = pn.widgets.Button(name='Run Analysis Now', button_type='primary')
+    # Sidebar controls (hidden in read-only mode)
+    run_btn = pn.widgets.Button(name='Run Analysis Now', button_type='primary',
+                                visible=not readonly)
     run_btn.on_click(lambda e: state.run_analysis())
 
     ntfy_test_btn = pn.widgets.Button(name='Test Notification', button_type='warning')
@@ -277,12 +290,15 @@ def create_app():
                        margin=(0, 0, 8, 0), height=36))
 
     # Build template
-    template = pn.template.FastListTemplate(
-        title='c16 Trading Dashboard',
-        theme='dark',
-        accent_base_color='#00c853',
-        header_background='#111',
-        sidebar=[
+    if readonly:
+        sidebar_items = [
+            pn.pane.Markdown("### Read-Only View"),
+            last_analysis_display,
+            pn.pane.Markdown("### Data Sources"),
+            ib_status_display,
+        ]
+    else:
+        sidebar_items = [
             pn.pane.Markdown("### Controls"),
             run_btn,
             _kill_switch_panel(state),
@@ -298,9 +314,16 @@ def create_app():
             pn.layout.Divider(),
             ntfy_test_btn,
             ntfy_status,
-        ],
+        ]
+
+    template = pn.template.FastListTemplate(
+        title='c16 Trading Dashboard' + (' (READ ONLY)' if readonly else ''),
+        theme='dark',
+        accent_base_color='#00c853',
+        header_background='#111',
+        sidebar=sidebar_items,
         main=[
-            ib_live_tab(state),
+            ib_live_tab(state, readonly=readonly),
         ],
     )
     logger.info("c14a Dashboard template built successfully — ready to serve")

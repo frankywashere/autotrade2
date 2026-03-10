@@ -102,11 +102,15 @@ def _update_ib_prices(state):
 
         # Exit checks + trailing handled by LiveEngine via bar events
 
-        # Bump position version for live P&L
+        # Bump position version for live P&L (throttled to 1x/sec to prevent UI flicker)
         if price_changed:
-            has_positions = bool(state.trade_db.get_open_trades(source='ib'))
-            if has_positions:
-                state.positions_version += 1
+            now_t = time.time()
+            last_pos_bump = getattr(state, '_last_pos_bump', 0)
+            if now_t - last_pos_bump >= 1.0:
+                has_positions = bool(state.trade_db.get_open_trades(source='ib'))
+                if has_positions:
+                    state.positions_version += 1
+                    state._last_pos_bump = now_t
 
 
 def analysis_loop(state):

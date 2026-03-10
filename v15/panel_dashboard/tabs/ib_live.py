@@ -171,7 +171,7 @@ def _algo_pnl_summary(state):
                    algo_control_version=state.param.algo_control_version)
 
 
-def _open_positions(state):
+def _open_positions(state, readonly=False):
     """Open IB positions with live P&L + Close/Hold buttons. Bound to positions_version."""
     container = pn.Column(sizing_mode='stretch_width', margin=(0, 0, 8, 0))
 
@@ -294,31 +294,35 @@ def _open_positions(state):
                 </div>
             """, sizing_mode='stretch_width')
 
-            # Build button row based on management mode
-            close_btn = pn.widgets.Button(
-                name='Close', button_type='danger', width=65, height=28,
-                margin=(0, 4, 0, 0))
-
             card = pn.Column(
                 styles={'background': '#1a1a2e', 'border': '1px solid #333',
                         'border-radius': '8px', 'padding': '12px'},
                 sizing_mode='stretch_width', margin=(0, 0, 6, 0))
 
-            close_btn.on_click(_make_close_callback(trade_id))
-
-            if mgmt == 'algo':
-                # Algo mode: Close + Hold buttons
-                hold_btn = pn.widgets.Button(
-                    name='Hold', button_type='warning', width=55, height=28,
-                    margin=(0, 0, 0, 0))
-                hold_btn.on_click(_make_hold_callback(trade_id, hold_btn, close_btn))
-                btn_row = pn.Row(close_btn, hold_btn)
+            if readonly:
+                top_row = pn.Row(card_html, align='center',
+                                 sizing_mode='stretch_width')
             else:
-                # Manual mode: just Close
-                btn_row = pn.Row(close_btn)
+                # Build button row based on management mode
+                close_btn = pn.widgets.Button(
+                    name='Close', button_type='danger', width=65, height=28,
+                    margin=(0, 4, 0, 0))
+                close_btn.on_click(_make_close_callback(trade_id))
 
-            top_row = pn.Row(card_html, btn_row, align='center',
-                             sizing_mode='stretch_width')
+                if mgmt == 'algo':
+                    # Algo mode: Close + Hold buttons
+                    hold_btn = pn.widgets.Button(
+                        name='Hold', button_type='warning', width=55, height=28,
+                        margin=(0, 0, 0, 0))
+                    hold_btn.on_click(_make_hold_callback(trade_id, hold_btn, close_btn))
+                    btn_row = pn.Row(close_btn, hold_btn)
+                else:
+                    # Manual mode: just Close
+                    btn_row = pn.Row(close_btn)
+
+                top_row = pn.Row(card_html, btn_row, align='center',
+                                 sizing_mode='stretch_width')
+
             card.append(top_row)
             container.append(card)
 
@@ -850,21 +854,22 @@ def _audio_alert(trades_version, trade_alert_type):
 # Tab Assembly
 # ---------------------------------------------------------------------------
 
-def ib_live_tab(state):
+def ib_live_tab(state, readonly=False):
     """Build the IB Live tab. Returns a Panel Column."""
     components = [
         _degraded_banner(state),
         _price_banner(state),
         _algo_pnl_summary(state),
-        _open_positions(state),
+        _open_positions(state, readonly=readonly),
     ]
 
-    # Order entry panel (if available)
-    try:
-        from v15.panel_dashboard.order_entry import order_entry_panel
-        components.append(order_entry_panel(state))
-    except ImportError:
-        pass
+    # Order entry panel (if available, hidden in read-only mode)
+    if not readonly:
+        try:
+            from v15.panel_dashboard.order_entry import order_entry_panel
+            components.append(order_entry_panel(state))
+        except ImportError:
+            pass
 
     # Trade alerts (entry + exit cards)
     components.append(pn.bind(_trade_alerts_pane, state.param.trade_alert_html))
