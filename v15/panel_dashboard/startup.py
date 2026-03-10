@@ -283,11 +283,12 @@ def _wire_tick_to_bar_feed(state, data):
                     success_count = consumed[symbol]
                     for i, bar in enumerate(new_bars):
                         # bar['time'] is naive local datetime from datetime.now().
-                        # Convert to tz-aware ET (matching IB historical bars
-                        # which are tz-aware from ib_async).
+                        # Convert to ET then strip tz — seeded historical bars
+                        # are tz-naive, so live bars must match to avoid
+                        # "Cannot compare tz-naive and tz-aware" on concat.
                         bar_local = bar['time']
                         bar_et = bar_local.astimezone().astimezone(ET)
-                        bar_time = pd.Timestamp(bar_et) + pd.Timedelta(minutes=1)
+                        bar_time = pd.Timestamp(bar_et.replace(tzinfo=None)) + pd.Timedelta(minutes=1)
                         try:
                             data.on_1min_close(symbol, bar_time, bar)
                             success_count = consumed[symbol] + i + 1
