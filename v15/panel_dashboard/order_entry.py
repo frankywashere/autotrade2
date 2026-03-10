@@ -435,6 +435,21 @@ def order_entry_panel(state) -> pn.Column:
             session = SESSION_MAP[session_select.value]
             price = price_input.value if otype in ('LMT', 'STP') else 0.0
 
+            # Validate session matches current time (prevent OVERNIGHT outside 8PM-4AM)
+            actual_routing = handler._get_exit_routing()
+            actual_session = actual_routing['session']
+            if session == 'overnight' and actual_session != 'overnight':
+                status_msg.object = (
+                    '<span style="color:#ff5252;font-weight:bold">'
+                    'OVERNIGHT only available 8PM-4AM ET — '
+                    f'current session: {actual_session.upper()}</span>')
+                return
+            if session == 'rth' and actual_session != 'rth':
+                status_msg.object = (
+                    '<span style="color:#ff5252;font-weight:bold">'
+                    f'RTH not open — current session: {actual_session.upper()}</span>')
+                return
+
             # Coerce MKT to LMT outside RTH
             if otype == 'MKT' and session != 'rth':
                 otype = 'LMT'
