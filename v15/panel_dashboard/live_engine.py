@@ -412,6 +412,10 @@ class LiveEngine:
                              algo.algo_id, pos.pos_id, e, exc_info=True)
                 continue
             trade_id = int(pos.pos_id)
+            logger.info("SEQ_SYNC: trade %d %s effective=%.2f db_stop=%.2f best=%.2f",
+                        trade_id, algo.algo_id,
+                        effective_stop if effective_stop else 0,
+                        pos.stop_price, pos.best_price)
             if effective_stop is not None and not isinstance(effective_stop, (int, float)):
                 logger.error("CRITICAL: %s.get_effective_stop() returned invalid type %s "
                              "for trade %d", algo.algo_id, type(effective_stop), trade_id)
