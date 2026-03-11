@@ -14,7 +14,7 @@ database:
   num_islands: 2
 
 evaluator:
-  timeout: 300
+  timeout: 600
   parallel_evaluations: 1
   cascade_evaluation: false
 
