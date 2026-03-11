@@ -279,6 +279,20 @@ class BacktestEngine:
             if effective_stop is None:
                 continue
 
+            # Profit-activated stop: skip breach check until in profit
+            if algo.config.profit_activated_stop:
+                underwater = ((pos.direction == 'long' and pos.best_price <= pos.entry_price) or
+                              (pos.direction == 'short' and pos.best_price >= pos.entry_price))
+                if underwater:
+                    max_uw = algo.config.max_underwater_mins
+                    if max_uw > 0 and count > max_uw:
+                        trade = self.portfolio.close_position(
+                            pid, bar_1m['close'], ts, 'uw_timeout')
+                        if trade:
+                            algo.on_fill(trade)
+                            closed_ids.append(pid)
+                    continue
+
             breached = False
             # For 'low' with interval=1: exit at effective_stop (resting IB stop,
             # price passed through the level). For all other modes: exit at the
@@ -351,6 +365,7 @@ class BacktestEngine:
         update_every_n = max(1, algo.config.stop_update_secs // 5)  # 5s bars between updates
         check_every_n = max(1, algo.config.stop_check_secs // 5)    # 5s bars between checks
         grace_ratchet_n = algo.config.grace_ratchet_secs // 5 if algo.config.grace_ratchet_secs > 0 else 0
+        profit_gate = algo.config.profit_activated_stop
         closed_ids = []
 
         # Get 5-sec bars for this minute
@@ -395,6 +410,7 @@ class BacktestEngine:
 
             exited = False
             exit_price = 0.0
+            exit_reason_override = None
             for _, bar5 in bars_5s.iterrows():
                 bar5_count += 1
                 b_open = float(bar5['open'])
@@ -411,6 +427,20 @@ class BacktestEngine:
                 # Knob B: check if price breached the stop on schedule
                 if bar5_count % check_every_n != 0:
                     continue
+
+                # Profit-activated stop: skip breach check until in profit
+                if profit_gate:
+                    underwater = ((pos.direction == 'long' and pos.best_price <= pos.entry_price) or
+                                  (pos.direction == 'short' and pos.best_price >= pos.entry_price))
+                    if underwater:
+                        # Check underwater timeout (count = 1-min bars since entry)
+                        max_uw = algo.config.max_underwater_mins
+                        if max_uw > 0 and count > max_uw:
+                            exit_price = float(bar5['close'])
+                            exited = True
+                            exit_reason_override = 'uw_timeout'
+                            break
+                        continue
 
                 b_close = float(bar5['close'])
 
@@ -442,7 +472,7 @@ class BacktestEngine:
             self._5s_bar_counts[pid] = bar5_count
 
             if exited:
-                reason = 'trail' if effective_stop != pos.stop_price else 'stop'
+                reason = exit_reason_override or ('trail' if effective_stop != pos.stop_price else 'stop')
                 trade = self.portfolio.close_position(pid, exit_price, ts, reason)
                 if trade:
                     algo.on_fill(trade)

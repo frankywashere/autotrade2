@@ -207,6 +207,10 @@ def main():
                         help='Check price vs stop every N seconds (5=5s, 60=1min, default: 5)')
     parser.add_argument('--grace-ratchet-secs', type=int, default=60,
                         help='Ratchet best_price during grace every N seconds (0=none, 5=5s, 60=1min, default: 60)')
+    parser.add_argument('--profit-activated-stop', action='store_true', default=False,
+                        help='Stop checks only begin once trade is in profit (best_price > entry_price)')
+    parser.add_argument('--max-underwater-mins', type=int, default=0,
+                        help='Force-close underwater trades after N minutes (0=disabled, only with --profit-activated-stop)')
     args = parser.parse_args()
 
     if not args.algo:
@@ -233,6 +237,11 @@ def main():
             print(f"ERROR: Could not find {tsla_5s}")
             sys.exit(1)
         spy_5s_path = spy_5s if os.path.isfile(spy_5s) else None
+        # Auto-detect VIX 1-min data
+        vix_1m = os.path.join(os.path.dirname(args.bar_data.rstrip('/')), 'VIXMin_IB.txt')
+        if not os.path.isfile(vix_1m):
+            vix_1m = os.path.join(args.bar_data, '..', 'VIXMin_IB.txt')
+        vix_path = vix_1m if os.path.isfile(vix_1m) else None
         print(f"Loading 5-sec bar data from {args.bar_data}...")
         data = DataProvider.from_5sec_bars(
             tsla_5s_path=tsla_5s,
@@ -240,12 +249,16 @@ def main():
             end=args.end,
             spy_5s_path=spy_5s_path,
             spy_path=args.spy,
+            vix_path=vix_path,
             rth_only=rth_only,
         )
         n_5s = len(data._df5s) if hasattr(data, '_df5s') else 0
         days = len(data.trading_days)
+        vix_info = ""
+        if data._vix1m is not None:
+            vix_info = f", VIX 1-min: {len(data._vix1m):,} bars"
         print(f"  Loaded {n_5s:,} 5-sec bars -> {len(data._df1m):,} 1-min bars, "
-              f"{days} trading days in {time.time()-t0:.1f}s")
+              f"{days} trading days{vix_info} in {time.time()-t0:.1f}s")
 
     elif args.tick_data:
         # Tick-sourced data path
@@ -330,6 +343,14 @@ def main():
             algo.config.grace_ratchet_secs = int(spec['params']['grace_ratchet_secs'])
         if 'grace_ratchet_secs' not in spec['params']:
             algo.config.grace_ratchet_secs = args.grace_ratchet_secs
+        if 'profit_activated_stop' in spec['params']:
+            algo.config.profit_activated_stop = str(spec['params']['profit_activated_stop']).lower() in ('true', '1', 'yes')
+        elif args.profit_activated_stop:
+            algo.config.profit_activated_stop = True
+        if 'max_underwater_mins' in spec['params']:
+            algo.config.max_underwater_mins = int(spec['params']['max_underwater_mins'])
+        elif args.max_underwater_mins > 0:
+            algo.config.max_underwater_mins = args.max_underwater_mins
         algos.append(algo)
         portfolio.register_algo(
             algo_id=algo.config.algo_id,

@@ -335,11 +335,16 @@ class SurferMLAlgo(AlgoBase):
                 except Exception as e:
                     logger.debug("SPY daily bars not available: %s", e)
                 try:
-                    vix_daily = self.data.get_bars('daily', time, symbol='VIX')
-                    if len(vix_daily) > 0:
-                        vix_df = vix_daily
+                    # Try 1-min VIX first (intraday resolution), fall back to daily
+                    vix_1m = self.data.get_bars('1min', time, symbol='VIX')
+                    if len(vix_1m) > 0:
+                        vix_df = vix_1m
+                    else:
+                        vix_daily = self.data.get_bars('daily', time, symbol='VIX')
+                        if len(vix_daily) > 0:
+                            vix_df = vix_daily
                 except Exception as e:
-                    logger.debug("VIX daily bars not available: %s", e)
+                    logger.debug("VIX bars not available: %s", e)
                 feature_vec, _ = build_feature_vector(
                     analysis=analysis,
                     bar_data=bar,

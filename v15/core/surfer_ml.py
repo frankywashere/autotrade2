@@ -546,10 +546,18 @@ def extract_correlation_features(
         else:
             vix_available = vix_df[vix_df.index <= current_time]
 
-        if len(vix_available) >= 5:
+        if len(vix_available) >= 1:
             vix_closes = vix_available['close'].values
-            features[3] = vix_closes[-1]
-            if len(vix_closes) >= 6:
+            features[3] = vix_closes[-1]  # Current VIX level (latest bar)
+
+            # 5-day change: resample to daily if intraday data, else use raw
+            vix_freq = pd.infer_freq(vix_available.index[-min(20, len(vix_available)):])
+            if vix_freq and 'T' in str(vix_freq):
+                # Intraday data — resample to daily for 5-day change
+                vix_daily = vix_available['close'].resample('1D').last().dropna()
+                if len(vix_daily) >= 6:
+                    features[4] = float(vix_daily.iloc[-1] - vix_daily.iloc[-6])
+            elif len(vix_closes) >= 6:
                 features[4] = vix_closes[-1] - vix_closes[-6]
 
     return features

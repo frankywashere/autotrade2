@@ -143,6 +143,7 @@ class DataProvider:
     @classmethod
     def from_5sec_bars(cls, tsla_5s_path: str, start: str, end: str,
                        spy_5s_path: str = None, spy_path: str = None,
+                       vix_path: str = None,
                        rth_only: bool = True) -> 'DataProvider':
         """Build DataProvider from 5-second bar CSVs.
 
@@ -204,7 +205,8 @@ class DataProvider:
             # just resample and store in _spy1m before _init_from_df1m
             instance._spy1m_from_5s = _resample_ohlcv(spy5s, '1min')
 
-        instance._init_from_df1m(spy_path, start, end, rth_only)
+        instance._init_from_df1m(spy_path, start, end, rth_only,
+                                vix_path=vix_path)
 
         # Override SPY 1-min if we resampled from 5-sec
         if hasattr(instance, '_spy1m_from_5s') and instance._spy1m_from_5s is not None:
@@ -224,12 +226,18 @@ class DataProvider:
         return self._5s_by_minute.get(minute_ts)
 
     def _init_from_df1m(self, spy_path: str = None, start: str = None,
-                        end: str = None, rth_only: bool = True):
+                        end: str = None, rth_only: bool = True,
+                        vix_path: str = None):
         """Shared init: resample all TFs, build _tf_bar_end, load SPY/VIX."""
         # Load SPY 1-min if provided (for intraday SPY features, optional)
         self._spy1m = None
         if spy_path and Path(spy_path).exists():
             self._spy1m = load_1min(spy_path, start, end, rth_only)
+
+        # Load VIX 1-min if provided (for intraday VIX features)
+        self._vix1m = None
+        if vix_path and Path(vix_path).exists():
+            self._vix1m = load_1min(vix_path, start, end, rth_only)
 
         # Pre-compute all resampled TFs
         self._tf_data: Dict[str, pd.DataFrame] = {'1min': self._df1m}
@@ -250,6 +258,14 @@ class DataProvider:
             for tf, rule in _RESAMPLE_RULES.items():
                 if rule is not None:
                     self._spy_tf_data[tf] = _resample_ohlcv(self._spy1m, rule)
+
+        # VIX resampled TFs (from 1-min if available)
+        self._vix_tf_data: Dict[str, pd.DataFrame] = {}
+        if self._vix1m is not None:
+            self._vix_tf_data['1min'] = self._vix1m
+            for tf, rule in _RESAMPLE_RULES.items():
+                if rule is not None:
+                    self._vix_tf_data[tf] = _resample_ohlcv(self._vix1m, rule)
 
         # Auxiliary daily data: SPY + VIX from native_tf (yfinance cache).
         # This is the authoritative daily source — always loaded, overrides
@@ -360,8 +376,19 @@ class DataProvider:
         """
         up_to_ts = pd.Timestamp(up_to)
 
-        # VIX: daily-only from auxiliary store
+        # VIX: use 1-min resampled data if available, fall back to daily-only
         if symbol == 'VIX':
+            if hasattr(self, '_vix_tf_data') and self._vix_tf_data:
+                if tf in self._vix_tf_data:
+                    vdf = self._vix_tf_data[tf]
+                    if tf == 'daily':
+                        return self._gate_daily(vdf, up_to_ts)
+                    return vdf[vdf.index <= up_to_ts]
+                # Requested TF not in VIX data — try daily fallback
+                if tf == 'daily' and 'VIX' in self._aux_daily:
+                    return self._gate_daily(self._aux_daily['VIX'], up_to_ts)
+                return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+            # No 1-min VIX data — daily-only from auxiliary store
             if 'VIX' not in self._aux_daily:
                 return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
             df = self._aux_daily['VIX']

@@ -64,6 +64,12 @@ class AlgoConfig:
                                           # 5=every 5s bar (default), 60=every 1min
     grace_ratchet_secs: int = 60          # How often to ratchet best_price during grace period (seconds).
                                           # 0=no ratcheting during grace, 5=every 5s, 60=every 1min (default)
+    profit_activated_stop: bool = False   # If True, stop checks only begin once trade is in profit
+                                          # (best_price > entry_price for long, < for short).
+                                          # Ratcheting still runs; stop just won't fire until profitable.
+    max_underwater_mins: int = 0          # Max minutes a trade can stay underwater (never in profit) before
+                                          # force-closing. 0=disabled (rely on algo's own timeout).
+                                          # Only active when profit_activated_stop=True.
     live_orders: bool = False             # Whether to place real IB orders (live only)
     # Optional active hours hint: engine skips on_bar() outside these hours.
     # Exits still run regardless. Algo can do additional filtering internally.
