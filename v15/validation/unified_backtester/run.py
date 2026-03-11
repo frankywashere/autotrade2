@@ -197,6 +197,8 @@ def main():
                         help='Ratchet best_price + recompute stop every N seconds (5=5s, 60=1min, 300=5min, default: 60)')
     parser.add_argument('--stop-check-secs', type=int, default=5,
                         help='Check price vs stop every N seconds (5=5s, 60=1min, default: 5)')
+    parser.add_argument('--grace-ratchet-secs', type=int, default=60,
+                        help='Ratchet best_price during grace every N seconds (0=none, 5=5s, 60=1min, default: 60)')
     args = parser.parse_args()
 
     if not args.algo:
@@ -316,6 +318,10 @@ def main():
             algo.config.stop_update_secs = args.stop_update_secs
         if 'stop_check_secs' not in spec['params']:
             algo.config.stop_check_secs = args.stop_check_secs
+        if 'grace_ratchet_secs' in spec['params']:
+            algo.config.grace_ratchet_secs = int(spec['params']['grace_ratchet_secs'])
+        if 'grace_ratchet_secs' not in spec['params']:
+            algo.config.grace_ratchet_secs = args.grace_ratchet_secs
         algos.append(algo)
         portfolio.register_algo(
             algo_id=algo.config.algo_id,

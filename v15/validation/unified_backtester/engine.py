@@ -350,6 +350,7 @@ class BacktestEngine:
         check_interval = algo.config.seq_check_interval
         update_every_n = max(1, algo.config.stop_update_secs // 5)  # 5s bars between updates
         check_every_n = max(1, algo.config.stop_check_secs // 5)    # 5s bars between checks
+        grace_ratchet_n = algo.config.grace_ratchet_secs // 5 if algo.config.grace_ratchet_secs > 0 else 0
         closed_ids = []
 
         # Get 5-sec bars for this minute
@@ -368,6 +369,15 @@ class BacktestEngine:
             self._entry_bar_counts[pid] = count
 
             if count <= grace:
+                # During grace: ratchet only (no exit checks) at configured interval
+                if grace_ratchet_n > 0:
+                    bar5_count = self._5s_bar_counts.get(pid, 0)
+                    for _, bar5 in bars_5s.iterrows():
+                        bar5_count += 1
+                        if bar5_count % grace_ratchet_n == 0:
+                            self.portfolio.update_position(
+                                pid, float(bar5['high']), float(bar5['low']))
+                    self._5s_bar_counts[pid] = bar5_count
                 continue
 
             # Check interval at 1-min level: first check right after grace, then every N
@@ -540,7 +550,14 @@ class BacktestEngine:
                 # extremes (matching broker-side stops that track continuously
                 # in live). hold_bars only increments at exit-check TF boundaries
                 # so algos count in their natural units (5-min bars).
+                no_grace_ratchet = (algo.config.grace_ratchet_secs == 0
+                                    and algo_id in self._sequential_algos)
                 for pos in self.portfolio.get_open_positions(algo_id):
+                    # Skip ratcheting during grace if grace_ratchet_secs=0
+                    if no_grace_ratchet:
+                        count = self._entry_bar_counts.get(pos.pos_id, 0)
+                        if count <= algo.config.exit_grace_bars:
+                            continue
                     self.portfolio.update_position(
                         pos.pos_id, bar_1m['high'], bar_1m['low'],
                         increment_hold=is_exit_boundary)
