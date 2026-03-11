@@ -143,7 +143,7 @@ class LiveEngine:
           try:
             # Skip if wrong TF for this algo
             is_sequential_1m = (tf == '1min' and
-                                algo.config.stop_check_mode == 'sequential')
+                                getattr(algo.config, 'stop_check_mode', '') == 'sequential')
             if not (tf == algo.config.primary_tf or
                     tf == algo.config.exit_check_tf or
                     is_sequential_1m):
@@ -189,14 +189,14 @@ class LiveEngine:
                     continue
                 for exit_sig in exits:
                     # Sequential: IB handles stop/trail — only pass TP/timeout/EOD
-                    if (algo.config.stop_check_mode == 'sequential' and
+                    if (getattr(algo.config, 'stop_check_mode', '') == 'sequential' and
                             exit_sig.reason in ('stop', 'trail')):
                         continue
                     self._execute_exit(algo, exit_sig, deferred_ib_ops)
 
                 # 3. Re-fetch positions after exits, then ratchet + sync
                 positions = self._get_positions(algo)
-                if algo.config.stop_check_mode == 'sequential':
+                if getattr(algo.config, 'stop_check_mode', '') == 'sequential':
                     # Ratchet already done on 1-min bars, just increment hold
                     self._increment_hold_bars(algo, positions)
                 else:
