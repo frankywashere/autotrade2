@@ -235,6 +235,13 @@ class IntradayAlgo(AlgoBase):
         self._trades_today = 0
         self._current_day = None
 
+        # Fail loud: ml_model_path is declared but ML gating is not implemented
+        ml_path = self.config.params.get('ml_model_path')
+        if ml_path is not None:
+            raise NotImplementedError(
+                f"Intraday algo: ml_model_path='{ml_path}' was set but ML gating "
+                f"is not implemented. Remove ml_model_path or set to None.")
+
         if data is not None and not getattr(data, 'is_live', False):
             # Backtest mode: precompute all features for speed
             print("  Precomputing intraday features...")
@@ -664,7 +671,8 @@ class IntradayAlgo(AlgoBase):
 
                 # Timeout: 78 5-min bars (matching original backtest)
                 # hold_bars counts 5-min bars since exit_check_tf='5min'
-                if pos.hold_bars >= 78:
+                max_hold_5m = self.config.max_hold_bars if self.config.max_hold_bars > 0 else 78
+                if pos.hold_bars >= max_hold_5m:
                     exits.append(ExitSignal(
                         pos_id=pos.pos_id, price=close, reason='timeout'))
                     continue

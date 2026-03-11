@@ -92,8 +92,13 @@ class SurferMLAlgo(AlgoBase):
                     model_dir = candidate
                     break
 
-        if not model_dir or not Path(model_dir).is_dir():
-            print("  No ML models found, running physics-only mode")
+        if model_dir and not Path(model_dir).is_dir():
+            raise FileNotFoundError(
+                f"ML model directory specified but not found: {model_dir}")
+
+        if not model_dir:
+            logger.warning("No ML models found — running physics-only mode "
+                           "(set ml_model_dir to specify model location)")
             return
 
         model_dir = Path(model_dir)
@@ -175,10 +180,16 @@ class SurferMLAlgo(AlgoBase):
                     else:
                         setattr(self, attr, obj)
                 except Exception as e:
-                    logger.warning("Failed to load ML model %s: %s", name, e)
+                    raise RuntimeError(
+                        f"ML model file exists but failed to load: {path}: {e}") from e
 
         loaded = sum(1 for m in [self._gbt_model, self._el_model,
                                   self._er_model, self._fast_rev_model] if m is not None)
+        if loaded == 0:
+            raise RuntimeError(
+                f"ML model directory exists ({model_dir}) but contains no loadable models. "
+                f"Expected: gbt_model.pkl, extreme_loser_model.pkl, "
+                f"extended_run_model.pkl, momentum_reversal_model.pkl")
         logger.info("Loaded %d/4 ML models from %s", loaded, model_dir)
 
     def warmup_bars(self) -> int:
@@ -358,8 +369,8 @@ class SurferMLAlgo(AlgoBase):
                     bars_df=df5,
                 )
             except Exception as e:
-                logger.warning("SurferML feature vector build failed: %s", e)
-                feature_vec = None
+                raise RuntimeError(
+                    f"SurferML feature vector build failed: {e}") from e
 
         # GBT soft gate: scale confidence, don't hard-skip
         # _gbt_model is a dict of Boosters: {'action': Booster, 'lifetime': Booster, ...}
@@ -377,7 +388,8 @@ class SurferMLAlgo(AlgoBase):
                     elif ml_action != physics_action:
                         conf *= 0.80  # ML disagrees with direction — penalize 20%
             except Exception as e:
-                logger.warning("SurferML GBT prediction failed: %s", e)
+                raise RuntimeError(
+                    f"SurferML GBT prediction failed: {e}") from e
 
         # Extended Run predictor — single Booster with derived features
         if self._er_model is not None and feature_vec is not None:
@@ -389,7 +401,8 @@ class SurferMLAlgo(AlgoBase):
                 elif er_prob > 0.55:
                     twm = 1.5
             except Exception as e:
-                logger.warning("SurferML ER model prediction failed: %s", e)
+                raise RuntimeError(
+                    f"SurferML ER model prediction failed: {e}") from e
 
         # Extreme Loser detector — single Booster with derived features
         if self._el_model is not None and feature_vec is not None:
@@ -401,7 +414,8 @@ class SurferMLAlgo(AlgoBase):
                     if signal_type == 'bounce':
                         conf *= 0.80  # Penalize EL bounces
             except Exception as e:
-                logger.warning("SurferML EL model prediction failed: %s", e)
+                raise RuntimeError(
+                    f"SurferML EL model prediction failed: {e}") from e
 
         # Fast Reversion (Momentum Reversal) detector — single Booster with derived features
         if self._fast_rev_model is not None and feature_vec is not None:
@@ -411,7 +425,8 @@ class SurferMLAlgo(AlgoBase):
                 if fast_rev_prob > 0.55:
                     fast_rev = True
             except Exception as e:
-                logger.warning("SurferML fast_rev model prediction failed: %s", e)
+                raise RuntimeError(
+                    f"SurferML fast_rev model prediction failed: {e}") from e
 
         # Re-check confidence after ML gating
         if conf < self.config.params.get('min_confidence', 0.01):
@@ -489,7 +504,7 @@ class SurferMLAlgo(AlgoBase):
         high/low for accurate detection.
         """
         exits = []
-        max_hold = self.config.params.get('max_hold_bars', 60)  # In 5-min bars
+        max_hold = self.config.max_hold_bars if self.config.max_hold_bars > 0 else self.config.params.get('max_hold_bars', 60)  # In 5-min bars
         eval_interval = self.config.eval_interval  # 3
 
         for pos in open_positions:

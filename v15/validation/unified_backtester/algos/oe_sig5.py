@@ -413,6 +413,11 @@ class OESig5Algo(AlgoBase):
         params = self.config.params
         trail_base = params.get('trail_base', 0.025)
         trail_power = params.get('trail_power', 12)
+        # max_hold_bars (5-min bars) from config overrides max_hold_days if set
+        if self.config.max_hold_bars > 0:
+            max_hold_5m_override = self.config.max_hold_bars
+        else:
+            max_hold_5m_override = 0
         max_hold = params.get('max_hold_days', 10)
 
         for pos in open_positions:
@@ -450,7 +455,7 @@ class OESig5Algo(AlgoBase):
                     continue
 
                 # Timeout: convert max_hold_days to 5-min bars (78 per day)
-                max_hold_5m = max_hold * 78
+                max_hold_5m = max_hold_5m_override if max_hold_5m_override > 0 else max_hold * 78
                 if pos.hold_bars >= max_hold_5m:
                     exits.append(ExitSignal(
                         pos_id=pos.pos_id,

@@ -70,6 +70,9 @@ class AlgoConfig:
     max_underwater_mins: int = 0          # Max minutes a trade can stay underwater (never in profit) before
                                           # force-closing. 0=disabled (rely on algo's own timeout).
                                           # Only active when profit_activated_stop=True.
+    max_hold_bars: int = 0                # Max 5-min bars before force-close. 0=use algo's own default
+                                          # (e.g., surfer-ml=60 i.e. 5hrs, cs-combo=780 i.e. 10 days).
+                                          # When >0, overrides the algo's internal timeout.
     live_orders: bool = False             # Whether to place real IB orders (live only)
     # Optional active hours hint: engine skips on_bar() outside these hours.
     # Exits still run regardless. Algo can do additional filtering internally.

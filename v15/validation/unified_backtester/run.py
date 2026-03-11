@@ -64,6 +64,16 @@ def _create_algo(spec: dict, data: DataProvider):
             config.params['max_trades_per_day'] = int(params['max_trades'])
         if 'ml_model' in params:
             config.params['ml_model_path'] = params['ml_model']
+        if 'stop_pct' in params:
+            config.params['stop_pct'] = float(params['stop_pct'])
+            config.params['signal_params']['stop'] = float(params['stop_pct'])
+        if 'tp_pct' in params:
+            config.params['tp_pct'] = float(params['tp_pct'])
+            config.params['signal_params']['tp'] = float(params['tp_pct'])
+        if 'min_confidence' in params:
+            config.params['min_confidence'] = float(params['min_confidence'])
+        if 'eval_interval' in params:
+            config.eval_interval = int(params['eval_interval'])
         # Active hours override (HHMM format, e.g., start_time=1300 for PM-only)
         if 'start_time' in params:
             import datetime as _dt
@@ -91,12 +101,22 @@ def _create_algo(spec: dict, data: DataProvider):
             config.max_equity_per_trade = float(params['max_per_trade'])
         if 'trail_power' in params:
             config.params['trail_power'] = int(params['trail_power'])
+        if 'trail_base' in params:
+            config.params['trail_base'] = float(params['trail_base'])
         if 'flat_sizing' in params:
             config.params['flat_sizing'] = str(params['flat_sizing']).lower() in ('true', '1', 'yes')
         if 'cooldown' in params:
             config.params['cooldown_days'] = int(params['cooldown'])
         if 'cache' in params:
             config.params['signal_cache'] = params['cache']
+        if 'stop_pct' in params:
+            config.params['stop_pct'] = float(params['stop_pct'])
+        if 'tp_pct' in params:
+            config.params['tp_pct'] = float(params['tp_pct'])
+        if 'min_confidence' in params:
+            config.params['min_confidence'] = float(params['min_confidence'])
+        if 'eval_interval' in params:
+            config.eval_interval = int(params['eval_interval'])
         if 'id' in params:
             config.algo_id = params['id']
         return CSComboAlgo(config, data)
@@ -112,12 +132,22 @@ def _create_algo(spec: dict, data: DataProvider):
             config.max_equity_per_trade = float(params['max_per_trade'])
         if 'trail_power' in params:
             config.params['trail_power'] = int(params['trail_power'])
+        if 'trail_base' in params:
+            config.params['trail_base'] = float(params['trail_base'])
         if 'flat_sizing' in params:
             config.params['flat_sizing'] = str(params['flat_sizing']).lower() in ('true', '1', 'yes')
         if 'cooldown' in params:
             config.params['cooldown_days'] = int(params['cooldown'])
         if 'cache' in params:
             config.params['signal_cache'] = params['cache']
+        if 'stop_pct' in params:
+            config.params['stop_pct'] = float(params['stop_pct'])
+        if 'tp_pct' in params:
+            config.params['tp_pct'] = float(params['tp_pct'])
+        if 'min_confidence' in params:
+            config.params['min_confidence'] = float(params['min_confidence'])
+        if 'eval_interval' in params:
+            config.eval_interval = int(params['eval_interval'])
         if 'id' in params:
             config.algo_id = params['id']
         return CSComboAlgo(config, data)
@@ -135,6 +165,18 @@ def _create_algo(spec: dict, data: DataProvider):
             config.params['flat_sizing'] = str(params['flat_sizing']).lower() in ('true', '1', 'yes')
         if 'model_dir' in params:
             config.params['ml_model_dir'] = params['model_dir']
+        if 'stop_pct' in params:
+            config.params['stop_pct'] = float(params['stop_pct'])
+        if 'tp_pct' in params:
+            config.params['tp_pct'] = float(params['tp_pct'])
+        if 'breakout_stop_mult' in params:
+            config.params['breakout_stop_mult'] = float(params['breakout_stop_mult'])
+        if 'ou_half_life' in params:
+            config.params['ou_half_life'] = float(params['ou_half_life'])
+        if 'min_confidence' in params:
+            config.params['min_confidence'] = float(params['min_confidence'])
+        if 'eval_interval' in params:
+            config.eval_interval = int(params['eval_interval'])
         if 'start_time' in params:
             import datetime as _dt
             t = str(params['start_time']).zfill(4)
@@ -156,8 +198,18 @@ def _create_algo(spec: dict, data: DataProvider):
             config.max_equity_per_trade = float(params['equity'])
         if 'trail_power' in params:
             config.params['trail_power'] = int(params['trail_power'])
+        if 'trail_base' in params:
+            config.params['trail_base'] = float(params['trail_base'])
         if 'cooldown' in params:
             config.params['cooldown_days'] = int(params['cooldown'])
+        if 'stop_pct' in params:
+            config.params['stop_pct'] = float(params['stop_pct'])
+        if 'tp_pct' in params:
+            config.params['tp_pct'] = float(params['tp_pct'])
+        if 'min_confidence' in params:
+            config.params['min_confidence'] = float(params['min_confidence'])
+        if 'eval_interval' in params:
+            config.eval_interval = int(params['eval_interval'])
         if 'id' in params:
             config.algo_id = params['id']
         return OESig5Algo(config, data)
@@ -211,6 +263,25 @@ def main():
                         help='Stop checks only begin once trade is in profit (best_price > entry_price)')
     parser.add_argument('--max-underwater-mins', type=int, default=0,
                         help='Force-close underwater trades after N minutes (0=disabled, only with --profit-activated-stop)')
+    parser.add_argument('--max-hold-bars', type=int, default=0,
+                        help='Max 5-min bars before force-close (0=use algo default, 60=5hrs, 780=10days)')
+    # Algo-level params (override algo defaults for all algos)
+    parser.add_argument('--stop-pct', type=float, default=None,
+                        help='Initial stop distance %% (e.g., 0.015 = 1.5%%)')
+    parser.add_argument('--tp-pct', type=float, default=None,
+                        help='Take profit distance %% (e.g., 0.012 = 1.2%%)')
+    parser.add_argument('--trail-base', type=float, default=None,
+                        help='Trail base for exponential trail (intra/cs/oe, e.g., 0.006)')
+    parser.add_argument('--trail-power', type=int, default=None,
+                        help='Trail power exponent (intra/cs/oe, e.g., 6 or 12)')
+    parser.add_argument('--min-confidence', type=float, default=None,
+                        help='Min confidence threshold to take signal (e.g., 0.01)')
+    parser.add_argument('--breakout-stop-mult', type=float, default=None,
+                        help='Breakout stop multiplier (surfer-ml only, e.g., 1.0)')
+    parser.add_argument('--ou-half-life', type=float, default=None,
+                        help='OU half-life for bounce timeout (surfer-ml only, e.g., 5.0)')
+    parser.add_argument('--eval-interval', type=int, default=None,
+                        help='Signal evaluation interval in primary TF bars (e.g., 3)')
     args = parser.parse_args()
 
     if not args.algo:
@@ -351,6 +422,32 @@ def main():
             algo.config.max_underwater_mins = int(spec['params']['max_underwater_mins'])
         elif args.max_underwater_mins > 0:
             algo.config.max_underwater_mins = args.max_underwater_mins
+        if 'max_hold_bars' in spec['params']:
+            algo.config.max_hold_bars = int(spec['params']['max_hold_bars'])
+        elif args.max_hold_bars > 0:
+            algo.config.max_hold_bars = args.max_hold_bars
+        # Global CLI overrides for algo-level params (only if not already set per-algo)
+        if 'stop_pct' not in spec['params'] and args.stop_pct is not None:
+            algo.config.params['stop_pct'] = args.stop_pct
+            # Also update signal_params for intraday
+            if 'signal_params' in algo.config.params:
+                algo.config.params['signal_params']['stop'] = args.stop_pct
+        if 'tp_pct' not in spec['params'] and args.tp_pct is not None:
+            algo.config.params['tp_pct'] = args.tp_pct
+            if 'signal_params' in algo.config.params:
+                algo.config.params['signal_params']['tp'] = args.tp_pct
+        if 'trail_base' not in spec['params'] and args.trail_base is not None:
+            algo.config.params['trail_base'] = args.trail_base
+        if 'trail_power' not in spec['params'] and args.trail_power is not None:
+            algo.config.params['trail_power'] = args.trail_power
+        if 'min_confidence' not in spec['params'] and args.min_confidence is not None:
+            algo.config.params['min_confidence'] = args.min_confidence
+        if 'breakout_stop_mult' not in spec['params'] and args.breakout_stop_mult is not None:
+            algo.config.params['breakout_stop_mult'] = args.breakout_stop_mult
+        if 'ou_half_life' not in spec['params'] and args.ou_half_life is not None:
+            algo.config.params['ou_half_life'] = args.ou_half_life
+        if 'eval_interval' not in spec['params'] and args.eval_interval is not None:
+            algo.config.eval_interval = args.eval_interval
         algos.append(algo)
         portfolio.register_algo(
             algo_id=algo.config.algo_id,
