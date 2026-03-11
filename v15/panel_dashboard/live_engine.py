@@ -142,7 +142,11 @@ class LiveEngine:
         for algo in self._algos:
           try:
             # Skip if wrong TF for this algo
-            if tf != algo.config.primary_tf and tf != algo.config.exit_check_tf:
+            is_sequential_1m = (tf == '1min' and
+                                algo.config.stop_check_mode == 'sequential')
+            if not (tf == algo.config.primary_tf or
+                    tf == algo.config.exit_check_tf or
+                    is_sequential_1m):
                 continue
 
             algo_enabled = self._algo_enabled.get(algo.algo_id, True)
@@ -167,6 +171,13 @@ class LiveEngine:
                         continue
                     algo_positions.append(pos)
 
+            # ---- Sequential: ratchet + sync stop on every 1-min bar ----
+            if is_sequential_1m and algo_positions:
+                self._ratchet_positions(algo, algo_positions, bar,
+                                        increment_hold=False)
+                self._sync_trailing_stops_inplace(algo, algo_positions,
+                                                   deferred_ib_ops)
+
             # 2. Check exits (ALWAYS — regardless of enabled state)
             if tf == algo.config.exit_check_tf and algo_positions:
                 try:
@@ -177,14 +188,21 @@ class LiveEngine:
                                  algo.algo_id, e, exc_info=True)
                     continue
                 for exit_sig in exits:
+                    # Sequential: IB handles stop/trail — only pass TP/timeout/EOD
+                    if (algo.config.stop_check_mode == 'sequential' and
+                            exit_sig.reason in ('stop', 'trail')):
+                        continue
                     self._execute_exit(algo, exit_sig, deferred_ib_ops)
 
-                # 3. Re-fetch positions after exits, then ratchet
+                # 3. Re-fetch positions after exits, then ratchet + sync
                 positions = self._get_positions(algo)
-                self._ratchet_positions(algo, positions, bar)
-
-                # 4. Sync broker-side trailing stops (deferred)
-                self._sync_trailing_stops(algo, positions, deferred_ib_ops)
+                if algo.config.stop_check_mode == 'sequential':
+                    # Ratchet already done on 1-min bars, just increment hold
+                    self._increment_hold_bars(algo, positions)
+                else:
+                    self._ratchet_positions(algo, positions, bar)
+                    # 4. Sync broker-side trailing stops (deferred)
+                    self._sync_trailing_stops(algo, positions, deferred_ib_ops)
 
             # 5. Active window gate — only applies to ENTRY generation
             if algo.config.active_start and algo.config.active_end:
@@ -236,7 +254,7 @@ class LiveEngine:
 
         For IB algos (live_orders=True): passes source='ib' which excludes
         pending rows (only partial/filled = real broker exposure).
-        For sim algos: passes engine source (e.g. 'yf').
+        For sim algos: passes engine source.
         """
         if not self._db:
             return []
@@ -279,8 +297,14 @@ class LiveEngine:
                          algo.algo_id, e, exc_info=True)
             raise  # Let per-algo fault isolation skip this algo entirely
 
-    def _ratchet_positions(self, algo, positions, bar):
-        """Direction-aware best/worst/hold_bars update."""
+    def _ratchet_positions(self, algo, positions, bar, increment_hold=True):
+        """Direction-aware best/worst/hold_bars update.
+
+        Args:
+            increment_hold: If False, skip hold_bars increment. Used on 1-min
+                bars for sequential mode where we only want price ratcheting;
+                hold_bars is incremented at 5-min boundaries instead.
+        """
         if not self._db:
             return
         for pos in positions:
@@ -296,11 +320,28 @@ class LiveEngine:
                     changes['best_price'] = bar['low']
                 if bar['high'] > pos.worst_price:
                     changes['worst_price'] = bar['high']
-            changes['hold_bars'] = pos.hold_bars + 1
+            if increment_hold:
+                changes['hold_bars'] = pos.hold_bars + 1
+            if not changes:
+                continue
             try:
                 self._db.update_trade_state(trade_id, **changes)
             except Exception as e:
                 logger.error("Ratchet failed for trade %d: %s", trade_id, e)
+
+    def _increment_hold_bars(self, algo, positions):
+        """Increment hold_bars only. Used at 5-min boundaries for sequential
+        algos where price ratcheting is done on 1-min bars."""
+        if not self._db:
+            return
+        for pos in positions:
+            trade_id = int(pos.pos_id)
+            try:
+                self._db.update_trade_state(trade_id,
+                                            hold_bars=pos.hold_bars + 1)
+            except Exception as e:
+                logger.error("Hold bars increment failed for trade %d: %s",
+                             trade_id, e)
 
     def _sync_trailing_stops(self, algo, positions, deferred_ib_ops=None):
         """Sync effective stop from algo state to IB resting stop orders."""
@@ -349,6 +390,58 @@ class LiveEngine:
                                                                effective_stop)
                         except Exception as e:
                             logger.error("Stop sync IB failed for trade %d: %s",
+                                         trade_id, e)
+
+    def _sync_trailing_stops_inplace(self, algo, positions, deferred_ib_ops=None):
+        """Sync effective stop via in-place modify (no cancel+replace).
+
+        Used by sequential mode on 1-min bars. No goodAfterTime delay —
+        the stop stays immediately active after grace period has passed.
+        For sim algos (no self._orders), just updates DB.
+        """
+        import math
+        for pos in positions:
+            if self._db:
+                trade = self._db.get_trade(int(pos.pos_id))
+                if trade and trade.get('management_mode') == 'manual':
+                    continue
+            try:
+                effective_stop = algo.get_effective_stop(pos)
+            except Exception as e:
+                logger.error("CRITICAL: %s.get_effective_stop() FAILED for trade %s: %s",
+                             algo.algo_id, pos.pos_id, e, exc_info=True)
+                continue
+            trade_id = int(pos.pos_id)
+            if effective_stop is not None and not isinstance(effective_stop, (int, float)):
+                logger.error("CRITICAL: %s.get_effective_stop() returned invalid type %s "
+                             "for trade %d", algo.algo_id, type(effective_stop), trade_id)
+                continue
+            if effective_stop and (math.isnan(effective_stop) or math.isinf(effective_stop)):
+                logger.error("CRITICAL: %s.get_effective_stop() returned %s for trade %d",
+                             algo.algo_id, effective_stop, trade_id)
+                continue
+            if effective_stop and effective_stop <= 0:
+                logger.error("CRITICAL: %s.get_effective_stop() returned %.2f for trade %d",
+                             algo.algo_id, effective_stop, trade_id)
+                continue
+            if effective_stop and effective_stop != pos.stop_price:
+                try:
+                    self._db.update_trade_state(trade_id,
+                                                stop_price=effective_stop)
+                except Exception as e:
+                    logger.error("Stop sync DB failed for trade %d: %s",
+                                 trade_id, e)
+                if self._orders:
+                    if deferred_ib_ops is not None:
+                        deferred_ib_ops.append(
+                            lambda tid=trade_id, s=effective_stop:
+                                self._orders.modify_stop_in_place(tid, s))
+                    else:
+                        try:
+                            self._orders.modify_stop_in_place(trade_id,
+                                                               effective_stop)
+                        except Exception as e:
+                            logger.error("Stop in-place sync failed for trade %d: %s",
                                          trade_id, e)
 
     def _fill_pending_entries(self, tf, time, bar, deferred_ib_ops=None):

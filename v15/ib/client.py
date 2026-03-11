@@ -640,6 +640,7 @@ class IBClient:
             logger.error("modify_stop_price: order %d not found", order_id)
             return False
         try:
+            trade.order.goodAfterTime = ''  # Clear grace — stop should be active
             trade.order.auxPrice = round(new_price, 2)
             future = asyncio.run_coroutine_threadsafe(
                 self._modify_order_async(trade), self._loop)

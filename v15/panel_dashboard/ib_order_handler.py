@@ -865,8 +865,14 @@ class IBOrderHandler:
     # ── Protective Stop ─────────────────────────────────────────────
 
     def _place_protective_stop(self, trade_id: int, stop_price: float,
-                               qty: int, direction: str) -> Optional[int]:
+                               qty: int, direction: str,
+                               good_after_time: str = '') -> Optional[int]:
         """Place or re-arm a protective stop for a trade.
+
+        Args:
+            good_after_time: IB goodAfterTime string. If set, stop stays
+                             inactive until this time (simulates delayed
+                             activation matching backtester behavior).
 
         Returns stop order_id on success, None on failure.
         """
@@ -882,7 +888,8 @@ class IBOrderHandler:
 
         result = self.ib.place_order(
             'TSLA', close_action, qty, 'STP', price=stop_price,
-            tif='GTC', order_ref=order_ref, outside_rth=True)
+            tif='GTC', order_ref=order_ref, outside_rth=True,
+            good_after_time=good_after_time)
 
         if 'error' in result:
             error_msg = result['error']
@@ -949,7 +956,13 @@ class IBOrderHandler:
                     # For now, cancel and re-place
                     self.ib.cancel_order(existing_stop)
 
-                self._place_protective_stop(trade_id, stop_price, qty, direction)
+                # Grace period on initial stop placement (no existing stop)
+                good_after = ''
+                if not existing_stop:
+                    good_after = self._compute_good_after_time(delay_minutes=5)
+
+                self._place_protective_stop(trade_id, stop_price, qty, direction,
+                                            good_after_time=good_after)
             finally:
                 lock.release()
 
@@ -957,8 +970,25 @@ class IBOrderHandler:
             if not self._stop_dirty.get(trade_id, False):
                 break
 
+    def _compute_good_after_time(self, delay_minutes: int = 5) -> str:
+        """Compute IB goodAfterTime string = now + delay_minutes.
+
+        Format: 'yyyymmdd hh:mm:ss US/Eastern'
+        """
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        et = datetime.now(ZoneInfo('US/Eastern'))
+        gat = et + timedelta(minutes=delay_minutes)
+        return gat.strftime('%Y%m%d %H:%M:%S US/Eastern')
+
     def modify_trailing_stop(self, trade_id: int, new_stop_price: float):
-        """Update the resting IB stop to a new price level (trailing ratchet)."""
+        """Update the resting IB stop to a new price level (trailing ratchet).
+
+        Always cancel+replace with goodAfterTime so the new stop stays
+        inactive for 5 minutes — matching the backtester's fixed/i=5
+        behavior where IB can't stop you out during the first 5 min
+        after each trail update.
+        """
         # Guard: skip if exit is already in progress (stop may have been cancelled)
         if self._exit_in_progress.get(trade_id):
             return
@@ -982,26 +1012,24 @@ class IBOrderHandler:
         if effective_open <= 0:
             return
 
-        # Try to modify in place — no cancel race
-        ok = self.ib.modify_stop_price(stop_order_id, new_stop_price)
-        if ok:
+        # Always cancel + replace with goodAfterTime (in-place modify
+        # can't update activation time, so we must replace)
+        good_after = self._compute_good_after_time(delay_minutes=5)
+        self.ib.cancel_order(stop_order_id)
+        new_stop_id = self._place_protective_stop(
+            trade_id, new_stop_price, effective_open, direction,
+            good_after_time=good_after)
+
+        if new_stop_id and new_stop_id != -1:
             try:
                 self.db.update_trade_state(trade_id, stop_price=new_stop_price)
             except Exception as e:
                 logger.error("Stop price DB update failed for trade %d: %s",
                              trade_id, e)
-            logger.info("Trailing stop modified: trade %d, order %d → $%.2f",
-                        trade_id, stop_order_id, new_stop_price)
-            return
-
-        # Fallback: cancel + replace (if modify failed for this order)
-        logger.warning("modify_stop_price failed for trade %d — "
-                       "falling back to cancel+replace", trade_id)
-        self.ib.cancel_order(stop_order_id)
-        new_stop_id = self._place_protective_stop(
-            trade_id, new_stop_price, effective_open, direction)
-
-        if new_stop_id is None:
+            logger.info("Trailing stop replaced: trade %d → $%.2f "
+                        "(goodAfterTime=%s)",
+                        trade_id, new_stop_price, good_after)
+        elif new_stop_id is None:
             # Real failure — revert DB stop_price to match what IB still has
             logger.error("Stop modification failed for trade %d — "
                          "reverting to $%.2f", trade_id, old_stop)
@@ -1015,6 +1043,35 @@ class IBOrderHandler:
             # Timeout — order may be in-flight, recovery will reconcile
             logger.warning("Stop modification timed out for trade %d — "
                            "order may be in-flight at IB", trade_id)
+
+    def modify_stop_in_place(self, trade_id: int, new_stop_price: float):
+        """Update resting stop price via in-place modify (no cancel+replace).
+
+        Used by sequential mode for 1-min trail updates. No goodAfterTime
+        delay — stop stays immediately active.
+        """
+        if self._exit_in_progress.get(trade_id):
+            return
+        trade = self._get_trade(trade_id)
+        if not trade:
+            return
+        if trade.get('management_mode') == 'manual':
+            return
+        stop_order_id = trade.get('ib_stop_order_id')
+        if not stop_order_id:
+            return
+
+        new_stop_price = round(new_stop_price, 2)
+        success = self.ib.modify_stop_price(stop_order_id, new_stop_price)
+        if success:
+            try:
+                self.db.update_trade_state(trade_id, stop_price=new_stop_price)
+            except Exception as e:
+                logger.error("Stop in-place DB update failed for trade %d: %s",
+                             trade_id, e)
+        else:
+            logger.warning("Stop in-place modify failed for trade %d (order %d) "
+                           "— will retry next bar", trade_id, stop_order_id)
 
     # ── Fill Callbacks ──────────────────────────────────────────────
 

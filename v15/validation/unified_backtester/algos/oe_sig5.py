@@ -433,7 +433,7 @@ class OESig5Algo(AlgoBase):
 
                 if low <= effective_stop:
                     is_trailing = best > pos.entry_price and trailing_stop > pos.stop_price
-                    reason = 'trailing' if is_trailing else 'stop'
+                    reason = 'trail' if is_trailing else 'stop'
                     exits.append(ExitSignal(
                         pos_id=pos.pos_id,
                         price=effective_stop,
