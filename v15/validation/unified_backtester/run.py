@@ -135,6 +135,14 @@ def _create_algo(spec: dict, data: DataProvider):
             config.params['flat_sizing'] = str(params['flat_sizing']).lower() in ('true', '1', 'yes')
         if 'model_dir' in params:
             config.params['ml_model_dir'] = params['model_dir']
+        if 'start_time' in params:
+            import datetime as _dt
+            t = str(params['start_time']).zfill(4)
+            config.active_start = _dt.time(int(t[:2]), int(t[2:]))
+        if 'end_time' in params:
+            import datetime as _dt
+            t = str(params['end_time']).zfill(4)
+            config.active_end = _dt.time(int(t[:2]), int(t[2:]))
         if 'id' in params:
             config.algo_id = params['id']
         return SurferMLAlgo(config, data)
