@@ -120,10 +120,24 @@ def _fetch_one_day(client, symbol: str, end_dt: str,
     else:
         contract = Stock(symbol, 'SMART', 'USD')
 
+    # Qualify contract (required for IND contracts)
+    qual_future = asyncio.run_coroutine_threadsafe(
+        client.ib.qualifyContractsAsync(contract), client._loop)
+    qualified = qual_future.result(timeout=10)
+    if qualified:
+        contract = qualified[0]
+
+    # IND contracts reject endDateTime with timezone — use without tz
+    if sec_type == 'IND':
+        # Strip ' US/Eastern' suffix if present
+        end_dt_clean = end_dt.replace(' US/Eastern', '')
+    else:
+        end_dt_clean = end_dt
+
     future = asyncio.run_coroutine_threadsafe(
         client.ib.reqHistoricalDataAsync(
             contract,
-            endDateTime=end_dt,
+            endDateTime=end_dt_clean,
             durationStr='1 D',
             barSizeSetting='1 min',
             whatToShow='TRADES',
