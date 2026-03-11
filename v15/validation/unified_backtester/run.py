@@ -176,6 +176,21 @@ def main():
                         help='Export trades to CSV file')
     parser.add_argument('--quiet', action='store_true',
                         help='Suppress progress output')
+    parser.add_argument('--stop-check-mode', type=str, default='sequential',
+                        choices=['current', 'fixed', 'pessimistic', 'sequential'],
+                        help='Stop check mode (default: sequential)')
+    parser.add_argument('--stop-check-interval', type=int, default=1,
+                        choices=[1, 2, 5],
+                        help='1-min bars between broker stop checks (fixed/pessimistic only, default: 1)')
+    parser.add_argument('--stop-check-delay', type=int, default=0,
+                        help='1-min bars delay before first broker stop check (fixed/pessimistic only, default: 0)')
+    parser.add_argument('--exit-grace-bars', type=int, default=5,
+                        help='1-min bars after entry before stop checks activate (sequential only, default: 5)')
+    parser.add_argument('--seq-check-price', type=str, default='low',
+                        choices=['low', 'open', 'close', 'open_close', 'open_fill_close'],
+                        help='Price field for sequential stop check (default: low)')
+    parser.add_argument('--seq-check-interval', type=int, default=1,
+                        help='Check every N 1-min bars after grace (1=every bar, 5=5-min, default: 1)')
     args = parser.parse_args()
 
     if not args.algo:
@@ -239,6 +254,32 @@ def main():
 
     for spec in algo_specs:
         algo = _create_algo(spec, data)
+        # Apply per-algo stop_check overrides from spec params
+        if 'stop_check_mode' in spec['params']:
+            algo.config.stop_check_mode = spec['params']['stop_check_mode']
+        if 'stop_check_interval' in spec['params']:
+            algo.config.stop_check_interval = int(spec['params']['stop_check_interval'])
+        if 'stop_check_delay' in spec['params']:
+            algo.config.stop_check_delay = int(spec['params']['stop_check_delay'])
+        if 'exit_grace_bars' in spec['params']:
+            algo.config.exit_grace_bars = int(spec['params']['exit_grace_bars'])
+        if 'seq_check_price' in spec['params']:
+            algo.config.seq_check_price = spec['params']['seq_check_price']
+        if 'seq_check_interval' in spec['params']:
+            algo.config.seq_check_interval = int(spec['params']['seq_check_interval'])
+        # Global CLI overrides (apply if not already set per-algo)
+        if 'stop_check_mode' not in spec['params']:
+            algo.config.stop_check_mode = args.stop_check_mode
+        if 'stop_check_interval' not in spec['params']:
+            algo.config.stop_check_interval = args.stop_check_interval
+        if 'stop_check_delay' not in spec['params']:
+            algo.config.stop_check_delay = args.stop_check_delay
+        if 'exit_grace_bars' not in spec['params']:
+            algo.config.exit_grace_bars = args.exit_grace_bars
+        if 'seq_check_price' not in spec['params']:
+            algo.config.seq_check_price = args.seq_check_price
+        if 'seq_check_interval' not in spec['params']:
+            algo.config.seq_check_interval = args.seq_check_interval
         algos.append(algo)
         portfolio.register_algo(
             algo_id=algo.config.algo_id,

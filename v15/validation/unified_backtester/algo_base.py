@@ -51,6 +51,12 @@ class AlgoConfig:
     cost_model: CostModel = field(default_factory=CostModel)
     params: dict = field(default_factory=dict)  # Algo-specific parameters
     exit_check_tf: str = '1min'           # TF for exit checking (1min = highest resolution)
+    stop_check_mode: str = 'sequential'     # 'current', 'fixed', 'pessimistic', 'sequential'
+    stop_check_interval: int = 1           # 1-min bars between broker stop checks (fixed/pessimistic)
+    stop_check_delay: int = 0             # 1-min bars to skip before first check after lock (fixed/pessimistic)
+    exit_grace_bars: int = 5              # 1-min bars after entry before stop checks activate (sequential)
+    seq_check_price: str = 'low'          # Price field for stop check: 'low', 'open', 'close' (sequential)
+    seq_check_interval: int = 1           # Check every N 1-min bars after grace: 1=every bar, 5=5-min (sequential)
     live_orders: bool = False             # Whether to place real IB orders (live only)
     # Optional active hours hint: engine skips on_bar() outside these hours.
     # Exits still run regardless. Algo can do additional filtering internally.

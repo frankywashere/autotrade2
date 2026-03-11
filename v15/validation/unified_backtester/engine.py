@@ -85,6 +85,19 @@ class BacktestEngine:
         # Pending entries per algo (filled at next bar's open)
         self._pending: Dict[str, List[PendingEntry]] = {a.algo_id: [] for a in algos}
 
+        # Broker stop checking state (for fixed/pessimistic modes)
+        self._broker_stops: Dict[str, float] = {}          # pos_id → locked stop
+        self._broker_check_counters: Dict[str, int] = {}   # pos_id → bar counter
+        self._broker_stop_algos: Set[str] = {
+            a.algo_id for a in algos if a.config.stop_check_mode in ('fixed', 'pessimistic')
+        }
+
+        # Sequential stop checking state (per-1m-bar, no ordering ambiguity)
+        self._sequential_algos: Set[str] = {
+            a.algo_id for a in algos if a.config.stop_check_mode == 'sequential'
+        }
+        self._entry_bar_counts: Dict[str, int] = {}  # pos_id → 1-min bars since entry
+
     def _build_trade_context(self, algo_id: str) -> TradeContext:
         """Build TradeContext from PortfolioManager state for ML features."""
         trades = self.portfolio.get_trades(algo_id)
@@ -162,6 +175,160 @@ class BacktestEngine:
 
         return remapped
 
+    def _check_broker_stops(self, algo: AlgoBase, ts: pd.Timestamp, bar_1m: dict):
+        """Check locked broker stops against 1-min bar on non-boundary bars.
+
+        For 'fixed' mode: exit at locked stop price.
+        For 'pessimistic' mode: exit at bar's worst price (gap-through stress test).
+        """
+        algo_id = algo.algo_id
+        mode = algo.config.stop_check_mode
+        interval = algo.config.stop_check_interval
+        delay = algo.config.stop_check_delay
+        closed_ids = []
+
+        for pos in self.portfolio.get_open_positions(algo_id):
+            pid = pos.pos_id
+            locked_stop = self._broker_stops.get(pid)
+            if locked_stop is None:
+                continue
+
+            # Increment counter
+            self._broker_check_counters[pid] = self._broker_check_counters.get(pid, 0) + 1
+
+            # Skip if still in delay window (simulates GoodAfterTime)
+            if self._broker_check_counters[pid] <= delay:
+                continue
+
+            # After delay, check every `interval` bars
+            bars_since_delay = self._broker_check_counters[pid] - delay
+            if bars_since_delay % interval != 0:
+                continue
+
+            # Check if stop is breached
+            breached = False
+            if pos.direction == 'long' and bar_1m['low'] <= locked_stop:
+                breached = True
+                if mode == 'pessimistic':
+                    exit_price = bar_1m['low']
+                else:
+                    exit_price = locked_stop
+            elif pos.direction == 'short' and bar_1m['high'] >= locked_stop:
+                breached = True
+                if mode == 'pessimistic':
+                    exit_price = bar_1m['high']
+                else:
+                    exit_price = locked_stop
+
+            if breached:
+                trade = self.portfolio.close_position(
+                    pid, exit_price, ts, 'broker_stop')
+                if trade:
+                    algo.on_fill(trade)
+                    closed_ids.append(pid)
+
+        # Clean up closed positions
+        for pid in closed_ids:
+            self._broker_stops.pop(pid, None)
+            self._broker_check_counters.pop(pid, None)
+
+    def _check_sequential_stops(self, algo: AlgoBase, ts: pd.Timestamp, bar_1m: dict):
+        """Check stops per-1m-bar with grace period. No ordering ambiguity.
+
+        For each open position:
+        1. Skip if still in grace period (first N bars after entry)
+        2. Skip if not on check interval (first check right after grace, then every N)
+        3. Compute effective_stop from get_effective_stop() (uses prior best_price)
+        4. Check configured price field(s) against effective_stop
+        5. Exit at effective_stop or bar close depending on mode
+
+        Ratcheting (Step 3 in main loop) happens AFTER this, so effective_stop
+        is always computed from prior bars — preserving chronological order.
+
+        Configurable via AlgoConfig:
+        - seq_check_price: 'low', 'open', 'close', 'open_close', 'open_fill_close'
+        - seq_check_interval: 1 (every bar), 5 (every 5th bar), etc.
+
+        open_fill_close mode: check open against stop. If breached, exit at
+        bar's close (realistic market order fill). If open OK, trade survives.
+        """
+        algo_id = algo.algo_id
+        grace = algo.config.exit_grace_bars
+        check_price = algo.config.seq_check_price
+        check_interval = algo.config.seq_check_interval
+        closed_ids = []
+
+        for pos in self.portfolio.get_open_positions(algo_id):
+            pid = pos.pos_id
+            count = self._entry_bar_counts.get(pid, 0) + 1
+            self._entry_bar_counts[pid] = count
+
+            if count <= grace:
+                continue
+
+            # Check interval: first check right after grace, then every N bars
+            bars_since_grace = count - grace
+            if check_interval > 1 and (bars_since_grace - 1) % check_interval != 0:
+                continue
+
+            effective_stop = algo.get_effective_stop(pos)
+            if effective_stop is None:
+                continue
+
+            breached = False
+            # For 'low' with interval=1: exit at effective_stop (resting IB stop,
+            # price passed through the level). For all other modes: exit at the
+            # price that triggered the breach (can't fill at stop if price already past).
+            fill_at_stop = (check_price == 'low' and check_interval == 1)
+            exit_price = effective_stop if fill_at_stop else bar_1m['close']
+
+            if pos.direction == 'long':
+                if check_price == 'open_fill_close':
+                    # Check open; if breached, fill at close (market order)
+                    if bar_1m['open'] <= effective_stop:
+                        breached = True
+                        exit_price = bar_1m['close']
+                elif check_price == 'open_close':
+                    # Check open first, then close; fill at close
+                    if bar_1m['open'] <= effective_stop or bar_1m['close'] <= effective_stop:
+                        breached = True
+                elif check_price == 'low':
+                    if bar_1m['low'] <= effective_stop:
+                        breached = True
+                        # low/1m: fill at stop (resting order). low/5m: fill at close
+                        exit_price = effective_stop if fill_at_stop else bar_1m['close']
+                else:
+                    # 'open' or 'close'
+                    if bar_1m[check_price] <= effective_stop:
+                        breached = True
+
+            elif pos.direction == 'short':
+                if check_price == 'open_fill_close':
+                    if bar_1m['open'] >= effective_stop:
+                        breached = True
+                        exit_price = bar_1m['close']
+                elif check_price == 'open_close':
+                    if bar_1m['open'] >= effective_stop or bar_1m['close'] >= effective_stop:
+                        breached = True
+                elif check_price == 'low':
+                    # For shorts, check high
+                    if bar_1m['high'] >= effective_stop:
+                        breached = True
+                        exit_price = effective_stop if fill_at_stop else bar_1m['close']
+                else:
+                    if bar_1m[check_price] >= effective_stop:
+                        breached = True
+
+            if breached:
+                reason = 'trail' if effective_stop != pos.stop_price else 'stop'
+                trade = self.portfolio.close_position(pid, exit_price, ts, reason)
+                if trade:
+                    algo.on_fill(trade)
+                    closed_ids.append(pid)
+
+        for pid in closed_ids:
+            self._entry_bar_counts.pop(pid, None)
+
     def run(self) -> Dict[str, dict]:
         """Run the backtest. Returns metrics dict per algo_id."""
         from .results import compute_metrics, print_report, print_summary_table
@@ -187,13 +354,39 @@ class BacktestEngine:
                 algo_id = algo.algo_id
 
                 # ---- STEP 1: Fill pending entries at this bar's open ----
+                positions_before = set(p.pos_id for p in self.portfolio.get_open_positions(algo_id))
                 self._fill_pending(algo, ts, bar_1m)
+
+                # Lock initial broker stop for newly filled positions
+                if algo_id in self._broker_stop_algos:
+                    for pos in self.portfolio.get_open_positions(algo_id):
+                        if pos.pos_id not in positions_before:
+                            initial_stop = algo.get_effective_stop(pos)
+                            if initial_stop is not None:
+                                self._broker_stops[pos.pos_id] = initial_stop
+                                self._broker_check_counters[pos.pos_id] = 0
+
+                # Initialize entry bar counter for newly filled positions (sequential mode)
+                if algo_id in self._sequential_algos:
+                    for pos in self.portfolio.get_open_positions(algo_id):
+                        if pos.pos_id not in positions_before:
+                            self._entry_bar_counts[pos.pos_id] = 0
+
+                is_exit_boundary = ts in self._algo_exit_bar_times.get(algo_id, set())
+
+                # ---- STEP 1.5a: Sequential stop check (EVERY bar) ----
+                if algo_id in self._sequential_algos:
+                    self._check_sequential_stops(algo, ts, bar_1m)
+
+                # ---- STEP 1.5b: Broker stop check on non-boundary bars ----
+                elif algo_id in self._broker_stop_algos and not is_exit_boundary:
+                    self._check_broker_stops(algo, ts, bar_1m)
 
                 # ---- STEP 2: Process exits BEFORE updating best/worst (causal) ----
                 # Stop/trail level is whatever was known at bar open.
                 # High/low ratcheting happens AFTER exit checks (Step 3).
                 positions = self.portfolio.get_open_positions(algo_id)
-                if positions and ts in self._algo_exit_bar_times.get(algo_id, set()):
+                if positions and is_exit_boundary:
                     # Get the exit-resolution bar (may be 1min, 5min, or daily)
                     exit_bar = self.data.get_current_bar(algo.config.exit_check_tf, ts)
                     if exit_bar is None:
@@ -201,17 +394,32 @@ class BacktestEngine:
                     positions = self.portfolio.get_open_positions(algo_id)
                     exits = algo.check_exits(ts, exit_bar, positions)
                     for ex in exits:
+                        # In sequential mode, stop/trail already handled per-1m-bar.
+                        # Only process non-stop exits (TP, timeout, EOD) from check_exits.
+                        if algo_id in self._sequential_algos and ex.reason in ('stop', 'trail'):
+                            continue
                         trade = self.portfolio.close_position(
                             ex.pos_id, ex.price, ts, ex.reason)
                         if trade:
                             algo.on_fill(trade)
+                            # Clean up broker dicts for closed positions
+                            self._broker_stops.pop(ex.pos_id, None)
+                            self._broker_check_counters.pop(ex.pos_id, None)
+                            self._entry_bar_counts.pop(ex.pos_id, None)
+
+                # ---- STEP 2.5: Re-lock broker stops for survivors at boundaries ----
+                if algo_id in self._broker_stop_algos and is_exit_boundary:
+                    for pos in self.portfolio.get_open_positions(algo_id):
+                        stop = algo.get_effective_stop(pos)
+                        if stop is not None:
+                            self._broker_stops[pos.pos_id] = stop
+                            self._broker_check_counters[pos.pos_id] = 0
 
                 # ---- STEP 3: Update best/worst prices AFTER exits (causal) ----
                 # Ratchet best/worst on every 1-min bar to capture true price
                 # extremes (matching broker-side stops that track continuously
                 # in live). hold_bars only increments at exit-check TF boundaries
                 # so algos count in their natural units (5-min bars).
-                is_exit_boundary = ts in self._algo_exit_bar_times.get(algo_id, set())
                 for pos in self.portfolio.get_open_positions(algo_id):
                     self.portfolio.update_position(
                         pos.pos_id, bar_1m['high'], bar_1m['low'],
@@ -265,6 +473,9 @@ class BacktestEngine:
                     pos.pos_id, final_price, final_time, 'end_of_data')
                 if trade:
                     algo.on_fill(trade)
+                    self._broker_stops.pop(pos.pos_id, None)
+                    self._broker_check_counters.pop(pos.pos_id, None)
+                    self._entry_bar_counts.pop(pos.pos_id, None)
 
         self.portfolio.record_equity(final_time)
 
