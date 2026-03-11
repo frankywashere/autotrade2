@@ -3,6 +3,7 @@
 Usage:
     python -m v15.ib.historical --symbol TSLA --months 6
     python -m v15.ib.historical --symbol TSLA --months 1 --output data/TSLAMin_IB.txt
+    python -m v15.ib.historical --symbol VIX --type IND --start 2025-01-01 --end 2026-03-07
 
 Output format matches data/TSLAMin.txt:
     YYYYMMDD HHMMSS;open;high;low;close;volume
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 def download_1min_bars(symbol: str, months: int, output: str,
                        host: str, port: int, end: str = None,
-                       start: str = None):
+                       start: str = None, sec_type: str = 'STK'):
     """Download 1-min bars day-by-day from IB and save in TSLAMin.txt format."""
     from v15.ib.client import IBClient
 
@@ -53,7 +54,7 @@ def download_1min_bars(symbol: str, months: int, output: str,
     while current > start_date:
         end_dt_str = current.strftime('%Y%m%d %H:%M:%S') + ' US/Eastern'
         try:
-            df = _fetch_one_day(client, symbol, end_dt_str)
+            df = _fetch_one_day(client, symbol, end_dt_str, sec_type=sec_type)
             if df is not None and len(df) > 0:
                 all_records.append(df)
                 day_count += 1
@@ -104,16 +105,20 @@ def download_1min_bars(symbol: str, months: int, output: str,
     logger.info("Saved to %s (%d lines)", output_path, len(combined))
 
 
-def _fetch_one_day(client, symbol: str, end_dt: str) -> pd.DataFrame:
+def _fetch_one_day(client, symbol: str, end_dt: str,
+                   sec_type: str = 'STK') -> pd.DataFrame:
     """Fetch 1 day of 1-min bars ending at end_dt.
 
     Uses reqHistoricalData with explicit endDateTime so we can
     page backward through time.
     """
     import asyncio
-    from ib_async import Stock
+    from ib_async import Stock, Index
 
-    contract = Stock(symbol, 'SMART', 'USD')
+    if sec_type == 'IND':
+        contract = Index(symbol, 'CBOE', 'USD')
+    else:
+        contract = Stock(symbol, 'SMART', 'USD')
 
     future = asyncio.run_coroutine_threadsafe(
         client.ib.reqHistoricalDataAsync(
@@ -159,6 +164,8 @@ def main():
                         help='End date YYYY-MM-DD (default: now)')
     parser.add_argument('--start', default=None,
                         help='Start date YYYY-MM-DD (overrides --months)')
+    parser.add_argument('--type', default='STK', choices=['STK', 'IND'],
+                        help='Security type: STK (stock/ETF) or IND (index like VIX)')
 
     args = parser.parse_args()
 
@@ -173,6 +180,7 @@ def main():
         port=args.port,
         end=args.end,
         start=args.start,
+        sec_type=args.type,
     )
 
 
