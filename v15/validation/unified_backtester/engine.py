@@ -97,6 +97,10 @@ class BacktestEngine:
             a.algo_id for a in algos if a.config.stop_check_mode == 'sequential'
         }
         self._entry_bar_counts: Dict[str, int] = {}  # pos_id → 1-min bars since entry
+        self._5s_bar_counts: Dict[str, int] = {}     # pos_id → running 5-sec bar counter
+
+        # 5-sec data: use honest fills when available
+        self._has_5s_data = hasattr(data, '_5s_by_minute') and data._5s_by_minute is not None
 
     def _build_trade_context(self, algo_id: str) -> TradeContext:
         """Build TradeContext from PortfolioManager state for ML features."""
@@ -329,6 +333,115 @@ class BacktestEngine:
         for pid in closed_ids:
             self._entry_bar_counts.pop(pid, None)
 
+    def _check_sequential_stops_5s(self, algo: AlgoBase, ts: pd.Timestamp, bar_1m: dict):
+        """5-sec honest fill stop check with configurable knobs.
+
+        Two independent knobs control the sub-loop:
+        - stop_update_secs: how often to ratchet best_price + recompute effective_stop
+        - stop_check_secs: how often to check if price breached the stop
+
+        Both are in seconds (5=every 5s bar, 60=every 1min, 300=every 5min).
+        The sub-loop walks all 5-sec bars but only acts on the configured intervals.
+
+        Honest fills: gap-through → fill at open; crossed → fill at stop.
+        """
+        algo_id = algo.algo_id
+        grace = algo.config.exit_grace_bars
+        check_interval = algo.config.seq_check_interval
+        update_every_n = max(1, algo.config.stop_update_secs // 5)  # 5s bars between updates
+        check_every_n = max(1, algo.config.stop_check_secs // 5)    # 5s bars between checks
+        closed_ids = []
+
+        # Get 5-sec bars for this minute
+        bars_5s = self.data.get_5s_bars_for_minute(ts)
+        if bars_5s is None or len(bars_5s) == 0:
+            # Fall back to 1-min check if no 5s data for this minute
+            self._check_sequential_stops(algo, ts, bar_1m)
+            return
+
+        for pos in self.portfolio.get_open_positions(algo_id):
+            pid = pos.pos_id
+            if pid in closed_ids:
+                continue
+
+            count = self._entry_bar_counts.get(pid, 0) + 1
+            self._entry_bar_counts[pid] = count
+
+            if count <= grace:
+                continue
+
+            # Check interval at 1-min level: first check right after grace, then every N
+            bars_since_grace = count - grace
+            if check_interval > 1 and (bars_since_grace - 1) % check_interval != 0:
+                continue
+
+            # Compute initial effective_stop for this minute
+            effective_stop = algo.get_effective_stop(pos)
+            if effective_stop is None:
+                continue
+
+            # Get the running 5s bar counter for this position (persists across minutes)
+            bar5_count = self._5s_bar_counts.get(pid, 0)
+
+            exited = False
+            exit_price = 0.0
+            for _, bar5 in bars_5s.iterrows():
+                bar5_count += 1
+                b_open = float(bar5['open'])
+                b_high = float(bar5['high'])
+                b_low  = float(bar5['low'])
+
+                # Knob A: ratchet + recompute stop on schedule
+                if bar5_count % update_every_n == 0:
+                    self.portfolio.update_position(pid, b_high, b_low)
+                    effective_stop = algo.get_effective_stop(pos)
+                    if effective_stop is None:
+                        break
+
+                # Knob B: check if price breached the stop on schedule
+                if bar5_count % check_every_n != 0:
+                    continue
+
+                b_close = float(bar5['close'])
+
+                if pos.direction == 'long':
+                    # 1. Check open — gap-through: fill at open
+                    if b_open <= effective_stop:
+                        exit_price = b_open
+                        exited = True
+                        break
+                    # 2. Check if stop is between open and close (crossed through)
+                    #    In 5 seconds, reasonable that it hit the stop level
+                    if b_close <= effective_stop:
+                        exit_price = effective_stop
+                        exited = True
+                        break
+                else:  # short
+                    # 1. Check open — gap-through: fill at open
+                    if b_open >= effective_stop:
+                        exit_price = b_open
+                        exited = True
+                        break
+                    # 2. Check if stop is between open and close (crossed through)
+                    if b_close >= effective_stop:
+                        exit_price = effective_stop
+                        exited = True
+                        break
+
+            # Persist counter
+            self._5s_bar_counts[pid] = bar5_count
+
+            if exited:
+                reason = 'trail' if effective_stop != pos.stop_price else 'stop'
+                trade = self.portfolio.close_position(pid, exit_price, ts, reason)
+                if trade:
+                    algo.on_fill(trade)
+                    closed_ids.append(pid)
+
+        for pid in closed_ids:
+            self._entry_bar_counts.pop(pid, None)
+            self._5s_bar_counts.pop(pid, None)
+
     def run(self) -> Dict[str, dict]:
         """Run the backtest. Returns metrics dict per algo_id."""
         from .results import compute_metrics, print_report, print_summary_table
@@ -340,6 +453,9 @@ class BacktestEngine:
             algo_names = [a.algo_id for a in self.algos]
             print(f"\nUnified Backtester — {len(self.algos)} algo(s): {algo_names}")
             print(f"Data: {self.data.start_time} to {self.data.end_time} ({total_1m_bars:,} 1-min bars)")
+            if self._has_5s_data:
+                n_5s = len(self.data._df5s) if hasattr(self.data, '_df5s') else 0
+                print(f"  5-sec bars: {n_5s:,} (honest fill mode)")
             print(f"Running...\n")
 
         prev_day = None
@@ -376,7 +492,10 @@ class BacktestEngine:
 
                 # ---- STEP 1.5a: Sequential stop check (EVERY bar) ----
                 if algo_id in self._sequential_algos:
-                    self._check_sequential_stops(algo, ts, bar_1m)
+                    if self._has_5s_data:
+                        self._check_sequential_stops_5s(algo, ts, bar_1m)
+                    else:
+                        self._check_sequential_stops(algo, ts, bar_1m)
 
                 # ---- STEP 1.5b: Broker stop check on non-boundary bars ----
                 elif algo_id in self._broker_stop_algos and not is_exit_boundary:
@@ -406,6 +525,7 @@ class BacktestEngine:
                             self._broker_stops.pop(ex.pos_id, None)
                             self._broker_check_counters.pop(ex.pos_id, None)
                             self._entry_bar_counts.pop(ex.pos_id, None)
+                            self._5s_bar_counts.pop(ex.pos_id, None)
 
                 # ---- STEP 2.5: Re-lock broker stops for survivors at boundaries ----
                 if algo_id in self._broker_stop_algos and is_exit_boundary:
@@ -476,6 +596,7 @@ class BacktestEngine:
                     self._broker_stops.pop(pos.pos_id, None)
                     self._broker_check_counters.pop(pos.pos_id, None)
                     self._entry_bar_counts.pop(pos.pos_id, None)
+                    self._5s_bar_counts.pop(pos.pos_id, None)
 
         self.portfolio.record_equity(final_time)
 

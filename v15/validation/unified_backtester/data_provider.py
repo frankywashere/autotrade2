@@ -140,6 +140,89 @@ class DataProvider:
         instance._init_from_df1m(spy_path, start, end, rth_only)
         return instance
 
+    @classmethod
+    def from_5sec_bars(cls, tsla_5s_path: str, start: str, end: str,
+                       spy_5s_path: str = None, spy_path: str = None,
+                       rth_only: bool = True) -> 'DataProvider':
+        """Build DataProvider from 5-second bar CSVs.
+
+        Loads 5-sec bars, resamples to 1-min, then follows normal init.
+        5-sec bars are pre-grouped by minute for fast engine lookup.
+        """
+        # Load TSLA 5-sec
+        df5s = pd.read_csv(tsla_5s_path, parse_dates=['time'])
+        df5s = df5s.set_index('time').sort_index()
+
+        # Date range filter
+        if start:
+            df5s = df5s[df5s.index >= pd.Timestamp(start)]
+        if end:
+            df5s = df5s[df5s.index <= pd.Timestamp(end)]
+
+        # RTH filter
+        if rth_only:
+            times = df5s.index.time
+            df5s = df5s[(times >= MKT_OPEN) & (times < MKT_CLOSE)]
+        else:
+            times = df5s.index.time
+            df5s = df5s[(times >= EXT_OPEN) & (times < EXT_CLOSE)]
+
+        if len(df5s) == 0:
+            raise ValueError(f"No 5-sec data loaded from {tsla_5s_path}")
+
+        # Resample 5-sec → 1-min
+        df1m = _resample_ohlcv(df5s, '1min')
+
+        # Pre-group 5-sec bars by minute for fast engine lookup
+        grouped = {}
+        minute_floor = df5s.index.floor('1min')
+        for minute_ts, group in df5s.groupby(minute_floor):
+            grouped[minute_ts] = group
+
+        instance = cls.__new__(cls)
+        instance._rth_only = rth_only
+        instance._df1m = df1m
+        instance._df5s = df5s
+        instance._5s_by_minute = grouped
+
+        # Load SPY 5-sec if provided, resample to 1-min
+        spy_1min_path = None
+        if spy_5s_path and Path(spy_5s_path).exists():
+            spy5s = pd.read_csv(spy_5s_path, parse_dates=['time'])
+            spy5s = spy5s.set_index('time').sort_index()
+            if start:
+                spy5s = spy5s[spy5s.index >= pd.Timestamp(start)]
+            if end:
+                spy5s = spy5s[spy5s.index <= pd.Timestamp(end)]
+            if rth_only:
+                times = spy5s.index.time
+                spy5s = spy5s[(times >= MKT_OPEN) & (times < MKT_CLOSE)]
+            else:
+                times = spy5s.index.time
+                spy5s = spy5s[(times >= EXT_OPEN) & (times < EXT_CLOSE)]
+            # Store resampled SPY 1-min as a temp file isn't needed;
+            # just resample and store in _spy1m before _init_from_df1m
+            instance._spy1m_from_5s = _resample_ohlcv(spy5s, '1min')
+
+        instance._init_from_df1m(spy_path, start, end, rth_only)
+
+        # Override SPY 1-min if we resampled from 5-sec
+        if hasattr(instance, '_spy1m_from_5s') and instance._spy1m_from_5s is not None:
+            instance._spy1m = instance._spy1m_from_5s
+            # Re-resample SPY TFs from the better 5-sec source
+            for tf, rule in _RESAMPLE_RULES.items():
+                if rule is not None:
+                    instance._spy_tf_data[tf] = _resample_ohlcv(
+                        instance._spy1m, rule)
+
+        return instance
+
+    def get_5s_bars_for_minute(self, minute_ts: pd.Timestamp) -> Optional[pd.DataFrame]:
+        """Return all 5-sec bars within the given 1-minute bar's window."""
+        if not hasattr(self, '_5s_by_minute') or self._5s_by_minute is None:
+            return None
+        return self._5s_by_minute.get(minute_ts)
+
     def _init_from_df1m(self, spy_path: str = None, start: str = None,
                         end: str = None, rth_only: bool = True):
         """Shared init: resample all TFs, build _tf_bar_end, load SPY/VIX."""

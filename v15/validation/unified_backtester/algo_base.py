@@ -57,6 +57,11 @@ class AlgoConfig:
     exit_grace_bars: int = 5              # 1-min bars after entry before stop checks activate (sequential)
     seq_check_price: str = 'low'          # Price field for stop check: 'low', 'open', 'close' (sequential)
     seq_check_interval: int = 1           # Check every N 1-min bars after grace: 1=every bar, 5=5-min (sequential)
+    # 5-sec sub-loop knobs (only active when 5s data available):
+    stop_update_secs: int = 60            # How often to ratchet best_price + recompute effective_stop (seconds).
+                                          # 5=every 5s bar, 60=every 1min (default), 300=every 5min
+    stop_check_secs: int = 5             # How often to check if price breached the stop (seconds).
+                                          # 5=every 5s bar (default), 60=every 1min
     live_orders: bool = False             # Whether to place real IB orders (live only)
     # Optional active hours hint: engine skips on_bar() outside these hours.
     # Exits still run regardless. Algo can do additional filtering internally.

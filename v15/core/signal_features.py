@@ -136,9 +136,12 @@ def build_feature_vector(
     bt_snapshot['volume_ratio_20'] = float(ctx_feats[2]) if len(ctx_feats) > 2 else 0.0
 
     # Temporal features (deltas and rates of change)
+    # bar_data may be a dict (backtester) or int (original surfer_backtest).
+    # extract_temporal_features needs an int index into the closes array.
+    bar_idx = bar_data if isinstance(bar_data, int) else len(closes) - 1
     temporal_feats = extract_temporal_features(
         bt_snapshot, history_buffer,
-        closes=closes, bar_idx=bar_data, eval_interval=eval_interval,
+        closes=closes, bar_idx=bar_idx, eval_interval=eval_interval,
     )
     feature_vec[offset:offset + len(TEMPORAL_FEATURES)] = temporal_feats
     offset += len(TEMPORAL_FEATURES)
@@ -150,7 +153,7 @@ def build_feature_vector(
     # Correlation features (SPY/VIX relationships)
     if spy_df is not None or vix_df is not None:
         corr_feats = extract_correlation_features(
-            bar_data, closes,
+            bar_idx, closes,
             spy_df=spy_df, vix_df=vix_df,
             tsla_index=tsla_index,
         )

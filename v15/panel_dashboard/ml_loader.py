@@ -21,6 +21,7 @@ class MLModels:
     gbt_feature_names: list = field(default_factory=list)
     el_model: Any = None             # ExtremeLoserDetector
     er_model: Any = None             # ExtendedRunPredictor
+    fast_rev_model: Any = None       # MomentumReversalDetector
     intraday_model: Any = None       # LightGBM filter
     intraday_features: list = field(default_factory=list)
     intraday_threshold: float = 0.5
@@ -81,9 +82,11 @@ def load_ml_models() -> MLModels:
         logger.warning("GBT model load failed: %s", e)
         models.load_errors.append(f"GBT: {e}")
 
-    # 2. EL (Extreme Loser) + ER (Extended Run) sub-models
+    # 2. EL (Extreme Loser) + ER (Extended Run) + Fast Rev (Momentum Reversal) sub-models
     try:
-        from v15.core.surfer_ml import ExtremeLoserDetector, ExtendedRunPredictor
+        from v15.core.surfer_ml import (
+            ExtremeLoserDetector, ExtendedRunPredictor, MomentumReversalDetector,
+        )
 
         el_path = _find_model_path('extreme_loser_model.pkl')
         if el_path:
@@ -94,9 +97,14 @@ def load_ml_models() -> MLModels:
         if er_path:
             models.er_model = ExtendedRunPredictor.load(str(er_path))
             logger.info("ER model loaded from %s", er_path)
+
+        fr_path = _find_model_path('momentum_reversal_model.pkl')
+        if fr_path:
+            models.fast_rev_model = MomentumReversalDetector.load(str(fr_path))
+            logger.info("Fast reversion model loaded from %s", fr_path)
     except Exception as e:
-        logger.warning("EL/ER model load failed: %s", e)
-        models.load_errors.append(f"EL/ER: {e}")
+        logger.warning("EL/ER/FastRev model load failed: %s", e)
+        models.load_errors.append(f"EL/ER/FastRev: {e}")
 
     # 3. Intraday ML model (LightGBM filter)
     try:

@@ -172,6 +172,8 @@ def main():
                         help='Include extended hours (4:00-20:00 ET)')
     parser.add_argument('--tick-data', type=str, default=None,
                         help='Path to tick data directory (e.g., data/ticks/TSLA)')
+    parser.add_argument('--bar-data', type=str, default=None,
+                        help='Path to 5-sec bar dir (e.g., data/bars_5s). Expects TSLA_5s.csv and optionally SPY_5s.csv')
     parser.add_argument('--csv', type=str, default=None,
                         help='Export trades to CSV file')
     parser.add_argument('--quiet', action='store_true',
@@ -191,6 +193,10 @@ def main():
                         help='Price field for sequential stop check (default: low)')
     parser.add_argument('--seq-check-interval', type=int, default=1,
                         help='Check every N 1-min bars after grace (1=every bar, 5=5-min, default: 1)')
+    parser.add_argument('--stop-update-secs', type=int, default=60,
+                        help='Ratchet best_price + recompute stop every N seconds (5=5s, 60=1min, 300=5min, default: 60)')
+    parser.add_argument('--stop-check-secs', type=int, default=5,
+                        help='Check price vs stop every N seconds (5=5s, 60=1min, default: 5)')
     args = parser.parse_args()
 
     if not args.algo:
@@ -209,7 +215,29 @@ def main():
     t0 = time.time()
     rth_only = not args.extended_hours
 
-    if args.tick_data:
+    if args.bar_data:
+        # 5-sec bar data path (honest fills)
+        tsla_5s = os.path.join(args.bar_data, 'TSLA_5s.csv')
+        spy_5s = os.path.join(args.bar_data, 'SPY_5s.csv')
+        if not os.path.isfile(tsla_5s):
+            print(f"ERROR: Could not find {tsla_5s}")
+            sys.exit(1)
+        spy_5s_path = spy_5s if os.path.isfile(spy_5s) else None
+        print(f"Loading 5-sec bar data from {args.bar_data}...")
+        data = DataProvider.from_5sec_bars(
+            tsla_5s_path=tsla_5s,
+            start=args.start,
+            end=args.end,
+            spy_5s_path=spy_5s_path,
+            spy_path=args.spy,
+            rth_only=rth_only,
+        )
+        n_5s = len(data._df5s) if hasattr(data, '_df5s') else 0
+        days = len(data.trading_days)
+        print(f"  Loaded {n_5s:,} 5-sec bars -> {len(data._df1m):,} 1-min bars, "
+              f"{days} trading days in {time.time()-t0:.1f}s")
+
+    elif args.tick_data:
         # Tick-sourced data path
         print(f"Loading tick data from {args.tick_data}...")
         data = DataProvider.from_ticks(
@@ -267,6 +295,10 @@ def main():
             algo.config.seq_check_price = spec['params']['seq_check_price']
         if 'seq_check_interval' in spec['params']:
             algo.config.seq_check_interval = int(spec['params']['seq_check_interval'])
+        if 'stop_update_secs' in spec['params']:
+            algo.config.stop_update_secs = int(spec['params']['stop_update_secs'])
+        if 'stop_check_secs' in spec['params']:
+            algo.config.stop_check_secs = int(spec['params']['stop_check_secs'])
         # Global CLI overrides (apply if not already set per-algo)
         if 'stop_check_mode' not in spec['params']:
             algo.config.stop_check_mode = args.stop_check_mode
@@ -280,6 +312,10 @@ def main():
             algo.config.seq_check_price = args.seq_check_price
         if 'seq_check_interval' not in spec['params']:
             algo.config.seq_check_interval = args.seq_check_interval
+        if 'stop_update_secs' not in spec['params']:
+            algo.config.stop_update_secs = args.stop_update_secs
+        if 'stop_check_secs' not in spec['params']:
+            algo.config.stop_check_secs = args.stop_check_secs
         algos.append(algo)
         portfolio.register_algo(
             algo_id=algo.config.algo_id,

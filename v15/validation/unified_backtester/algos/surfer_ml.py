@@ -65,6 +65,10 @@ class SurferMLAlgo(AlgoBase):
         self._el_model = None
         self._er_model = None
         self._fast_rev_model = None
+        # Feature derivation functions for sub-models (EL/ER/fast_rev)
+        self._el_derive = None   # callable(full_vec) -> subset_vec
+        self._er_derive = None
+        self._fr_derive = None
         self._load_models()
 
         # Track positions' internal state (for profit-tier trail)
@@ -93,6 +97,47 @@ class SurferMLAlgo(AlgoBase):
             return
 
         model_dir = Path(model_dir)
+
+        # Full feature names (for mapping sub-model features)
+        from v15.core.signal_features import get_feature_names
+        full_names = get_feature_names()
+        full_name_to_idx = {n: i for i, n in enumerate(full_names)}
+
+        def _build_derive_fn(derived_names, train_names):
+            """Build a function that extracts derived feature subset from full vector.
+
+            derived_names: subset feature names the model expects
+            train_names: feature names the model was trained on (for name mapping)
+            """
+            train_to_idx = {n: i for i, n in enumerate(train_names)}
+            # Map derived names back to full feature vector indices
+            # Derived names may have prefixes like 'el_' — try stripping
+            indices = []
+            for dn in derived_names:
+                # Try direct match in full names first
+                if dn in full_name_to_idx:
+                    indices.append(full_name_to_idx[dn])
+                else:
+                    # Strip common prefixes and try again
+                    for prefix in ('el_', 'er_', 'mr_'):
+                        stripped = dn[len(prefix):] if dn.startswith(prefix) else None
+                        if stripped and stripped in full_name_to_idx:
+                            indices.append(full_name_to_idx[stripped])
+                            break
+                    else:
+                        # Try matching in training names → get position → map to full
+                        if dn in train_to_idx:
+                            tidx = train_to_idx[dn]
+                            if tidx < len(full_names):
+                                indices.append(tidx)
+                            else:
+                                indices.append(0)  # fallback
+                        else:
+                            indices.append(0)  # fallback — feature will be 0
+            import numpy as _np
+            idx_arr = _np.array(indices)
+            return lambda fv: fv[idx_arr]
+
         for name, attr in [
             ('gbt_model.pkl', '_gbt_model'),
             ('extreme_loser_model.pkl', '_el_model'),
@@ -103,7 +148,32 @@ class SurferMLAlgo(AlgoBase):
             if path.exists():
                 try:
                     with open(path, 'rb') as f:
-                        setattr(self, attr, pickle.load(f))
+                        obj = pickle.load(f)
+                    if isinstance(obj, dict):
+                        train_names = obj.get('feature_names', [])
+                        if 'models' in obj:
+                            # GBT: dict of Boosters, uses full feature vector
+                            setattr(self, attr, obj['models'])
+                        elif 'model' in obj:
+                            setattr(self, attr, obj['model'])
+                            # Build derivation function for sub-models
+                            derived_key = {
+                                '_el_model': 'el_feature_names',
+                                '_er_model': 'derived_names',
+                                '_fast_rev_model': 'mr_feature_names',
+                            }.get(attr)
+                            if derived_key and derived_key in obj:
+                                derive_fn = _build_derive_fn(
+                                    obj[derived_key], train_names)
+                                derive_attr = {
+                                    '_el_model': '_el_derive',
+                                    '_er_model': '_er_derive',
+                                    '_fast_rev_model': '_fr_derive',
+                                }.get(attr)
+                                if derive_attr:
+                                    setattr(self, derive_attr, derive_fn)
+                    else:
+                        setattr(self, attr, obj)
                 except Exception as e:
                     logger.warning("Failed to load ML model %s: %s", name, e)
 
@@ -287,31 +357,28 @@ class SurferMLAlgo(AlgoBase):
                 feature_vec = None
 
         # GBT soft gate: scale confidence, don't hard-skip
+        # _gbt_model is a dict of Boosters: {'action': Booster, 'lifetime': Booster, ...}
         if self._gbt_model is not None and feature_vec is not None:
             try:
-                ml_pred = self._gbt_model.predict(feature_vec.reshape(1, -1))
-                ml_action = int(ml_pred.get('action', [0])[0])
-                # 0=HOLD, 1=BUY, 2=SELL
-                physics_action = 1 if direction == 'long' else 2
-                if ml_action == 0:
-                    # ML says HOLD — penalize confidence 20%
-                    conf *= 0.80
-                elif ml_action != physics_action:
-                    # ML disagrees with direction — penalize 20%
-                    conf *= 0.80
-                # Lifetime prediction: cap max_hold if model predicts short life
-                if 'lifetime' in ml_pred:
-                    predicted_life = float(ml_pred['lifetime'][0])
-                    if predicted_life > 0:
-                        pass  # Informational only for now
+                fv = feature_vec.reshape(1, -1)
+                action_model = self._gbt_model.get('action')
+                if action_model is not None:
+                    probs = action_model.predict(fv)  # shape (1, 3): [HOLD, BUY, SELL]
+                    ml_action = int(probs[0].argmax())
+                    # 0=HOLD, 1=BUY, 2=SELL
+                    physics_action = 1 if direction == 'long' else 2
+                    if ml_action == 0:
+                        conf *= 0.80  # ML says HOLD — penalize 20%
+                    elif ml_action != physics_action:
+                        conf *= 0.80  # ML disagrees with direction — penalize 20%
             except Exception as e:
                 logger.warning("SurferML GBT prediction failed: %s", e)
 
-        # Extended Run predictor
+        # Extended Run predictor — single Booster with derived features
         if self._er_model is not None and feature_vec is not None:
             try:
-                er_pred = self._er_model.predict(feature_vec.reshape(1, -1))
-                er_prob = float(er_pred.get('run_prob', [0.5])[0])
+                fv = self._er_derive(feature_vec) if self._er_derive else feature_vec
+                er_prob = float(self._er_model.predict(fv.reshape(1, -1))[0])
                 if er_prob > 0.70:
                     twm = 2.0  # Let winners run — wider trail
                 elif er_prob > 0.55:
@@ -319,11 +386,11 @@ class SurferMLAlgo(AlgoBase):
             except Exception as e:
                 logger.warning("SurferML ER model prediction failed: %s", e)
 
-        # Extreme Loser detector
+        # Extreme Loser detector — single Booster with derived features
         if self._el_model is not None and feature_vec is not None:
             try:
-                el_pred = self._el_model.predict(feature_vec.reshape(1, -1))
-                el_loser_prob = float(el_pred.get('loser_prob', [0.0])[0])
+                fv = self._el_derive(feature_vec) if self._el_derive else feature_vec
+                el_loser_prob = float(self._el_model.predict(fv.reshape(1, -1))[0])
                 if el_loser_prob > 0.18:
                     el_flagged = True
                     if signal_type == 'bounce':
@@ -331,11 +398,11 @@ class SurferMLAlgo(AlgoBase):
             except Exception as e:
                 logger.warning("SurferML EL model prediction failed: %s", e)
 
-        # Fast Reversion (Momentum Reversal) detector
+        # Fast Reversion (Momentum Reversal) detector — single Booster with derived features
         if self._fast_rev_model is not None and feature_vec is not None:
             try:
-                rev_pred = self._fast_rev_model.predict(feature_vec.reshape(1, -1))
-                fast_rev_prob = float(rev_pred.get('fast_reversion_prob', [0.0])[0])
+                fv = self._fr_derive(feature_vec) if self._fr_derive else feature_vec
+                fast_rev_prob = float(self._fast_rev_model.predict(fv.reshape(1, -1))[0])
                 if fast_rev_prob > 0.55:
                     fast_rev = True
             except Exception as e:
@@ -398,7 +465,6 @@ class SurferMLAlgo(AlgoBase):
         sig_high = position.metadata.get('signal_bar_high', position.entry_price)
         sig_low = position.metadata.get('signal_bar_low', position.entry_price)
         self._pos_state[position.pos_id] = {
-            'trailing_stop': position.entry_price,
             'el_flagged': position.metadata.get('el_flagged', False),
             'trail_width_mult': position.metadata.get('trail_width_mult', 1.0),
             'fast_reversion': position.metadata.get('fast_reversion', False),
@@ -410,11 +476,12 @@ class SurferMLAlgo(AlgoBase):
 
     def check_exits(self, time: pd.Timestamp, bar: dict,
                     open_positions: list) -> List[ExitSignal]:
-        """Profit-tier trailing stop system (matching surfer_backtest).
+        """Check exits: stop/trail via get_effective_stop(), TP, and timeouts.
 
-        The original surfer_backtest only checks exits every eval_interval bars
-        (every 3 bars = 15 min), using the window high/low across those bars.
-        We accumulate high/low across bars and only evaluate on eval boundaries.
+        In sequential mode, stop/trail exits are filtered by the engine
+        (handled per-bar by _check_sequential_stops instead). TP/timeout
+        still evaluated here at eval_interval boundaries using window
+        high/low for accurate detection.
         """
         exits = []
         max_hold = self.config.params.get('max_hold_bars', 60)  # In 5-min bars
@@ -423,7 +490,7 @@ class SurferMLAlgo(AlgoBase):
         for pos in open_positions:
             state = self._pos_state.get(pos.pos_id, {})
 
-            # Accumulate window high/low across bars (matching original's window_high/window_low)
+            # Accumulate window high/low across bars for TP detection
             bar_high = bar['high']
             bar_low = bar['low']
             state.setdefault('window_high', bar_high)
@@ -431,7 +498,7 @@ class SurferMLAlgo(AlgoBase):
             state['window_high'] = max(state['window_high'], bar_high)
             state['window_low'] = min(state['window_low'], bar_low)
 
-            # Only evaluate exit every eval_interval bars (matching original's eval loop)
+            # Only evaluate exit every eval_interval bars
             state.setdefault('exit_bar_count', 0)
             state['exit_bar_count'] += 1
             if state['exit_bar_count'] < eval_interval:
@@ -446,65 +513,13 @@ class SurferMLAlgo(AlgoBase):
             state['window_high'] = bar['high']
             state['window_low'] = bar['low']
 
-            entry = pos.entry_price
             is_breakout = pos.signal_type == 'break'
-            tp_dist = abs(pos.tp_price - entry) / entry if entry > 0 else 0.01
-            initial_stop_dist = abs(pos.stop_price - entry) / entry if entry > 0 else 0.01
-
-            twm = state.get('trail_width_mult', 1.0)
-            el = state.get('el_flagged', False)
-            fast_rev = state.get('fast_reversion', False) and not is_breakout
             ou_hl = state.get('ou_half_life', 5.0)
-            trailing = state.get('trailing_stop', entry)
+
+            # Stop/trail check — delegates to pure get_effective_stop()
+            effective_stop = self.get_effective_stop(pos)
 
             if pos.direction == 'long':
-                # Causal: use trailing from PRIOR eval window. Ratchet AFTER exit check.
-
-                if is_breakout:
-                    profit_from_best = (trailing - entry) / entry
-                    if initial_stop_dist < 0.001 and profit_from_best > 0.0001:
-                        trail_price = trailing * (1 - initial_stop_dist * 0.50 * twm)
-                        effective_stop = max(pos.stop_price, trail_price)
-                    elif profit_from_best > 0.015:
-                        trail_price = trailing * (1 - initial_stop_dist * 0.01 * twm)
-                        effective_stop = max(pos.stop_price, trail_price)
-                    elif profit_from_best > 0.008:
-                        trail_price = trailing * (1 - initial_stop_dist * 0.02 * twm)
-                        effective_stop = max(pos.stop_price, trail_price)
-                    else:
-                        tier3_thresh = 0.002 if el else 0.0008
-                        trail_mult = 0.20 if el else 0.01
-                        if profit_from_best > tier3_thresh:
-                            trail_price = trailing * (1 - initial_stop_dist * trail_mult * twm)
-                            effective_stop = max(pos.stop_price, trail_price)
-                        else:
-                            effective_stop = pos.stop_price
-                else:
-                    # Bounce: ratio-based tiers
-                    profit_from_entry = (trailing - entry) / entry
-                    profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
-                    tight = el or fast_rev
-
-                    if profit_ratio >= 0.80:
-                        trail_price = trailing * (1 - initial_stop_dist * 0.005 * twm)
-                        effective_stop = max(pos.stop_price, trail_price)
-                    elif profit_ratio >= (0.60 if tight else 0.55):
-                        trail_price = trailing * (1 - initial_stop_dist * 0.02 * twm)
-                        effective_stop = max(pos.stop_price, trail_price)
-                    elif profit_ratio >= (0.30 if tight else 0.40):
-                        mult = 0.08 if tight else 0.06
-                        trail_price = trailing * (1 - initial_stop_dist * mult * twm)
-                        effective_stop = max(pos.stop_price, trail_price)
-                    elif profit_ratio >= (0.10 if tight else 0.15):
-                        effective_stop = max(pos.stop_price, entry * 1.0005)
-                    else:
-                        effective_stop = pos.stop_price
-
-                # Store effective stop for broker-side sync BEFORE exit check
-                # so get_effective_stop() always reflects the latest computation.
-                state['effective_stop'] = effective_stop
-
-                # Check exit conditions
                 if low <= effective_stop:
                     reason = 'stop' if effective_stop == pos.stop_price else 'trail'
                     exits.append(ExitSignal(pos_id=pos.pos_id, price=effective_stop, reason=reason))
@@ -512,59 +527,11 @@ class SurferMLAlgo(AlgoBase):
                 if high >= pos.tp_price:
                     exits.append(ExitSignal(pos_id=pos.pos_id, price=pos.tp_price, reason='tp'))
                     continue
-                hold_5m = pos.hold_bars  # hold_bars now counts in exit_check_tf units
+                hold_5m = pos.hold_bars
                 if not is_breakout and hold_5m >= max(6, int(ou_hl * 3)):
                     exits.append(ExitSignal(pos_id=pos.pos_id, price=close, reason='ou_timeout'))
                     continue
-                # Ratchet trailing stop AFTER exit check (causal: effective next eval)
-                if high > trailing:
-                    state['trailing_stop'] = high
-
             else:  # short
-                # Causal: use trailing from PRIOR eval window
-
-                if is_breakout:
-                    profit_from_best = (entry - trailing) / entry
-                    if initial_stop_dist < 0.001 and profit_from_best > 0.0001:
-                        trail_price = trailing * (1 + initial_stop_dist * 0.50 * twm)
-                        effective_stop = min(pos.stop_price, trail_price)
-                    elif profit_from_best > 0.015:
-                        trail_price = trailing * (1 + initial_stop_dist * 0.01 * twm)
-                        effective_stop = min(pos.stop_price, trail_price)
-                    elif profit_from_best > 0.008:
-                        trail_price = trailing * (1 + initial_stop_dist * 0.02 * twm)
-                        effective_stop = min(pos.stop_price, trail_price)
-                    else:
-                        tier3_thresh = 0.002 if el else 0.0003
-                        trail_mult = 0.20 if el else 0.01
-                        if profit_from_best > tier3_thresh:
-                            trail_price = trailing * (1 + initial_stop_dist * trail_mult * twm)
-                            effective_stop = min(pos.stop_price, trail_price)
-                        else:
-                            effective_stop = pos.stop_price
-                else:
-                    profit_from_entry = (entry - trailing) / entry
-                    profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
-                    tight = el or fast_rev
-
-                    if profit_ratio >= 0.80:
-                        trail_price = trailing * (1 + initial_stop_dist * 0.005 * twm)
-                        effective_stop = min(pos.stop_price, trail_price)
-                    elif profit_ratio >= (0.60 if tight else 0.55):
-                        trail_price = trailing * (1 + initial_stop_dist * 0.02 * twm)
-                        effective_stop = min(pos.stop_price, trail_price)
-                    elif profit_ratio >= (0.30 if tight else 0.40):
-                        mult = 0.08 if tight else 0.06
-                        trail_price = trailing * (1 + initial_stop_dist * mult * twm)
-                        effective_stop = min(pos.stop_price, trail_price)
-                    elif profit_ratio >= (0.10 if tight else 0.15):
-                        effective_stop = min(pos.stop_price, entry * 0.9995)
-                    else:
-                        effective_stop = pos.stop_price
-
-                # Store effective stop for broker-side sync BEFORE exit check
-                state['effective_stop'] = effective_stop
-
                 if high >= effective_stop:
                     reason = 'stop' if effective_stop == pos.stop_price else 'trail'
                     exits.append(ExitSignal(pos_id=pos.pos_id, price=effective_stop, reason=reason))
@@ -572,17 +539,13 @@ class SurferMLAlgo(AlgoBase):
                 if low <= pos.tp_price:
                     exits.append(ExitSignal(pos_id=pos.pos_id, price=pos.tp_price, reason='tp'))
                     continue
-                hold_5m = pos.hold_bars  # hold_bars now counts in exit_check_tf units
+                hold_5m = pos.hold_bars
                 if not is_breakout and hold_5m >= max(6, int(ou_hl * 3)):
                     exits.append(ExitSignal(pos_id=pos.pos_id, price=close, reason='ou_timeout'))
                     continue
-                # Ratchet trailing stop AFTER exit check (causal: effective next eval)
-                if trailing == 0 or low < trailing:
-                    state['trailing_stop'] = low
 
             # Hard timeout (max_hold is in 5-min bars)
-            hold_5m = pos.hold_bars  # hold_bars now counts in exit_check_tf units
-            if hold_5m >= max_hold:
+            if pos.hold_bars >= max_hold:
                 exits.append(ExitSignal(pos_id=pos.pos_id, price=close, reason='timeout'))
 
         return exits
@@ -592,12 +555,120 @@ class SurferMLAlgo(AlgoBase):
         self._pos_state.pop(trade.pos_id, None)
 
     def get_effective_stop(self, position) -> Optional[float]:
-        """Return current effective stop (tier-adjusted) for broker-side sync."""
+        """Compute effective stop from position.best_price (engine-ratcheted).
+
+        Pure function — no internal state needed. The engine controls how
+        often best_price updates (every 5s, 1min, 5min, etc.), which
+        determines how often the stop level changes.
+        """
         state = self._pos_state.get(position.pos_id, {})
-        return state.get('effective_stop', position.stop_price)
+        entry = position.entry_price
+        if entry <= 0:
+            return position.stop_price
+
+        trailing = position.best_price  # Engine-ratcheted high watermark
+        is_breakout = position.signal_type == 'break'
+        tp_dist = abs(position.tp_price - entry) / entry if entry > 0 else 0.01
+        initial_stop_dist = abs(position.stop_price - entry) / entry if entry > 0 else 0.01
+
+        twm = state.get('trail_width_mult', 1.0)
+        el = state.get('el_flagged', False)
+        fast_rev = state.get('fast_reversion', False) and not is_breakout
+
+        if position.direction == 'long':
+            profit_from_best = (trailing - entry) / entry
+
+            if is_breakout:
+                if initial_stop_dist < 0.001 and profit_from_best > 0.0001:
+                    trail_price = trailing * (1 - initial_stop_dist * 0.50 * twm)
+                    effective_stop = max(position.stop_price, trail_price)
+                elif profit_from_best > 0.015:
+                    trail_price = trailing * (1 - initial_stop_dist * 0.01 * twm)
+                    effective_stop = max(position.stop_price, trail_price)
+                elif profit_from_best > 0.008:
+                    trail_price = trailing * (1 - initial_stop_dist * 0.02 * twm)
+                    effective_stop = max(position.stop_price, trail_price)
+                else:
+                    tier3_thresh = 0.002 if el else 0.0008
+                    trail_mult = 0.20 if el else 0.01
+                    if profit_from_best > tier3_thresh:
+                        trail_price = trailing * (1 - initial_stop_dist * trail_mult * twm)
+                        effective_stop = max(position.stop_price, trail_price)
+                    else:
+                        effective_stop = position.stop_price
+            else:
+                # Bounce: ratio-based tiers
+                profit_from_entry = (trailing - entry) / entry
+                profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
+                tight = el or fast_rev
+
+                if profit_ratio >= 0.80:
+                    trail_price = trailing * (1 - initial_stop_dist * 0.005 * twm)
+                    effective_stop = max(position.stop_price, trail_price)
+                elif profit_ratio >= (0.60 if tight else 0.55):
+                    trail_price = trailing * (1 - initial_stop_dist * 0.02 * twm)
+                    effective_stop = max(position.stop_price, trail_price)
+                elif profit_ratio >= (0.30 if tight else 0.40):
+                    mult = 0.08 if tight else 0.06
+                    trail_price = trailing * (1 - initial_stop_dist * mult * twm)
+                    effective_stop = max(position.stop_price, trail_price)
+                elif profit_ratio >= (0.10 if tight else 0.15):
+                    effective_stop = max(position.stop_price, entry * 1.0005)
+                else:
+                    effective_stop = position.stop_price
+
+            return effective_stop
+
+        else:  # short
+            profit_from_best = (entry - trailing) / entry
+
+            if is_breakout:
+                if initial_stop_dist < 0.001 and profit_from_best > 0.0001:
+                    trail_price = trailing * (1 + initial_stop_dist * 0.50 * twm)
+                    effective_stop = min(position.stop_price, trail_price)
+                elif profit_from_best > 0.015:
+                    trail_price = trailing * (1 + initial_stop_dist * 0.01 * twm)
+                    effective_stop = min(position.stop_price, trail_price)
+                elif profit_from_best > 0.008:
+                    trail_price = trailing * (1 + initial_stop_dist * 0.02 * twm)
+                    effective_stop = min(position.stop_price, trail_price)
+                else:
+                    tier3_thresh = 0.002 if el else 0.0003
+                    trail_mult = 0.20 if el else 0.01
+                    if profit_from_best > tier3_thresh:
+                        trail_price = trailing * (1 + initial_stop_dist * trail_mult * twm)
+                        effective_stop = min(position.stop_price, trail_price)
+                    else:
+                        effective_stop = position.stop_price
+            else:
+                profit_from_entry = (entry - trailing) / entry
+                profit_ratio = profit_from_entry / max(tp_dist, 1e-6)
+                tight = el or fast_rev
+
+                if profit_ratio >= 0.80:
+                    trail_price = trailing * (1 + initial_stop_dist * 0.005 * twm)
+                    effective_stop = min(position.stop_price, trail_price)
+                elif profit_ratio >= (0.60 if tight else 0.55):
+                    trail_price = trailing * (1 + initial_stop_dist * 0.02 * twm)
+                    effective_stop = min(position.stop_price, trail_price)
+                elif profit_ratio >= (0.30 if tight else 0.40):
+                    mult = 0.08 if tight else 0.06
+                    trail_price = trailing * (1 + initial_stop_dist * mult * twm)
+                    effective_stop = min(position.stop_price, trail_price)
+                elif profit_ratio >= (0.10 if tight else 0.15):
+                    effective_stop = min(position.stop_price, entry * 0.9995)
+                else:
+                    effective_stop = position.stop_price
+
+            return effective_stop
 
     def serialize_state(self, pos_id: str) -> dict:
-        """Persist trail state for crash recovery."""
+        """Persist trail state for crash recovery.
+
+        trailing_stop/effective_stop no longer stored — get_effective_stop()
+        computes fresh from pos.best_price. Only signal-derived modifiers
+        and window state need persisting.
+        """
         return dict(self._pos_state.get(pos_id, {}))
 
     def restore_state(self, pos_id: str, state: dict):

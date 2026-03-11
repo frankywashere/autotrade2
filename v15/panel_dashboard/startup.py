@@ -62,6 +62,7 @@ def load_models(state):
     state._ml_feature_names = models.gbt_feature_names
     state._el_model = models.el_model
     state._er_model = models.er_model
+    state._fast_rev_model = models.fast_rev_model
     state._intraday_ml_model = models.intraday_model
     state._intraday_ml_features = models.intraday_features
 
