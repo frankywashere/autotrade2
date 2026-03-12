@@ -17,5 +17,6 @@ evaluator:
   timeout: 600
   parallel_evaluations: 1
   cascade_evaluation: false
+  max_tasks_per_child: 1
 
 diff_based_evolution: false
