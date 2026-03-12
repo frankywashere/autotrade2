@@ -212,7 +212,9 @@ def evaluate(program_path: str) -> dict:
 
     # Score: PnL * Sharpe bonus * WR bonus * trade count * drawdown
     if total_pnl <= 0:
-        score = 0.0
+        # Give negative PnL a small negative score so LLM sees gradient
+        # -$100K → score ~-100K, -$1K → score ~-1K (closer to breakeven = better)
+        score = total_pnl * trade_mult * dd_mult
     else:
         score = (total_pnl
                  * (1.0 + max(sharpe, 0) * 0.2)     # Sharpe bonus
@@ -222,7 +224,7 @@ def evaluate(program_path: str) -> dict:
                  * dd_mult)
 
     return {
-        'combined_score': max(score, 0.0),
+        'combined_score': score,
         'total_pnl': total_pnl,
         'n_trades': n_trades,
         'win_rate': win_rate,
