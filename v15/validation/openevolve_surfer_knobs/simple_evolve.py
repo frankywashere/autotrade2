@@ -25,6 +25,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 LOG_FILE = os.path.join(OUTPUT_DIR, "simple_evolve.log")
 BEST_FILE = os.path.join(OUTPUT_DIR, "best_program.py")
+STATE_FILE = os.path.join(OUTPUT_DIR, "evolve_state.json")
 
 # Evaluator runs in subprocess to avoid memory leaks
 EVAL_SCRIPT = os.path.join(BASE_DIR, "eval_subprocess.py")
@@ -135,6 +136,34 @@ IMPORTANT: Respond with ONLY a JSON object containing the knobs. No explanation.
 Example: {{"exit_grace_bars": 3, "stop_update_secs": 45, ...}}"""
 
 
+def save_state(iteration, best_score, best_knobs, best_metrics, history):
+    """Save evolution state for resume."""
+    state = {
+        "iteration": iteration,
+        "best_score": best_score,
+        "best_knobs": best_knobs,
+        "best_metrics": {k: v for k, v in best_metrics.items()
+                         if isinstance(v, (int, float, str, bool))},
+        "history": history[-50:],  # Keep last 50 entries
+    }
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, STATE_FILE)
+
+
+def load_state():
+    """Load saved state if it exists. Returns None if no state."""
+    if not os.path.isfile(STATE_FILE):
+        return None
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        log(f"Warning: could not load state: {e}")
+        return None
+
+
 def write_program(knobs, path):
     """Write a knob configuration as a Python program file."""
     code = '''"""Auto-generated knob configuration."""
@@ -185,33 +214,48 @@ def main():
     log("Simple Evolve: Surfer-ML Knob Tuning (Phase A)")
     log("=" * 60)
 
-    # Evaluate initial program
-    initial_program = os.path.join(BASE_DIR, "initial_program.py")
-    log("Evaluating initial program...")
-    result = evaluate_in_subprocess(initial_program)
-    if not result or result.get("combined_score", 0) <= 0:
-        log(f"Initial evaluation failed: {result}")
-        sys.exit(1)
+    # Check for resume state
+    saved = load_state()
+    start_iteration = 1
 
-    best_score = result["combined_score"]
-    best_knobs = result.get("knobs", {})
-    best_metrics = result
-    log(f"Initial: score={best_score:.0f} PnL=${result['total_pnl']:.0f} "
-        f"trades={result['n_trades']:.0f} WR={result['win_rate']:.1f}% "
-        f"Sharpe={result['sharpe']:.3f} DD={result['max_drawdown_pct']:.1f}%")
+    if saved:
+        start_iteration = saved["iteration"] + 1
+        best_score = saved["best_score"]
+        best_knobs = saved["best_knobs"]
+        best_metrics = saved["best_metrics"]
+        history = saved["history"]
+        log(f"RESUMING from iteration {start_iteration} "
+            f"(best score={best_score:.0f}, "
+            f"PnL=${best_metrics.get('total_pnl', 0):.0f})")
+    else:
+        # Evaluate initial program
+        initial_program = os.path.join(BASE_DIR, "initial_program.py")
+        log("Evaluating initial program...")
+        result = evaluate_in_subprocess(initial_program)
+        if not result or result.get("combined_score", 0) <= 0:
+            log(f"Initial evaluation failed: {result}")
+            sys.exit(1)
 
-    # Save initial as best
-    write_program(best_knobs, BEST_FILE)
+        best_score = result["combined_score"]
+        best_knobs = result.get("knobs", {})
+        best_metrics = result
+        log(f"Initial: score={best_score:.0f} PnL=${result['total_pnl']:.0f} "
+            f"trades={result['n_trades']:.0f} WR={result['win_rate']:.1f}% "
+            f"Sharpe={result['sharpe']:.3f} DD={result['max_drawdown_pct']:.1f}%")
 
-    history = [{
-        "score": best_score, "pnl": result["total_pnl"],
-        "trades": result["n_trades"], "wr": result["win_rate"],
-        "sharpe": result["sharpe"], "dd": result["max_drawdown_pct"],
-        "knobs": best_knobs,
-    }]
+        # Save initial as best
+        write_program(best_knobs, BEST_FILE)
+
+        history = [{
+            "score": best_score, "pnl": result["total_pnl"],
+            "trades": result["n_trades"], "wr": result["win_rate"],
+            "sharpe": result["sharpe"], "dd": result["max_drawdown_pct"],
+            "knobs": best_knobs,
+        }]
+        save_state(0, best_score, best_knobs, best_metrics, history)
 
     # Evolution loop
-    for i in range(1, MAX_ITERATIONS + 1):
+    for i in range(start_iteration, MAX_ITERATIONS + 1):
         log(f"\n--- Iteration {i}/{MAX_ITERATIONS} ---")
 
         # Call LLM for new knobs
@@ -275,6 +319,8 @@ def main():
             write_program(best_knobs, BEST_FILE)
         else:
             log(f"  No improvement (best={best_score:.0f})")
+
+        save_state(i, best_score, best_knobs, best_metrics, history)
 
     log(f"\n{'=' * 60}")
     log(f"Evolution complete. Best score: {best_score:.0f}")

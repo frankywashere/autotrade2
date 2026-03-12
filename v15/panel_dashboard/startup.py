@@ -114,19 +114,19 @@ def create_live_engine(state):
                 initial_equity=100_000.0, max_equity_per_trade=100_000.0,
                 max_positions=2, primary_tf='5min', eval_interval=2,
                 exit_check_tf='5min', cost_model=cost,
-                # OpenEvolve Phase A best (iter 5): score=1.05M, $43K, 0.32 Sharpe
+                # OpenEvolve Phase A best (iter 6): score=1.14M, $45K, 0.34 Sharpe, 16.6% DD
                 exit_grace_bars=4,
                 stop_update_secs=45,
                 stop_check_secs=10,
                 grace_ratchet_secs=225,
                 profit_activated_stop=False,
-                max_underwater_mins=75,
-                max_hold_bars=55,
+                max_underwater_mins=90,
+                max_hold_bars=60,
                 params={
                     'flat_sizing': True, 'min_confidence': 0.01,
-                    'max_hold_bars': 55, 'ou_half_life': 5.0,
+                    'max_hold_bars': 60, 'ou_half_life': 5.0,
                     'stop_pct': 0.015, 'tp_pct': 0.012,
-                    'breakout_stop_mult': 0.58,
+                    'breakout_stop_mult': 0.55,
                 },
             ), data=data),
             IntradayAlgo(config=AlgoConfig(
