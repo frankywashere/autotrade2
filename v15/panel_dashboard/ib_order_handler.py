@@ -117,6 +117,7 @@ class IBOrderHandler:
         # Per-trade stop serialization
         self._stop_locks: dict[int, threading.Lock] = {}
         self._stop_dirty: dict[int, bool] = {}
+        self._stop_pending: dict[int, dict] = {}  # trade_id -> latest {stop_price, qty, direction}
 
         # Exit-in-progress flags
         self._exit_in_progress: dict[int, bool] = {}  # trade_id -> bool
@@ -150,6 +151,18 @@ class IBOrderHandler:
         Called from IB event loop thread. Callback should acquire its own lock.
         """
         self._live_engine_callback = callback
+
+    def _dispatch_off_ib_loop(self, fn, *args):
+        """Run fn(*args) in a worker thread to avoid IB event-loop deadlock.
+
+        IB callbacks run on the ib-event-loop thread. Calling ib.place_order()
+        from that thread deadlocks because place_order() uses
+        run_coroutine_threadsafe() to queue work onto the same loop it's
+        blocking.  Dispatching to a short-lived thread breaks the cycle.
+        """
+        t = threading.Thread(target=fn, args=args, daemon=True,
+                             name=f'ib-dispatch-{fn.__name__}')
+        t.start()
 
     def _notify_live_engine(self, trade_id, fill_price, fill_qty, is_entry):
         """Notify LiveEngine of a fill (if callback registered)."""
@@ -395,6 +408,16 @@ class IBOrderHandler:
         logger.warning("Emergency stop placed: order_id=%d for entry %d, "
                         "%d shares @ $%.2f", stop_order_id, entry_order_id,
                         qty, stop_price)
+
+    def _cancel_and_place_emergency_stop(self, cancel_order_id, entry_order_id,
+                                          stop_price, qty, direction):
+        """Cancel existing emergency stop (if any) and place a new one.
+
+        Runs off IB event-loop thread (via _dispatch_off_ib_loop).
+        """
+        if cancel_order_id:
+            self.ib.cancel_order(cancel_order_id)
+        self._place_emergency_stop(entry_order_id, stop_price, qty, direction)
 
     # ── Exit Flow ───────────────────────────────────────────────────
 
@@ -931,9 +954,15 @@ class IBOrderHandler:
         """Place or resize a protective stop, serialized per trade_id.
 
         Uses _stop_lock with dirty flag to ensure at most one placement
-        is in flight per trade.
+        is in flight per trade.  _stop_pending stores the latest values
+        so a dirty loop-back picks up the most recent qty/price (not stale
+        args from a previous partial fill).
         """
         lock = self._stop_locks.setdefault(trade_id, threading.Lock())
+
+        # Always store latest values so loop-back uses them
+        self._stop_pending[trade_id] = {
+            'stop_price': stop_price, 'qty': qty, 'direction': direction}
 
         while True:
             acquired = lock.acquire(blocking=False)
@@ -945,15 +974,19 @@ class IBOrderHandler:
             try:
                 self._stop_dirty[trade_id] = False
 
+                # Read latest pending values (may have been updated by
+                # a concurrent partial fill while we waited)
+                pending = self._stop_pending.get(trade_id, {})
+                sp = pending.get('stop_price', stop_price)
+                q = pending.get('qty', qty)
+                d = pending.get('direction', direction)
+
                 trade = self._get_trade(trade_id)
                 if not trade:
                     return
 
                 existing_stop = trade.get('ib_stop_order_id')
                 if existing_stop:
-                    # Modify existing stop
-                    # TODO: Use ib.modifyOrder() instead of cancel+replace
-                    # For now, cancel and re-place
                     self.ib.cancel_order(existing_stop)
 
                 # Grace period on initial stop placement (no existing stop)
@@ -961,7 +994,7 @@ class IBOrderHandler:
                 if not existing_stop:
                     good_after = self._compute_good_after_time(delay_minutes=5)
 
-                self._place_protective_stop(trade_id, stop_price, qty, direction,
+                self._place_protective_stop(trade_id, sp, q, d,
                                             good_after_time=good_after)
             finally:
                 lock.release()
@@ -1168,7 +1201,8 @@ class IBOrderHandler:
                          "placing emergency stop", trade_id, fill.shares, fill.price)
             direction = trade.get('direction', 'long')
             stop_price = trade.get('stop_price', 0)
-            self._place_emergency_stop(
+            self._dispatch_off_ib_loop(
+                self._place_emergency_stop,
                 fill.order_id, stop_price or fill.price * 0.98,
                 fill.shares, direction)
             self._set_degraded(f"Late entry fill on closed trade {trade_id}")
@@ -1230,13 +1264,15 @@ class IBOrderHandler:
         logger.info("Entry fill applied: trade %d, %d/%d shares @ $%.2f (avg $%.2f)",
                      trade_id, new_filled, total_shares, fill.price, new_avg)
 
-        # Place/resize protective stop on EVERY fill
-        # Use recalculated stop from updates (actual fill price) if available,
-        # otherwise fall back to DB value (which may be stale pre-update)
+        # Place/resize protective stop on EVERY fill.
+        # Dispatch off IB event-loop thread to avoid deadlock:
+        # on_exec_details (IB thread) → place_order → run_coroutine_threadsafe
+        # would block the same event loop.
         direction = trade.get('direction', ctx.get('direction', 'long'))
         stop_price = updates.get('stop_price',
                                   trade.get('stop_price', ctx.get('stop_price', 0)))
-        self.place_or_resize_stop(trade_id, stop_price, new_filled, direction)
+        self._dispatch_off_ib_loop(
+            self.place_or_resize_stop, trade_id, stop_price, new_filled, direction)
 
         self._state.positions_version += 1
         self._notify_live_engine(trade_id, fill.price, fill.shares, is_entry=True)
@@ -1374,17 +1410,13 @@ class IBOrderHandler:
         self._set_degraded(f"Late fill on failed entry order {order_id}: "
                            f"{fill.shares} shares")
 
-        # Resize or place emergency stop
+        # Resize or place emergency stop (dispatch off IB thread —
+        # cancel_order also uses run_coroutine_threadsafe so must be off-loop)
         em = self._emergency_stops.get(order_id)
-        if em:
-            # Resize
-            self.ib.cancel_order(em.stop_order_id)
-            self._place_emergency_stop(
-                order_id, ctx.stop_price, ctx.filled_shares, ctx.direction)
-        else:
-            # Place new
-            self._place_emergency_stop(
-                order_id, ctx.stop_price, ctx.filled_shares, ctx.direction)
+        cancel_id = em.stop_order_id if em else None
+        self._dispatch_off_ib_loop(
+            self._cancel_and_place_emergency_stop,
+            cancel_id, order_id, ctx.stop_price, ctx.filled_shares, ctx.direction)
 
     # ── Status Callbacks ────────────────────────────────────────────
 
