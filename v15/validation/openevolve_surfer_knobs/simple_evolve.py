@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""
+Simple evolutionary knob tuning for surfer-ml.
+
+Bypasses OpenEvolve's ProcessPoolExecutor (which crashes on Windows)
+and runs everything in a single process with subprocess-based evaluation
+to prevent memory leaks.
+
+Usage:
+    python -u v15/validation/openevolve_surfer_knobs/simple_evolve.py
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+# ── Config ────────────────────────────────────────────────────────────────────
+MAX_ITERATIONS = 200
+CLAUDE_CMD = r"C:\Users\frank\.local\bin\claude.exe"
+MODEL = "sonnet"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+LOG_FILE = os.path.join(OUTPUT_DIR, "simple_evolve.log")
+BEST_FILE = os.path.join(OUTPUT_DIR, "best_program.py")
+
+# Evaluator runs in subprocess to avoid memory leaks
+EVAL_SCRIPT = os.path.join(BASE_DIR, "eval_subprocess.py")
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def log(msg):
+    """Log to file and stdout."""
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{ts} - {msg}"
+    print(line, flush=True)
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def evaluate_in_subprocess(program_path):
+    """Run evaluator in a fresh subprocess to avoid memory leaks."""
+    try:
+        result = subprocess.run(
+            [sys.executable, EVAL_SCRIPT, program_path],
+            capture_output=True, text=True, timeout=600,
+            encoding="utf-8", errors="replace",
+        )
+        if result.returncode != 0:
+            log(f"  Eval subprocess failed: {result.stderr[-500:]}")
+            return None
+        # Last line of stdout is the JSON result
+        lines = result.stdout.strip().split("\n")
+        for line in reversed(lines):
+            line = line.strip()
+            if line.startswith("{"):
+                return json.loads(line)
+        log(f"  No JSON in eval output: {result.stdout[-300:]}")
+        return None
+    except subprocess.TimeoutExpired:
+        log("  Eval timed out (600s)")
+        return None
+    except Exception as e:
+        log(f"  Eval error: {e}")
+        return None
+
+
+def call_llm(prompt):
+    """Call Claude via CLI."""
+    try:
+        result = subprocess.run(
+            [CLAUDE_CMD, "--print", "--model", MODEL,
+             "--dangerously-skip-permissions"],
+            input=prompt, capture_output=True, text=True,
+            timeout=300, encoding="utf-8", errors="replace",
+        )
+        return result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        log("  LLM timed out (300s)")
+        return None
+    except Exception as e:
+        log(f"  LLM error: {e}")
+        return None
+
+
+def build_prompt(current_knobs, current_score, current_metrics, history):
+    """Build prompt for LLM to suggest new knobs."""
+    history_str = ""
+    if history:
+        history_str = "\n\nPrevious attempts (sorted by score, best first):\n"
+        for h in sorted(history, key=lambda x: x["score"], reverse=True)[:10]:
+            history_str += (
+                f"  Score={h['score']:.0f} PnL=${h['pnl']:.0f} "
+                f"Trades={h['trades']} WR={h['wr']:.1f}% "
+                f"Sharpe={h['sharpe']:.3f} DD={h['dd']:.1f}% "
+                f"Knobs={json.dumps(h['knobs'])}\n"
+            )
+
+    return f"""You are tuning hyperparameters for a trading algorithm (surfer-ml).
+The algorithm trades TSLA using ML-based entry signals with configurable
+stop-loss and exit management.
+
+Current best configuration (score={current_score:.0f}):
+{json.dumps(current_knobs, indent=2)}
+
+Current best metrics:
+  Total P&L: ${current_metrics.get('total_pnl', 0):.0f}
+  Trades: {current_metrics.get('n_trades', 0):.0f}
+  Win Rate: {current_metrics.get('win_rate', 0):.1f}%
+  Sharpe: {current_metrics.get('sharpe', 0):.3f}
+  Profit Factor: {current_metrics.get('profit_factor', 0):.3f}
+  Max Drawdown: {current_metrics.get('max_drawdown_pct', 0):.1f}%
+{history_str}
+Knob ranges:
+  exit_grace_bars: 0-15 (1-min bars of grace after entry before stops activate)
+  stop_update_secs: 5-600 (how often to ratchet best_price in seconds)
+  stop_check_secs: 5-60 (how often to check price vs stop in seconds)
+  grace_ratchet_secs: 0-300 (ratchet during grace period, 0=disabled)
+  profit_activated_stop: true/false (stop only fires after trade is in profit)
+  max_underwater_mins: 0-600 (force-close if never profitable, 0=disabled)
+  max_hold_bars: 20-9999 (5-min bars before timeout, 60=5hrs)
+  breakout_stop_mult: 0.05-2.0 (multiplier for breakout stop distance)
+  eval_interval: 1-6 (evaluate signal every N 5-min bars)
+
+Scoring: PnL * Sharpe_bonus * WR_bonus * PF_bonus * trade_count_mult * drawdown_mult
+Higher is better. Key: maximize PnL and Sharpe while keeping drawdown low.
+
+Suggest a NEW configuration that might improve the score. Try something
+different from previous attempts. Be creative but stay within ranges.
+
+IMPORTANT: Respond with ONLY a JSON object containing the knobs. No explanation.
+Example: {{"exit_grace_bars": 3, "stop_update_secs": 45, ...}}"""
+
+
+def write_program(knobs, path):
+    """Write a knob configuration as a Python program file."""
+    code = '''"""Auto-generated knob configuration."""
+
+def get_knobs() -> dict:
+    return %s
+''' % repr(knobs)
+    with open(path, "w") as f:
+        f.write(code)
+
+
+def parse_knobs(llm_response):
+    """Extract knobs dict from LLM response."""
+    if not llm_response:
+        return None
+    # Find JSON in response
+    text = llm_response.strip()
+    # Try to find JSON block
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start < 0 or end <= start:
+        return None
+    try:
+        raw = json.loads(text[start:end])
+    except json.JSONDecodeError:
+        return None
+
+    # Validate and clamp
+    try:
+        knobs = {
+            "exit_grace_bars": max(0, min(15, int(raw.get("exit_grace_bars", 5)))),
+            "stop_update_secs": max(5, min(600, int(raw.get("stop_update_secs", 60)))),
+            "stop_check_secs": max(5, min(60, int(raw.get("stop_check_secs", 5)))),
+            "grace_ratchet_secs": max(0, min(300, int(raw.get("grace_ratchet_secs", 60)))),
+            "profit_activated_stop": bool(raw.get("profit_activated_stop", True)),
+            "max_underwater_mins": max(0, min(600, int(raw.get("max_underwater_mins", 0)))),
+            "max_hold_bars": max(20, min(9999, int(raw.get("max_hold_bars", 60)))),
+            "breakout_stop_mult": max(0.05, min(2.0, float(raw.get("breakout_stop_mult", 1.0)))),
+            "eval_interval": max(1, min(6, int(raw.get("eval_interval", 3)))),
+        }
+        return knobs
+    except (ValueError, TypeError):
+        return None
+
+
+def main():
+    log("=" * 60)
+    log("Simple Evolve: Surfer-ML Knob Tuning (Phase A)")
+    log("=" * 60)
+
+    # Evaluate initial program
+    initial_program = os.path.join(BASE_DIR, "initial_program.py")
+    log("Evaluating initial program...")
+    result = evaluate_in_subprocess(initial_program)
+    if not result or result.get("combined_score", 0) <= 0:
+        log(f"Initial evaluation failed: {result}")
+        sys.exit(1)
+
+    best_score = result["combined_score"]
+    best_knobs = result.get("knobs", {})
+    best_metrics = result
+    log(f"Initial: score={best_score:.0f} PnL=${result['total_pnl']:.0f} "
+        f"trades={result['n_trades']:.0f} WR={result['win_rate']:.1f}% "
+        f"Sharpe={result['sharpe']:.3f} DD={result['max_drawdown_pct']:.1f}%")
+
+    # Save initial as best
+    write_program(best_knobs, BEST_FILE)
+
+    history = [{
+        "score": best_score, "pnl": result["total_pnl"],
+        "trades": result["n_trades"], "wr": result["win_rate"],
+        "sharpe": result["sharpe"], "dd": result["max_drawdown_pct"],
+        "knobs": best_knobs,
+    }]
+
+    # Evolution loop
+    for i in range(1, MAX_ITERATIONS + 1):
+        log(f"\n--- Iteration {i}/{MAX_ITERATIONS} ---")
+
+        # Call LLM for new knobs
+        prompt = build_prompt(best_knobs, best_score, best_metrics, history)
+        log("  Calling LLM...")
+        t0 = time.time()
+        response = call_llm(prompt)
+        llm_time = time.time() - t0
+        log(f"  LLM responded in {llm_time:.1f}s")
+
+        knobs = parse_knobs(response)
+        if not knobs:
+            log(f"  Failed to parse knobs from response: {(response or '')[:200]}")
+            continue
+
+        log(f"  Knobs: {json.dumps(knobs)}")
+
+        # Write candidate program
+        with tempfile.NamedTemporaryFile(suffix=".py", delete=False,
+                                          dir=OUTPUT_DIR, mode="w") as tf:
+            tf.write(f'"""Auto-generated iteration {i}."""\n\n'
+                     f'def get_knobs() -> dict:\n'
+                     f'    return {repr(knobs)}\n')
+            candidate_path = tf.name
+
+        # Evaluate
+        log("  Evaluating...")
+        t0 = time.time()
+        result = evaluate_in_subprocess(candidate_path)
+        eval_time = time.time() - t0
+
+        # Clean up temp file
+        try:
+            os.unlink(candidate_path)
+        except OSError:
+            pass
+
+        if not result or result.get("combined_score", 0) <= 0:
+            log(f"  Evaluation failed ({eval_time:.0f}s): {result}")
+            continue
+
+        score = result["combined_score"]
+        log(f"  Result ({eval_time:.0f}s): score={score:.0f} "
+            f"PnL=${result['total_pnl']:.0f} trades={result['n_trades']:.0f} "
+            f"WR={result['win_rate']:.1f}% Sharpe={result['sharpe']:.3f} "
+            f"DD={result['max_drawdown_pct']:.1f}%")
+
+        history.append({
+            "score": score, "pnl": result["total_pnl"],
+            "trades": result["n_trades"], "wr": result["win_rate"],
+            "sharpe": result["sharpe"], "dd": result["max_drawdown_pct"],
+            "knobs": knobs,
+        })
+
+        if score > best_score:
+            improvement = score - best_score
+            log(f"  *** NEW BEST! score={score:.0f} (+{improvement:.0f}) ***")
+            best_score = score
+            best_knobs = knobs
+            best_metrics = result
+            write_program(best_knobs, BEST_FILE)
+        else:
+            log(f"  No improvement (best={best_score:.0f})")
+
+    log(f"\n{'=' * 60}")
+    log(f"Evolution complete. Best score: {best_score:.0f}")
+    log(f"Best knobs: {json.dumps(best_knobs, indent=2)}")
+    log(f"Best program saved to: {BEST_FILE}")
+
+
+if __name__ == "__main__":
+    main()
