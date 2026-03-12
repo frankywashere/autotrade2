@@ -213,6 +213,50 @@ def _open_positions(state, readonly=False):
                 logger.error("Close trade %d: order_entry_controller not available", trade_id)
         return _on_close
 
+    def _make_cancel_stop_callback(trade_id, btn):
+        def _on_cancel_stop(event):
+            btn.disabled = True
+            btn.name = '...'
+            handler = getattr(state, 'ib_order_handler', None)
+            if not handler:
+                btn.name = 'Err'
+                return
+            try:
+                ok = handler.cancel_algo_stop(trade_id)
+                if ok:
+                    btn.name = 'Done'
+                    state.positions_version += 1
+                else:
+                    btn.name = 'Fail'
+                    btn.disabled = False
+            except Exception as e:
+                btn.name = 'Err'
+                btn.disabled = False
+                logger.error("Cancel stop error for trade %d: %s", trade_id, e)
+        return _on_cancel_stop
+
+    def _make_cancel_entry_callback(trade_id, btn):
+        def _on_cancel_entry(event):
+            btn.disabled = True
+            btn.name = '...'
+            handler = getattr(state, 'ib_order_handler', None)
+            if not handler:
+                btn.name = 'Err'
+                return
+            try:
+                ok = handler.cancel_algo_entry(trade_id)
+                if ok:
+                    btn.name = 'Done'
+                    state.positions_version += 1
+                else:
+                    btn.name = 'Fail'
+                    btn.disabled = False
+            except Exception as e:
+                btn.name = 'Err'
+                btn.disabled = False
+                logger.error("Cancel entry error for trade %d: %s", trade_id, e)
+        return _on_cancel_entry
+
     def _render(positions_version):
         container.clear()
         if not hasattr(state, 'trade_db') or state.trade_db is None:
@@ -310,12 +354,30 @@ def _open_positions(state, readonly=False):
                 close_btn.on_click(_make_close_callback(trade_id))
 
                 if mgmt == 'algo':
-                    # Algo mode: Close + Hold buttons
+                    # Algo mode: Close + Hold + conditional cancel buttons
                     hold_btn = pn.widgets.Button(
                         name='Hold', button_type='warning', width=55, height=28,
                         margin=(0, 0, 0, 0))
                     hold_btn.on_click(_make_hold_callback(trade_id, hold_btn, close_btn))
-                    btn_row = pn.Row(close_btn, hold_btn)
+                    buttons = [close_btn, hold_btn]
+
+                    # Cancel Stop button (only if stop is resting at IB)
+                    if t.get('ib_stop_order_id'):
+                        cs_btn = pn.widgets.Button(
+                            name='X Stop', button_type='light', width=60, height=28,
+                            margin=(0, 0, 0, 4))
+                        cs_btn.on_click(_make_cancel_stop_callback(trade_id, cs_btn))
+                        buttons.append(cs_btn)
+
+                    # Cancel Entry button (only if entry not fully filled)
+                    if fill_status in ('pending', 'partial'):
+                        ce_btn = pn.widgets.Button(
+                            name='X Entry', button_type='light', width=60, height=28,
+                            margin=(0, 0, 0, 4))
+                        ce_btn.on_click(_make_cancel_entry_callback(trade_id, ce_btn))
+                        buttons.append(ce_btn)
+
+                    btn_row = pn.Row(*buttons)
                 else:
                     # Manual mode: just Close
                     btn_row = pn.Row(close_btn)

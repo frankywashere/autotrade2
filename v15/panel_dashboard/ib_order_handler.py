@@ -512,6 +512,89 @@ class IBOrderHandler:
                        trade_id)
         return True
 
+    def cancel_algo_stop(self, trade_id: int) -> bool:
+        """Cancel the resting protective stop for a trade.
+
+        Stays in algo management mode — LiveEngine will re-place the stop
+        on the next 1-min bar (SEQ_SYNC) or 5-min ratchet cycle.
+        Use take_over_trade() instead to permanently disable algo management.
+
+        Returns True if cancel was sent (or no stop to cancel).
+        """
+        trade = self._get_trade(trade_id)
+        if not trade:
+            logger.error("cancel_algo_stop: trade %d not found", trade_id)
+            return False
+
+        stop_oid = trade.get('ib_stop_order_id')
+        if not stop_oid:
+            logger.info("cancel_algo_stop: trade %d has no resting stop", trade_id)
+            return True
+
+        # NULL DB first, then cancel at IB (prevents ghost re-arm)
+        try:
+            self.db.update_trade_state(trade_id, ib_stop_order_id=None,
+                                       ib_stop_perm_id=None)
+        except Exception as e:
+            logger.error("cancel_algo_stop: DB update failed for trade %d: %s",
+                         trade_id, e)
+            return False
+
+        self.ib.cancel_order(stop_oid)
+        self._state.positions_version += 1
+        logger.info("cancel_algo_stop: cancelled stop %d for trade %d",
+                     stop_oid, trade_id)
+        return True
+
+    def cancel_algo_entry(self, trade_id: int) -> bool:
+        """Cancel a pending (unfilled) entry order for a trade.
+
+        If partially filled, cancels the remaining qty. The filled portion
+        stays as an open position and gets a protective stop.
+
+        Returns True if cancel was sent.
+        """
+        trade = self._get_trade(trade_id)
+        if not trade:
+            logger.error("cancel_algo_entry: trade %d not found", trade_id)
+            return False
+
+        entry_oid = trade.get('ib_entry_order_id')
+        if not entry_oid:
+            logger.info("cancel_algo_entry: trade %d has no pending entry", trade_id)
+            return True
+
+        fill_status = trade.get('ib_fill_status', '')
+        if fill_status == 'filled':
+            logger.info("cancel_algo_entry: trade %d already fully filled", trade_id)
+            return True
+
+        filled = trade.get('filled_shares', 0)
+        self.ib.cancel_order(entry_oid)
+
+        if filled == 0:
+            # No fills yet — mark trade as cancelled
+            try:
+                self.db.update_trade_state(
+                    trade_id, ib_fill_status='cancelled',
+                    exit_reason='cancelled', exit_time=_now_eastern())
+            except Exception as e:
+                logger.error("cancel_algo_entry: DB update failed for trade %d: %s",
+                             trade_id, e)
+        else:
+            # Partial fill — update shares to actual filled amount
+            try:
+                self.db.update_trade_state(
+                    trade_id, shares=filled, ib_fill_status='filled')
+            except Exception as e:
+                logger.error("cancel_algo_entry: DB update failed for trade %d: %s",
+                             trade_id, e)
+
+        self._state.positions_version += 1
+        logger.info("cancel_algo_entry: cancelled entry %d for trade %d "
+                     "(filled=%d)", entry_oid, trade_id, filled)
+        return True
+
     def place_manual_exit(self, trade_id: int, order_type: str,
                           price: float, session: str) -> bool:
         """Place a user-specified exit order for a manual-mode trade.
