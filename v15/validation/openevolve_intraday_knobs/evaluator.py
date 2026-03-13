@@ -188,11 +188,12 @@ def evaluate(program_path: str) -> dict:
     dd = m['max_drawdown_pct']
     n_trades = m['total_trades']
 
-    # Trade count penalty: too few (<100) = overfit filter, too many (>5000) = noise
-    if n_trades < 30:
+    # v4: Balanced scoring (matches surfer-ml formula)
+    # Trade count penalty: too few (<50) = overfit, too many (>5000) = noise
+    if n_trades < 50:
         trade_mult = 0.2
-    elif n_trades < 100:
-        trade_mult = 0.5 + 0.5 * (n_trades - 30) / 70
+    elif n_trades < 200:
+        trade_mult = 0.5 + 0.5 * (n_trades - 50) / 150
     elif n_trades <= 3000:
         trade_mult = 1.0
     elif n_trades <= 5000:
@@ -210,11 +211,9 @@ def evaluate(program_path: str) -> dict:
     else:
         dd_mult = 0.3
 
-    # Score: PnL * Sharpe bonus * WR bonus * trade count * drawdown
+    # Score: PnL * Sharpe bonus * WR bonus * PF bonus * trade count * drawdown
     if total_pnl <= 0:
-        # Give negative PnL a small negative score so LLM sees gradient
-        # -$100K → score ~-100K, -$1K → score ~-1K (closer to breakeven = better)
-        score = total_pnl * trade_mult * dd_mult
+        score = 0.0
     else:
         score = (total_pnl
                  * (1.0 + max(sharpe, 0) * 0.2)     # Sharpe bonus
