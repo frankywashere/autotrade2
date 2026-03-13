@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 """
-Simple evolutionary knob tuning for intraday.
+Simple evolutionary knob tuning for intraday (v3 — PnL-dominant scoring).
 
-Bypasses OpenEvolve's ProcessPoolExecutor (which crashes on Windows)
-and runs everything in a single process with subprocess-based evaluation
-to prevent memory leaks.
+Improvements over v1:
+- Forced exploration rounds (every 3rd iteration)
+- Diverse history (top 5 + 10 diverse entries spanning different regimes)
+- Random perturbation (2-3 knobs bumped 20-50% of range after LLM suggests)
+- Anti-repeat detection (5 consecutive similar configs → forced big jump)
+- Multiple starting basins (3 different seed configs tried at start)
 
 Usage:
     python -u v15/validation/openevolve_intraday_knobs/simple_evolve.py
 """
 
 import json
+import math
 import os
+import random
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MAX_ITERATIONS = 200
@@ -30,7 +36,72 @@ STATE_FILE = os.path.join(OUTPUT_DIR, "evolve_state.json")
 # Evaluator runs in subprocess to avoid memory leaks
 EVAL_SCRIPT = os.path.join(BASE_DIR, "eval_subprocess.py")
 
+# Exploration config
+EXPLORE_EVERY = 3       # Every Nth iteration is forced exploration
+PERTURB_KNOBS = 2       # Number of knobs to randomly perturb
+PERTURB_FRAC = 0.3      # Fraction of range to perturb by
+REPEAT_WINDOW = 5       # Consecutive similar configs before forced jump
+REPEAT_SIMILARITY = 0.02  # Max fractional difference to count as "similar"
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ── Knob ranges (used for perturbation and diversity) ─────────────────────────
+KNOB_RANGES = {
+    "vwap_thresh":         (-0.50, 0.0,   "float"),
+    "d_min":               (0.05,  0.60,  "float"),
+    "h1_min":              (0.05,  0.40,  "float"),
+    "f5_thresh":           (0.10,  0.50,  "float"),
+    "div_thresh":          (0.05,  0.50,  "float"),
+    "div_f5_thresh":       (0.10,  0.50,  "float"),
+    "min_vol_ratio":       (0.0,   2.0,   "float"),
+    "stop_pct":            (0.003, 0.025, "float"),
+    "tp_pct":              (0.005, 0.050, "float"),
+    "trail_base":          (0.002, 0.020, "float"),
+    "trail_power":         (1,     12,    "int"),
+    "trail_floor":         (0.0,   0.008, "float"),
+    "exit_grace_bars":     (0,     15,    "int"),
+    "stop_update_secs":    (5,     600,   "int"),
+    "stop_check_secs":     (5,     60,    "int"),
+    "grace_ratchet_secs":  (0,     300,   "int"),
+    "max_hold_bars":       (10,    156,   "int"),
+    "eval_interval":       (1,     4,     "int"),
+    "max_trades_per_day":  (1,     50,    "int"),
+    "max_underwater_mins": (0,     600,   "int"),
+}
+
+# ── Alternative starting seeds (different basins) ────────────────────────────
+SEED_CONFIGS = [
+    {  # Seed A: Loose filters, tight stops, high frequency
+        "vwap_thresh": -0.05, "d_min": 0.10, "h1_min": 0.08,
+        "f5_thresh": 0.45, "div_thresh": 0.10, "div_f5_thresh": 0.40,
+        "min_vol_ratio": 0.0, "stop_pct": 0.005, "tp_pct": 0.015,
+        "trail_base": 0.004, "trail_power": 3, "trail_floor": 0.002,
+        "exit_grace_bars": 2, "stop_update_secs": 30, "stop_check_secs": 5,
+        "grace_ratchet_secs": 0, "max_hold_bars": 40, "eval_interval": 1,
+        "max_trades_per_day": 20, "profit_activated_stop": False,
+        "max_underwater_mins": 0,
+    },
+    {  # Seed B: Strict filters, wide stops, low frequency
+        "vwap_thresh": -0.30, "d_min": 0.45, "h1_min": 0.30,
+        "f5_thresh": 0.15, "div_thresh": 0.35, "div_f5_thresh": 0.20,
+        "min_vol_ratio": 1.5, "stop_pct": 0.018, "tp_pct": 0.040,
+        "trail_base": 0.010, "trail_power": 8, "trail_floor": 0.005,
+        "exit_grace_bars": 10, "stop_update_secs": 120, "stop_check_secs": 10,
+        "grace_ratchet_secs": 120, "max_hold_bars": 100, "eval_interval": 3,
+        "max_trades_per_day": 5, "profit_activated_stop": True,
+        "max_underwater_mins": 60,
+    },
+    {  # Seed C: No volume filter, moderate everything, profit-activated
+        "vwap_thresh": -0.20, "d_min": 0.30, "h1_min": 0.20,
+        "f5_thresh": 0.25, "div_thresh": 0.15, "div_f5_thresh": 0.30,
+        "min_vol_ratio": 0.0, "stop_pct": 0.012, "tp_pct": 0.030,
+        "trail_base": 0.007, "trail_power": 5, "trail_floor": 0.003,
+        "exit_grace_bars": 7, "stop_update_secs": 60, "stop_check_secs": 5,
+        "grace_ratchet_secs": 90, "max_hold_bars": 60, "eval_interval": 2,
+        "max_trades_per_day": 10, "profit_activated_stop": True,
+        "max_underwater_mins": 120,
+    },
+]
 
 
 def log(msg):
@@ -45,24 +116,28 @@ def log(msg):
 def evaluate_in_subprocess(program_path):
     """Run evaluator in a fresh subprocess to avoid memory leaks."""
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             [sys.executable, EVAL_SCRIPT, program_path],
-            capture_output=True, text=True, timeout=600,
-            encoding="utf-8", errors="replace",
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
         )
-        if result.returncode != 0:
-            log(f"  Eval subprocess failed: {result.stderr[-500:]}")
+        try:
+            stdout, stderr = proc.communicate(timeout=300)
+        except subprocess.TimeoutExpired:
+            log("  Eval timed out (300s) — killing process tree")
+            _kill_tree(proc.pid)
+            proc.wait(timeout=5)
+            return None
+        if proc.returncode != 0:
+            log(f"  Eval subprocess failed: {stderr[-500:]}")
             return None
         # Last line of stdout is the JSON result
-        lines = result.stdout.strip().split("\n")
+        lines = stdout.strip().split("\n")
         for line in reversed(lines):
             line = line.strip()
             if line.startswith("{"):
                 return json.loads(line)
-        log(f"  No JSON in eval output: {result.stdout[-300:]}")
-        return None
-    except subprocess.TimeoutExpired:
-        log("  Eval timed out (600s)")
+        log(f"  No JSON in eval output: {stdout[-300:]}")
         return None
     except Exception as e:
         log(f"  Eval error: {e}")
@@ -70,35 +145,160 @@ def evaluate_in_subprocess(program_path):
 
 
 def call_llm(prompt):
-    """Call Claude via CLI."""
+    """Call Claude via CLI with robust timeout + process kill."""
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             [CLAUDE_CMD, "--print", "--model", MODEL,
              "--dangerously-skip-permissions"],
-            input=prompt, capture_output=True, text=True,
-            timeout=300, encoding="utf-8", errors="replace",
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace",
         )
-        return result.stdout.strip()
-    except subprocess.TimeoutExpired:
-        log("  LLM timed out (300s)")
-        return None
+        try:
+            stdout, stderr = proc.communicate(input=prompt, timeout=120)
+            return stdout.strip()
+        except subprocess.TimeoutExpired:
+            log("  LLM timed out (120s) — killing process tree")
+            _kill_tree(proc.pid)
+            proc.wait(timeout=5)
+            return None
     except Exception as e:
         log(f"  LLM error: {e}")
         return None
 
 
-def build_prompt(current_knobs, current_score, current_metrics, history):
+def _kill_tree(pid):
+    """Kill a process and all its children (Windows-compatible)."""
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True, timeout=10,
+        )
+    except Exception:
+        try:
+            os.kill(pid, 9)
+        except Exception:
+            pass
+
+
+def _knob_distance(k1, k2):
+    """Compute normalized distance between two knob configs (0-1 scale)."""
+    total = 0.0
+    count = 0
+    for key, (lo, hi, typ) in KNOB_RANGES.items():
+        v1 = float(k1.get(key, 0))
+        v2 = float(k2.get(key, 0))
+        rng = hi - lo
+        if rng > 0:
+            total += abs(v1 - v2) / rng
+            count += 1
+    return total / max(count, 1)
+
+
+def _select_diverse_history(history, n_top=5, n_diverse=10):
+    """Select top N by score + N diverse entries spanning different regimes."""
+    if len(history) <= n_top + n_diverse:
+        return history
+
+    sorted_h = sorted(history, key=lambda x: x["score"], reverse=True)
+    top = sorted_h[:n_top]
+
+    # Select diverse entries from remaining
+    remaining = sorted_h[n_top:]
+    diverse = []
+    selected_knobs = [h["knobs"] for h in top]
+
+    for _ in range(n_diverse):
+        if not remaining:
+            break
+        # Pick the entry most distant from all already selected
+        best_idx = 0
+        best_min_dist = -1
+        for idx, h in enumerate(remaining):
+            min_dist = min(_knob_distance(h["knobs"], sk)
+                          for sk in selected_knobs)
+            if min_dist > best_min_dist:
+                best_min_dist = min_dist
+                best_idx = idx
+        chosen = remaining.pop(best_idx)
+        diverse.append(chosen)
+        selected_knobs.append(chosen["knobs"])
+
+    return top + diverse
+
+
+def _is_repeat(knobs, recent_knobs):
+    """Check if knobs are too similar to all recent configs."""
+    if len(recent_knobs) < REPEAT_WINDOW:
+        return False
+    for rk in recent_knobs[-REPEAT_WINDOW:]:
+        if _knob_distance(knobs, rk) > REPEAT_SIMILARITY:
+            return False
+    return True
+
+
+def _perturb_knobs(knobs, n_perturb=PERTURB_KNOBS, frac=PERTURB_FRAC):
+    """Randomly perturb N knobs by a fraction of their range."""
+    knobs = dict(knobs)
+    numeric_keys = list(KNOB_RANGES.keys())
+    to_perturb = random.sample(numeric_keys, min(n_perturb, len(numeric_keys)))
+
+    for key in to_perturb:
+        lo, hi, typ = KNOB_RANGES[key]
+        rng = hi - lo
+        delta = random.uniform(-frac, frac) * rng
+        val = float(knobs.get(key, (lo + hi) / 2)) + delta
+        if typ == "int":
+            val = int(round(max(lo, min(hi, val))))
+        else:
+            val = round(max(lo, min(hi, val)), 6)
+        knobs[key] = val
+
+    return knobs
+
+
+def _random_knobs():
+    """Generate completely random knobs for a big jump."""
+    knobs = {}
+    for key, (lo, hi, typ) in KNOB_RANGES.items():
+        if typ == "int":
+            knobs[key] = random.randint(int(lo), int(hi))
+        else:
+            knobs[key] = round(random.uniform(lo, hi), 6)
+    knobs["profit_activated_stop"] = random.choice([True, False])
+    return knobs
+
+
+def build_prompt(current_knobs, current_score, current_metrics, history,
+                 explore_mode=False):
     """Build prompt for LLM to suggest new knobs."""
+    # Use diverse history selection
+    display_history = _select_diverse_history(history)
+
     history_str = ""
-    if history:
-        history_str = "\n\nPrevious attempts (sorted by score, best first):\n"
-        for h in sorted(history, key=lambda x: x["score"], reverse=True)[:15]:
+    if display_history:
+        history_str = "\n\nPrevious attempts (top 5 by score + 10 diverse):\n"
+        for h in display_history:
             history_str += (
                 f"  Score={h['score']:.0f} PnL=${h['pnl']:.0f} "
                 f"Trades={h['trades']} WR={h['wr']:.1f}% "
                 f"Sharpe={h['sharpe']:.3f} DD={h['dd']:.1f}% "
                 f"Knobs={json.dumps(h['knobs'])}\n"
             )
+
+    explore_instruction = ""
+    if explore_mode:
+        explore_instruction = """
+*** EXPLORATION ROUND ***
+You MUST try something RADICALLY different from all previous attempts.
+Change at least 5 knobs by large amounts. Try a completely different regime:
+- If previous bests used strict filters, try loose filters with tight stops
+- If previous bests used few trades/day, try many trades with tighter exits
+- If previous bests used high trail_power, try low trail_power with wide trail_base
+- Try disabling profit_activated_stop if it was enabled, or vice versa
+- Try very different max_hold_bars (short holds vs full-day holds)
+Do NOT make small tweaks — the goal is to discover new scoring basins.
+"""
 
     return f"""You are tuning hyperparameters for an intraday trading algorithm.
 The algorithm trades TSLA using multi-timeframe channel analysis with VWAP
@@ -154,7 +354,7 @@ Strategy tips:
 - Tighter signal filters (lower f5_thresh, more negative vwap_thresh) = fewer but higher quality trades
 - Wider stops = more breathing room but larger losses on bad trades
 - Trail power controls how much confidence affects trailing: high power = loose trail at low conf
-
+{explore_instruction}
 Suggest a NEW configuration that might improve the score. Try something
 different from previous attempts. Be creative but stay within ranges.
 
@@ -170,7 +370,7 @@ def save_state(iteration, best_score, best_knobs, best_metrics, history):
         "best_knobs": best_knobs,
         "best_metrics": {k: v for k, v in best_metrics.items()
                          if isinstance(v, (int, float, str, bool))},
-        "history": history[-50:],  # Keep last 50 entries
+        "history": history[-100:],  # Keep last 100 entries (more for diversity)
     }
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -250,14 +450,45 @@ def parse_knobs(llm_response):
         return None
 
 
+def eval_knobs(knobs, label=""):
+    """Evaluate a knob config and return (score, result) or (None, None)."""
+    with tempfile.NamedTemporaryFile(suffix=".py", delete=False,
+                                      dir=OUTPUT_DIR, mode="w") as tf:
+        tf.write(f'"""Auto-generated {label}."""\n\n'
+                 f'def get_knobs() -> dict:\n'
+                 f'    return {repr(knobs)}\n')
+        candidate_path = tf.name
+
+    t0 = time.time()
+    result = evaluate_in_subprocess(candidate_path)
+    eval_time = time.time() - t0
+
+    try:
+        os.unlink(candidate_path)
+    except OSError:
+        pass
+
+    if not result:
+        log(f"  Evaluation failed ({eval_time:.0f}s)")
+        return None, None
+
+    score = result["combined_score"]
+    log(f"  {label} ({eval_time:.0f}s): score={score:.0f} "
+        f"PnL=${result['total_pnl']:.0f} trades={result['n_trades']:.0f} "
+        f"WR={result['win_rate']:.1f}% Sharpe={result['sharpe']:.3f} "
+        f"DD={result['max_drawdown_pct']:.1f}%")
+    return score, result
+
+
 def main():
     log("=" * 60)
-    log("Simple Evolve: Intraday Knob Tuning (Phase A)")
+    log("Simple Evolve v2: Intraday Knob Tuning (with exploration)")
     log("=" * 60)
 
     # Check for resume state
     saved = load_state()
     start_iteration = 1
+    recent_knobs = []  # Track recent configs for anti-repeat
 
     if saved:
         start_iteration = saved["iteration"] + 1
@@ -265,13 +496,18 @@ def main():
         best_knobs = saved["best_knobs"]
         best_metrics = saved["best_metrics"]
         history = saved["history"]
+        # Populate recent_knobs from history tail
+        recent_knobs = [h["knobs"] for h in history[-REPEAT_WINDOW:]]
         log(f"RESUMING from iteration {start_iteration} "
             f"(best score={best_score:.0f}, "
             f"PnL=${best_metrics.get('total_pnl', 0):.0f})")
     else:
+        # ── Phase 0: Evaluate multiple starting basins ────────────────────
+        log("Phase 0: Evaluating seed configs from different basins...")
+
         # Evaluate initial program
         initial_program = os.path.join(BASE_DIR, "initial_program.py")
-        log("Evaluating initial program...")
+        log("  Evaluating initial (default) config...")
         result = evaluate_in_subprocess(initial_program)
         if not result:
             log(f"Initial evaluation failed: {result}")
@@ -280,12 +516,8 @@ def main():
         best_score = result.get("combined_score", 0.0)
         best_knobs = result.get("knobs", {})
         best_metrics = result
-        log(f"Initial: score={best_score:.0f} PnL=${result['total_pnl']:.0f} "
-            f"trades={result['n_trades']:.0f} WR={result['win_rate']:.1f}% "
-            f"Sharpe={result['sharpe']:.3f} DD={result['max_drawdown_pct']:.1f}%")
-
-        # Save initial as best
-        write_program(best_knobs, BEST_FILE)
+        log(f"  Default: score={best_score:.0f} PnL=${result['total_pnl']:.0f} "
+            f"trades={result['n_trades']:.0f}")
 
         history = [{
             "score": best_score, "pnl": result["total_pnl"],
@@ -293,56 +525,76 @@ def main():
             "sharpe": result["sharpe"], "dd": result["max_drawdown_pct"],
             "knobs": best_knobs,
         }]
+
+        # Evaluate alternative seeds
+        for idx, seed in enumerate(SEED_CONFIGS):
+            label = f"Seed {chr(65 + idx)}"
+            log(f"  Evaluating {label}...")
+            score, res = eval_knobs(seed, label)
+            if res is None:
+                continue
+            history.append({
+                "score": score, "pnl": res["total_pnl"],
+                "trades": res["n_trades"], "wr": res["win_rate"],
+                "sharpe": res["sharpe"], "dd": res["max_drawdown_pct"],
+                "knobs": seed,
+            })
+            if score > best_score:
+                log(f"  *** {label} is new best! score={score:.0f} ***")
+                best_score = score
+                best_knobs = seed
+                best_metrics = res
+
+        write_program(best_knobs, BEST_FILE)
         save_state(0, best_score, best_knobs, best_metrics, history)
+        log(f"Phase 0 complete. Best score: {best_score:.0f}")
 
-    # Evolution loop
+    # ── Evolution loop ────────────────────────────────────────────────────
+    consecutive_errors = 0
     for i in range(start_iteration, MAX_ITERATIONS + 1):
-        log(f"\n--- Iteration {i}/{MAX_ITERATIONS} ---")
+      try:
+        is_explore = (i % EXPLORE_EVERY == 0)
+        is_anti_repeat = _is_repeat(best_knobs, recent_knobs)
 
-        # Call LLM for new knobs
-        prompt = build_prompt(best_knobs, best_score, best_metrics, history)
-        log("  Calling LLM...")
-        t0 = time.time()
-        response = call_llm(prompt)
-        llm_time = time.time() - t0
-        log(f"  LLM responded in {llm_time:.1f}s")
+        mode = "EXPLORE" if is_explore else ("ANTI-REPEAT" if is_anti_repeat else "exploit")
+        log(f"\n--- Iteration {i}/{MAX_ITERATIONS} [{mode}] ---")
 
-        knobs = parse_knobs(response)
-        if not knobs:
-            log(f"  Failed to parse knobs from response: {(response or '')[:200]}")
-            continue
+        if is_anti_repeat:
+            # Stuck in a rut — generate random knobs
+            log("  Anti-repeat triggered! Generating random config...")
+            knobs = _random_knobs()
+            log(f"  Random knobs: {json.dumps(knobs)}")
+        else:
+            # Call LLM for new knobs
+            prompt = build_prompt(best_knobs, best_score, best_metrics,
+                                  history, explore_mode=is_explore)
+            log("  Calling LLM...")
+            t0 = time.time()
+            response = call_llm(prompt)
+            llm_time = time.time() - t0
+            log(f"  LLM responded in {llm_time:.1f}s")
 
-        log(f"  Knobs: {json.dumps(knobs)}")
+            knobs = parse_knobs(response)
+            if not knobs:
+                log(f"  Failed to parse knobs: {(response or '')[:200]}")
+                continue
 
-        # Write candidate program
-        with tempfile.NamedTemporaryFile(suffix=".py", delete=False,
-                                          dir=OUTPUT_DIR, mode="w") as tf:
-            tf.write(f'"""Auto-generated iteration {i}."""\n\n'
-                     f'def get_knobs() -> dict:\n'
-                     f'    return {repr(knobs)}\n')
-            candidate_path = tf.name
+            # Apply random perturbation on non-explore rounds
+            if not is_explore:
+                knobs = _perturb_knobs(knobs)
+
+            log(f"  Knobs: {json.dumps(knobs)}")
 
         # Evaluate
-        log("  Evaluating...")
-        t0 = time.time()
-        result = evaluate_in_subprocess(candidate_path)
-        eval_time = time.time() - t0
-
-        # Clean up temp file
-        try:
-            os.unlink(candidate_path)
-        except OSError:
-            pass
-
-        if not result:
-            log(f"  Evaluation failed ({eval_time:.0f}s): {result}")
+        score, result = eval_knobs(knobs, f"iter {i}")
+        if result is None:
             continue
 
-        score = result["combined_score"]
-        log(f"  Result ({eval_time:.0f}s): score={score:.0f} "
-            f"PnL=${result['total_pnl']:.0f} trades={result['n_trades']:.0f} "
-            f"WR={result['win_rate']:.1f}% Sharpe={result['sharpe']:.3f} "
-            f"DD={result['max_drawdown_pct']:.1f}%")
+        consecutive_errors = 0  # Reset on success
+
+        recent_knobs.append(knobs)
+        if len(recent_knobs) > REPEAT_WINDOW * 2:
+            recent_knobs = recent_knobs[-REPEAT_WINDOW * 2:]
 
         history.append({
             "score": score, "pnl": result["total_pnl"],
@@ -362,6 +614,14 @@ def main():
             log(f"  No improvement (best={best_score:.0f})")
 
         save_state(i, best_score, best_knobs, best_metrics, history)
+
+      except Exception as e:
+        consecutive_errors += 1
+        log(f"  ITERATION {i} CRASHED: {e}\n{traceback.format_exc()}")
+        if consecutive_errors >= 5:
+            log("  5 consecutive errors — aborting to avoid infinite loop")
+            break
+        continue
 
     log(f"\n{'=' * 60}")
     log(f"Evolution complete. Best score: {best_score:.0f}")
