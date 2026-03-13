@@ -338,11 +338,28 @@ class IBOrderHandler:
                                           direction, shares)
             return None
 
-        # Step 4: Drain any early-arriving fills
-        self._drain_pending_entry(order_id, trade_id)
+        # Step 4: Set trade_id and drain buffered fills ATOMICALLY.
+        # Must hold _buffer_lock while setting trade_id so that
+        # _on_entry_fill (which reads trade_id under the same lock)
+        # either sees trade_id and applies directly, or buffers before
+        # we pop — no fill can land in a gap between drain and assign.
+        ctx = self._entry_orders[order_id]
+        with self._buffer_lock:
+            ctx['trade_id'] = trade_id
+            fills = self._pending_fills.pop(order_id, [])
+            late_fills = self._unregistered_fills.pop(order_id, [])
+            fills.extend(late_fills)
+            terminal = self._pending_terminal.pop(order_id, None)
 
-        # Update context with trade_id
-        self._entry_orders[order_id]['trade_id'] = trade_id
+        if late_fills:
+            logger.info("Draining %d late-registered fills for entry order %d "
+                        "(trade %d)", len(late_fills), order_id, trade_id)
+
+        for fill in fills:
+            self._apply_entry_fill(trade_id, fill, ctx)
+
+        if terminal:
+            self._on_entry_terminal(order_id, terminal.status)
 
         logger.info("Entry order placed: order_id=%d, trade_id=%d, algo=%s, "
                      "%s %d shares", order_id, trade_id, algo_id, direction, shares)
@@ -1070,6 +1087,15 @@ class IBOrderHandler:
 
                 existing_stop = trade.get('ib_stop_order_id')
                 if existing_stop:
+                    # NULL DB stop_id and remove from routing BEFORE cancel
+                    # so the cancel callback's Guard 2 sees mismatch and
+                    # does NOT re-arm (we're about to place the new stop)
+                    try:
+                        self.db.update_trade_state(
+                            trade_id, ib_stop_order_id=None)
+                    except Exception:
+                        pass  # Best-effort; placement will overwrite anyway
+                    self._stop_orders.pop(existing_stop, None)
                     self.ib.cancel_order(existing_stop)
 
                 # Grace period on initial stop placement (no existing stop)
@@ -1131,6 +1157,14 @@ class IBOrderHandler:
         # Always cancel + replace with goodAfterTime (in-place modify
         # can't update activation time, so we must replace)
         good_after = self._compute_good_after_time(delay_minutes=5)
+        # NULL DB stop_id and remove from routing BEFORE cancel
+        # so the cancel callback's Guard 2 sees mismatch and
+        # does NOT re-arm (we're about to place the replacement)
+        try:
+            self.db.update_trade_state(trade_id, ib_stop_order_id=None)
+        except Exception:
+            pass  # Best-effort; placement will overwrite anyway
+        self._stop_orders.pop(stop_order_id, None)
         self.ib.cancel_order(stop_order_id)
         new_stop_id = self._place_protective_stop(
             trade_id, new_stop_price, effective_open, direction,
@@ -1209,17 +1243,9 @@ class IBOrderHandler:
         fill_shares = int(exec_obj.shares)
         fill_price = float(exec_obj.price)
 
-        # Convert broker timestamp to ET
+        # Use our own clock for fill timestamps (IB paper trading
+        # returns unreliable Execution.time — off by hours)
         fill_time = _now_eastern()
-        broker_time = getattr(exec_obj, 'time', None)
-        if broker_time:
-            try:
-                if hasattr(broker_time, 'isoformat'):
-                    fill_time = broker_time.astimezone(ET).isoformat()
-                else:
-                    fill_time = str(broker_time)
-            except Exception as e:
-                logger.warning("Failed to parse broker fill time: %s", e)
 
         perm_id = int(getattr(exec_obj, 'permId', 0))
 
@@ -1258,15 +1284,18 @@ class IBOrderHandler:
     def _on_entry_fill(self, order_id: int, fill: FillData):
         """Handle a fill on an entry order."""
         ctx = self._entry_orders.get(order_id, {})
-        trade_id = ctx.get('trade_id')
 
-        if trade_id is None:
-            # DB row doesn't exist yet — buffer
-            with self._buffer_lock:
+        # Read trade_id under lock — atomic with buffer append so that
+        # the registration code's set-trade_id + drain-buffer is also
+        # atomic and no fill falls into the gap between drain and assign.
+        with self._buffer_lock:
+            trade_id = ctx.get('trade_id')
+            if trade_id is None:
+                # DB row doesn't exist yet — buffer
                 self._pending_fills.setdefault(order_id, []).append(fill)
-            logger.info("Entry fill buffered (pre-DB): order %d, %d @ $%.2f",
-                        order_id, fill.shares, fill.price)
-            return
+                logger.info("Entry fill buffered (pre-DB): order %d, %d @ $%.2f",
+                            order_id, fill.shares, fill.price)
+                return
 
         # Apply fill to DB
         self._apply_entry_fill(trade_id, fill, ctx)
