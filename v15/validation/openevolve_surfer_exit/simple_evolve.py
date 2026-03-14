@@ -50,7 +50,7 @@ def evaluate_in_subprocess(program_path):
     try:
         result = subprocess.run(
             [sys.executable, EVAL_SCRIPT, program_path],
-            capture_output=True, text=True, timeout=600,
+            capture_output=True, text=True, timeout=1200,
             encoding="utf-8", errors="replace",
         )
         if result.returncode != 0:
@@ -65,7 +65,7 @@ def evaluate_in_subprocess(program_path):
         log(f"  No JSON in eval output: {result.stdout[-300:]}")
         return None
     except subprocess.TimeoutExpired:
-        log("  Eval timed out (600s)")
+        log("  Eval timed out (1200s)")
         return None
     except Exception as e:
         log(f"  Eval error: {e}")
