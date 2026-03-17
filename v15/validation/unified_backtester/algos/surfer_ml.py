@@ -71,6 +71,10 @@ class SurferMLAlgo(AlgoBase):
         self._fr_derive = None
         self._load_models()
 
+        # Precomputed channel cache (set externally to skip on-the-fly detection)
+        # Dict[pd.Timestamp, ChannelAnalysis] — see v15.core.channel_cache
+        self._channel_cache: Optional[dict] = None
+
         # Track positions' internal state (for profit-tier trail)
         self._pos_state: Dict[str, dict] = {}  # pos_id -> trail state
 
@@ -205,84 +209,97 @@ class SurferMLAlgo(AlgoBase):
         - Higher TFs: completed bars only, tail(100)
         - Direct analyze_channels() call (not prepare_multi_tf_analysis)
         """
-        try:
-            from v15.core.channel import detect_channels_multi_window, select_best_channel
-            from v15.core.channel_surfer import analyze_channels, TF_WINDOWS
-        except ImportError as e:
-            logger.error("SurferML.on_bar() FAILED: ImportError: %s", e)
-            return []
-
         # Anti-pyramid: skip if already have position in same direction
         existing_dirs = {p.direction for p in open_positions}
         existing_types = {getattr(p, 'signal_type', '') for p in open_positions}
 
-        # Get 5-min data: last 100 bars (matching original line 1443)
-        df5 = self.data.get_bars('5min', time)
-        if len(df5) < 20:
-            return []
-        df_slice = df5.tail(100)
-
-        # Detect channels on 5-min slice (matching original lines 1450-1457)
-        try:
-            multi = detect_channels_multi_window(df_slice, windows=[10, 15, 20, 30, 40])
-            best_ch, _ = select_best_channel(multi)
-        except Exception as e:
-            logger.error("SurferML channel detection failed: %s", e, exc_info=True)
-            return []
-
-        if best_ch is None or not best_ch.valid:
-            return []
-
-        # Build multi-TF channel dict (matching original lines 1460-1506)
-        slice_closes = df_slice['close'].values
-        channels_by_tf = {'5min': best_ch}
-        prices_by_tf = {'5min': slice_closes}
-        current_prices = {'5min': float(slice_closes[-1])}
-        volumes_dict = {}
-        if 'volume' in df_slice.columns:
-            volumes_dict['5min'] = df_slice['volume'].values
-
-        # Add higher TF channels (matching original lines 1477-1506)
-        _TF_PERIOD = {
-            '1h': pd.Timedelta(hours=1),
-            '4h': pd.Timedelta(hours=4),
-            'daily': pd.Timedelta(days=1),
-        }
-        for tf_label in ('1h', '4h', 'daily'):
+        # ---- Channel detection: use precomputed cache or compute on-the-fly ----
+        if self._channel_cache is not None:
+            # Fast path: lookup precomputed result by timestamp
+            cached = self._channel_cache.get(time)
+            if cached is None:
+                return []
+            # Support both formats: ChannelAnalysis directly or dict with 'analysis' key
+            if isinstance(cached, dict):
+                analysis = cached['analysis']
+            else:
+                analysis = cached
+        else:
+            # Slow path: compute channels on-the-fly (original behavior)
             try:
-                tf_df = self.data.get_bars(tf_label, time)
-            except (ValueError, KeyError):
-                continue
-            if len(tf_df) == 0:
-                continue
-            # Only include completed bars
-            tf_period = _TF_PERIOD.get(tf_label, pd.Timedelta(hours=1))
-            tf_available = tf_df[tf_df.index + tf_period <= time]
-            tf_recent = tf_available.tail(100)
-            if len(tf_recent) < 30:
-                continue
-            tf_windows = TF_WINDOWS.get(tf_label, [20, 30, 40])
+                from v15.core.channel import detect_channels_multi_window, select_best_channel
+                from v15.core.channel_surfer import analyze_channels, TF_WINDOWS
+            except ImportError as e:
+                logger.error("SurferML.on_bar() FAILED: ImportError: %s", e)
+                return []
+
+            # Get 5-min data: last 100 bars (matching original line 1443)
+            df5 = self.data.get_bars('5min', time)
+            if len(df5) < 20:
+                return []
+            df_slice = df5.tail(100)
+
+            # Detect channels on 5-min slice (matching original lines 1450-1457)
             try:
-                tf_multi = detect_channels_multi_window(tf_recent, windows=tf_windows)
-                tf_ch, _ = select_best_channel(tf_multi)
-                if tf_ch and tf_ch.valid:
-                    channels_by_tf[tf_label] = tf_ch
-                    prices_by_tf[tf_label] = tf_recent['close'].values
-                    current_prices[tf_label] = float(tf_recent['close'].iloc[-1])
-                    if 'volume' in tf_recent.columns:
-                        volumes_dict[tf_label] = tf_recent['volume'].values
+                multi = detect_channels_multi_window(df_slice, windows=[10, 15, 20, 30, 40])
+                best_ch, _ = select_best_channel(multi)
             except Exception as e:
-                logger.warning("SurferML %s channel detection failed: %s", tf_label, e)
-                continue
+                logger.error("SurferML channel detection failed: %s", e, exc_info=True)
+                return []
 
-        try:
-            analysis = analyze_channels(
-                channels_by_tf, prices_by_tf, current_prices,
-                volumes_by_tf=volumes_dict if volumes_dict else None,
-            )
-        except Exception as e:
-            logger.error("SurferML analyze_channels() failed: %s", e, exc_info=True)
-            return []
+            if best_ch is None or not best_ch.valid:
+                return []
+
+            # Build multi-TF channel dict (matching original lines 1460-1506)
+            slice_closes = df_slice['close'].values
+            channels_by_tf = {'5min': best_ch}
+            prices_by_tf = {'5min': slice_closes}
+            current_prices = {'5min': float(slice_closes[-1])}
+            volumes_dict = {}
+            if 'volume' in df_slice.columns:
+                volumes_dict['5min'] = df_slice['volume'].values
+
+            # Add higher TF channels (matching original lines 1477-1506)
+            _TF_PERIOD = {
+                '1h': pd.Timedelta(hours=1),
+                '4h': pd.Timedelta(hours=4),
+                'daily': pd.Timedelta(days=1),
+            }
+            for tf_label in ('1h', '4h', 'daily'):
+                try:
+                    tf_df = self.data.get_bars(tf_label, time)
+                except (ValueError, KeyError):
+                    continue
+                if len(tf_df) == 0:
+                    continue
+                # Only include completed bars
+                tf_period = _TF_PERIOD.get(tf_label, pd.Timedelta(hours=1))
+                tf_available = tf_df[tf_df.index + tf_period <= time]
+                tf_recent = tf_available.tail(100)
+                if len(tf_recent) < 30:
+                    continue
+                tf_windows = TF_WINDOWS.get(tf_label, [20, 30, 40])
+                try:
+                    tf_multi = detect_channels_multi_window(tf_recent, windows=tf_windows)
+                    tf_ch, _ = select_best_channel(tf_multi)
+                    if tf_ch and tf_ch.valid:
+                        channels_by_tf[tf_label] = tf_ch
+                        prices_by_tf[tf_label] = tf_recent['close'].values
+                        current_prices[tf_label] = float(tf_recent['close'].iloc[-1])
+                        if 'volume' in tf_recent.columns:
+                            volumes_dict[tf_label] = tf_recent['volume'].values
+                except Exception as e:
+                    logger.warning("SurferML %s channel detection failed: %s", tf_label, e)
+                    continue
+
+            try:
+                analysis = analyze_channels(
+                    channels_by_tf, prices_by_tf, current_prices,
+                    volumes_by_tf=volumes_dict if volumes_dict else None,
+                )
+            except Exception as e:
+                logger.error("SurferML analyze_channels() failed: %s", e, exc_info=True)
+                return []
 
         sig = analysis.signal
         if sig.action not in ('BUY', 'SELL'):

@@ -199,9 +199,72 @@ def _load_holdout_data():
     return _HOLDOUT_DATA
 
 
+def _load_channel_cache(data, label: str):
+    """Load or build the precomputed channel cache for a DataProvider.
+
+    The cache is pickled alongside the DataProvider so it only needs to be
+    computed once per dataset.  Subsequent subprocess evaluations load from
+    disk (~seconds vs ~hours of on-the-fly channel detection).
+    """
+    cache_key = _cache_key(label, 'channel_cache_v1')
+    pkl_path = _pickle_path(f'{label}_channel_cache_{cache_key}')
+
+    if os.path.isfile(pkl_path):
+        try:
+            with open(pkl_path, 'rb') as f:
+                cache = pickle.load(f)
+            print(f"[evaluator] Loaded channel cache from {pkl_path} "
+                  f"({len(cache)} entries)")
+            return cache
+        except Exception as e:
+            print(f"[evaluator] Channel cache load failed ({e}), rebuilding...")
+
+    from v15.core.channel_cache import precompute_channels_full
+    import logging
+    logging.basicConfig(level=logging.INFO)
+
+    print(f"[evaluator] Precomputing channel cache for {label}...")
+    cache = precompute_channels_full(data, eval_interval=3)
+    print(f"[evaluator] Channel cache built: {len(cache)} entries")
+
+    try:
+        with open(pkl_path, 'wb') as f:
+            pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+        size_mb = os.path.getsize(pkl_path) / (1024 * 1024)
+        print(f"[evaluator] Saved channel cache ({pkl_path}, {size_mb:.0f} MB)")
+    except Exception as e:
+        print(f"[evaluator] WARNING: failed to save channel cache: {e}")
+
+    return cache
+
+
+# Module-level channel caches (loaded once per process alongside data)
+_TRAIN_CHANNEL_CACHE = None
+_HOLDOUT_CHANNEL_CACHE = None
+
+
+def _get_train_channel_cache(data):
+    """Get or build the training channel cache."""
+    global _TRAIN_CHANNEL_CACHE
+    if _TRAIN_CHANNEL_CACHE is not None:
+        return _TRAIN_CHANNEL_CACHE
+    _TRAIN_CHANNEL_CACHE = _load_channel_cache(data, 'train')
+    return _TRAIN_CHANNEL_CACHE
+
+
+def _get_holdout_channel_cache(data):
+    """Get or build the holdout channel cache."""
+    global _HOLDOUT_CHANNEL_CACHE
+    if _HOLDOUT_CHANNEL_CACHE is not None:
+        return _HOLDOUT_CHANNEL_CACHE
+    _HOLDOUT_CHANNEL_CACHE = _load_channel_cache(data, 'holdout')
+    return _HOLDOUT_CHANNEL_CACHE
+
+
 def _run_backtest(data, candidate_on_bar, candidate_compute_atr,
                   stop_check_mode: str, stop_check_secs: int,
-                  stop_update_secs: int, grace_ratchet_secs: int):
+                  stop_update_secs: int, grace_ratchet_secs: int,
+                  channel_cache=None):
     """Run a single backtest with the given data and config. Returns (metrics, error)."""
     from copy import deepcopy
     from v15.validation.unified_backtester.algos.surfer_ml import (
@@ -226,6 +289,14 @@ def _run_backtest(data, candidate_on_bar, candidate_compute_atr,
 
     algo = SurferMLAlgo(config, data)
 
+    # Set precomputed channel cache on the algo instance.
+    # - If on_bar is NOT monkey-patched: the built-in on_bar uses it directly.
+    # - If on_bar IS monkey-patched: the candidate can check self._channel_cache
+    #   or call lookup_cached_analysis(time) from v15.core.channel_cache.
+    #   Candidates that don't check it will run at full speed (no regression).
+    if channel_cache is not None:
+        algo._channel_cache = channel_cache
+
     # Monkey-patch entry logic
     algo.on_bar = types.MethodType(candidate_on_bar, algo)
     algo._compute_current_atr = types.MethodType(candidate_compute_atr, algo)
@@ -240,7 +311,15 @@ def _run_backtest(data, candidate_on_bar, candidate_compute_atr,
     )
 
     engine = BacktestEngine(data, [algo], portfolio, verbose=False)
-    engine.run()
+
+    # Activate the channel cache as thread-local context so that candidates
+    # can also use lookup_cached_analysis(time) or lookup_cached_full(time)
+    if channel_cache is not None:
+        from v15.core.channel_cache import active_channel_cache
+        with active_channel_cache(channel_cache):
+            engine.run()
+    else:
+        engine.run()
 
     trades = portfolio.get_trades(algo_id='surfer-ml')
     if not trades:
@@ -326,6 +405,13 @@ def evaluate(program_path: str) -> dict:
     except Exception as e:
         return {'combined_score': 0.0, 'error': f'train data load failed: {e}'}
 
+    # Load precomputed channel cache (built once, reused across evaluations)
+    try:
+        train_cc = _get_train_channel_cache(train_data)
+    except Exception as e:
+        print(f"[evaluator] WARNING: channel cache failed ({e}), running without cache")
+        train_cc = None
+
     try:
         train_m, train_err = _run_backtest(
             data=train_data,
@@ -338,6 +424,7 @@ def evaluate(program_path: str) -> dict:
             stop_check_secs=60,
             stop_update_secs=60,
             grace_ratchet_secs=60,
+            channel_cache=train_cc,
         )
     except Exception as e:
         return {'combined_score': 0.0,
@@ -363,6 +450,14 @@ def evaluate(program_path: str) -> dict:
     # ── 2. Holdout backtest (5-sec data, sequential stop mode) ───────────────
     try:
         holdout_data = _load_holdout_data()
+
+        # Load holdout channel cache
+        try:
+            holdout_cc = _get_holdout_channel_cache(holdout_data)
+        except Exception as e:
+            print(f"[evaluator] WARNING: holdout channel cache failed ({e})")
+            holdout_cc = None
+
         holdout_m, holdout_err = _run_backtest(
             data=holdout_data,
             candidate_on_bar=candidate_on_bar,
@@ -372,6 +467,7 @@ def evaluate(program_path: str) -> dict:
             stop_check_secs=5,
             stop_update_secs=60,
             grace_ratchet_secs=60,
+            channel_cache=holdout_cc,
         )
         if holdout_m is not None:
             result['holdout_total_pnl'] = holdout_m['total_pnl']

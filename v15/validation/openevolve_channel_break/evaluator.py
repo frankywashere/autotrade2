@@ -266,6 +266,9 @@ class ChannelBreakAlgo:
         self._predict_fn = predict_fn
         self._pos_state = {}
         self._bar_count = 0
+        # Precomputed channel cache (set externally)
+        # Dict[pd.Timestamp, dict] with keys: analysis, best_ch, channels_by_tf, df_slice
+        self._channel_cache = None
 
     @property
     def algo_id(self):
@@ -276,86 +279,88 @@ class ChannelBreakAlgo:
 
     def on_bar(self, time, bar, open_positions, context=None):
         """Run channel detection, extract features, call candidate predictor."""
-        from v15.core.channel import detect_channels_multi_window, select_best_channel
-        from v15.core.channel_surfer import (
-            analyze_channels, TF_WINDOWS,
-            compute_channel_position, compute_potential_energy,
-            compute_kinetic_energy, compute_binding_energy,
-            compute_shannon_entropy, compute_oscillation_period,
-            compute_channel_health, compute_squeeze_score,
-            compute_momentum_turn, compute_volume_score,
-            fit_ou_process, compute_ou_reversion_score,
-            estimate_break_probability, OU_MIN_SAMPLES,
-        )
-        from v15.core.channel_surfer import TFChannelState, Direction
         from v15.validation.unified_backtester.algo_base import Signal
 
         # Anti-pyramid: skip if already have position in same direction
         existing_dirs = {p.direction for p in open_positions}
 
-        # Get 5-min data: last 100 bars (matching surfer_ml)
-        df5 = self.data.get_bars('5min', time)
-        if len(df5) < 20:
-            return []
-        df_slice = df5.tail(100)
+        # ---- Channel detection: use precomputed cache or compute on-the-fly ----
+        if self._channel_cache is not None:
+            cached = self._channel_cache.get(time)
+            if cached is None:
+                return []
+            analysis = cached['analysis']
+            best_ch = cached['best_ch']
+            channels_by_tf = cached['channels_by_tf']
+            df_slice = cached['df_slice']
+        else:
+            # Slow path: compute channels on-the-fly (original behavior)
+            from v15.core.channel import detect_channels_multi_window, select_best_channel
+            from v15.core.channel_surfer import analyze_channels, TF_WINDOWS
 
-        # Detect channels on 5-min slice (matching surfer_ml lines 226-228)
-        try:
-            multi = detect_channels_multi_window(df_slice, windows=[10, 15, 20, 30, 40])
-            best_ch, _ = select_best_channel(multi)
-        except Exception:
-            return []
+            # Get 5-min data: last 100 bars (matching surfer_ml)
+            df5 = self.data.get_bars('5min', time)
+            if len(df5) < 20:
+                return []
+            df_slice = df5.tail(100)
 
-        if best_ch is None or not best_ch.valid:
-            return []
-
-        # Build multi-TF channel dict (matching surfer_ml lines 236-276)
-        slice_closes = df_slice['close'].values
-        channels_by_tf = {'5min': best_ch}
-        prices_by_tf = {'5min': slice_closes}
-        current_prices = {'5min': float(slice_closes[-1])}
-        volumes_dict = {}
-        if 'volume' in df_slice.columns:
-            volumes_dict['5min'] = df_slice['volume'].values
-
-        _TF_PERIOD = {
-            '1h': pd.Timedelta(hours=1),
-            '4h': pd.Timedelta(hours=4),
-            'daily': pd.Timedelta(days=1),
-        }
-        for tf_label in ('1h', '4h', 'daily'):
+            # Detect channels on 5-min slice (matching surfer_ml lines 226-228)
             try:
-                tf_df = self.data.get_bars(tf_label, time)
-            except (ValueError, KeyError):
-                continue
-            if len(tf_df) == 0:
-                continue
-            tf_period = _TF_PERIOD.get(tf_label, pd.Timedelta(hours=1))
-            tf_available = tf_df[tf_df.index + tf_period <= time]
-            tf_recent = tf_available.tail(100)
-            if len(tf_recent) < 30:
-                continue
-            tf_windows = TF_WINDOWS.get(tf_label, [20, 30, 40])
-            try:
-                tf_multi = detect_channels_multi_window(tf_recent, windows=tf_windows)
-                tf_ch, _ = select_best_channel(tf_multi)
-                if tf_ch and tf_ch.valid:
-                    channels_by_tf[tf_label] = tf_ch
-                    prices_by_tf[tf_label] = tf_recent['close'].values
-                    current_prices[tf_label] = float(tf_recent['close'].iloc[-1])
-                    if 'volume' in tf_recent.columns:
-                        volumes_dict[tf_label] = tf_recent['volume'].values
+                multi = detect_channels_multi_window(df_slice, windows=[10, 15, 20, 30, 40])
+                best_ch, _ = select_best_channel(multi)
             except Exception:
-                continue
+                return []
 
-        # Run analyze_channels to get full TFChannelState objects
-        try:
-            analysis = analyze_channels(
-                channels_by_tf, prices_by_tf, current_prices,
-                volumes_by_tf=volumes_dict if volumes_dict else None,
-            )
-        except Exception:
-            return []
+            if best_ch is None or not best_ch.valid:
+                return []
+
+            # Build multi-TF channel dict (matching surfer_ml lines 236-276)
+            slice_closes = df_slice['close'].values
+            channels_by_tf = {'5min': best_ch}
+            prices_by_tf = {'5min': slice_closes}
+            current_prices = {'5min': float(slice_closes[-1])}
+            volumes_dict = {}
+            if 'volume' in df_slice.columns:
+                volumes_dict['5min'] = df_slice['volume'].values
+
+            _TF_PERIOD = {
+                '1h': pd.Timedelta(hours=1),
+                '4h': pd.Timedelta(hours=4),
+                'daily': pd.Timedelta(days=1),
+            }
+            for tf_label in ('1h', '4h', 'daily'):
+                try:
+                    tf_df = self.data.get_bars(tf_label, time)
+                except (ValueError, KeyError):
+                    continue
+                if len(tf_df) == 0:
+                    continue
+                tf_period = _TF_PERIOD.get(tf_label, pd.Timedelta(hours=1))
+                tf_available = tf_df[tf_df.index + tf_period <= time]
+                tf_recent = tf_available.tail(100)
+                if len(tf_recent) < 30:
+                    continue
+                tf_windows = TF_WINDOWS.get(tf_label, [20, 30, 40])
+                try:
+                    tf_multi = detect_channels_multi_window(tf_recent, windows=tf_windows)
+                    tf_ch, _ = select_best_channel(tf_multi)
+                    if tf_ch and tf_ch.valid:
+                        channels_by_tf[tf_label] = tf_ch
+                        prices_by_tf[tf_label] = tf_recent['close'].values
+                        current_prices[tf_label] = float(tf_recent['close'].iloc[-1])
+                        if 'volume' in tf_recent.columns:
+                            volumes_dict[tf_label] = tf_recent['volume'].values
+                except Exception:
+                    continue
+
+            # Run analyze_channels to get full TFChannelState objects
+            try:
+                analysis = analyze_channels(
+                    channels_by_tf, prices_by_tf, current_prices,
+                    volumes_by_tf=volumes_dict if volumes_dict else None,
+                )
+            except Exception:
+                return []
 
         # Extract 5-min channel features
         primary_state = analysis.tf_states.get('5min')
@@ -567,9 +572,72 @@ class ChannelBreakAlgo:
         return exits
 
 
+# ── Channel cache ─────────────────────────────────────────────────────
+
+def _load_channel_cache(data, label: str):
+    """Load or build the precomputed channel cache for ChannelBreakAlgo.
+
+    Uses precompute_channels_full which stores the raw Channel
+    objects and df_slice needed for feature extraction.
+    """
+    cache_key = _cache_key(label, 'break_channel_cache_v1')
+    pkl_path = _pickle_path(f'{label}_break_channel_cache_{cache_key}')
+
+    if os.path.isfile(pkl_path):
+        try:
+            with open(pkl_path, 'rb') as f:
+                cache = pickle.load(f)
+            print(f"[evaluator:break] Loaded channel cache from {pkl_path} "
+                  f"({len(cache)} entries)")
+            return cache
+        except Exception as e:
+            print(f"[evaluator:break] Channel cache load failed ({e}), rebuilding...")
+
+    from v15.core.channel_cache import precompute_channels_full
+    import logging
+    logging.basicConfig(level=logging.INFO)
+
+    print(f"[evaluator:break] Precomputing channel cache for {label}...")
+    cache = precompute_channels_full(data, eval_interval=3)
+    print(f"[evaluator:break] Channel cache built: {len(cache)} entries")
+
+    try:
+        with open(pkl_path, 'wb') as f:
+            pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+        size_mb = os.path.getsize(pkl_path) / (1024 * 1024)
+        print(f"[evaluator:break] Saved channel cache ({pkl_path}, {size_mb:.0f} MB)")
+    except Exception as e:
+        print(f"[evaluator:break] WARNING: failed to save channel cache: {e}")
+
+    return cache
+
+
+_TRAIN_CHANNEL_CACHE = None
+_HOLDOUT_CHANNEL_CACHE = None
+
+
+def _get_train_channel_cache(data):
+    """Get or build the training channel cache."""
+    global _TRAIN_CHANNEL_CACHE
+    if _TRAIN_CHANNEL_CACHE is not None:
+        return _TRAIN_CHANNEL_CACHE
+    _TRAIN_CHANNEL_CACHE = _load_channel_cache(data, 'train')
+    return _TRAIN_CHANNEL_CACHE
+
+
+def _get_holdout_channel_cache(data):
+    """Get or build the holdout channel cache."""
+    global _HOLDOUT_CHANNEL_CACHE
+    if _HOLDOUT_CHANNEL_CACHE is not None:
+        return _HOLDOUT_CHANNEL_CACHE
+    _HOLDOUT_CHANNEL_CACHE = _load_channel_cache(data, 'holdout')
+    return _HOLDOUT_CHANNEL_CACHE
+
+
 # ── Backtest runner (shared by train + holdout) ──────────────────────────
 
-def _run_backtest(data, predict_fn, stop_check_mode='window', use_sequential=False):
+def _run_backtest(data, predict_fn, stop_check_mode='window', use_sequential=False,
+                  channel_cache=None):
     """Run a single backtest on the given DataProvider, return (metrics, n_trades).
 
     Args:
@@ -612,6 +680,10 @@ def _run_backtest(data, predict_fn, stop_check_mode='window', use_sequential=Fal
     )
 
     algo = ChannelBreakAlgo(config, data, predict_fn)
+
+    # Set precomputed channel cache (skips on-the-fly detection in on_bar)
+    if channel_cache is not None:
+        algo._channel_cache = channel_cache
 
     portfolio = PortfolioManager()
     portfolio.register_algo(
@@ -710,12 +782,20 @@ def evaluate(program_path: str) -> dict:
     except Exception as e:
         return {'combined_score': 0.0, 'error': f'import failed: {e}'}
 
+    # Load precomputed channel cache (built once, reused across evaluations)
+    try:
+        train_cc = _get_train_channel_cache(train_data)
+    except Exception as e:
+        print(f"[evaluator:break] WARNING: channel cache failed ({e}), running without")
+        train_cc = None
+
     # ── Run training backtest (1-min, 2015-2024) ──────────────────────
     try:
         train_m, train_n = _run_backtest(
             train_data, candidate_predict,
             stop_check_mode='current',
             use_sequential=False,
+            channel_cache=train_cc,
         )
     except Exception as e:
         return {'combined_score': 0.0, 'error': f'train backtest failed: {traceback.format_exc()}'}
@@ -740,10 +820,19 @@ def evaluate(program_path: str) -> dict:
     # ── Run holdout backtest (5-sec, 2025-2026) — reported only ───────
     try:
         holdout_data = _load_holdout_data()
+
+        # Load holdout channel cache
+        try:
+            holdout_cc = _get_holdout_channel_cache(holdout_data)
+        except Exception as e:
+            print(f"[evaluator:break] WARNING: holdout channel cache failed ({e})")
+            holdout_cc = None
+
         holdout_m, holdout_n = _run_backtest(
             holdout_data, candidate_predict,
             stop_check_mode='sequential',
             use_sequential=True,
+            channel_cache=holdout_cc,
         )
         if holdout_m is not None:
             result['holdout_total_pnl'] = holdout_m['total_pnl']
