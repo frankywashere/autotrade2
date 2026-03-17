@@ -251,8 +251,24 @@ def _create_algo(spec: dict, data: DataProvider):
             config.algo_id = params['id']
         return OESig5Algo(config, data)
 
+    elif algo_type in ('b2-cross', 'b2_cross', 'b2'):
+        from .algos.b2_cross_asset import B2CrossAssetAlgo, DEFAULT_B2_CONFIG
+        from copy import deepcopy
+        config = deepcopy(DEFAULT_B2_CONFIG)
+        if 'equity' in params:
+            config.initial_equity = float(params['equity'])
+            config.max_equity_per_trade = float(params['equity'])
+        if 'max_hold_bars' in params:
+            config.params['max_hold_bars'] = int(params['max_hold_bars'])
+            config.max_hold_bars = int(params['max_hold_bars'])
+        if 'eval_interval' in params:
+            config.eval_interval = int(params['eval_interval'])
+        if 'id' in params:
+            config.algo_id = params['id']
+        return B2CrossAssetAlgo(config, data)
+
     else:
-        raise ValueError(f"Unknown algo type: {algo_type}. Available: intraday, cs-combo, cs-dw, surfer-ml, surfer-ml-v2, oe-sig5")
+        raise ValueError(f"Unknown algo type: {algo_type}. Available: intraday, cs-combo, cs-dw, surfer-ml, surfer-ml-v2, oe-sig5, b2-cross")
 
 
 def main():
@@ -329,7 +345,8 @@ def main():
     algo_specs = [_parse_algo_spec(s) for s in args.algo]
     needs_context = any(s['algo_type'] in ('surfer-ml', 'surfer_ml', 'surfer',
                                             'surfer-ml-v2', 'surfer_ml_v2', 'surfer-v2',
-                                            'oe-sig5', 'oe_sig5', 'oe')
+                                            'oe-sig5', 'oe_sig5', 'oe',
+                                            'b2-cross', 'b2_cross', 'b2')
                         for s in algo_specs)
     if needs_context:
         print("  SPY/VIX daily context will be auto-loaded from native_tf (yfinance cache)")

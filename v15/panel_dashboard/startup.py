@@ -84,6 +84,7 @@ def create_live_engine(state):
     from v15.validation.unified_backtester.algos.intraday import IntradayAlgo
     from v15.validation.unified_backtester.algos.cs_combo import CSComboAlgo
     from v15.validation.unified_backtester.algos.oe_sig5 import OESig5Algo
+    from v15.validation.unified_backtester.algos.b2_cross_asset import B2CrossAssetAlgo
     import datetime as dt
 
     try:
@@ -216,6 +217,17 @@ def create_live_engine(state):
                     'default_confidence': 0.7,
                     'trail_power': 12, 'trail_base': 0.025,
                     'max_hold_days': 10, 'cooldown_days': 0,
+                },
+            ), data=data),
+            B2CrossAssetAlgo(config=AlgoConfig(
+                algo_id='c16-b2', live_orders=True,
+                initial_equity=100_000.0, max_equity_per_trade=100_000.0,
+                max_positions=2, primary_tf='5min', eval_interval=1,
+                exit_check_tf='5min', cost_model=cost,
+                max_hold_bars=60,
+                params={
+                    'flat_sizing': True,
+                    'max_hold_bars': 60,
                 },
             ), data=data),
         ]
