@@ -80,6 +80,7 @@ def create_live_engine(state):
     from v15.panel_dashboard.live_engine import LiveEngine
     from v15.validation.unified_backtester.algo_base import AlgoConfig, CostModel
     from v15.validation.unified_backtester.algos.surfer_ml import SurferMLAlgo
+    from v15.validation.unified_backtester.algos.surfer_ml_v2 import SurferMLV2Algo
     from v15.validation.unified_backtester.algos.intraday import IntradayAlgo
     from v15.validation.unified_backtester.algos.cs_combo import CSComboAlgo
     from v15.validation.unified_backtester.algos.oe_sig5 import OESig5Algo
@@ -115,6 +116,26 @@ def create_live_engine(state):
                 max_positions=2, primary_tf='5min', eval_interval=2,
                 exit_check_tf='5min', cost_model=cost,
                 # OpenEvolve Phase A best (iter 6): score=1.14M, $45K, 0.34 Sharpe, 16.6% DD
+                exit_grace_bars=4,
+                stop_update_secs=45,
+                stop_check_secs=10,
+                grace_ratchet_secs=225,
+                profit_activated_stop=False,
+                max_underwater_mins=90,
+                max_hold_bars=60,
+                params={
+                    'flat_sizing': True, 'min_confidence': 0.01,
+                    'max_hold_bars': 60, 'ou_half_life': 5.0,
+                    'stop_pct': 0.015, 'tp_pct': 0.012,
+                    'breakout_stop_mult': 0.55,
+                },
+            ), data=data),
+            SurferMLV2Algo(config=AlgoConfig(
+                algo_id='c16-ml-v2', live_orders=True,
+                initial_equity=100_000.0, max_equity_per_trade=100_000.0,
+                max_positions=2, primary_tf='5min', eval_interval=2,
+                exit_check_tf='5min', cost_model=cost,
+                # Same knobs as c16-ml — only exit logic differs (Phase C evolved)
                 exit_grace_bars=4,
                 stop_update_secs=45,
                 stop_check_secs=10,

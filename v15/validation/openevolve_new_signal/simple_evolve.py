@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Phase C: Evolutionary exit logic tuning for surfer-ml.
+Phase B2: Evolutionary discovery of new cross-asset TSLA/SPY/VIX signal.
 
-Instead of tuning numeric knobs (Phase A), the LLM rewrites the actual
-Python code for get_effective_stop() and check_exits(). The evaluator
-monkey-patches these onto SurferMLAlgo and runs the full backtest.
+Clean-slate signal search: NO channel physics, NO existing ML models.
+The LLM writes raw Python that reads 5-min TSLA/SPY/VIX bars (RTH only,
+09:30-16:00 ET) and decides when to enter trades. The evaluator backtests
+on 2015-2024 (scored) and 2025-01 to 2025-09 (holdout, reported only).
 
 Usage:
-    python -u v15/validation/openevolve_surfer_exit/simple_evolve.py
+    python -u v15/validation/openevolve_new_signal/simple_evolve.py
 """
 
 import json
@@ -20,7 +21,7 @@ import time
 import traceback
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MAX_ITERATIONS = 300
+MAX_ITERATIONS = 1000
 CLAUDE_CMD = r"C:\Users\frank\.local\bin\claude.exe"
 MODEL = "sonnet"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -29,7 +30,6 @@ LOG_FILE = os.path.join(OUTPUT_DIR, "simple_evolve.log")
 BEST_FILE = os.path.join(OUTPUT_DIR, "best_program.py")
 STATE_FILE = os.path.join(OUTPUT_DIR, "evolve_state.json")
 
-# Evaluator runs in subprocess to avoid memory leaks
 EVAL_SCRIPT = os.path.join(BASE_DIR, "eval_subprocess.py")
 INITIAL_PROGRAM = os.path.join(BASE_DIR, "initial_program.py")
 
@@ -50,7 +50,7 @@ def evaluate_in_subprocess(program_path):
     try:
         result = subprocess.run(
             [sys.executable, EVAL_SCRIPT, program_path],
-            capture_output=True, text=True, timeout=1200,
+            capture_output=True, text=True, timeout=600,
             encoding="utf-8", errors="replace",
         )
         if result.returncode != 0:
@@ -65,7 +65,7 @@ def evaluate_in_subprocess(program_path):
         log(f"  No JSON in eval output: {result.stdout[-300:]}")
         return None
     except subprocess.TimeoutExpired:
-        log("  Eval timed out (1200s)")
+        log("  Eval timed out (600s)")
         return None
     except Exception as e:
         log(f"  Eval error: {e}")
@@ -97,54 +97,74 @@ def read_program_code(path):
 
 
 def build_prompt(current_code, current_score, current_metrics, history):
-    """Build prompt for LLM to suggest improved exit logic code."""
+    """Build prompt for LLM to discover new cross-asset trading signals."""
     history_str = ""
     if history:
         history_str = "\n\nPrevious attempts (sorted by score, best first):\n"
-        for h in sorted(history, key=lambda x: x["score"], reverse=True)[:8]:
+        for h in sorted(history, key=lambda x: x["score"], reverse=True)[:10]:
             desc = h.get("description", "no description")
+            holdout_info = ""
+            if 'holdout_pnl' in h:
+                holdout_info = f" [HOLDOUT: ${h['holdout_pnl']:.0f}/{h['holdout_trades']} trades]"
             history_str += (
                 f"  Score={h['score']:.0f} PnL=${h['pnl']:.0f} "
                 f"Trades={h['trades']} WR={h['wr']:.1f}% "
-                f"Sharpe={h['sharpe']:.3f} DD={h['dd']:.1f}% "
-                f"— {desc}\n"
+                f"Sharpe={h['sharpe']:.3f} DD={h['dd']:.1f}%"
+                f"{holdout_info} -- {desc}\n"
             )
 
-    return f"""You are evolving exit logic for a TSLA trading algorithm (surfer-ml).
-The ML entry signal is FROZEN — you can ONLY change how exits work.
+    holdout_str = ""
+    hp = current_metrics.get('holdout_pnl', 0)
+    ht = current_metrics.get('holdout_trades', 0)
+    hs = current_metrics.get('holdout_sharpe', 0)
+    if ht > 0:
+        holdout_str = f"""
+## Holdout period (2025-01 to 2025-09, NOT used for scoring — reality check only):
+  PnL: ${hp:.0f}  Trades: {ht}  Sharpe: {hs:.3f}
+  WARNING: If holdout PnL is much worse than training, you are likely overfitting.
+  Aim for signals that generalize — structural cross-asset relationships, not curve-fitted patterns.
+"""
 
-You must write TWO Python functions: get_effective_stop() and check_exits().
-These are monkey-patched as methods onto the algo instance (use `self`).
+    return f"""You are discovering NEW trading signals for TSLA using cross-asset data.
+This is a CLEAN-SLATE search — no existing models, no channel physics.
 
-## Position object fields (READ-ONLY, do not modify):
-  pos.pos_id — unique position ID
-  pos.direction — 'long' or 'short'
-  pos.entry_price — fill price at entry
-  pos.stop_price — initial stop (set at entry, never changes)
-  pos.tp_price — take-profit price (set at entry, never changes)
-  pos.best_price — highest price seen for longs, lowest for shorts (engine-ratcheted)
-  pos.hold_bars — number of 5-min bars held so far
-  pos.signal_type — 'bounce' or 'break'
-  pos.metadata — dict with 'el_flagged', 'trail_width_mult', 'fast_reversion', 'ou_half_life', etc.
+You must write a Python function: generate_signals()
 
-## Per-position state: self._pos_state[pos.pos_id]
-  A dict you can read/write. Seeded at entry with:
-    'el_flagged': bool, 'trail_width_mult': float, 'fast_reversion': bool,
-    'ou_half_life': float, 'window_high': float, 'window_low': float
-  You can add any keys you want for tracking state across bars.
+## Function signature:
+```python
+def generate_signals(tsla_bars, spy_bars, vix_bars, current_time, position_info):
+    \"\"\"
+    Args:
+        tsla_bars: pd.DataFrame with columns [open, high, low, close, volume]
+                   Last 100 FIVE-MINUTE RTH bars ending at current_time (DatetimeIndex)
+                   RTH = 09:30-16:00 ET. ~78 bars per trading day.
+        spy_bars: pd.DataFrame, same format, same timestamps
+        vix_bars: pd.DataFrame, same format (VIX index values in OHLC)
+        current_time: pd.Timestamp (current bar's timestamp, always during RTH)
+        position_info: dict with 'has_long': bool, 'has_short': bool,
+                       'n_positions': int, 'max_positions': int (=2)
+    Returns:
+        list of dicts: [{{'direction': 'long'/'short', 'confidence': 0-1,
+                         'stop_pct': float (e.g. 0.005 = 0.5%),
+                         'tp_pct': float (e.g. 0.008 = 0.8%)}}]
+        Empty list = no signal.
+    \"\"\"
+```
 
-## Config values available: self.config.max_hold_bars, self.config.eval_interval
-
-## ExitSignal: import from v15.validation.unified_backtester.algo_base
-  ExitSignal(pos_id=str, price=float, reason=str)
-  Valid reasons: 'stop', 'trail', 'tp', 'ou_timeout', 'timeout'
+## Execution model:
+- Called once per 5-MINUTE bar during RTH 09:30-16:00 ET (2015-2024 training, 2025-01 to 2025-09 holdout)
+- Entry at current bar's close, exits at stop/TP/timeout (max 78 bars = ~1 trading day)
+- Max 2 simultaneous positions, flat $100K sizing per trade
+- Simple fixed stop/TP exits (the stop_pct and tp_pct you return)
+- Typical stop: 0.1%-2%. Typical TP: 0.2%-3%. These are INTRADAY moves.
+- Slippage: 0.05% per side. Commission: $2 round-trip.
 
 ## Current best code (score={current_score:.0f}):
 ```python
 {current_code}
 ```
 
-## Current best metrics:
+## Current best metrics (TRAINING period 2015-2024):
   Total P&L: ${current_metrics.get('total_pnl', 0):.0f}
   Trades: {current_metrics.get('n_trades', 0):.0f}
   Win Rate: {current_metrics.get('win_rate', 0):.1f}%
@@ -152,34 +172,39 @@ These are monkey-patched as methods onto the algo instance (use `self`).
   Profit Factor: {current_metrics.get('profit_factor', 0):.3f}
   Max Drawdown: {current_metrics.get('max_drawdown_pct', 0):.1f}%
   Avg P&L per trade: ${current_metrics.get('avg_pnl', 0):.0f}
-{history_str}
+  Avg hold (5-min bars): {current_metrics.get('avg_hold', 0):.1f}
+{holdout_str}{history_str}
 ## Scoring formula:
 score = PnL * (1 + max(sharpe,0) * 0.2) * (0.3 + WR * 0.7) * (1 + max(PF-1,0) * 0.1) * trade_mult * dd_mult
-Higher is better. Maximize PnL and Sharpe while keeping drawdown low.
+- trade_mult penalizes <500 trades (overfit) or >25000 trades (noise)
+- dd_mult penalizes >10% drawdown
+- Minimum 500 trades on training period required for full score
 
-## What to try:
-- Different trailing stop tightening curves (polynomial, exponential, step-function)
-- Different profit tier thresholds or number of tiers
-- Time-based trail tightening (tighter as hold_bars increases)
-- Different handling of breakout vs bounce signal types
-- Asymmetric long/short trailing (market has upward bias)
-- Earlier/later breakeven moves
-- Dynamic TP adjustment based on momentum
-- Different OU timeout formulas
-- ATR-based or volatility-adaptive stops (you can compute from recent bars)
+## Ideas to explore (you can combine these freely):
+- **Cross-asset momentum**: TSLA vs SPY relative strength, TSLA/SPY ratio mean-reversion
+- **Volatility regime**: VIX level thresholds, VIX spikes, VIX mean-reversion
+- **Volume patterns**: TSLA volume spikes relative to moving average, volume-price divergence
+- **Multi-period momentum**: Different lookback periods (5, 12, 25, 50, 78 bars) combined
+- **Mean reversion**: Bollinger band touches, distance from moving averages, z-scores
+- **Trend following**: Moving average crossovers, breakout from N-bar range
+- **Cross-asset divergence**: When TSLA decouples from SPY, catch the reversion
+- **Intraday patterns**: Opening range breakout, VWAP deviation, time-of-day effects
+- **Risk-adjusted entry**: Scale stop_pct and tp_pct based on recent realized volatility
+- **Adaptive parameters**: Different behavior in high-vol vs low-vol regimes
+- **Time-of-day effects**: First/last hour patterns, lunch hour lull, opening drive
 
 ## Rules:
-1. You MUST define both get_effective_stop(self, position) and check_exits(self, time, bar, open_positions)
-2. get_effective_stop returns a float (the effective stop price) or None
-3. check_exits returns a list of ExitSignal objects
-4. Import ExitSignal inside check_exits: from v15.validation.unified_backtester.algo_base import ExitSignal
-5. Do NOT import or modify the entry signal — only exit logic
-6. Keep it simple enough to not crash. If in doubt, keep existing logic and change one thing.
-7. Include a brief # comment at the top describing what you changed
+1. You MUST define: def generate_signals(tsla_bars, spy_bars, vix_bars, current_time, position_info)
+2. Return a list of dicts with 'direction', 'confidence', 'stop_pct', 'tp_pct'
+3. You may import numpy and pandas (already available)
+4. Do NOT use any external data — only the bars passed in
+5. Keep code robust — handle edge cases (empty arrays, division by zero)
+6. Include a brief # comment at the top describing your approach
+7. Aim for GENERALIZABLE signals — structural relationships, not curve-fitted patterns
 
 ## Output format:
-Respond with ONLY a Python code block containing both functions. No explanation outside the code.
-Start with ```python and end with ```. Include necessary imports (typing, etc.) at the top of the block.
+Respond with ONLY a Python code block. No explanation outside the code.
+Start with ```python and end with ```.
 """
 
 
@@ -188,33 +213,34 @@ def extract_code(llm_response):
     if not llm_response:
         return None
 
-    # Try to find ```python ... ``` block
+    # Try ```python ... ```
     pattern = r'```python\s*\n(.*?)```'
     match = re.search(pattern, llm_response, re.DOTALL)
     if match:
         return match.group(1).strip()
 
-    # Try ``` ... ``` without language tag
+    # Try ``` ... ```
     pattern = r'```\s*\n(.*?)```'
     match = re.search(pattern, llm_response, re.DOTALL)
     if match:
         code = match.group(1).strip()
-        if 'def get_effective_stop' in code:
+        if 'def generate_signals' in code:
             return code
 
-    # If response itself looks like code
-    if 'def get_effective_stop' in llm_response and 'def check_exits' in llm_response:
+    # If response looks like code
+    if 'def generate_signals' in llm_response:
         return llm_response.strip()
 
     return None
 
 
 def validate_code(code):
-    """Basic validation that the code defines required functions."""
-    if 'def get_effective_stop' not in code:
-        return False, "missing get_effective_stop()"
-    if 'def check_exits' not in code:
-        return False, "missing check_exits()"
+    """Basic validation that the code defines the required function."""
+    if 'def generate_signals' not in code:
+        return False, "missing generate_signals()"
+    # Check it accepts the right number of arguments
+    if 'generate_signals(' not in code:
+        return False, "generate_signals not callable"
     # Try to compile
     try:
         compile(code, '<candidate>', 'exec')
@@ -228,7 +254,7 @@ def extract_description(code):
     for line in code.split('\n'):
         line = line.strip()
         if line.startswith('#') and len(line) > 3:
-            return line[1:].strip()[:100]
+            return line[1:].strip()[:120]
     return "no description"
 
 
@@ -239,7 +265,7 @@ def save_state(iteration, best_score, best_metrics, history):
         "best_score": best_score,
         "best_metrics": {k: v for k, v in best_metrics.items()
                          if isinstance(v, (int, float, str, bool))},
-        "history": history[-50:],  # Keep last 50 entries
+        "history": history[-50:],
     }
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -248,7 +274,7 @@ def save_state(iteration, best_score, best_metrics, history):
 
 
 def load_state():
-    """Load saved state if it exists. Returns None if no state."""
+    """Load saved state if it exists."""
     if not os.path.isfile(STATE_FILE):
         return None
     try:
@@ -261,8 +287,12 @@ def load_state():
 
 def main():
     log("=" * 60)
-    log("Phase C: Surfer-ML Exit Logic Evolution")
+    log("Phase B2: New Cross-Asset Signal Discovery")
     log("=" * 60)
+    log(f"Training: 2015-01-01 to 2024-12-31 (scored)")
+    log(f"Holdout:  2025-01-01 to 2025-09-27 (reported only)")
+    log(f"Data: 5-min TSLA/SPY/VIX bars from 1-min files (RTH only)")
+    log(f"Max iterations: {MAX_ITERATIONS}")
 
     # Check for resume state
     saved = load_state()
@@ -273,7 +303,6 @@ def main():
         best_score = saved["best_score"]
         best_metrics = saved["best_metrics"]
         history = saved["history"]
-        # Best code is in BEST_FILE
         if os.path.isfile(BEST_FILE):
             best_code = read_program_code(BEST_FILE)
         else:
@@ -283,28 +312,41 @@ def main():
             f"PnL=${best_metrics.get('total_pnl', 0):.0f})")
     else:
         # Evaluate initial program
-        log("Evaluating initial program (current exit logic)...")
+        log("Evaluating initial program...")
         result = evaluate_in_subprocess(INITIAL_PROGRAM)
-        if not result or result.get("combined_score", 0) <= 0:
+        if not result:
             log(f"Initial evaluation failed: {result}")
             sys.exit(1)
 
-        best_score = result["combined_score"]
+        best_score = result.get("combined_score", 0)
         best_metrics = result
         best_code = read_program_code(INITIAL_PROGRAM)
-        log(f"Initial: score={best_score:.0f} PnL=${result['total_pnl']:.0f} "
-            f"trades={result['n_trades']:.0f} WR={result['win_rate']:.1f}% "
-            f"Sharpe={result['sharpe']:.3f} DD={result['max_drawdown_pct']:.1f}%")
+
+        log(f"Initial: score={best_score:.0f} "
+            f"PnL=${result.get('total_pnl', 0):.0f} "
+            f"trades={result.get('n_trades', 0):.0f} "
+            f"WR={result.get('win_rate', 0):.1f}% "
+            f"Sharpe={result.get('sharpe', 0):.3f} "
+            f"DD={result.get('max_drawdown_pct', 0):.1f}%")
+
+        holdout_pnl = result.get('holdout_pnl', 0)
+        holdout_trades = result.get('holdout_trades', 0)
+        log(f"  Holdout: PnL=${holdout_pnl:.0f} trades={holdout_trades}")
 
         # Save initial as best
         with open(BEST_FILE, "w", encoding="utf-8") as f:
             f.write(best_code)
 
         history = [{
-            "score": best_score, "pnl": result["total_pnl"],
-            "trades": result["n_trades"], "wr": result["win_rate"],
-            "sharpe": result["sharpe"], "dd": result["max_drawdown_pct"],
-            "description": "initial (current production logic)",
+            "score": best_score,
+            "pnl": result.get("total_pnl", 0),
+            "trades": result.get("n_trades", 0),
+            "wr": result.get("win_rate", 0),
+            "sharpe": result.get("sharpe", 0),
+            "dd": result.get("max_drawdown_pct", 0),
+            "holdout_pnl": holdout_pnl,
+            "holdout_trades": holdout_trades,
+            "description": "initial (RSI + VIX spike + SPY trend)",
         }]
         save_state(0, best_score, best_metrics, history)
 
@@ -314,9 +356,9 @@ def main():
         try:
             log(f"\n--- Iteration {i}/{MAX_ITERATIONS} ---")
 
-            # Call LLM for new exit logic code
+            # Call LLM for new signal code
             prompt = build_prompt(best_code, best_score, best_metrics, history)
-            log("  Calling LLM for exit logic code...")
+            log("  Calling LLM for signal code...")
             t0 = time.time()
             response = call_llm(prompt)
             llm_time = time.time() - t0
@@ -334,9 +376,9 @@ def main():
                 continue
 
             description = extract_description(code)
-            log(f"  Change: {description}")
+            log(f"  Approach: {description}")
 
-            # Write candidate program to temp file
+            # Write candidate to temp file
             with tempfile.NamedTemporaryFile(suffix=".py", delete=False,
                                               dir=OUTPUT_DIR, mode="w",
                                               encoding="utf-8") as tf:
@@ -356,38 +398,56 @@ def main():
                 pass
 
             if not result or result.get("combined_score", 0) <= 0:
-                error = result.get("error", "unknown") if result else "no result"
-                log(f"  Evaluation failed ({eval_time:.0f}s): {error[:200]}")
+                if result and 'total_pnl' in result:
+                    log(f"  Score=0 ({eval_time:.0f}s): PnL=${result['total_pnl']:.0f} trades={result.get('n_trades',0)} WR={result.get('win_rate',0):.1f}% Sharpe={result.get('sharpe',0):.3f}")
+                else:
+                    error = result.get("error", "unknown") if result else "no result"
+                    log(f"  Evaluation failed ({eval_time:.0f}s): {error[:200]}")
                 continue
 
             score = result["combined_score"]
+            holdout_pnl = result.get('holdout_pnl', 0)
+            holdout_trades = result.get('holdout_trades', 0)
+
             log(f"  Result ({eval_time:.0f}s): score={score:.0f} "
-                f"PnL=${result['total_pnl']:.0f} trades={result['n_trades']:.0f} "
-                f"WR={result['win_rate']:.1f}% Sharpe={result['sharpe']:.3f} "
+                f"PnL=${result['total_pnl']:.0f} "
+                f"trades={result['n_trades']:.0f} "
+                f"WR={result['win_rate']:.1f}% "
+                f"Sharpe={result['sharpe']:.3f} "
                 f"DD={result['max_drawdown_pct']:.1f}%")
+            log(f"  Holdout: PnL=${holdout_pnl:.0f} "
+                f"trades={holdout_trades}")
 
             history.append({
-                "score": score, "pnl": result["total_pnl"],
-                "trades": result["n_trades"], "wr": result["win_rate"],
-                "sharpe": result["sharpe"], "dd": result["max_drawdown_pct"],
+                "score": score,
+                "pnl": result["total_pnl"],
+                "trades": result["n_trades"],
+                "wr": result["win_rate"],
+                "sharpe": result["sharpe"],
+                "dd": result["max_drawdown_pct"],
+                "holdout_pnl": holdout_pnl,
+                "holdout_trades": holdout_trades,
                 "description": description,
             })
 
             if score > best_score:
                 improvement = score - best_score
-                log(f"  *** NEW BEST! score={score:.0f} (+{improvement:.0f}) ***")
+                log(f"  *** NEW BEST! score={score:.0f} "
+                    f"(+{improvement:.0f}) ***")
                 best_score = score
                 best_metrics = result
                 best_code = code
                 with open(BEST_FILE, "w", encoding="utf-8") as f:
                     f.write(code)
-                # Also save numbered copy for reference
+                # Numbered copy
                 numbered = os.path.join(OUTPUT_DIR, f"best_iter{i}.py")
                 with open(numbered, "w", encoding="utf-8") as f:
-                    f.write(f"# Score={score:.0f} PnL=${result['total_pnl']:.0f} "
+                    f.write(f"# Score={score:.0f} "
+                            f"PnL=${result['total_pnl']:.0f} "
                             f"Trades={result['n_trades']:.0f} "
                             f"WR={result['win_rate']:.1f}% "
-                            f"Sharpe={result['sharpe']:.3f}\n")
+                            f"Sharpe={result['sharpe']:.3f} "
+                            f"Holdout=${holdout_pnl:.0f}\n")
                     f.write(code)
             else:
                 log(f"  No improvement (best={best_score:.0f})")
@@ -399,7 +459,7 @@ def main():
             consecutive_errors += 1
             log(f"  ITERATION {i} CRASHED: {e}\n{traceback.format_exc()}")
             if consecutive_errors >= 5:
-                log("  5 consecutive errors — aborting to avoid infinite loop")
+                log("  5 consecutive errors -- aborting")
                 break
             continue
 
@@ -408,6 +468,7 @@ def main():
     log(f"Best metrics: PnL=${best_metrics.get('total_pnl', 0):.0f} "
         f"Sharpe={best_metrics.get('sharpe', 0):.3f} "
         f"DD={best_metrics.get('max_drawdown_pct', 0):.1f}%")
+    log(f"Holdout: PnL=${best_metrics.get('holdout_pnl', 0):.0f}")
     log(f"Best program saved to: {BEST_FILE}")
 
 

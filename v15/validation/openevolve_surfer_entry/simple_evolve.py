@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Phase C: Evolutionary exit logic tuning for surfer-ml.
+Phase B1: Evolutionary entry logic tuning for surfer-ml.
 
-Instead of tuning numeric knobs (Phase A), the LLM rewrites the actual
-Python code for get_effective_stop() and check_exits(). The evaluator
-monkey-patches these onto SurferMLAlgo and runs the full backtest.
+The LLM rewrites the actual Python code for on_bar() and _compute_current_atr().
+The evaluator monkey-patches these onto SurferMLAlgo and runs the full backtest.
+ML models are frozen -- the LLM evolves the code that uses them.
+Exit logic is frozen -- only entry logic changes.
 
 Usage:
-    python -u v15/validation/openevolve_surfer_exit/simple_evolve.py
+    python -u v15/validation/openevolve_surfer_entry/simple_evolve.py
 """
 
 import json
@@ -19,8 +20,8 @@ import tempfile
 import time
 import traceback
 
-# ── Config ────────────────────────────────────────────────────────────────────
-MAX_ITERATIONS = 300
+# -- Config --
+MAX_ITERATIONS = 1000
 CLAUDE_CMD = r"C:\Users\frank\.local\bin\claude.exe"
 MODEL = "sonnet"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -50,7 +51,7 @@ def evaluate_in_subprocess(program_path):
     try:
         result = subprocess.run(
             [sys.executable, EVAL_SCRIPT, program_path],
-            capture_output=True, text=True, timeout=1200,
+            capture_output=True, text=True, timeout=3600,
             encoding="utf-8", errors="replace",
         )
         if result.returncode != 0:
@@ -97,7 +98,7 @@ def read_program_code(path):
 
 
 def build_prompt(current_code, current_score, current_metrics, history):
-    """Build prompt for LLM to suggest improved exit logic code."""
+    """Build prompt for LLM to suggest improved entry logic code."""
     history_str = ""
     if history:
         history_str = "\n\nPrevious attempts (sorted by score, best first):\n"
@@ -107,37 +108,56 @@ def build_prompt(current_code, current_score, current_metrics, history):
                 f"  Score={h['score']:.0f} PnL=${h['pnl']:.0f} "
                 f"Trades={h['trades']} WR={h['wr']:.1f}% "
                 f"Sharpe={h['sharpe']:.3f} DD={h['dd']:.1f}% "
-                f"— {desc}\n"
+                f"-- {desc}\n"
             )
 
-    return f"""You are evolving exit logic for a TSLA trading algorithm (surfer-ml).
-The ML entry signal is FROZEN — you can ONLY change how exits work.
+    return f"""You are evolving ENTRY logic for a TSLA trading algorithm (surfer-ml).
+The exit logic is FROZEN -- you can ONLY change how entries work.
+The ML models (GBT, EL, ER, fast_rev) are FROZEN -- you can only change how their outputs are used.
 
-You must write TWO Python functions: get_effective_stop() and check_exits().
+You must write TWO Python functions: on_bar() and _compute_current_atr().
 These are monkey-patched as methods onto the algo instance (use `self`).
 
-## Position object fields (READ-ONLY, do not modify):
-  pos.pos_id — unique position ID
-  pos.direction — 'long' or 'short'
-  pos.entry_price — fill price at entry
-  pos.stop_price — initial stop (set at entry, never changes)
-  pos.tp_price — take-profit price (set at entry, never changes)
-  pos.best_price — highest price seen for longs, lowest for shorts (engine-ratcheted)
-  pos.hold_bars — number of 5-min bars held so far
-  pos.signal_type — 'bounce' or 'break'
-  pos.metadata — dict with 'el_flagged', 'trail_width_mult', 'fast_reversion', 'ou_half_life', etc.
+## self (SurferMLAlgo instance) fields:
+  self.data -- DataProvider with get_bars(tf, time, symbol='TSLA'/'SPY'/'VIX')
+    TFs: '5min', '1h', '4h', 'daily'. Returns DataFrame with OHLCV columns.
+  self.config.algo_id -- 'surfer-ml'
+  self.config.eval_interval -- 3 (check every 3 bars = 15 min)
+  self.config.params -- dict with:
+    'min_confidence' (0.01), 'stop_pct' (0.015), 'tp_pct' (0.012),
+    'atr_period' (14), 'breakout_stop_mult' (1.00), 'ou_half_life' (5.0)
+  self._gbt_model -- dict of Boosters: {{'action': Booster, ...}} or None
+  self._el_model -- Extreme Loser Booster or None
+  self._er_model -- Extended Run Booster or None
+  self._fast_rev_model -- Fast Reversion Booster or None
+  self._el_derive, self._er_derive, self._fr_derive -- callable(full_vec) -> subset or None
+  self._history_buffer -- list (for build_feature_vector temporal features)
+  self._feature_names -- list or None
+  self._pos_state -- dict[pos_id, dict]
 
-## Per-position state: self._pos_state[pos.pos_id]
-  A dict you can read/write. Seeded at entry with:
-    'el_flagged': bool, 'trail_width_mult': float, 'fast_reversion': bool,
-    'ou_half_life': float, 'window_high': float, 'window_low': float
-  You can add any keys you want for tracking state across bars.
+## on_bar parameters:
+  time -- pd.Timestamp of current bar
+  bar -- dict with 'open', 'high', 'low', 'close', 'volume'
+  open_positions -- list of Position objects with .direction, .signal_type, etc.
+  context -- TradeContext (passed to build_feature_vector)
 
-## Config values available: self.config.max_hold_bars, self.config.eval_interval
+## on_bar must return: List[Signal]
+  Signal(algo_id, direction, price, confidence, stop_pct, tp_pct, signal_type, metadata)
+  Import: from v15.validation.unified_backtester.algo_base import Signal
 
-## ExitSignal: import from v15.validation.unified_backtester.algo_base
-  ExitSignal(pos_id=str, price=float, reason=str)
-  Valid reasons: 'stop', 'trail', 'tp', 'ou_timeout', 'timeout'
+## Channel detection pipeline (KEEP THIS STRUCTURE):
+  from v15.core.channel import detect_channels_multi_window, select_best_channel
+  from v15.core.channel_surfer import analyze_channels, TF_WINDOWS
+  - detect_channels_multi_window(df, windows=[...]) -> multi-window results
+  - select_best_channel(multi) -> (best_channel, score)
+  - analyze_channels(channels_by_tf, prices_by_tf, current_prices, volumes_by_tf) -> analysis
+  - analysis.signal has: .action ('BUY'/'SELL'/'HOLD'), .confidence, .signal_type ('bounce'/'break'),
+    .suggested_stop_pct, .suggested_tp_pct
+
+## ML feature vector (KEEP THIS CALL):
+  from v15.core.signal_features import build_feature_vector
+  feature_vec, _ = build_feature_vector(analysis, bar_data, closes, spy_df, vix_df,
+                                         tsla_index, history_buffer, eval_interval, context, bars_df)
 
 ## Current best code (score={current_score:.0f}):
 ```python
@@ -157,29 +177,47 @@ These are monkey-patched as methods onto the algo instance (use `self`).
 score = PnL * (1 + max(sharpe,0) * 0.2) * (0.3 + WR * 0.7) * (1 + max(PF-1,0) * 0.1) * trade_mult * dd_mult
 Higher is better. Maximize PnL and Sharpe while keeping drawdown low.
 
-## What to try:
-- Different trailing stop tightening curves (polynomial, exponential, step-function)
-- Different profit tier thresholds or number of tiers
-- Time-based trail tightening (tighter as hold_bars increases)
-- Different handling of breakout vs bounce signal types
-- Asymmetric long/short trailing (market has upward bias)
-- Earlier/later breakeven moves
-- Dynamic TP adjustment based on momentum
-- Different OU timeout formulas
-- ATR-based or volatility-adaptive stops (you can compute from recent bars)
+## What you CAN change (entry logic):
+- Channel detection window sizes (e.g., [10, 15, 20, 30, 40] for 5-min)
+- Higher TF window sizes (via TF_WINDOWS or custom)
+- Minimum bar count thresholds (currently 20 for 5-min, 30 for higher TFs)
+- Confidence thresholds and how confidence is scaled
+- GBT soft gate: how ML agreement/disagreement scales confidence (currently 0.80 penalty)
+- EL threshold (currently 0.18) and how it affects confidence
+- ER thresholds (0.55, 0.70) and trail_width_mult values (1.5, 2.0)
+- Fast reversion threshold (currently 0.55)
+- ATR stop/TP sizing: floor/cap ratios for bounce vs break
+- Breakout stop multiplier
+- TP widening logic (currently 1.30x for bounce conf > 0.65)
+- Anti-pyramid rules (currently blocks same-direction AND same-type)
+- Adding time-of-day filters (market hours, avoid open/close, etc.)
+- Adding volatility filters (reject signals during extreme volatility)
+- Adding trend alignment filters (e.g., skip longs when daily channel is bearish)
+- Using SPY/VIX data for entry gating
+- Using ER/EL probabilities to adjust stop_pct/tp_pct, not just metadata
+- Different lookback lengths for 5-min slice (currently 100 bars)
+
+## What is FROZEN (do NOT change):
+- Exit logic (get_effective_stop, check_exits) -- handled separately
+- ML model weights (GBT, EL, ER, fast_rev) -- models are loaded externally
+- build_feature_vector() call signature -- keep the same parameters
+- Signal metadata keys: el_flagged, trail_width_mult, fast_reversion, ou_half_life,
+  signal_bar_high, signal_bar_low -- exit logic depends on these
 
 ## Rules:
-1. You MUST define both get_effective_stop(self, position) and check_exits(self, time, bar, open_positions)
-2. get_effective_stop returns a float (the effective stop price) or None
-3. check_exits returns a list of ExitSignal objects
-4. Import ExitSignal inside check_exits: from v15.validation.unified_backtester.algo_base import ExitSignal
-5. Do NOT import or modify the entry signal — only exit logic
+1. You MUST define both on_bar(self, time, bar, open_positions, context=None) and _compute_current_atr(self, time)
+2. on_bar returns a list of Signal objects (usually 0 or 1 signals)
+3. _compute_current_atr returns a float (ATR value)
+4. Import Signal inside on_bar: from v15.validation.unified_backtester.algo_base import Signal
+5. Do NOT modify exit logic, ML model loading, or on_position_opened
 6. Keep it simple enough to not crash. If in doubt, keep existing logic and change one thing.
 7. Include a brief # comment at the top describing what you changed
+8. ALWAYS include the signal metadata dict with all required keys (el_flagged, trail_width_mult, etc.)
+9. ALWAYS call build_feature_vector and the ML models -- they provide critical gating
 
 ## Output format:
 Respond with ONLY a Python code block containing both functions. No explanation outside the code.
-Start with ```python and end with ```. Include necessary imports (typing, etc.) at the top of the block.
+Start with ```python and end with ```. Include necessary imports (numpy, pandas, logging, etc.) at the top of the block.
 """
 
 
@@ -199,11 +237,11 @@ def extract_code(llm_response):
     match = re.search(pattern, llm_response, re.DOTALL)
     if match:
         code = match.group(1).strip()
-        if 'def get_effective_stop' in code:
+        if 'def on_bar' in code:
             return code
 
     # If response itself looks like code
-    if 'def get_effective_stop' in llm_response and 'def check_exits' in llm_response:
+    if 'def on_bar' in llm_response and 'def _compute_current_atr' in llm_response:
         return llm_response.strip()
 
     return None
@@ -211,10 +249,10 @@ def extract_code(llm_response):
 
 def validate_code(code):
     """Basic validation that the code defines required functions."""
-    if 'def get_effective_stop' not in code:
-        return False, "missing get_effective_stop()"
-    if 'def check_exits' not in code:
-        return False, "missing check_exits()"
+    if 'def on_bar' not in code:
+        return False, "missing on_bar()"
+    if 'def _compute_current_atr' not in code:
+        return False, "missing _compute_current_atr()"
     # Try to compile
     try:
         compile(code, '<candidate>', 'exec')
@@ -261,7 +299,7 @@ def load_state():
 
 def main():
     log("=" * 60)
-    log("Phase C: Surfer-ML Exit Logic Evolution")
+    log("Phase B1: Surfer-ML Entry Logic Evolution")
     log("=" * 60)
 
     # Check for resume state
@@ -283,7 +321,7 @@ def main():
             f"PnL=${best_metrics.get('total_pnl', 0):.0f})")
     else:
         # Evaluate initial program
-        log("Evaluating initial program (current exit logic)...")
+        log("Evaluating initial program (current entry logic)...")
         result = evaluate_in_subprocess(INITIAL_PROGRAM)
         if not result or result.get("combined_score", 0) <= 0:
             log(f"Initial evaluation failed: {result}")
@@ -314,9 +352,9 @@ def main():
         try:
             log(f"\n--- Iteration {i}/{MAX_ITERATIONS} ---")
 
-            # Call LLM for new exit logic code
+            # Call LLM for new entry logic code
             prompt = build_prompt(best_code, best_score, best_metrics, history)
-            log("  Calling LLM for exit logic code...")
+            log("  Calling LLM for entry logic code...")
             t0 = time.time()
             response = call_llm(prompt)
             llm_time = time.time() - t0
@@ -399,7 +437,7 @@ def main():
             consecutive_errors += 1
             log(f"  ITERATION {i} CRASHED: {e}\n{traceback.format_exc()}")
             if consecutive_errors >= 5:
-                log("  5 consecutive errors — aborting to avoid infinite loop")
+                log("  5 consecutive errors -- aborting to avoid infinite loop")
                 break
             continue
 

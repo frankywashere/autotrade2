@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-Phase C: Evolutionary exit logic tuning for surfer-ml.
+Phase B3: Evolutionary channel break predictor.
 
-Instead of tuning numeric knobs (Phase A), the LLM rewrites the actual
-Python code for get_effective_stop() and check_exits(). The evaluator
-monkey-patches these onto SurferMLAlgo and runs the full backtest.
+The LLM evolves predict_channel_break() — a function that predicts
+whether a price channel will break, which direction, and generates
+entry signals timed BEFORE the break.
+
+The evaluator runs channel detection on 5-min TSLA data, extracts all
+channel physics features (energy, entropy, OU, squeeze, health, etc.)
+plus multi-TF channel data, and passes them to the candidate function.
 
 Usage:
-    python -u v15/validation/openevolve_surfer_exit/simple_evolve.py
+    python -u v15/validation/openevolve_channel_break/simple_evolve.py
 """
 
 import json
@@ -19,8 +23,8 @@ import tempfile
 import time
 import traceback
 
-# ── Config ────────────────────────────────────────────────────────────────────
-MAX_ITERATIONS = 300
+# ── Config ────────────────────────────────────────────────────────────────
+MAX_ITERATIONS = 1000
 CLAUDE_CMD = r"C:\Users\frank\.local\bin\claude.exe"
 MODEL = "sonnet"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -50,13 +54,12 @@ def evaluate_in_subprocess(program_path):
     try:
         result = subprocess.run(
             [sys.executable, EVAL_SCRIPT, program_path],
-            capture_output=True, text=True, timeout=1200,
+            capture_output=True, text=True, timeout=3600,
             encoding="utf-8", errors="replace",
         )
         if result.returncode != 0:
             log(f"  Eval subprocess failed: {result.stderr[-500:]}")
             return None
-        # Last line of stdout is the JSON result
         lines = result.stdout.strip().split("\n")
         for line in reversed(lines):
             line = line.strip()
@@ -97,7 +100,7 @@ def read_program_code(path):
 
 
 def build_prompt(current_code, current_score, current_metrics, history):
-    """Build prompt for LLM to suggest improved exit logic code."""
+    """Build prompt for LLM to suggest improved channel break predictor."""
     history_str = ""
     if history:
         history_str = "\n\nPrevious attempts (sorted by score, best first):\n"
@@ -107,37 +110,68 @@ def build_prompt(current_code, current_score, current_metrics, history):
                 f"  Score={h['score']:.0f} PnL=${h['pnl']:.0f} "
                 f"Trades={h['trades']} WR={h['wr']:.1f}% "
                 f"Sharpe={h['sharpe']:.3f} DD={h['dd']:.1f}% "
-                f"— {desc}\n"
+                f"-- {desc}\n"
             )
 
-    return f"""You are evolving exit logic for a TSLA trading algorithm (surfer-ml).
-The ML entry signal is FROZEN — you can ONLY change how exits work.
+    return f"""You are evolving a channel break predictor for TSLA trading.
 
-You must write TWO Python functions: get_effective_stop() and check_exits().
-These are monkey-patched as methods onto the algo instance (use `self`).
+The function predict_channel_break() receives rich channel physics features from
+detected price channels and must predict:
+1. Whether a channel will break in the next ~20 bars (5-min bars)
+2. Which direction (up or down)
+3. Generate BUY/SELL entry signals timed BEFORE the break
 
-## Position object fields (READ-ONLY, do not modify):
-  pos.pos_id — unique position ID
-  pos.direction — 'long' or 'short'
-  pos.entry_price — fill price at entry
-  pos.stop_price — initial stop (set at entry, never changes)
-  pos.tp_price — take-profit price (set at entry, never changes)
-  pos.best_price — highest price seen for longs, lowest for shorts (engine-ratcheted)
-  pos.hold_bars — number of 5-min bars held so far
-  pos.signal_type — 'bounce' or 'break'
-  pos.metadata — dict with 'el_flagged', 'trail_width_mult', 'fast_reversion', 'ou_half_life', etc.
+## Available channel_features (dict, 5-min primary channel):
+Physics features:
+  - energy_ratio: total_energy/binding_energy (>1.2 = break imminent)
+  - total_energy, potential_energy, kinetic_energy, binding_energy
+  - position_pct: 0=lower bound, 0.5=center, 1=upper bound
+  - center_distance: signed -1 to +1
+  - momentum_direction: +1=toward upper, -1=toward lower
+  - momentum_is_turning: bool
+  - momentum_turn_score: 0-1
 
-## Per-position state: self._pos_state[pos.pos_id]
-  A dict you can read/write. Seeded at entry with:
-    'el_flagged': bool, 'trail_width_mult': float, 'fast_reversion': bool,
-    'ou_half_life': float, 'window_high': float, 'window_low': float
-  You can add any keys you want for tracking state across bars.
+Channel structure:
+  - channel_health: 0=dying, 1=strong
+  - squeeze_score: 0-1 (compression -> explosive moves)
+  - entropy: Shannon entropy (0=predictable, 1=random)
+  - r_squared: regression fit quality (0-1)
+  - width_pct: channel width as % of price
+  - alternation_ratio: bounce cleanliness (0-1)
+  - bounce_count, complete_cycles, quality_score
+  - bars_since_last_touch, upper_touches, lower_touches
+  - false_break_rate: 0-1 (resilience to false breaks)
 
-## Config values available: self.config.max_hold_bars, self.config.eval_interval
+Mean-reversion:
+  - ou_theta: OU speed (<0.05 = channel failing)
+  - ou_half_life: bars to half-revert
+  - ou_reversion_score: 0-1
+  - oscillation_period, bars_to_next_bounce
 
-## ExitSignal: import from v15.validation.unified_backtester.algo_base
-  ExitSignal(pos_id=str, price=float, reason=str)
-  Valid reasons: 'stop', 'trail', 'tp', 'ou_timeout', 'timeout'
+Break probability (existing hand-crafted):
+  - break_prob, break_prob_up, break_prob_down (0-1)
+
+Trend:
+  - slope_pct: channel slope as % per bar
+  - channel_direction: 'bull', 'bear', 'sideways'
+  - volume_score: 0-1
+
+## multi_tf_features (dict of TF -> dict):
+  Higher TFs: '1h', '4h', 'daily' (when available)
+  Each has the same feature keys as channel_features.
+  Use for confluence: if higher TF agrees, break is more likely.
+
+## recent_bars (pd.DataFrame, last 100 5-min OHLCV bars):
+  Columns: open, high, low, close, volume
+  Can use for feature engineering: volume patterns, candle analysis, etc.
+
+## Return dict:
+  'break_imminent': bool
+  'break_direction': 'up' or 'down' or None
+  'confidence': float 0-1
+  'signal': 'BUY', 'SELL', or None
+  'stop_pct': float (0.002-0.030)
+  'tp_pct': float (0.005-0.050)
 
 ## Current best code (score={current_score:.0f}):
 ```python
@@ -156,30 +190,34 @@ These are monkey-patched as methods onto the algo instance (use `self`).
 ## Scoring formula:
 score = PnL * (1 + max(sharpe,0) * 0.2) * (0.3 + WR * 0.7) * (1 + max(PF-1,0) * 0.1) * trade_mult * dd_mult
 Higher is better. Maximize PnL and Sharpe while keeping drawdown low.
+Trade count penalty: <50 trades = 0.2x, 200-3000 = 1.0x, >5000 = 0.7x
 
 ## What to try:
-- Different trailing stop tightening curves (polynomial, exponential, step-function)
-- Different profit tier thresholds or number of tiers
-- Time-based trail tightening (tighter as hold_bars increases)
-- Different handling of breakout vs bounce signal types
-- Asymmetric long/short trailing (market has upward bias)
-- Earlier/later breakeven moves
-- Dynamic TP adjustment based on momentum
-- Different OU timeout formulas
-- ATR-based or volatility-adaptive stops (you can compute from recent bars)
+- Novel combinations of energy_ratio, squeeze_score, health, ou_theta
+- Use recent_bars for volume spike detection, candle patterns, volatility expansion
+- Multi-TF confluence: require higher TF alignment for entry direction
+- Rate-of-change features: is energy_ratio INCREASING? Is health DECREASING?
+  (Compute from recent_bars price action as proxy)
+- Asymmetric long/short thresholds (market has upward bias)
+- Better stop/TP sizing: ATR-based, or dynamic from channel width + squeeze
+- Time-of-day filtering using recent_bars index (if timestamps available)
+- Position within oscillation cycle: bars_to_next_bounce for timing
+- Channel age via complete_cycles: older channels break differently
+- Combine false_break_rate with current energy: low false_break + high energy = real break
+- Volume confirmation: look for volume expansion in recent_bars near boundaries
+- Entropy acceleration: rapidly increasing entropy = structure breakdown
 
 ## Rules:
-1. You MUST define both get_effective_stop(self, position) and check_exits(self, time, bar, open_positions)
-2. get_effective_stop returns a float (the effective stop price) or None
-3. check_exits returns a list of ExitSignal objects
-4. Import ExitSignal inside check_exits: from v15.validation.unified_backtester.algo_base import ExitSignal
-5. Do NOT import or modify the entry signal — only exit logic
-6. Keep it simple enough to not crash. If in doubt, keep existing logic and change one thing.
-7. Include a brief # comment at the top describing what you changed
+1. You MUST define: def predict_channel_break(channel_features, multi_tf_features, recent_bars) -> dict
+2. Import numpy and pandas at the top
+3. Keep it robust — use .get() with defaults for all feature access
+4. Return dict with all required keys (break_imminent, break_direction, confidence, signal, stop_pct, tp_pct)
+5. Do NOT try to modify the evaluator or exit logic — only the predictor function
+6. Include a brief # comment at the top describing what you changed
 
 ## Output format:
-Respond with ONLY a Python code block containing both functions. No explanation outside the code.
-Start with ```python and end with ```. Include necessary imports (typing, etc.) at the top of the block.
+Respond with ONLY a Python code block containing the function. No explanation outside the code.
+Start with ```python and end with ```.
 """
 
 
@@ -188,34 +226,28 @@ def extract_code(llm_response):
     if not llm_response:
         return None
 
-    # Try to find ```python ... ``` block
     pattern = r'```python\s*\n(.*?)```'
     match = re.search(pattern, llm_response, re.DOTALL)
     if match:
         return match.group(1).strip()
 
-    # Try ``` ... ``` without language tag
     pattern = r'```\s*\n(.*?)```'
     match = re.search(pattern, llm_response, re.DOTALL)
     if match:
         code = match.group(1).strip()
-        if 'def get_effective_stop' in code:
+        if 'def predict_channel_break' in code:
             return code
 
-    # If response itself looks like code
-    if 'def get_effective_stop' in llm_response and 'def check_exits' in llm_response:
+    if 'def predict_channel_break' in llm_response:
         return llm_response.strip()
 
     return None
 
 
 def validate_code(code):
-    """Basic validation that the code defines required functions."""
-    if 'def get_effective_stop' not in code:
-        return False, "missing get_effective_stop()"
-    if 'def check_exits' not in code:
-        return False, "missing check_exits()"
-    # Try to compile
+    """Basic validation that the code defines required function."""
+    if 'def predict_channel_break' not in code:
+        return False, "missing predict_channel_break()"
     try:
         compile(code, '<candidate>', 'exec')
     except SyntaxError as e:
@@ -239,7 +271,7 @@ def save_state(iteration, best_score, best_metrics, history):
         "best_score": best_score,
         "best_metrics": {k: v for k, v in best_metrics.items()
                          if isinstance(v, (int, float, str, bool))},
-        "history": history[-50:],  # Keep last 50 entries
+        "history": history[-50:],
     }
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -248,7 +280,7 @@ def save_state(iteration, best_score, best_metrics, history):
 
 
 def load_state():
-    """Load saved state if it exists. Returns None if no state."""
+    """Load saved state if it exists."""
     if not os.path.isfile(STATE_FILE):
         return None
     try:
@@ -261,7 +293,7 @@ def load_state():
 
 def main():
     log("=" * 60)
-    log("Phase C: Surfer-ML Exit Logic Evolution")
+    log("Phase B3: Channel Break Predictor Evolution")
     log("=" * 60)
 
     # Check for resume state
@@ -273,7 +305,6 @@ def main():
         best_score = saved["best_score"]
         best_metrics = saved["best_metrics"]
         history = saved["history"]
-        # Best code is in BEST_FILE
         if os.path.isfile(BEST_FILE):
             best_code = read_program_code(BEST_FILE)
         else:
@@ -283,7 +314,7 @@ def main():
             f"PnL=${best_metrics.get('total_pnl', 0):.0f})")
     else:
         # Evaluate initial program
-        log("Evaluating initial program (current exit logic)...")
+        log("Evaluating initial program (basic energy+squeeze predictor)...")
         result = evaluate_in_subprocess(INITIAL_PROGRAM)
         if not result or result.get("combined_score", 0) <= 0:
             log(f"Initial evaluation failed: {result}")
@@ -296,7 +327,6 @@ def main():
             f"trades={result['n_trades']:.0f} WR={result['win_rate']:.1f}% "
             f"Sharpe={result['sharpe']:.3f} DD={result['max_drawdown_pct']:.1f}%")
 
-        # Save initial as best
         with open(BEST_FILE, "w", encoding="utf-8") as f:
             f.write(best_code)
 
@@ -304,7 +334,7 @@ def main():
             "score": best_score, "pnl": result["total_pnl"],
             "trades": result["n_trades"], "wr": result["win_rate"],
             "sharpe": result["sharpe"], "dd": result["max_drawdown_pct"],
-            "description": "initial (current production logic)",
+            "description": "initial (energy_ratio + squeeze + health)",
         }]
         save_state(0, best_score, best_metrics, history)
 
@@ -314,9 +344,8 @@ def main():
         try:
             log(f"\n--- Iteration {i}/{MAX_ITERATIONS} ---")
 
-            # Call LLM for new exit logic code
             prompt = build_prompt(best_code, best_score, best_metrics, history)
-            log("  Calling LLM for exit logic code...")
+            log("  Calling LLM for channel break predictor code...")
             t0 = time.time()
             response = call_llm(prompt)
             llm_time = time.time() - t0
@@ -336,20 +365,17 @@ def main():
             description = extract_description(code)
             log(f"  Change: {description}")
 
-            # Write candidate program to temp file
             with tempfile.NamedTemporaryFile(suffix=".py", delete=False,
                                               dir=OUTPUT_DIR, mode="w",
                                               encoding="utf-8") as tf:
                 tf.write(code)
                 candidate_path = tf.name
 
-            # Evaluate
             log("  Evaluating...")
             t0 = time.time()
             result = evaluate_in_subprocess(candidate_path)
             eval_time = time.time() - t0
 
-            # Clean up temp file
             try:
                 os.unlink(candidate_path)
             except OSError:
@@ -381,7 +407,6 @@ def main():
                 best_code = code
                 with open(BEST_FILE, "w", encoding="utf-8") as f:
                     f.write(code)
-                # Also save numbered copy for reference
                 numbered = os.path.join(OUTPUT_DIR, f"best_iter{i}.py")
                 with open(numbered, "w", encoding="utf-8") as f:
                     f.write(f"# Score={score:.0f} PnL=${result['total_pnl']:.0f} "
@@ -399,7 +424,7 @@ def main():
             consecutive_errors += 1
             log(f"  ITERATION {i} CRASHED: {e}\n{traceback.format_exc()}")
             if consecutive_errors >= 5:
-                log("  5 consecutive errors — aborting to avoid infinite loop")
+                log("  5 consecutive errors -- aborting to avoid infinite loop")
                 break
             continue
 

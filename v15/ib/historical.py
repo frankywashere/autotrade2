@@ -31,7 +31,7 @@ def download_1min_bars(symbol: str, months: int, output: str,
     """Download 1-min bars day-by-day from IB and save in TSLAMin.txt format."""
     from v15.ib.client import IBClient
 
-    client = IBClient(host=host, port=port, client_id=99)
+    client = IBClient(host=host, port=port, client_id=88)
     logger.info("Connecting to IB Gateway at %s:%d ...", host, port)
     client.connect()
     logger.info("Connected.")
@@ -62,8 +62,9 @@ def download_1min_bars(symbol: str, months: int, output: str,
                 logger.info("  Day %d: %s — %d bars (earliest: %s)",
                              day_count, current.strftime('%Y-%m-%d'),
                              len(df), earliest)
-                # Move to previous day (strip tz to keep comparison naive)
-                current = pd.Timestamp(earliest).tz_localize(None).to_pydatetime() - timedelta(seconds=1)
+                # Move to previous calendar day (don't jump by bar timestamp —
+                # timezone mismatches cause multi-day skips for IND contracts)
+                current = current.replace(hour=0, minute=0, second=0) - timedelta(seconds=1)
             else:
                 # No data (weekend/holiday) — just step back 1 day
                 current -= timedelta(days=1)

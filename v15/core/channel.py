@@ -11,7 +11,6 @@ copied to v15/core/ to remove the v7 dependency.
 import numpy as np
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
-from scipy import stats
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict
 from enum import IntEnum
@@ -178,53 +177,65 @@ def detect_bounces(
     Returns:
         Tuple of (touches, bounce_count, complete_cycles, upper_touches, lower_touches)
     """
-    touches = []
     channel_width = upper_line - lower_line
 
-    for i in range(len(high)):
-        width = channel_width[i]
-        if width <= 0:
-            continue
+    # Vectorized touch detection
+    valid = channel_width > 0
+    # Safe divide (avoid division by zero; invalid entries won't pass threshold)
+    safe_width = np.where(valid, channel_width, 1.0)
+    upper_dist = (upper_line - high) / safe_width
+    lower_dist = (low - lower_line) / safe_width
 
-        # Check if HIGH is near/above upper line
-        upper_dist = (upper_line[i] - high[i]) / width
-        # Check if LOW is near/below lower line
-        lower_dist = (low[i] - lower_line[i]) / width
+    upper_touch_mask = valid & (upper_dist <= threshold)
+    lower_touch_mask = valid & (lower_dist <= threshold)
 
-        # Touch upper if HIGH is within threshold of upper (or above it)
-        if upper_dist <= threshold:
-            touches.append(Touch(bar_index=i, touch_type=TouchType.UPPER, price=high[i]))
-        # Touch lower if LOW is within threshold of lower (or below it)
-        if lower_dist <= threshold:
-            touches.append(Touch(bar_index=i, touch_type=TouchType.LOWER, price=low[i]))
+    upper_indices = np.nonzero(upper_touch_mask)[0]
+    lower_indices = np.nonzero(lower_touch_mask)[0]
+
+    # Build touches list sorted by bar index, with upper before lower for same bar
+    # (preserving original loop order: upper checked first, then lower)
+    touches = []
+    ui, li = 0, 0
+    n_upper, n_lower = len(upper_indices), len(lower_indices)
+    while ui < n_upper or li < n_lower:
+        u_idx = upper_indices[ui] if ui < n_upper else len(high) + 1
+        l_idx = lower_indices[li] if li < n_lower else len(high) + 1
+        if u_idx <= l_idx:
+            touches.append(Touch(bar_index=int(u_idx), touch_type=TouchType.UPPER, price=high[u_idx]))
+            ui += 1
+            if l_idx == u_idx:
+                touches.append(Touch(bar_index=int(l_idx), touch_type=TouchType.LOWER, price=low[l_idx]))
+                li += 1
+        else:
+            touches.append(Touch(bar_index=int(l_idx), touch_type=TouchType.LOWER, price=low[l_idx]))
+            li += 1
 
     # Count alternating touches (bounces)
-    bounce_count = 0
-    last_type = None
-    for touch in touches:
-        if last_type is not None and touch.touch_type != last_type:
-            bounce_count += 1
-        last_type = touch.touch_type
+    if len(touches) > 1:
+        touch_types = np.array([t.touch_type for t in touches], dtype=np.int8)
+        bounce_count = int(np.count_nonzero(np.diff(touch_types)))
+    else:
+        bounce_count = 0
 
     # Count complete cycles (full round-trips)
     complete_cycles = 0
     i = 0
-    while i < len(touches) - 2:
+    n_touches = len(touches)
+    while i < n_touches - 2:
         t1 = touches[i].touch_type
         t2 = touches[i + 1].touch_type
         t3 = touches[i + 2].touch_type
 
         # Lower → Upper → Lower OR Upper → Lower → Upper
-        if (t1 == TouchType.LOWER and t2 == TouchType.UPPER and t3 == TouchType.LOWER) or \
-           (t1 == TouchType.UPPER and t2 == TouchType.LOWER and t3 == TouchType.UPPER):
+        if t1 != t2 and t2 != t3 and t1 == t3:
             complete_cycles += 1
             i += 2  # Skip to after this cycle
         else:
             i += 1
 
-    # Count upper and lower touches
-    upper_touches = sum(1 for t in touches if t.touch_type == TouchType.UPPER)
-    lower_touches = sum(1 for t in touches if t.touch_type == TouchType.LOWER)
+    # Count upper and lower touches (already computed)
+    upper_touches = n_upper
+    lower_touches = n_lower
 
     return touches, bounce_count, complete_cycles, upper_touches, lower_touches
 
@@ -261,16 +272,29 @@ def detect_channel(
     n = len(close)
     x = np.arange(n)
 
-    # Linear regression on close prices
-    slope, intercept, r_value, p_value, std_err = stats.linregress(x, close)
-    r_squared = r_value ** 2
+    # Linear regression on close prices (pure numpy, avoids scipy overhead)
+    x_f = x.astype(np.float64)
+    n_f = float(n)
+    x_mean = x_f.mean()
+    y_mean = close.mean()
+    xm = x_f - x_mean
+    ym = close - y_mean
+    xy_cov = (xm * ym).sum()
+    x_var = (xm * xm).sum()
+    slope = xy_cov / x_var
+    intercept = y_mean - slope * x_mean
 
     # Center line (regression fit)
-    center_line = slope * x + intercept
+    center_line = slope * x_f + intercept
 
     # Residuals and standard deviation
     residuals = close - center_line
     std_dev = np.std(residuals)
+
+    # R-squared (matches r_value**2 from scipy.stats.linregress)
+    ss_res = (residuals * residuals).sum()
+    ss_tot = (ym * ym).sum()
+    r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
 
     # Upper and lower bounds
     upper_line = center_line + std_multiplier * std_dev

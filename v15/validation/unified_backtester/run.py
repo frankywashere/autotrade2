@@ -189,6 +189,43 @@ def _create_algo(spec: dict, data: DataProvider):
             config.algo_id = params['id']
         return SurferMLAlgo(config, data)
 
+    elif algo_type in ('surfer-ml-v2', 'surfer_ml_v2', 'surfer-v2'):
+        from .algos.surfer_ml_v2 import SurferMLV2Algo, DEFAULT_SURFER_ML_V2_CONFIG
+        from copy import deepcopy
+        config = deepcopy(DEFAULT_SURFER_ML_V2_CONFIG)
+        if 'equity' in params:
+            config.initial_equity = float(params['equity'])
+            config.max_equity_per_trade = float(params['equity'])
+        if 'max_per_trade' in params:
+            config.max_equity_per_trade = float(params['max_per_trade'])
+        if 'flat_sizing' in params:
+            config.params['flat_sizing'] = str(params['flat_sizing']).lower() in ('true', '1', 'yes')
+        if 'model_dir' in params:
+            config.params['ml_model_dir'] = params['model_dir']
+        if 'stop_pct' in params:
+            config.params['stop_pct'] = float(params['stop_pct'])
+        if 'tp_pct' in params:
+            config.params['tp_pct'] = float(params['tp_pct'])
+        if 'breakout_stop_mult' in params:
+            config.params['breakout_stop_mult'] = float(params['breakout_stop_mult'])
+        if 'ou_half_life' in params:
+            config.params['ou_half_life'] = float(params['ou_half_life'])
+        if 'min_confidence' in params:
+            config.params['min_confidence'] = float(params['min_confidence'])
+        if 'eval_interval' in params:
+            config.eval_interval = int(params['eval_interval'])
+        if 'start_time' in params:
+            import datetime as _dt
+            t = str(params['start_time']).zfill(4)
+            config.active_start = _dt.time(int(t[:2]), int(t[2:]))
+        if 'end_time' in params:
+            import datetime as _dt
+            t = str(params['end_time']).zfill(4)
+            config.active_end = _dt.time(int(t[:2]), int(t[2:]))
+        if 'id' in params:
+            config.algo_id = params['id']
+        return SurferMLV2Algo(config, data)
+
     elif algo_type in ('oe-sig5', 'oe_sig5', 'oe'):
         from .algos.oe_sig5 import OESig5Algo, DEFAULT_OE_SIG5_CONFIG
         from copy import deepcopy
@@ -215,7 +252,7 @@ def _create_algo(spec: dict, data: DataProvider):
         return OESig5Algo(config, data)
 
     else:
-        raise ValueError(f"Unknown algo type: {algo_type}. Available: intraday, cs-combo, cs-dw, surfer-ml, oe-sig5")
+        raise ValueError(f"Unknown algo type: {algo_type}. Available: intraday, cs-combo, cs-dw, surfer-ml, surfer-ml-v2, oe-sig5")
 
 
 def main():
@@ -291,6 +328,7 @@ def main():
     # Parse algos early to check data requirements
     algo_specs = [_parse_algo_spec(s) for s in args.algo]
     needs_context = any(s['algo_type'] in ('surfer-ml', 'surfer_ml', 'surfer',
+                                            'surfer-ml-v2', 'surfer_ml_v2', 'surfer-v2',
                                             'oe-sig5', 'oe_sig5', 'oe')
                         for s in algo_specs)
     if needs_context:

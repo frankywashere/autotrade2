@@ -20,9 +20,19 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from scipy import stats as sp_stats
-
 from .channel import Channel, Direction, TouchType, detect_channel
+
+# Module-level cache for Hanning windows (keyed by size)
+_hanning_cache: Dict[int, np.ndarray] = {}
+
+
+def _get_hanning(n: int) -> np.ndarray:
+    """Return cached Hanning window of given size."""
+    w = _hanning_cache.get(n)
+    if w is None:
+        w = np.hanning(n)
+        _hanning_cache[n] = w
+    return w
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -682,20 +692,15 @@ def compute_oscillation_period(
 
     recent = prices[-lookback:] if len(prices) > lookback else prices
 
-    # Compute channel-relative position for each bar
+    # Compute channel-relative position for each bar (vectorized)
     n = len(channel.center_line)
-    positions = []
-    for i, price in enumerate(recent):
-        bar_idx = min(n - 1, max(0, n - len(recent) + i))
-        center = channel.center_line[bar_idx]
-        upper = channel.upper_line[bar_idx]
-        width = upper - center
-        if width > 0:
-            positions.append((price - center) / width)
-        else:
-            positions.append(0.0)
-
-    signal = np.array(positions)
+    nr = len(recent)
+    bar_indices = np.clip(np.arange(nr) + (n - nr), 0, n - 1)
+    centers = channel.center_line[bar_indices]
+    uppers = channel.upper_line[bar_indices]
+    widths = uppers - centers
+    safe_widths = np.where(widths > 0, widths, 1.0)
+    signal = np.where(widths > 0, (recent - centers) / safe_widths, 0.0)
 
     # Remove trend (use residuals from linear fit)
     x = np.arange(len(signal))
@@ -707,8 +712,8 @@ def compute_oscillation_period(
     if n_pts < 10:
         return 0.0, 0.0
 
-    # Window function to reduce spectral leakage
-    windowed = detrended * np.hanning(n_pts)
+    # Window function to reduce spectral leakage (cached)
+    windowed = detrended * _get_hanning(n_pts)
     fft_vals = np.fft.rfft(windowed)
     power = np.abs(fft_vals) ** 2
 
@@ -1522,13 +1527,14 @@ def analyze_channels(
         latest_upper = channel.upper_line[-1]
         latest_lower = channel.lower_line[-1]
         latest_width = latest_upper - latest_lower
-        ou_positions = []
         if latest_width > 0:
-            for p in prices[-ou_lookback:]:
-                pos_val = (p - latest_lower) / latest_width
-                ou_positions.append(max(0.0, min(1.0, pos_val)))
+            ou_positions = np.clip(
+                (prices[-ou_lookback:] - latest_lower) / latest_width, 0.0, 1.0
+            )
+        else:
+            ou_positions = np.array([])
 
-        ou_params = fit_ou_process(np.array(ou_positions)) if len(ou_positions) >= OU_MIN_SAMPLES else None
+        ou_params = fit_ou_process(ou_positions) if len(ou_positions) >= OU_MIN_SAMPLES else None
         ou_rev_score = compute_ou_reversion_score(ou_params, pos_pct)
 
         # 10. Break probability
