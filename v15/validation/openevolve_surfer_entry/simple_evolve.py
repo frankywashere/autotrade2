@@ -66,7 +66,7 @@ def evaluate_in_subprocess(program_path):
         log(f"  No JSON in eval output: {result.stdout[-300:]}")
         return None
     except subprocess.TimeoutExpired:
-        log("  Eval timed out (1200s)")
+        log("  Eval timed out (3600s)")
         return None
     except Exception as e:
         log(f"  Eval error: {e}")

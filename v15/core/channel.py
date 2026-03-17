@@ -6,6 +6,9 @@ Key insight: Use HIGHS for upper touches, LOWS for lower touches.
 
 NOTE: This module was originally in v7/core/channel.py and has been
 copied to v15/core/ to remove the v7 dependency.
+
+Performance: The inner computation is JIT-compiled with numba for C-speed
+execution. Falls back to pure-numpy if numba is unavailable.
 """
 
 import numpy as np
@@ -14,6 +17,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict
 from enum import IntEnum
+
+try:
+    import numba
+    _HAS_NUMBA = True
+except ImportError:
+    _HAS_NUMBA = False
 
 
 # Standard window sizes for multi-window channel detection
@@ -154,6 +163,161 @@ class Channel:
         return ((price - lower) / price) * 100 if price > 0 else 0.0
 
 
+# ---------------------------------------------------------------------------
+# Numba JIT-compiled core (C-speed inner loop)
+# ---------------------------------------------------------------------------
+
+def _make_jit_core():
+    """Build and return the numba-compiled core function, or None if unavailable."""
+    if not _HAS_NUMBA:
+        return None
+
+    @numba.njit(cache=True)
+    def _detect_channel_core(close, high, low, std_multiplier, touch_threshold):
+        """
+        JIT-compiled core of detect_channel + detect_bounces.
+
+        Returns a flat tuple of scalars and arrays — no Python objects.
+
+        Returns:
+            (slope, intercept, r_squared, std_dev, avg_price,
+             upper, lower, center,
+             touch_bar_indices, touch_types, touch_prices, n_touches,
+             bounce_count, complete_cycles, upper_touches_count, lower_touches_count)
+        """
+        n = len(close)
+
+        # --- Linear regression on close prices ---
+        x = np.arange(n).astype(np.float64)
+        x_mean = 0.0
+        y_mean = 0.0
+        for i in range(n):
+            x_mean += x[i]
+            y_mean += close[i]
+        x_mean /= n
+        y_mean /= n
+
+        xy_cov = 0.0
+        x_var = 0.0
+        ss_tot = 0.0
+        for i in range(n):
+            xm = x[i] - x_mean
+            ym = close[i] - y_mean
+            xy_cov += xm * ym
+            x_var += xm * xm
+            ss_tot += ym * ym
+
+        slope = xy_cov / x_var
+        intercept = y_mean - slope * x_mean
+
+        # --- Center line, residuals, std_dev ---
+        center = np.empty(n, dtype=np.float64)
+        residuals_sq_sum = 0.0
+        residuals_sum = 0.0
+        for i in range(n):
+            center[i] = slope * x[i] + intercept
+            r = close[i] - center[i]
+            residuals_sum += r
+            residuals_sq_sum += r * r
+
+        # Population std (matches np.std)
+        res_mean = residuals_sum / n
+        # Var = E[X^2] - (E[X])^2
+        variance = residuals_sq_sum / n - res_mean * res_mean
+        if variance < 0.0:
+            variance = 0.0
+        std_dev = variance ** 0.5
+
+        # --- R-squared ---
+        ss_res = residuals_sq_sum
+        if ss_tot > 0.0:
+            r_squared = 1.0 - ss_res / ss_tot
+        else:
+            r_squared = 0.0
+
+        # --- Upper and lower bounds ---
+        band = std_multiplier * std_dev
+        upper = np.empty(n, dtype=np.float64)
+        lower = np.empty(n, dtype=np.float64)
+        avg_price = 0.0
+        for i in range(n):
+            upper[i] = center[i] + band
+            lower[i] = center[i] - band
+            avg_price += close[i]
+        avg_price /= n
+
+        # --- Touch detection ---
+        # First pass: count touches to allocate arrays
+        max_touches = 2 * n  # Upper bound: both upper and lower at every bar
+        touch_bar_indices = np.empty(max_touches, dtype=np.int64)
+        touch_types = np.empty(max_touches, dtype=np.int8)  # 1=UPPER, 0=LOWER
+        touch_prices = np.empty(max_touches, dtype=np.float64)
+        t_count = 0
+        upper_touches_count = 0
+        lower_touches_count = 0
+
+        for i in range(n):
+            width = upper[i] - lower[i]
+            if width <= 0.0:
+                continue
+            u_dist = (upper[i] - high[i]) / width
+            l_dist = (low[i] - lower[i]) / width
+
+            is_upper = u_dist <= touch_threshold
+            is_lower = l_dist <= touch_threshold
+
+            # Upper before lower for same bar (preserving original merge order)
+            if is_upper:
+                touch_bar_indices[t_count] = i
+                touch_types[t_count] = 1  # UPPER
+                touch_prices[t_count] = high[i]
+                t_count += 1
+                upper_touches_count += 1
+            if is_lower:
+                touch_bar_indices[t_count] = i
+                touch_types[t_count] = 0  # LOWER
+                touch_prices[t_count] = low[i]
+                t_count += 1
+                lower_touches_count += 1
+
+        # --- Bounce count (alternating touches) ---
+        bounce_count = 0
+        if t_count > 1:
+            for i in range(t_count - 1):
+                if touch_types[i] != touch_types[i + 1]:
+                    bounce_count += 1
+
+        # --- Complete cycles ---
+        complete_cycles = 0
+        i = 0
+        while i < t_count - 2:
+            t1 = touch_types[i]
+            t2 = touch_types[i + 1]
+            t3 = touch_types[i + 2]
+            if t1 != t2 and t2 != t3 and t1 == t3:
+                complete_cycles += 1
+                i += 2
+            else:
+                i += 1
+
+        # Trim touch arrays to actual size
+        out_bar_indices = touch_bar_indices[:t_count].copy()
+        out_types = touch_types[:t_count].copy()
+        out_prices = touch_prices[:t_count].copy()
+
+        return (slope, intercept, r_squared, std_dev, avg_price,
+                upper, lower, center,
+                out_bar_indices, out_types, out_prices, t_count,
+                bounce_count, complete_cycles,
+                upper_touches_count, lower_touches_count)
+
+    return _detect_channel_core
+
+
+# Build JIT function at import time (compilation is deferred until first call)
+_detect_channel_core_jit = _make_jit_core()
+
+
 def detect_bounces(
     high: np.ndarray,
     low: np.ndarray,
@@ -250,6 +414,9 @@ def detect_channel(
     """
     Detect a price channel in OHLCV data.
 
+    Uses numba JIT-compiled core for C-speed computation when available,
+    falls back to pure-numpy otherwise.
+
     Args:
         df: DataFrame with columns [open, high, low, close, volume]
         window: Number of bars to use for regression
@@ -269,53 +436,82 @@ def detect_channel(
     high = df_slice['high'].values.astype(np.float64)
     low = df_slice['low'].values.astype(np.float64)
 
-    n = len(close)
-    x = np.arange(n)
+    if _detect_channel_core_jit is not None:
+        # --- Fast path: numba JIT ---
+        (slope, intercept, r_squared, std_dev, avg_price,
+         upper_line, lower_line, center_line,
+         touch_bar_indices, touch_types_arr, touch_prices_arr, n_touches,
+         bounce_count, complete_cycles,
+         upper_touches, lower_touches) = _detect_channel_core_jit(
+            close, high, low, std_multiplier, touch_threshold)
 
-    # Linear regression on close prices (pure numpy, avoids scipy overhead)
-    x_f = x.astype(np.float64)
-    n_f = float(n)
-    x_mean = x_f.mean()
-    y_mean = close.mean()
-    xm = x_f - x_mean
-    ym = close - y_mean
-    xy_cov = (xm * ym).sum()
-    x_var = (xm * xm).sum()
-    slope = xy_cov / x_var
-    intercept = y_mean - slope * x_mean
+        # Convert scalar numpy types to Python (for dataclass compatibility)
+        slope = float(slope)
+        intercept = float(intercept)
+        r_squared = float(r_squared)
+        std_dev = float(std_dev)
+        avg_price = float(avg_price)
+        bounce_count = int(bounce_count)
+        complete_cycles = int(complete_cycles)
+        upper_touches = int(upper_touches)
+        lower_touches = int(lower_touches)
+        n_touches = int(n_touches)
 
-    # Center line (regression fit)
-    center_line = slope * x_f + intercept
+        # Build Touch objects from arrays
+        touches = []
+        for i in range(n_touches):
+            tt = TouchType.UPPER if touch_types_arr[i] == 1 else TouchType.LOWER
+            touches.append(Touch(
+                bar_index=int(touch_bar_indices[i]),
+                touch_type=tt,
+                price=float(touch_prices_arr[i]),
+            ))
 
-    # Residuals and standard deviation
-    residuals = close - center_line
-    std_dev = np.std(residuals)
+        # Channel width as percentage
+        width_pct = ((upper_line[-1] - lower_line[-1]) / avg_price) * 100 if avg_price > 0 else 0.0
+    else:
+        # --- Fallback: pure-numpy path ---
+        n = len(close)
+        x = np.arange(n)
 
-    # R-squared (matches r_value**2 from scipy.stats.linregress)
-    ss_res = (residuals * residuals).sum()
-    ss_tot = (ym * ym).sum()
-    r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        # Linear regression on close prices (pure numpy, avoids scipy overhead)
+        x_f = x.astype(np.float64)
+        x_mean = x_f.mean()
+        y_mean = close.mean()
+        xm = x_f - x_mean
+        ym = close - y_mean
+        xy_cov = (xm * ym).sum()
+        x_var = (xm * xm).sum()
+        slope = xy_cov / x_var
+        intercept = y_mean - slope * x_mean
 
-    # Upper and lower bounds
-    upper_line = center_line + std_multiplier * std_dev
-    lower_line = center_line - std_multiplier * std_dev
+        # Center line (regression fit)
+        center_line = slope * x_f + intercept
 
-    # Channel width as percentage
-    avg_price = np.mean(close)
-    width_pct = ((upper_line[-1] - lower_line[-1]) / avg_price) * 100 if avg_price > 0 else 0.0
+        # Residuals and standard deviation
+        residuals = close - center_line
+        std_dev = np.std(residuals)
 
-    # Detect bounces
-    touches, bounce_count, complete_cycles, upper_touches, lower_touches = detect_bounces(
-        high, low, upper_line, lower_line, touch_threshold
-    )
+        # R-squared (matches r_value**2 from scipy.stats.linregress)
+        ss_res = (residuals * residuals).sum()
+        ss_tot = (ym * ym).sum()
+        r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+        # Upper and lower bounds
+        upper_line = center_line + std_multiplier * std_dev
+        lower_line = center_line - std_multiplier * std_dev
+
+        # Channel width as percentage
+        avg_price = np.mean(close)
+        width_pct = ((upper_line[-1] - lower_line[-1]) / avg_price) * 100 if avg_price > 0 else 0.0
+
+        # Detect bounces
+        touches, bounce_count, complete_cycles, upper_touches, lower_touches = detect_bounces(
+            high, low, upper_line, lower_line, touch_threshold
+        )
 
     # Calculate alternation metrics
-    # alternations = bounce_count (each L->U or U->L transition)
     alternations = bounce_count
-    # alternation_ratio measures how "clean" the bouncing is
-    # LULULU -> 5 alternations out of 5 transitions = 1.0 (perfect)
-    # UULUU -> 2 alternations out of 4 transitions = 0.5 (some consecutive)
-    # UUUUU -> 0 alternations = 0.0 (no bouncing)
     alternation_ratio = bounce_count / max(1, len(touches) - 1) if len(touches) > 1 else 0.0
 
     # Determine direction based on slope
@@ -328,8 +524,7 @@ def detect_channel(
         direction = Direction.SIDEWAYS
 
     # Valid if enough alternating bounces
-    # bounce_count measures L→U and U→L transitions, which is what we want
-    valid = bounce_count >= min_cycles  # min_cycles now means min alternating bounces
+    valid = bounce_count >= min_cycles
 
     channel = Channel(
         valid=valid,
