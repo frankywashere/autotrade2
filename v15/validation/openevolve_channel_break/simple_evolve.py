@@ -82,11 +82,13 @@ def call_llm(prompt):
             [CLAUDE_CMD, "--print", "--model", MODEL,
              "--dangerously-skip-permissions"],
             input=prompt, capture_output=True, text=True,
-            timeout=600, encoding="utf-8", errors="replace",
+            timeout=900, encoding="utf-8", errors="replace",
         )
+        if result.returncode != 0:
+            log(f"  LLM stderr: {result.stderr[-200:]}")
         return result.stdout.strip()
     except subprocess.TimeoutExpired:
-        log("  LLM timed out (600s)")
+        log("  LLM timed out (900s)")
         return None
     except Exception as e:
         log(f"  LLM error: {e}")
@@ -106,10 +108,13 @@ def build_prompt(current_code, current_score, current_metrics, history):
         history_str = "\n\nPrevious attempts (sorted by score, best first):\n"
         for h in sorted(history, key=lambda x: x["score"], reverse=True)[:8]:
             desc = h.get("description", "no description")
+            holdout_info = ""
+            if h.get('holdout_pnl', 0) != 0 or h.get('holdout_trades', 0) > 0:
+                holdout_info = f" [HOLDOUT: ${h.get('holdout_pnl',0):.0f}/{h.get('holdout_trades',0)} trades Sharpe={h.get('holdout_sharpe',0):.3f}]"
             history_str += (
                 f"  Score={h['score']:.0f} PnL=${h['pnl']:.0f} "
                 f"Trades={h['trades']} WR={h['wr']:.1f}% "
-                f"Sharpe={h['sharpe']:.3f} DD={h['dd']:.1f}% "
+                f"Sharpe={h['sharpe']:.3f} DD={h['dd']:.1f}%{holdout_info} "
                 f"-- {desc}\n"
             )
 
@@ -216,7 +221,9 @@ Trade count penalty: <50 trades = 0.2x, 200-3000 = 1.0x, >5000 = 0.7x
 6. Include a brief # comment at the top describing what you changed
 
 ## Output format:
-Respond with ONLY a Python code block containing the function. No explanation outside the code.
+Respond with ONLY a Python code block containing the COMPLETE function definition.
+You MUST include the full function starting with `def predict_channel_break(channel_features, multi_tf_features, recent_bars):` — do NOT return partial code, snippets, or diffs.
+Return the ENTIRE function from `def` to the final `return` statement.
 Start with ```python and end with ```.
 """
 
@@ -353,13 +360,16 @@ def main():
 
             code = extract_code(response)
             if not code:
+                resp_len = len(response or '')
+                snippet = (response or '')[:200]
                 log(f"  Failed to extract code from response "
-                    f"({len(response or '')} chars)")
+                    f"({resp_len} chars): {snippet}")
                 continue
 
             valid, reason = validate_code(code)
             if not valid:
-                log(f"  Invalid code: {reason}")
+                # Log first 200 chars of extracted code for debugging
+                log(f"  Invalid code: {reason} (first 200 chars: {code[:200]})")
                 continue
 
             description = extract_description(code)
@@ -387,15 +397,21 @@ def main():
                 continue
 
             score = result["combined_score"]
+            holdout_pnl = result.get('holdout_total_pnl', 0)
+            holdout_trades = result.get('holdout_n_trades', 0)
+            holdout_sharpe = result.get('holdout_sharpe', 0)
             log(f"  Result ({eval_time:.0f}s): score={score:.0f} "
                 f"PnL=${result['total_pnl']:.0f} trades={result['n_trades']:.0f} "
                 f"WR={result['win_rate']:.1f}% Sharpe={result['sharpe']:.3f} "
                 f"DD={result['max_drawdown_pct']:.1f}%")
+            log(f"  Holdout: PnL=${holdout_pnl:.0f} trades={holdout_trades} Sharpe={holdout_sharpe:.3f}")
 
             history.append({
                 "score": score, "pnl": result["total_pnl"],
                 "trades": result["n_trades"], "wr": result["win_rate"],
                 "sharpe": result["sharpe"], "dd": result["max_drawdown_pct"],
+                "holdout_pnl": holdout_pnl, "holdout_trades": holdout_trades,
+                "holdout_sharpe": holdout_sharpe,
                 "description": description,
             })
 
